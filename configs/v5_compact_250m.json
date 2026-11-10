@@ -1,0 +1,17 @@
+{
+  "preset": "v5_compact",
+  "total_target_params": 250000000,
+  "vocab_size": 32000,
+  "surface_dim": 768,
+  "radial_dim": 512,
+  "num_shells": 32,
+  "num_shortcut_tracts": 96,
+  "num_heads": 8,
+  "max_phase_steps": 1024,
+  "thinking_cycles": 4,
+  "use_tied_embeddings": true,
+  "use_swiglu": true,
+  "use_shell_tap": true,
+  "use_plan": true,
+  "phase_scale": 2.0
+}
