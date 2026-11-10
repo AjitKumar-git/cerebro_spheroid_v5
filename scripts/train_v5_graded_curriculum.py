@@ -229,11 +229,15 @@ def main():
     accum_loss = 0.0
     accum_act_loss = 0.0
     tokens_processed = 0
-    step = 0
-    max_steps = args.test_steps or args.total_steps
+    step = start_step
+    max_steps = (start_step + args.test_steps) if args.test_steps else args.total_steps
 
-    current_phase = get_curriculum_phase(0, schedule_config)
-    print(f"Entering {PHASE_NAMES[current_phase]} (Step 0 -> {schedule_config.phase_1_end})")
+    if step >= max_steps:
+        print(f"✓ Already reached target step ({step:,} >= {max_steps:,}). Nothing to train.")
+        return
+
+    current_phase = get_curriculum_phase(step, schedule_config)
+    print(f"Entering {PHASE_NAMES[current_phase]} (Step {step:,} -> {max_steps:,})")
 
     model.train()
     action_head.train()
