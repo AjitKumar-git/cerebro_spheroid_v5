@@ -357,7 +357,7 @@ class VolumetricSpheroidCoreV5(nn.Module):
         if self.use_sparse_mot and self.top_k_tracts < self.num_shortcut_tracts:
             routing_logits = self.tract_router(state_radial[:, -1, :])  # [B, T]
             topk_scores, topk_indices = torch.topk(routing_logits, self.top_k_tracts, dim=-1)
-            routing_weights = F.softmax(topk_scores, dim=-1)
+            routing_weights = F.softmax(topk_scores, dim=-1).to(dtype=routing_logits.dtype)
             routing_mask = torch.zeros_like(routing_logits).scatter_(-1, topk_indices, routing_weights)
             eff_conductances = conductances.unsqueeze(0) * routing_mask  # [B, T]
         else:
@@ -959,9 +959,10 @@ class CerebroSpheroidV5(nn.Module):
     ) -> str:
         """Convenience method for generating text from a prompt string."""
         dev = device if device is not None else next(self.parameters()).device
-        STIM_ID = 20436  # Integer token ID for <stim>
+        STIM_ID = 20436 if self.config.vocab_size > 20436 else (getattr(tokenizer, "bos_token_id", 1) or 1)
         raw_ids = tokenizer.encode(prompt, add_special_tokens=False)
-        input_ids = [STIM_ID] + raw_ids if (not raw_ids or raw_ids[0] != STIM_ID) else raw_ids
+        safe_ids = [t % self.config.vocab_size for t in raw_ids]
+        input_ids = [STIM_ID] + safe_ids if (not safe_ids or safe_ids[0] != STIM_ID) else safe_ids
         tok_tensor = torch.tensor([input_ids], dtype=torch.long, device=dev)
 
         out_ids = self.generate(
