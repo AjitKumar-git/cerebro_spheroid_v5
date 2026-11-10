@@ -246,11 +246,18 @@ class SensoryInputDNNV5(nn.Module):
         self.k_proj = nn.Linear(surface_dim, surface_dim, bias=False)
         self.v_proj = nn.Linear(surface_dim, surface_dim, bias=False)
 
+        # Contextual inter-token multi-head self-attention across prompt tokens
+        self.ctx_norm = RMSNorm(surface_dim)
+        self.q_self = nn.Linear(surface_dim, surface_dim, bias=False)
+        self.k_self = nn.Linear(surface_dim, surface_dim, bias=False)
+        self.v_self = nn.Linear(surface_dim, surface_dim, bias=False)
+        self.out_self = nn.Linear(surface_dim, surface_dim, bias=False)
+
     def forward(self, input_ids_or_emb: torch.Tensor) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Accepts integer token IDs [B, L] or soft embedding vectors [B, D] / [B, L, D].
         Returns:
-            flux: High-dimensional sensory representation [B, L, D]
+            flux: Contextual sensory representation [B, L, D]
             kv: Tuple of (keys, values) shaped [B, H, L, head_dim] for cross-resonance.
         """
         if input_ids_or_emb.dtype in (torch.int32, torch.int64):
@@ -266,6 +273,17 @@ class SensoryInputDNNV5(nn.Module):
         h = self.norm_in(x)
         h = x + self.dropout(self.swiglu(h))
         flux = self.norm_out(h)
+
+        # Contextual Inter-Token Mixing (Eliminates Bag-of-Words flaw)
+        if L > 1:
+            h_ctx = self.ctx_norm(flux)
+            q_s = self.q_self(h_ctx).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+            k_s = self.k_self(h_ctx).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+            v_s = self.v_self(h_ctx).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+            scores = torch.matmul(q_s, k_s.transpose(-1, -2)) / math.sqrt(self.head_dim)
+            attn_p = F.softmax(scores, dim=-1)
+            ctx = torch.matmul(attn_p, v_s).transpose(1, 2).contiguous().view(B, L, D)
+            flux = flux + self.dropout(self.out_self(ctx))
 
         # Multi-Head KV projections: [B, L, D] -> [B, H, L, head_dim]
         k = self.k_proj(flux).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
@@ -458,7 +476,7 @@ class PremotorMotorDecoderV5(nn.Module):
         self.num_heads = num_heads
         self.head_dim = surface_dim // num_heads
         self.max_phase_steps = max_phase_steps
-        self.phase_scale = phase_scale
+        self.phase_scale = nn.Parameter(torch.tensor(0.5))
         self.use_plan = use_plan
         self.use_shell_tap = use_shell_tap
         self.top_k_resonance = top_k_resonance
@@ -523,6 +541,7 @@ class PremotorMotorDecoderV5(nn.Module):
         auditory_feedback: Optional[torch.Tensor] = None,
         repetition_penalty: float = 1.25,
         return_hidden: bool = False,
+        causal_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Union[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor], Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]]:
         """
         Executes a single motor verbalization step:
@@ -545,7 +564,7 @@ class PremotorMotorDecoderV5(nn.Module):
         p_idx = min(max(0, int(step_idx)), max_phase - 1)
         phase = self.phase_embed.weight[p_idx].to(state.dtype)
         p_norm = phase.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-        p_scaled = phase * (self.phase_scale / p_norm)
+        p_scaled = phase * (torch.clamp(self.phase_scale, 0.05, 1.5) / p_norm)
 
         motor_surface = surface + p_scaled
         if auditory_feedback is not None:
@@ -553,7 +572,11 @@ class PremotorMotorDecoderV5(nn.Module):
 
         # 2. Multi-Head Arcuate Fasciculus Cross-Resonance with RoPE & Top-K Sparsity
         if sensory_kv is not None:
-            keys, values = sensory_kv  # [B, H, L, head_dim]
+            keys, values = sensory_kv  # [B, H, L_prompt, head_dim]
+            if causal_kv is not None and causal_kv[0].shape[2] > 0:
+                c_k, c_v = causal_kv
+                keys = torch.cat([keys, c_k], dim=2)
+                values = torch.cat([values, c_v], dim=2)
             L = keys.shape[2]
             q = self.q_proj(motor_surface).view(B, self.num_heads, 1, self.head_dim)
 
@@ -885,15 +908,21 @@ class CerebroSpheroidV5(nn.Module):
                     break
 
         # Pre-embed teacher feedback tokens if available
+        if feedback_tokens is None and targets is not None:
+            # Automatic teacher-forcing feedback from targets
+            feedback_tokens = targets[:, :t_len]
+
         if feedback_tokens is not None:
             safe_feedback = torch.clamp(feedback_tokens, min=0)
-            tf_flux, _ = self.sensory_dnn(safe_feedback)
+            tf_flux, (tf_keys, tf_values) = self.sensory_dnn(safe_feedback)
             valid_mask = (feedback_tokens >= 0).unsqueeze(-1).float()
             tf_flux = tf_flux * valid_mask
         else:
             tf_flux = None
+            tf_keys = None
+            tf_values = None
 
-        # 4. Motor Emission Loop
+        # 4. Motor Emission Loop with Causal KV Resonance & Differentiable Thought Steering
         plan = self.motor_decoder.init_plan(B, dev) if self.config.use_plan else None
         refractory = torch.zeros(B, self.config.vocab_size, device=dev)
         prev_thought = torch.zeros(B, self.config.surface_dim, device=dev)
@@ -910,6 +939,11 @@ class CerebroSpheroidV5(nn.Module):
             else:
                 auditory_in = prev_thought if t > 0 else None
 
+            # Causal KV Cache: Token t cross-attends to Prompt KV AND past generated tokens (0..t-1)
+            causal_kv = None
+            if tf_keys is not None and t > 0:
+                causal_kv = (tf_keys[:, :, :t, :], tf_values[:, :, :t, :])
+
             logits, efference, refractory, plan = self.motor_decoder(
                 state=state,
                 sensory_kv=sensory_kv,
@@ -918,14 +952,15 @@ class CerebroSpheroidV5(nn.Module):
                 refractory_trace=refractory,
                 step_idx=t,
                 auditory_feedback=auditory_in,
+                causal_kv=causal_kv,
             )
             all_logits.append(logits)
 
-            # Thought re-afference for step t+1 (isolated gradient)
-            with torch.no_grad():
-                soft_p = F.softmax(logits, dim=-1)
-                soft_emb = soft_p @ tied_w
-                prev_thought, _ = self.sensory_dnn(soft_emb)
+            # Differentiable thought re-afference for step t+1 (calibrated residual BPTT gradient)
+            soft_p = F.softmax(logits, dim=-1)
+            soft_emb = soft_p @ tied_w
+            soft_emb_diff = 0.2 * soft_emb + 0.8 * soft_emb.detach()
+            prev_thought, _ = self.sensory_dnn(soft_emb_diff)
 
             # Closed-loop state propagation via efference copy injection
             state_eff = self.volumetric_core.inject_efference_copy(state, efference)
@@ -1005,11 +1040,18 @@ class CerebroSpheroidV5(nn.Module):
         prev_thought = torch.zeros(B, self.config.surface_dim, device=dev)
 
         generated_tokens = []
+        causal_keys_list = []
+        causal_values_list = []
         finished = torch.zeros(B, dtype=torch.bool, device=dev)
         tied_w = self.sensory_dnn.embedding.weight
 
         for t in range(max_new_tokens):
             auditory_in = prev_thought if t > 0 else None
+
+            # Causal KV Cache: Query past emitted tokens
+            causal_kv = None
+            if len(causal_keys_list) > 0:
+                causal_kv = (torch.cat(causal_keys_list, dim=2), torch.cat(causal_values_list, dim=2))
 
             logits, efference, refractory, plan = self.motor_decoder(
                 state=state,
@@ -1020,6 +1062,7 @@ class CerebroSpheroidV5(nn.Module):
                 step_idx=t,
                 auditory_feedback=auditory_in,
                 repetition_penalty=repetition_penalty,
+                causal_kv=causal_kv,
             )
 
             # Temperature and sampling
@@ -1046,8 +1089,10 @@ class CerebroSpheroidV5(nn.Module):
             if finished.all():
                 break
 
-            # Thought re-afference: discrete token embedding matching training distribution
-            prev_thought, _ = self.sensory_dnn(next_tok.squeeze(-1))
+            # Thought re-afference & update causal KV buffer
+            prev_thought, (tok_k, tok_v) = self.sensory_dnn(next_tok.squeeze(-1))
+            causal_keys_list.append(tok_k)
+            causal_values_list.append(tok_v)
 
             # Efference copy state propagation
             state_eff = self.volumetric_core.inject_efference_copy(state, efference)
