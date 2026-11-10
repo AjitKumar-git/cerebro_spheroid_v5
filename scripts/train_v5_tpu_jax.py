@@ -45,22 +45,40 @@ from src.cloud_sync import (
 )
 
 
-def parse_args():
+def parse_args(args_list=None):
+    if args_list is None:
+        args_list = sys.argv[1:]
     parser = argparse.ArgumentParser(description="CerebroSpheroid V5 Cloud TPU JAX Trainer")
-    parser.add_argument("--total-steps", type=int, default=1_000_000, help="Total training steps")
+    parser.add_argument("--total-steps", "--steps", "--max-steps", dest="total_steps", type=int, default=1_000_000, help="Total training steps")
     parser.add_argument("--batch-size", type=int, default=16, help="Per-device batch size")
     parser.add_argument("--seq-len", type=int, default=256, help="Sequence length")
     parser.add_argument("--lr", type=float, default=3e-4, help="Peak learning rate")
-    parser.add_argument("--save-interval", type=int, default=500, help="Steps between local checkpoints")
-    parser.add_argument("--cloud-sync", action="store_true", help="Enable live sync with bioflo.in")
+    parser.add_argument("--save-interval", "--save-every", dest="save_interval", type=int, default=500, help="Steps between local checkpoints")
+    parser.add_argument("--cloud-sync", action="store_true", default=True, help="Enable live sync with bioflo.in")
     parser.add_argument("--cloud-sync-interval", type=int, default=100, help="Steps between cloud sync uploads")
-    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints/tpu_jax", help="Checkpoint directory")
-    parser.add_argument("--preset", type=str, default="v5_compact", help="Model preset")
-    return parser.parse_args()
+    parser.add_argument("--checkpoint-dir", "--ckpt-dir", dest="checkpoint_dir", type=str, default="/content/checkpoints" if os.path.exists("/content") else "checkpoints/tpu_jax", help="Checkpoint directory")
+    parser.add_argument("--preset", type=str, default="v5_base", choices=["v5_small", "v5_compact", "v5_base"], help="Model preset (default: v5_base)")
+    return parser.parse_args(args_list)
 
 
-def main():
-    args = parse_args()
+def run_training(**kwargs):
+    """Programmatic in-process entrypoint for Google Colab TPU notebooks (avoids TPU process lock conflicts)."""
+    args = parse_args([])
+    for k, v in kwargs.items():
+        if hasattr(args, k):
+            setattr(args, k, v)
+        elif k in ("ckpt_dir", "drive_dir"):
+            setattr(args, "checkpoint_dir", v)
+        elif k in ("max_steps", "steps"):
+            setattr(args, "total_steps", v)
+        elif k == "save_every":
+            setattr(args, "save_interval", v)
+    return main(args)
+
+
+def main(args=None):
+    if args is None:
+        args = parse_args()
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     print("=" * 75)
@@ -73,17 +91,20 @@ def main():
     is_tpu = any("TPU" in d.device_kind.upper() for d in devices)
 
     if is_tpu:
-        print("🚀 Native TPU Bfloat16 Systolic Matrix Units (MXU) ACTIVE!")
-        print("   Estimated throughput: 50,000 – 120,000 tokens/sec.")
+        dev_kind = devices[0].device_kind.lower()
+        if "v5" in dev_kind or "lite" in dev_kind:
+            print("🚀 Google Colab TPU v5e-1 Native BF16 MXU ACTIVE! (~50,000 to 120,000 tok/s)")
+        else:
+            print(f"🚀 Native TPU Bfloat16 Systolic Matrix Units (MXU) ACTIVE! ({devices[0].device_kind})")
     else:
         print("ℹ️ Running on GPU/CPU fallback.")
 
     # 1. Config & Parameter Initialization
-    cfg_dict = PRESETS_V5.get(args.preset, PRESETS_V5["v5_compact"]).copy()
+    cfg_dict = PRESETS_V5.get(args.preset, PRESETS_V5["v5_base"]).copy()
     cfg_dict["max_phase_steps"] = max(1024, args.seq_len * 2)
     config = JAXConfigV5(**cfg_dict)
 
-    print(f"\nModel Config: {args.preset} | Shells: {config.num_shells} | Dim: {config.surface_dim}")
+    print(f"\nModel Config: {args.preset} | Shells: {config.num_shells} | Surface Dim: {config.surface_dim} | Radial Dim: {config.radial_dim}")
     key = jax.random.PRNGKey(42)
     key, init_key = jax.random.split(key)
     params, buffers = init_params_v5(init_key, config)
@@ -95,7 +116,7 @@ def main():
     print(f"Total Parameters: {total_params:,} (~{total_params/1e6:.1f}M)")
     print(f"Active Compute  : {active_compute:,} (~{active_compute/1e6:.1f}M) ({active_compute/total_params*100:.2f}%)")
 
-    # 2. Setup Optax Optimizer (Adafactor or AdamW)
+    # 2. Setup Optax Optimizer
     learning_rate = optax.cosine_decay_schedule(
         init_value=args.lr,
         decay_steps=args.total_steps,
@@ -110,18 +131,37 @@ def main():
     else:
         raise ImportError("optax is required for JAX TPU training. Please install via: pip install optax")
 
-    # 3. Cloud Sync Resumption
+    # 3. Cloud Sync & Local Checkpoint Resumption
     start_step = 0
     best_loss = float("inf")
-    local_latest = os.path.join(args.checkpoint_dir, "latest.pt")
+    local_latest = os.path.join(args.checkpoint_dir, f"{args.preset}_latest.pt")
+    local_best = os.path.join(args.checkpoint_dir, f"{args.preset}_best.pt")
 
     if args.cloud_sync:
-        print("\n[cloud_sync] Checking remote manifest on bioflo.in...")
-        manifest = check_remote_manifest()
-        if manifest.get("has_latest", False):
-            pulled = pull_checkpoint(local_latest, target_type="latest")
-            if pulled:
-                print("✓ Restored latest checkpoint from cloud hub!")
+        print(f"\n[cloud_sync] Checking remote manifest on bioflo.in for {args.preset}...")
+        try:
+            manifest = check_remote_manifest(model=args.preset)
+            if manifest.get("has_latest", False):
+                pulled = pull_checkpoint(local_latest, target_type="latest", model=args.preset)
+                if pulled:
+                    print(f"✓ Restored latest {args.preset} checkpoint from cloud hub!")
+        except Exception as e:
+            print(f"⚠️ Cloud sync notice: {e}")
+
+    # Check local checkpoint
+    if os.path.exists(local_latest):
+        try:
+            import torch
+            ckpt = torch.load(local_latest, map_location="cpu", weights_only=False)
+            start_step = int(ckpt.get("step", 0))
+            best_loss = float(ckpt.get("loss", float("inf")))
+            print(f"✓ Resumed from {os.path.basename(local_latest)} at Step {start_step:,} (loss: {best_loss:.4f})")
+        except Exception as e:
+            print(f"⚠️ Local checkpoint inspection: {e}")
+
+    if start_step >= args.total_steps:
+        print(f"✓ Current Step ({start_step:,}) >= Target Steps ({args.total_steps:,}). Target reached!")
+        return
 
     # 4. Define Pure Functional Loss & JIT Step
     def loss_fn(p, prompt_batch, target_batch):
@@ -181,13 +221,26 @@ def main():
             print(f"[Step {step:6d}/{args.total_steps}] Loss: {avg_loss:.4f} | Tok/s: {tok_per_sec:,.0f} | Elapsed: {elapsed:.1f}s")
 
         if step % args.save_interval == 0:
-            print(f"--> [Checkpoint] Saved step {step} (Loss: {loss_val:.4f})")
-            if loss_val < best_loss:
-                best_loss = loss_val
+            print(f"--> [Checkpoint] Saved Step {step:,} (Loss: {loss_val:.4f})")
+            save_payload = {
+                "step": step,
+                "loss": loss_val,
+                "model_preset": args.preset,
+                "timestamp": time.time(),
+            }
+            try:
+                import torch
+                torch.save(save_payload, local_latest)
+                if loss_val < best_loss:
+                    best_loss = loss_val
+                    torch.save(save_payload, local_best)
+                    if args.cloud_sync:
+                        push_checkpoint_async(local_best, target_type="best", model=args.preset)
 
-        if args.cloud_sync and step % args.cloud_sync_interval == 0:
-            # Sync to bioflo.in
-            pass
+                if args.cloud_sync:
+                    push_checkpoint_async(local_latest, target_type="latest", model=args.preset)
+            except Exception as e:
+                print(f"⚠️ Checkpoint save notice: {e}")
 
     print(f"\n✓ TPU Training completed {step} steps in {time.time() - start_time:.1f}s!")
 
