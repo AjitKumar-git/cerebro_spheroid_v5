@@ -55,7 +55,9 @@ class ModelConfigV5:
     use_energy_regularization: bool = True # Contrastive fixed-point energy guard
     enable_multimodal: bool = True         # Multimodal continuous sensory projection
     visual_dim: int = 512                  # Perceptual / Visual patch dimension
+    audio_dim: int = 512                   # Acoustic / Audio frame dimension
     num_visual_patches: int = 16           # Default visual tokens per perceptual stimulus
+    image_patch_size: int = 16             # Pixel patch size (16x16)
 
 
 PRESETS_V5: Dict[str, Dict[str, Any]] = {
@@ -171,6 +173,42 @@ class MTPHead(nn.Module):
         h_scaled = (h_next * self.affine_scale) / max(temp, 1e-4)
         logits = F.linear(h_scaled, tied_w)
         return logits, h_next
+
+
+class ImagePatchStem(nn.Module):
+    """
+    2D Convolutional Patchify Stem (Retinotopic sensory mapping):
+    Converts raw RGB pixel grids [B, 3, H, W] into spatial visual tokens [B, P, visual_dim].
+    """
+
+    def __init__(self, patch_size: int = 16, in_channels: int = 3, visual_dim: int = 512):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, visual_dim, kernel_size=patch_size, stride=patch_size, bias=False)
+        self.norm = RMSNorm(visual_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, H, W] -> [B, visual_dim, H', W'] -> [B, P, visual_dim]
+        h = self.conv(x).flatten(2).transpose(1, 2)
+        return self.norm(h)
+
+
+class AudioWaveformStem(nn.Module):
+    """
+    1D Convolutional Acoustic Stem (Tonotopic cochlear mapping):
+    Converts raw 16kHz audio waveforms [B, 1, T_samples] or [B, T_samples] into temporal acoustic tokens [B, T_frames, audio_dim].
+    Uses 20ms frame resolution (kernel 400, stride 160 at 16kHz).
+    """
+
+    def __init__(self, kernel_size: int = 400, stride: int = 160, audio_dim: int = 512):
+        super().__init__()
+        self.conv = nn.Conv1d(1, audio_dim, kernel_size=kernel_size, stride=stride, padding=kernel_size // 2, bias=False)
+        self.norm = RMSNorm(audio_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        h = self.conv(x).transpose(1, 2)
+        return self.norm(h)
 
 
 class SensoryInputDNNV5(nn.Module):
@@ -697,9 +735,19 @@ class CerebroSpheroidV5(nn.Module):
         else:
             self.halting_gate = None
 
-        # 7. Multimodal Perceptual Projection (Vision / Continuous Sensory Flux)
+        # 7. Multimodal Perceptual Projections (Images, Audio, Continuous Sensors)
         if getattr(self.config, "enable_multimodal", False):
             v_dim = getattr(self.config, "visual_dim", self.config.surface_dim)
+            self.image_stem = ImagePatchStem(
+                patch_size=getattr(self.config, "image_patch_size", 16),
+                in_channels=3,
+                visual_dim=v_dim,
+            )
+            self.audio_stem = AudioWaveformStem(
+                kernel_size=400,
+                stride=160,
+                audio_dim=v_dim,
+            )
             self.perceptual_projector = nn.Sequential(
                 RMSNorm(v_dim),
                 nn.Linear(v_dim, self.config.surface_dim, bias=False),
@@ -707,6 +755,8 @@ class CerebroSpheroidV5(nn.Module):
                 RMSNorm(self.config.surface_dim),
             )
         else:
+            self.image_stem = None
+            self.audio_stem = None
             self.perceptual_projector = None
 
         self.current_spheroid_state: Optional[torch.Tensor] = None
@@ -716,6 +766,10 @@ class CerebroSpheroidV5(nn.Module):
         sensory = sum(p.numel() for p in self.sensory_dnn.parameters())
         if self.perceptual_projector is not None:
             sensory += sum(p.numel() for p in self.perceptual_projector.parameters())
+        if self.image_stem is not None:
+            sensory += sum(p.numel() for p in self.image_stem.parameters())
+        if self.audio_stem is not None:
+            sensory += sum(p.numel() for p in self.audio_stem.parameters())
         core = sum(p.numel() for p in self.volumetric_core.parameters())
         motor = sum(p.numel() for p in self.motor_decoder.parameters())
         total = sum(p.numel() for p in self.parameters())
@@ -744,10 +798,12 @@ class CerebroSpheroidV5(nn.Module):
         pad_id: int = 0,
         target_len: Optional[int] = None,
         perceptual_inputs: Optional[torch.Tensor] = None,
+        images: Optional[torch.Tensor] = None,
+        audio: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Differentiable training rollout engine:
-        1. Encodes sensory prompt & multimodal perceptual flux into Arcuate Fasciculus KV and centroid.
+        1. Encodes sensory prompt, raw images, and raw audio into Arcuate Fasciculus KV and centroid.
         2. Sets Shell K-1 (Surface) to prompt centroid.
         3. Executes subconscious deliberation cycles in subcortical core.
         4. Steps through motor emissions with scheduled sampling and thought re-afference.
@@ -755,10 +811,20 @@ class CerebroSpheroidV5(nn.Module):
         dev = prompts.device
         t_len = target_len if target_len is not None else (targets.shape[1] if targets is not None else 128)
 
-        # 1. Sensory Ingestion (Multimodal Perceptual Projections or Text Embeddings)
-        if perceptual_inputs is not None and self.perceptual_projector is not None:
-            B_vis, P_vis, _ = perceptual_inputs.shape
-            vis_flux = self.perceptual_projector(perceptual_inputs)  # [B, P, D]
+        # 1. Sensory Ingestion (Multimodal Images, Audio, Perceptual Flux or Text)
+        sensory_tokens_list = []
+        if images is not None and self.image_stem is not None:
+            sensory_tokens_list.append(self.image_stem(images))
+        if audio is not None and self.audio_stem is not None:
+            sensory_tokens_list.append(self.audio_stem(audio))
+        if perceptual_inputs is not None:
+            sensory_tokens_list.append(perceptual_inputs)
+
+        has_perceptual = len(sensory_tokens_list) > 0 and self.perceptual_projector is not None
+        if has_perceptual:
+            raw_p_flux = torch.cat(sensory_tokens_list, dim=1)  # [B, P_total, visual_dim]
+            B_vis, P_vis, _ = raw_p_flux.shape
+            vis_flux = self.perceptual_projector(raw_p_flux)   # [B, P_total, surface_dim]
             if prompts.dim() == 2 and prompts.dtype in (torch.int32, torch.int64):
                 txt_emb = self.sensory_dnn.embedding(prompts)  # [B, L, D]
                 combined_emb = torch.cat([vis_flux, txt_emb], dim=1)  # [B, P+L, D]

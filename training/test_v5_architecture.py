@@ -124,5 +124,28 @@ class TestCerebroSpheroidV5(unittest.TestCase):
         print(f"\n[Test 6] Multimodal Perceptual Rollout Loss: {loss.item():.4f} | Logits: {list(logits.shape)}")
 
 
+    def test_07_raw_images_and_audio_end_to_end(self):
+        """Verifies native end-to-end ingestion of raw RGB images [B, 3, H, W] and audio waveforms [B, 1, T]."""
+        B = 2
+        L_p, L_t = 8, 16
+        # Raw 64x64 RGB images
+        raw_images = torch.randn(B, 3, 64, 64, device=self.device)
+        # Raw audio waveform (1600 samples = 100ms at 16kHz)
+        raw_audio = torch.randn(B, 1, 1600, device=self.device)
+        prompts = torch.randint(0, self.cfg_test.vocab_size, (B, L_p), device=self.device)
+        targets = torch.randint(0, self.cfg_test.vocab_size, (B, L_t), device=self.device)
+
+        loss, logits = self.model_test(
+            prompts,
+            targets=targets,
+            images=raw_images,
+            audio=raw_audio,
+        )
+        self.assertFalse(torch.isnan(loss), "Omni-modal loss must not be NaN")
+        self.assertGreater(loss.item(), 0.0, "Omni-modal loss must be positive")
+        self.assertEqual(logits.shape, (B, L_t, self.cfg_test.vocab_size))
+        print(f"\n[Test 7] Raw Images + Audio + Text Omni-Modal Loss: {loss.item():.4f} | Logits: {list(logits.shape)}")
+
+
 if __name__ == "__main__":
     unittest.main()
