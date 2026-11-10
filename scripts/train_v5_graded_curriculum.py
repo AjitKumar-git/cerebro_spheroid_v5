@@ -36,6 +36,13 @@ from transformers import AutoTokenizer
 
 from src.spheroid_v5 import CerebroSpheroidV5, ModelConfigV5
 from src.agentic_harness import ActionType, ToolActionHead
+from src.cloud_sync import (
+    check_remote_manifest,
+    detect_source_environment,
+    pull_checkpoint,
+    push_checkpoint_async,
+    wait_for_in_flight_uploads,
+)
 from src.graded_curriculum import (
     CurriculumPhase,
     CurriculumScheduleConfig,
@@ -57,6 +64,8 @@ def parse_args():
     parser.add_argument("--log-interval", type=int, default=10, help="Steps between log lines")
     parser.add_argument("--save-interval", type=int, default=1000, help="Steps between checkpoints")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints/graded_curriculum", help="Checkpoint directory")
+    parser.add_argument("--cloud-sync", action="store_true", help="Enable bi-directional checkpoint sync with bioflo.in")
+    parser.add_argument("--cloud-sync-interval", type=int, default=100, help="Steps between background cloud sync uploads")
     parser.add_argument("--offline", action="store_true", help="Force offline mode using local datasets & cache")
     return parser.parse_args()
 
@@ -122,6 +131,31 @@ def main():
 
     total_params = sum(p.numel() for p in model.parameters()) + sum(p.numel() for p in action_head.parameters())
     print(f"Total Parameters (Model + ActionHead): {total_params:,} (~{total_params/1e6:.1f}M)")
+
+    # 1b. Checkpoint Resumption & Cloud Sync Integration
+    start_step = 0
+    best_loss = float("inf")
+    local_latest = os.path.join(args.checkpoint_dir, "latest.pt")
+    
+    if args.cloud_sync:
+        print("[cloud_sync] Checking remote manifest on bioflo.in...")
+        manifest = check_remote_manifest()
+        if manifest.get("has_latest", False):
+            pulled = pull_checkpoint(local_latest, target_type="latest")
+            if pulled:
+                print(f"✓ Restored latest checkpoint from cloud hub!")
+
+    if os.path.exists(local_latest):
+        try:
+            ckpt = torch.load(local_latest, map_location=device, weights_only=False)
+            model.load_state_dict(ckpt["model_state"], strict=False)
+            if "action_head_state" in ckpt:
+                action_head.load_state_dict(ckpt["action_head_state"], strict=False)
+            start_step = ckpt.get("step", 0)
+            best_loss = ckpt.get("loss", float("inf"))
+            print(f"✓ Resumed from checkpoint at step {start_step:,} (loss: {best_loss:.4f})")
+        except Exception as e:
+            print(f"⚠️ Could not load checkpoint from {local_latest}: {e}")
 
     # 2. Setup Memory-Saving Curriculum Streamer
     schedule_config = CurriculumScheduleConfig(
@@ -248,26 +282,53 @@ def main():
             accum_loss = 0.0
             accum_act_loss = 0.0
 
-        # Periodic Checkpointing
+        # Periodic Checkpointing & Cloud Sync
         if step % args.save_interval == 0 and step > 0:
             ckpt_path = os.path.join(args.checkpoint_dir, f"v5_step_{step}.pt")
-            torch.save({
+            latest_path = os.path.join(args.checkpoint_dir, "latest.pt")
+            best_path = os.path.join(args.checkpoint_dir, "best.pt")
+
+            ckpt_payload = {
                 "step": step,
                 "model_state": model.state_dict(),
                 "action_head_state": action_head.state_dict(),
                 "config": config,
-            }, ckpt_path)
+                "loss": avg_loss,
+            }
+            torch.save(ckpt_payload, ckpt_path)
+            torch.save(ckpt_payload, latest_path)
             print(f"--> Saved checkpoint: {ckpt_path}")
+
+            is_best = False
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                torch.save(ckpt_payload, best_path)
+                is_best = True
+                print(f"🌟 New best loss: {best_loss:.4f} -> saved {best_path}")
+
+            if args.cloud_sync and (step % args.cloud_sync_interval == 0):
+                push_checkpoint_async(latest_path, step=step, loss=avg_loss, target_type="latest")
+                if is_best:
+                    push_checkpoint_async(best_path, step=step, loss=best_loss, target_type="best")
 
     # Final Checkpoint
     final_ckpt = os.path.join(args.checkpoint_dir, "v5_graded_final.pt")
-    torch.save({
+    latest_path = os.path.join(args.checkpoint_dir, "latest.pt")
+    final_payload = {
         "step": step,
         "model_state": model.state_dict(),
         "action_head_state": action_head.state_dict(),
         "config": config,
-    }, final_ckpt)
+        "loss": avg_loss if 'avg_loss' in locals() else 0.0,
+    }
+    torch.save(final_payload, final_ckpt)
+    torch.save(final_payload, latest_path)
     print(f"\n✓ Graded training completed {step} steps! Final checkpoint: {final_ckpt}")
+
+    if args.cloud_sync:
+        print("[cloud_sync] Flushing final checkpoints to cloud hub...")
+        push_checkpoint(latest_path, step=step, loss=final_payload["loss"], target_type="latest")
+        wait_for_in_flight_uploads()
 
 
 if __name__ == "__main__":
