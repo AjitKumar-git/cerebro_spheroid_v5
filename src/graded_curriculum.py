@@ -148,9 +148,11 @@ class GradedCurriculumStreamer:
         config: CurriculumScheduleConfig,
         search_dirs: Optional[List[str]] = None,
         seed: int = 42,
+        mix: str = "auto",
     ):
         self.tokenizer = tokenizer
         self.config = config
+        self.mix = mix.lower()
         self.rng = random.Random(seed)
         self.search_dirs = search_dirs or [
             "data",
@@ -165,6 +167,7 @@ class GradedCurriculumStreamer:
         catalog: Dict[str, List[str]] = {
             "basic": [],
             "reasoning": [],
+            "code": [],
             "workflows": [],
             "gold": [],
         }
@@ -176,11 +179,13 @@ class GradedCurriculumStreamer:
 
         for f in found_files:
             fname = os.path.basename(f).lower()
-            if "world_knowledge" in fname or "canonical" in fname:
+            if "world_knowledge" in fname or "canonical" in fname or "cosmopedia" in fname or "fineweb" in fname:
                 catalog["basic"].append(f)
-            elif "openhermes" in fname or "gsm8k" in fname:
+            elif "openhermes" in fname or "gsm8k" in fname or "finemath" in fname:
                 catalog["reasoning"].append(f)
-            elif "ultrachat" in fname or "lmsys" in fname or "tool" in fname:
+            elif "stack" in fname or "python" in fname:
+                catalog["code"].append(f)
+            elif "ultrachat" in fname or "lmsys" in fname or "tool" in fname or "smoltalk" in fname:
                 catalog["workflows"].append(f)
             elif "cerebro_cognitive" in fname:
                 catalog["gold"].append(f)
@@ -304,16 +309,45 @@ class GradedCurriculumStreamer:
     def get_sample_for_phase(self, phase: CurriculumPhase) -> Tuple[str, int, Optional[torch.Tensor]]:
         """
         Samples a training text, action label, and optional perceptual visual patch tensor.
+        Respects active self.mix override if configured.
         Returns:
             text: formatted text string
             action_label: int (0=CHAT, 1=BASH, 2=PYTHON, 3=FILE_READ, 4=FILE_WRITE, 5=CALC)
             perceptual_flux: Optional[torch.Tensor] [P, visual_dim]
         """
+        active_phase = phase
+        if self.mix == "foundation":
+            active_phase = CurriculumPhase.PHASE_1_BASIC
+        elif self.mix == "reasoning":
+            active_phase = CurriculumPhase.PHASE_2_REASONING
+        elif self.mix == "agentic":
+            active_phase = CurriculumPhase.PHASE_3_WORKFLOWS
+        elif self.mix in ("consolidation", "balanced", "gold"):
+            active_phase = CurriculumPhase.PHASE_4_CONSOLIDATION
+        elif self.mix == "code":
+            files = self._dataset_files.get("code", [])
+            if files:
+                f = self.rng.choice(files)
+                for s in self._stream_parquet_samples(f):
+                    return s, 2, None  # Action 2 = PYTHON
+            return (
+                "User: Write a python function for quicksort.\n"
+                "Assistant: def quicksort(arr):\n"
+                "    if len(arr) <= 1: return arr\n"
+                "    pivot = arr[len(arr) // 2]\n"
+                "    left = [x for x in arr if x < pivot]\n"
+                "    middle = [x for x in arr if x == pivot]\n"
+                "    right = [x for x in arr if x > pivot]\n"
+                "    return quicksort(left) + middle + quicksort(right)",
+                2,
+                None,
+            )
+
         # If sampling a multimodal perceptual example
         if self.rng.random() < getattr(self.config, "multimodal_sample_ratio", 0.35):
-            return self._generate_synthetic_multimodal(phase)
+            return self._generate_synthetic_multimodal(active_phase)
 
-        if phase == CurriculumPhase.PHASE_1_BASIC:
+        if active_phase == CurriculumPhase.PHASE_1_BASIC:
             files = self._dataset_files["basic"]
             if files:
                 f = self.rng.choice(files)
@@ -321,7 +355,7 @@ class GradedCurriculumStreamer:
                     return s, 0, None  # Action 0 = CHAT
             return self._generate_synthetic_basic(), 0, None
 
-        elif phase == CurriculumPhase.PHASE_2_REASONING:
+        elif active_phase == CurriculumPhase.PHASE_2_REASONING:
             files = self._dataset_files["reasoning"]
             if files:
                 f = self.rng.choice(files)
@@ -330,7 +364,7 @@ class GradedCurriculumStreamer:
             # Fallback
             return self._generate_synthetic_basic(), 0, None
 
-        elif phase == CurriculumPhase.PHASE_3_WORKFLOWS:
+        elif active_phase == CurriculumPhase.PHASE_3_WORKFLOWS:
             # 60% agentic tool traces, 40% multi-turn conversations
             if self.rng.random() < 0.6:
                 text, act = self._generate_synthetic_agentic()

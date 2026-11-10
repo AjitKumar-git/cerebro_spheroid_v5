@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -69,13 +70,21 @@ def wait_for_in_flight_uploads(timeout: float = 60.0):
         _ACTIVE_UPLOAD_THREADS = [t for t in _ACTIVE_UPLOAD_THREADS if t.is_alive()]
 
 
-def check_remote_manifest(url: Optional[str] = None, token: Optional[str] = None) -> Dict[str, Any]:
-    """Queries bioflo.in to retrieve checkpoint status, step numbers, and loss metrics."""
+def check_remote_manifest(
+    model: Optional[str] = None,
+    url: Optional[str] = None,
+    token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Queries bioflo.in to retrieve checkpoint status, step numbers, and loss metrics for model tier."""
     sync_url = url or DEFAULT_URL
     sync_token = token or DEFAULT_TOKEN
 
+    req_url = f"{sync_url}?action=status"
+    if model:
+        req_url += f"&model={model}"
+
     req = urllib.request.Request(
-        f"{sync_url}?action=status",
+        req_url,
         headers={"Authorization": f"Bearer {sync_token}", "User-Agent": "CerebroV5CloudSync/1.0"}
     )
     try:
@@ -114,13 +123,14 @@ def _download_range_chunk(url: str, token: str, start: int, end: int, filepath: 
 def pull_checkpoint(
     local_dest: str,
     target_type: str = "latest",
+    model: Optional[str] = None,
     url: Optional[str] = None,
     token: Optional[str] = None,
     show_progress: bool = True,
     num_workers: int = 8,
 ) -> bool:
     """
-    Downloads latest.pt or best.pt from bioflo.in with parallel range streaming.
+    Downloads latest.pt or best.pt for the specified model tier from bioflo.in.
     Returns True if successfully downloaded and integrity verified.
     """
     sync_url = url or DEFAULT_URL
@@ -128,10 +138,13 @@ def pull_checkpoint(
 
     os.makedirs(os.path.dirname(os.path.abspath(local_dest)), exist_ok=True)
     download_url = f"{sync_url}?action=download&type={target_type}"
+    if model:
+        download_url += f"&model={model}"
     tmp_dest = local_dest + ".part"
 
     try:
-        print(f"🔄 [cloud_sync] Downloading {target_type}.pt from {sync_url}...")
+        model_str = f"[{model}] " if model else ""
+        print(f"🔄 [cloud_sync] Downloading {model_str}{target_type}.pt from {sync_url}...")
         t0 = time.time()
 
         # Probe total size
@@ -218,35 +231,37 @@ def push_checkpoint(
     step: int,
     loss: float,
     target_type: str = "latest",
+    model: Optional[str] = None,
     source_node: Optional[str] = None,
     url: Optional[str] = None,
     token: Optional[str] = None,
     chunk_size_mb: int = 10,
 ) -> bool:
     """
-    Uploads a checkpoint to bioflo.in using chunked streaming.
+    Uploads a checkpoint to bioflo.in using chunked streaming for a specific model tier.
     Bypasses Cloudflare limits and ensures zero timeouts.
     """
     if not os.path.exists(file_path):
         print(f"⚠️ [cloud_sync] Cannot push: {file_path} not found.")
         return False
 
+    slot_key = f"{model}_{target_type}" if model else target_type
+
     global _IN_FLIGHT_UPLOADS, _IN_FLIGHT_UPLOAD_TIMES, _LAST_BEST_UPLOAD_TIME
     with _UPLOAD_LOCK:
         now = time.time()
         if target_type == "best":
             elapsed = now - _LAST_BEST_UPLOAD_TIME
-            if elapsed < _BEST_COOLDOWN_SECONDS and _IN_FLIGHT_UPLOADS.get(target_type) != step:
+            if elapsed < _BEST_COOLDOWN_SECONDS and _IN_FLIGHT_UPLOADS.get(slot_key) != step:
                 return False
 
-        if target_type in _IN_FLIGHT_UPLOADS and _IN_FLIGHT_UPLOADS[target_type] != step:
-            prev_step = _IN_FLIGHT_UPLOADS[target_type]
-            start_t = _IN_FLIGHT_UPLOAD_TIMES.get(target_type, now)
+        if slot_key in _IN_FLIGHT_UPLOADS and _IN_FLIGHT_UPLOADS[slot_key] != step:
+            start_t = _IN_FLIGHT_UPLOAD_TIMES.get(slot_key, now)
             if now - start_t < 180.0:
                 return False
 
-        _IN_FLIGHT_UPLOADS[target_type] = step
-        _IN_FLIGHT_UPLOAD_TIMES[target_type] = now
+        _IN_FLIGHT_UPLOADS[slot_key] = step
+        _IN_FLIGHT_UPLOAD_TIMES[slot_key] = now
         if target_type == "best":
             _LAST_BEST_UPLOAD_TIME = now
 
@@ -258,7 +273,8 @@ def push_checkpoint(
     chunk_size = chunk_size_mb * 1024 * 1024
     total_chunks = max(1, (file_size + chunk_size - 1) // chunk_size)
 
-    print(f"\n🌐 [cloud_sync] Mirroring {target_type}.pt (Step {step:,}, Loss {loss:.4f}) "
+    model_label = f"[{model}] " if model else ""
+    print(f"\n🌐 [cloud_sync] Mirroring {model_label}{target_type}.pt (Step {step:,}, Loss {loss:.4f}) "
           f"to {sync_url} across {total_chunks} chunk(s)...")
 
     t0 = time.time()
@@ -272,7 +288,7 @@ def push_checkpoint(
                 boundary = f"----WebKitFormBoundary{os.urandom(8).hex()}"
                 body = []
 
-                for k, v in [
+                form_fields = [
                     ("action", "upload_chunk"),
                     ("type", target_type),
                     ("chunk_index", str(idx)),
@@ -280,7 +296,11 @@ def push_checkpoint(
                     ("step", str(step)),
                     ("loss", f"{loss:.6f}"),
                     ("source", node_name),
-                ]:
+                ]
+                if model:
+                    form_fields.append(("model", str(model)))
+
+                for k, v in form_fields:
                     body.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode("utf-8"))
 
                 body.append(
@@ -306,7 +326,8 @@ def push_checkpoint(
                     try:
                         with urllib.request.urlopen(req, timeout=90) as resp:
                             res_data = json.loads(resp.read().decode("utf-8"))
-                            if res_data.get("status") not in ("chunk_saved", "complete"):
+                            status = res_data.get("status")
+                            if status not in ("chunk_saved", "complete", "completed", "in_progress"):
                                 raise RuntimeError(f"Server rejected chunk: {res_data}")
                             break
                     except Exception as e:
@@ -316,15 +337,15 @@ def push_checkpoint(
 
         dt = time.time() - t0
         sz_mb = file_size / 1e6
-        print(f"✅ [cloud_sync] Successfully mirrored {target_type}.pt ({sz_mb:.1f} MB in {dt:.1f}s) to bioflo.in")
+        print(f"✅ [cloud_sync] Successfully mirrored {model_label}{target_type}.pt ({sz_mb:.1f} MB in {dt:.1f}s) to bioflo.in")
         return True
     except Exception as e:
-        print(f"⚠️ [cloud_sync] Upload failed for {target_type}.pt: {e}")
+        print(f"⚠️ [cloud_sync] Upload failed for {model_label}{target_type}.pt: {e}")
         return False
     finally:
         with _UPLOAD_LOCK:
-            _IN_FLIGHT_UPLOADS.pop(target_type, None)
-            _IN_FLIGHT_UPLOAD_TIMES.pop(target_type, None)
+            _IN_FLIGHT_UPLOADS.pop(slot_key, None)
+            _IN_FLIGHT_UPLOAD_TIMES.pop(slot_key, None)
 
 
 def push_checkpoint_async(
@@ -332,6 +353,7 @@ def push_checkpoint_async(
     step: int,
     loss: float,
     target_type: str = "latest",
+    model: Optional[str] = None,
     source_node: Optional[str] = None,
     url: Optional[str] = None,
     token: Optional[str] = None,
@@ -344,14 +366,52 @@ def push_checkpoint_async(
             "step": step,
             "loss": loss,
             "target_type": target_type,
+            "model": model,
             "source_node": source_node,
             "url": url,
             "token": token,
         },
         daemon=True,
-        name=f"cloud_sync_upload_{target_type}_{step}",
+        name=f"cloud_sync_upload_{model or 'default'}_{target_type}_{step}",
     )
     with _UPLOAD_LOCK:
         _ACTIVE_UPLOAD_THREADS.append(thread)
     thread.start()
     return thread
+
+
+def notify_training_start(
+    step: int = 0,
+    model: Optional[str] = None,
+    source_node: Optional[str] = None,
+    hours: float = 8.5,
+    message: Optional[str] = None,
+    url: Optional[str] = None,
+    token: Optional[str] = None,
+) -> bool:
+    """Notifies the central hub on bioflo.in that training has started."""
+    sync_url = url or DEFAULT_URL
+    sync_token = token or DEFAULT_TOKEN
+    node_name = source_node or detect_source_environment()
+    model_name = model or "v5_small"
+    msg = message or f"🚀 CerebroSpheroid {model_name} training active on {node_name}"
+
+    params = urllib.parse.urlencode({
+        "action": "notify",
+        "model": model_name,
+        "source": node_name,
+        "step": str(step),
+        "hours": str(hours),
+        "message": msg,
+    })
+    req = urllib.request.Request(
+        f"{sync_url}?{params}",
+        headers={"Authorization": f"Bearer {sync_token}", "User-Agent": "CerebroV5CloudSync/1.0"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data.get("success", False)
+    except Exception as e:
+        print(f"⚠️ [cloud_sync] Could not send start notification: {e}")
+        return False

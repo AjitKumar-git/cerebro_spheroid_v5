@@ -34,11 +34,12 @@ import torch.nn.functional as F
 from transformers.optimization import Adafactor
 from transformers import AutoTokenizer
 
-from src.spheroid_v5 import CerebroSpheroidV5, ModelConfigV5
+from src.spheroid_v5 import CerebroSpheroidV5, ModelConfigV5, PRESETS_V5
 from src.agentic_harness import ActionType, ToolActionHead
 from src.cloud_sync import (
     check_remote_manifest,
     detect_source_environment,
+    notify_training_start,
     pull_checkpoint,
     push_checkpoint_async,
     wait_for_in_flight_uploads,
@@ -70,6 +71,8 @@ def parse_args():
     parser.add_argument("--elastic-window", action=argparse.BooleanOptionalAction, default=True, help="Enable V4-style elastic complementary sliding window")
     parser.add_argument("--total-window", type=int, default=1024, help="Total sequence budget (prompt + response) for elastic window")
     parser.add_argument("--tail-prob", type=float, default=0.25, help="V4 tail probability for EOS representation in window sampling")
+    parser.add_argument("--model-preset", type=str, default="v5_small", choices=["v5_small", "v5_compact", "v5_base"], help="Model preset architecture tier (v5_small: 101M, v5_compact: 244M, v5_base: 617M)")
+    parser.add_argument("--mix", type=str, default="auto", choices=["auto", "foundation", "reasoning", "code", "agentic", "consolidation"], help="Curriculum data mixture selection")
     return parser.parse_args()
 
 
@@ -115,50 +118,58 @@ def main():
     # 1. Initialize Tokenizer & Model
     tokenizer = load_local_tokenizer(offline=args.offline)
 
-    config = ModelConfigV5(
-        vocab_size=32000,
-        surface_dim=768,
-        radial_dim=512,
-        num_shells=32,
-        num_shortcut_tracts=96,
-        top_k_tracts=24,
-        num_heads=8,
-        max_seq_len=max(32768, getattr(args, "total_window", 1024) + 512),
-        thinking_cycles=4,
-        use_sparse_mot=True,
-        use_energy_regularization=True,
-    )
+    preset_kwargs = PRESETS_V5[args.model_preset].copy()
+    preset_kwargs["max_seq_len"] = max(32768, getattr(args, "total_window", 1024) + 512)
+    preset_kwargs["use_sparse_mot"] = True
+    preset_kwargs["use_energy_regularization"] = True
+    config = ModelConfigV5(**preset_kwargs)
 
     model = CerebroSpheroidV5(config).to(device)
     action_head = ToolActionHead(surface_dim=config.surface_dim, num_actions=len(ActionType)).to(device)
 
     total_params = sum(p.numel() for p in model.parameters()) + sum(p.numel() for p in action_head.parameters())
+    print(f"Model Preset: {args.model_preset} ({config.num_shells} shells, {config.surface_dim} surface dim)")
     print(f"Total Parameters (Model + ActionHead): {total_params:,} (~{total_params/1e6:.1f}M)")
+
+    # Adjust checkpoint directory to model tier if using default
+    if args.checkpoint_dir == "checkpoints/graded_curriculum":
+        args.checkpoint_dir = f"checkpoints/{args.model_preset}"
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     # 1b. Checkpoint Resumption & Cloud Sync Integration
     start_step = 0
     best_loss = float("inf")
-    local_latest = os.path.join(args.checkpoint_dir, "latest.pt")
+    local_latest = os.path.join(args.checkpoint_dir, f"{args.model_preset}_latest.pt")
+    local_best = os.path.join(args.checkpoint_dir, f"{args.model_preset}_best.pt")
+    legacy_latest = os.path.join(args.checkpoint_dir, "latest.pt")
     
     if args.cloud_sync:
-        print("[cloud_sync] Checking remote manifest on bioflo.in...")
-        manifest = check_remote_manifest()
+        print(f"[cloud_sync] Checking remote manifest on bioflo.in for {args.model_preset}...")
+        notify_training_start(step=start_step, model=args.model_preset)
+        manifest = check_remote_manifest(model=args.model_preset)
         if manifest.get("has_latest", False):
-            pulled = pull_checkpoint(local_latest, target_type="latest")
+            pulled = pull_checkpoint(local_latest, target_type="latest", model=args.model_preset)
             if pulled:
-                print(f"✓ Restored latest checkpoint from cloud hub!")
+                print(f"✓ Restored {args.model_preset} latest checkpoint from cloud hub!")
 
-    if os.path.exists(local_latest):
+    # Check local candidates for resumption
+    load_cand = None
+    for cand in [local_latest, legacy_latest]:
+        if os.path.exists(cand):
+            load_cand = cand
+            break
+
+    if load_cand is not None:
         try:
-            ckpt = torch.load(local_latest, map_location=device, weights_only=False)
+            ckpt = torch.load(load_cand, map_location=device, weights_only=False)
             model.load_state_dict(ckpt["model_state"], strict=False)
             if "action_head_state" in ckpt:
                 action_head.load_state_dict(ckpt["action_head_state"], strict=False)
             start_step = ckpt.get("step", 0)
             best_loss = ckpt.get("loss", float("inf"))
-            print(f"✓ Resumed from checkpoint at step {start_step:,} (loss: {best_loss:.4f})")
+            print(f"✓ Resumed from {os.path.basename(load_cand)} at step {start_step:,} (loss: {best_loss:.4f})")
         except Exception as e:
-            print(f"⚠️ Could not load checkpoint from {local_latest}: {e}")
+            print(f"⚠️ Could not load checkpoint from {load_cand}: {e}")
 
     # 2. Setup Memory-Saving Curriculum Streamer
     schedule_config = CurriculumScheduleConfig(
@@ -175,6 +186,7 @@ def main():
     streamer = GradedCurriculumStreamer(
         tokenizer=tokenizer,
         config=schedule_config,
+        mix=args.mix,
         search_dirs=[
             "data",
             "../reasoning_agent/data",
@@ -308,9 +320,11 @@ def main():
 
         # Periodic Checkpointing & Cloud Sync
         if step % args.save_interval == 0 and step > 0:
-            ckpt_path = os.path.join(args.checkpoint_dir, f"v5_step_{step}.pt")
-            latest_path = os.path.join(args.checkpoint_dir, "latest.pt")
-            best_path = os.path.join(args.checkpoint_dir, "best.pt")
+            ckpt_path = os.path.join(args.checkpoint_dir, f"{args.model_preset}_step_{step}.pt")
+            latest_path = os.path.join(args.checkpoint_dir, f"{args.model_preset}_latest.pt")
+            best_path = os.path.join(args.checkpoint_dir, f"{args.model_preset}_best.pt")
+            legacy_latest = os.path.join(args.checkpoint_dir, "latest.pt")
+            legacy_best = os.path.join(args.checkpoint_dir, "best.pt")
 
             ckpt_payload = {
                 "step": step,
@@ -318,40 +332,46 @@ def main():
                 "action_head_state": action_head.state_dict(),
                 "config": config,
                 "loss": avg_loss,
+                "model_preset": args.model_preset,
             }
             torch.save(ckpt_payload, ckpt_path)
             torch.save(ckpt_payload, latest_path)
+            torch.save(ckpt_payload, legacy_latest)
             print(f"--> Saved checkpoint: {ckpt_path}")
 
             is_best = False
             if avg_loss < best_loss:
                 best_loss = avg_loss
                 torch.save(ckpt_payload, best_path)
+                torch.save(ckpt_payload, legacy_best)
                 is_best = True
                 print(f"🌟 New best loss: {best_loss:.4f} -> saved {best_path}")
 
             if args.cloud_sync and (step % args.cloud_sync_interval == 0):
-                push_checkpoint_async(latest_path, step=step, loss=avg_loss, target_type="latest")
+                push_checkpoint_async(latest_path, step=step, loss=avg_loss, target_type="latest", model=args.model_preset)
                 if is_best:
-                    push_checkpoint_async(best_path, step=step, loss=best_loss, target_type="best")
+                    push_checkpoint_async(best_path, step=step, loss=best_loss, target_type="best", model=args.model_preset)
 
     # Final Checkpoint
-    final_ckpt = os.path.join(args.checkpoint_dir, "v5_graded_final.pt")
-    latest_path = os.path.join(args.checkpoint_dir, "latest.pt")
+    final_ckpt = os.path.join(args.checkpoint_dir, f"{args.model_preset}_graded_final.pt")
+    latest_path = os.path.join(args.checkpoint_dir, f"{args.model_preset}_latest.pt")
+    legacy_latest = os.path.join(args.checkpoint_dir, "latest.pt")
     final_payload = {
         "step": step,
         "model_state": model.state_dict(),
         "action_head_state": action_head.state_dict(),
         "config": config,
         "loss": avg_loss if 'avg_loss' in locals() else 0.0,
+        "model_preset": args.model_preset,
     }
     torch.save(final_payload, final_ckpt)
     torch.save(final_payload, latest_path)
+    torch.save(final_payload, legacy_latest)
     print(f"\n✓ Graded training completed {step} steps! Final checkpoint: {final_ckpt}")
 
     if args.cloud_sync:
-        print("[cloud_sync] Flushing final checkpoints to cloud hub...")
-        push_checkpoint(latest_path, step=step, loss=final_payload["loss"], target_type="latest")
+        print(f"[cloud_sync] Flushing final {args.model_preset} checkpoints to cloud hub...")
+        push_checkpoint(latest_path, step=step, loss=final_payload["loss"], target_type="latest", model=args.model_preset)
         wait_for_in_flight_uploads()
 
 
