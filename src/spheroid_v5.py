@@ -347,10 +347,10 @@ class VolumetricSpheroidCoreV5(nn.Module):
         out_flux = torch.einsum("bkd,kde->bke", rad_out, self.w_radial_out)  # [B, K-1, Dr]
         out_up = self.radial_up(out_flux)  # [B, K-1, D]
 
-        # Assemble radial deltas
-        state_radial = state_intra.clone()
-        state_radial[:, :-1, :] = state_radial[:, :-1, :] + 0.1 * in_up
-        state_radial[:, 1:, :] = state_radial[:, 1:, :] + 0.1 * out_up
+        # Assemble radial deltas out-of-place (zero in-place modifications)
+        delta_in = F.pad(0.1 * in_up, (0, 0, 0, 1))    # [B, K, D], zero padded on Shell K-1
+        delta_out = F.pad(0.1 * out_up, (0, 0, 1, 0))  # [B, K, D], zero padded on Shell 0
+        state_radial = state_intra + delta_in + delta_out
 
         # 3. Mixture-of-Axonal-Tracts (MoT Sparse Small-World Routing)
         conductances = torch.sigmoid(self.shortcut_gate)  # [T]
@@ -366,19 +366,19 @@ class VolumetricSpheroidCoreV5(nn.Module):
         src_acts = state_radial[:, self.src_indices, :]   # [B, T, D]
         shortcut_flux = torch.einsum("btd,tde->bte", src_acts, self.shortcut_weight) * eff_conductances.unsqueeze(-1)
 
-        # Scatter add into destination shells
-        state_next = state_radial.clone()
+        # Assemble axonal skip flux out-of-place
+        delta_shortcut = torch.zeros_like(state_radial)
         for t in range(self.num_shortcut_tracts):
             dst = self.dst_indices[t]
-            state_next[:, dst, :] = state_next[:, dst, :] + 0.05 * shortcut_flux[:, t, :]
+            delta_shortcut[:, dst, :] = delta_shortcut[:, dst, :] + 0.05 * shortcut_flux[:, t, :]
+        state_next = state_radial + delta_shortcut
 
         return self.radial_norm(state_next)
 
     def inject_efference_copy(self, state: torch.Tensor, efference: torch.Tensor) -> torch.Tensor:
-        """Injects motor efference copy directly into Shell 0 (Subcortical Core)."""
-        eff_projected = self.efference_gate(efference)
-        state_new = state.clone()
-        state_new[:, 0, :] = state_new[:, 0, :] + eff_projected
+        """Injects motor efference copy directly into Shell 0 out-of-place."""
+        eff_projected = self.efference_gate(efference).unsqueeze(1)  # [B, 1, D]
+        state_new = torch.cat([state[:, :1, :] + eff_projected, state[:, 1:, :]], dim=1)
         return state_new
 
 
@@ -742,16 +742,16 @@ class CerebroSpheroidV5(nn.Module):
         mask = (prompts != pad_id).unsqueeze(-1).float()
         prompt_centroid = torch.sum(sensory_flux * mask, dim=1) / torch.clamp(torch.sum(mask, dim=1), min=1.0)
 
-        # 2. State Initialization: Cortical Surface receives sensory prompt flux
-        state = self.init_spheroid_state(B, dev)
-        state[:, -1, :] = prompt_centroid
+        # 2. State Initialization: Cortical Surface receives sensory prompt flux out-of-place
+        subcortical = torch.zeros(B, self.config.num_shells - 1, self.config.surface_dim, device=dev)
+        state = torch.cat([subcortical, prompt_centroid.unsqueeze(1)], dim=1)
 
         # 3. Subconscious Deliberation Cycles with Memory Probing & Adaptive Halting
         cycles = self.config.max_thinking_cycles if self.config.use_adaptive_thinking else self.config.thinking_cycles
         energy_loss = torch.tensor(0.0, device=dev)
 
         for cycle in range(cycles):
-            state_prev = state
+            state_prev = state.clone()
             if sensory_kv is not None and self.deliberation_probe is not None:
                 keys, values = sensory_kv
                 L_kv = keys.shape[2]
@@ -764,7 +764,8 @@ class CerebroSpheroidV5(nn.Module):
                     scores = torch.where(scores < topk_v[..., -1, None], torch.full_like(scores, -1e9), scores)
                 attn_p = F.softmax(scores, dim=-1)
                 retrieved = torch.matmul(attn_p, values).transpose(1, 2).contiguous().view(B, self.config.surface_dim)
-                state[:, -1, :] = state[:, -1, :] + 0.1 * self.deliberation_probe_norm(retrieved)
+                state_mantle = state[:, -1:, :] + 0.1 * self.deliberation_probe_norm(retrieved).unsqueeze(1)
+                state = torch.cat([state[:, :-1, :], state_mantle], dim=1)
 
             state = self.volumetric_core.deliberate_step(state)
 
@@ -861,9 +862,9 @@ class CerebroSpheroidV5(nn.Module):
         sensory_flux, sensory_kv = self.sensory_dnn(prompt_ids)
         prompt_centroid = sensory_flux.mean(dim=1)
 
-        # 2. Initialize concentric state and execute subconscious deliberation
-        state = self.init_spheroid_state(B, dev)
-        state[:, -1, :] = prompt_centroid
+        # 2. State Initialization: Cortical Surface receives sensory prompt flux out-of-place
+        subcortical = torch.zeros(B, self.config.num_shells - 1, self.config.surface_dim, device=dev)
+        state = torch.cat([subcortical, prompt_centroid.unsqueeze(1)], dim=1)
 
         for cycle in range(cycles):
             if sensory_kv is not None and self.deliberation_probe is not None:
@@ -878,7 +879,8 @@ class CerebroSpheroidV5(nn.Module):
                     scores = torch.where(scores < topk_v[..., -1, None], torch.full_like(scores, -1e9), scores)
                 attn_p = F.softmax(scores, dim=-1)
                 retrieved = torch.matmul(attn_p, values).transpose(1, 2).contiguous().view(B, self.config.surface_dim)
-                state[:, -1, :] = state[:, -1, :] + 0.1 * self.deliberation_probe_norm(retrieved)
+                state_mantle = state[:, -1:, :] + 0.1 * self.deliberation_probe_norm(retrieved).unsqueeze(1)
+                state = torch.cat([state[:, :-1, :], state_mantle], dim=1)
 
             state = self.volumetric_core.deliberate_step(state)
 
