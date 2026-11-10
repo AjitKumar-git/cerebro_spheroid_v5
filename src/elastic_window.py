@@ -18,8 +18,36 @@ Core Principles:
 from typing import Dict, List, Tuple, Optional, Any, Iterator
 import collections
 import queue
+import random
 import threading
 import numpy as np
+
+
+def sample_window(
+    answer_ids: List[int],
+    window: int,
+    rng: Optional[random.Random] = None,
+    tail_probability: float = 0.25,
+) -> Tuple[Optional[int], List[int]]:
+    """Picks the scored slice of one answer and the token heard before it (V4 window algorithm).
+
+    Returns `(context_token, scored_tokens)`. The context token is fed to the auditory channel
+    at step 0 and never scored, so a mid-answer window is conditioned on real text instead of
+    on silence. `tail_probability` of windows are the final `window` tokens, which keeps
+    end-of-text and EOS in the objective even though most answers are longer than a window.
+    """
+    if rng is None:
+        rng = random.Random()
+    if len(answer_ids) <= window:
+        return None, list(answer_ids)
+    max_start = len(answer_ids) - window - 1
+    if max_start <= 0:
+        start = 0
+    elif rng.random() < tail_probability:
+        start = max_start
+    else:
+        start = rng.randint(0, max_start)
+    return answer_ids[start], answer_ids[start + 1 : start + 1 + window]
 
 
 def get_default_elastic_buckets(total_window: int = 1024) -> List[Tuple[str, int, int]]:
@@ -85,6 +113,8 @@ class ElasticBucketBatcher:
         framework: str = "jax",  # 'jax' or 'torch'
         target_pad_id: int = -100,
         return_feedback: bool = False,
+        rng: Optional[random.Random] = None,
+        tail_probability: float = 0.25,
     ):
         self.tokenizer = tokenizer
         self.data_iter = data_iterator
@@ -94,6 +124,8 @@ class ElasticBucketBatcher:
         self.framework = framework.lower()
         self.target_pad_id = target_pad_id
         self.return_feedback = return_feedback
+        self.rng = rng or random.Random(42)
+        self.tail_probability = tail_probability
         self.max_queue_size = max(batch_size * 4, 128)
 
         self.pad_id = tokenizer.pad_token_id if (hasattr(tokenizer, "pad_token_id") and tokenizer.pad_token_id is not None) else 0
@@ -153,7 +185,7 @@ class ElasticBucketBatcher:
             return str(q_txt), str(r_txt)
         return "", ""
 
-    def _format_batch(self, b_idx: int, name: str, p_list: list, t_list: list):
+    def _format_batch(self, b_idx: int, name: str, p_list: list, t_list: list, c_list: Optional[list] = None):
         if self.framework == "torch":
             import torch
             prompts = torch.tensor(p_list, dtype=torch.long)
@@ -162,6 +194,10 @@ class ElasticBucketBatcher:
                 feedback = torch.full_like(targets, self.target_pad_id)
                 if targets.shape[1] > 1:
                     feedback[:, 1:] = targets[:, :-1]
+                if c_list is not None:
+                    for i, c in enumerate(c_list):
+                        if c is not None:
+                            feedback[i, 0] = c
                 return b_idx, name, prompts, targets, feedback
             return b_idx, name, prompts, targets
         elif self.framework == "jax":
@@ -171,6 +207,10 @@ class ElasticBucketBatcher:
             if self.return_feedback:
                 feedback = jnp.full_like(targets, self.target_pad_id)
                 feedback = feedback.at[:, 1:].set(targets[:, :-1])
+                if c_list is not None:
+                    for i, c in enumerate(c_list):
+                        if c is not None:
+                            feedback = feedback.at[i, 0].set(c)
                 return b_idx, name, prompts, targets, feedback
             return b_idx, name, prompts, targets
         else:
@@ -197,8 +237,8 @@ class ElasticBucketBatcher:
                 if len(self.queues[b_idx]) >= self.batch_size:
                     name, p_len, t_len = self.buckets[b_idx]
                     batch_items = [self.queues[b_idx].popleft() for _ in range(self.batch_size)]
-                    p_list, t_list = zip(*batch_items)
-                    return self._format_batch(b_idx, name, p_list, t_list)
+                    p_list, t_list, c_list = zip(*batch_items)
+                    return self._format_batch(b_idx, name, p_list, t_list, c_list)
 
             # Ingest more records from stream
             try:
@@ -214,8 +254,8 @@ class ElasticBucketBatcher:
                 while len(items) < self.batch_size:
                     items.append(items[0])
                 name, p_len, t_len = self.buckets[best_b]
-                p_list, t_list = zip(*items)
-                return self._format_batch(best_b, name, p_list, t_list)
+                p_list, t_list, c_list = zip(*items)
+                return self._format_batch(best_b, name, p_list, t_list, c_list)
 
             q_txt, r_txt = self._extract_text_pair(row)
             if not q_txt or not r_txt:
@@ -263,11 +303,13 @@ class ElasticBucketBatcher:
                 q_padded = q_ids + [self.pad_id] * (bp - len(q_ids))
 
             if len(r_ids) > bt:
-                r_padded = r_ids[:bt]
+                context_token, scored = sample_window(r_ids, bt, self.rng, self.tail_probability)
+                r_padded = scored
             else:
+                context_token = None
                 r_padded = r_ids + [self.target_pad_id] * (bt - len(r_ids))
 
-            self.queues[b_idx].append((q_padded, r_padded))
+            self.queues[b_idx].append((q_padded, r_padded, context_token))
 
 
 class PrefetchedBatcher:

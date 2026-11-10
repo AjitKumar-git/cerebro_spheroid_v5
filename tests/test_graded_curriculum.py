@@ -121,8 +121,42 @@ def test_streaming_batch_generation():
     print("✓ GradedCurriculumStreamer on-the-fly multimodal batching passed.")
 
 
+def test_elastic_window_batching():
+    print("Testing GradedCurriculumStreamer Elastic Window Batching (V4 Algorithm)...")
+    cfg = CurriculumScheduleConfig(seq_len=64, batch_size=2)
+
+    class MockTokenizer:
+        vocab_size = 1000
+        pad_token_id = 0
+        eos_token_id = 2
+        def encode(self, text, add_special_tokens=False):
+            return [ord(c) % 1000 for c in text]
+
+    streamer = GradedCurriculumStreamer(
+        tokenizer=MockTokenizer(),
+        config=cfg,
+        search_dirs=["data", "../reasoning_agent/data"],
+    )
+
+    device = torch.device("cpu")
+    prompts, targets, feedback, act, vis, ph, b_name = streamer.get_elastic_batch(
+        step=5000,
+        device=device,
+        batch_size=2,
+        total_window=512,
+        tail_probability=0.25,
+    )
+
+    assert prompts.dim() == 2 and prompts.shape[0] == 2
+    assert targets.dim() == 2 and targets.shape[0] == 2
+    assert feedback.dim() == 2 and feedback.shape == targets.shape
+    assert act.shape == (2,)
+    print(f"✓ Elastic window batching passed: bucket={b_name}, prompts={prompts.shape}, targets={targets.shape}")
+
+
 if __name__ == "__main__":
     test_phase_boundaries()
     test_lr_schedule_continuity()
     test_streaming_batch_generation()
+    test_elastic_window_batching()
     print("\nAll Graded Curriculum tests PASSED successfully!")

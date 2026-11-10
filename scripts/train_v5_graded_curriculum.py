@@ -67,6 +67,9 @@ def parse_args():
     parser.add_argument("--cloud-sync", action="store_true", help="Enable bi-directional checkpoint sync with bioflo.in")
     parser.add_argument("--cloud-sync-interval", type=int, default=100, help="Steps between background cloud sync uploads")
     parser.add_argument("--offline", action="store_true", help="Force offline mode using local datasets & cache")
+    parser.add_argument("--elastic-window", action=argparse.BooleanOptionalAction, default=True, help="Enable V4-style elastic complementary sliding window")
+    parser.add_argument("--total-window", type=int, default=1024, help="Total sequence budget (prompt + response) for elastic window")
+    parser.add_argument("--tail-prob", type=float, default=0.25, help="V4 tail probability for EOS representation in window sampling")
     return parser.parse_args()
 
 
@@ -120,7 +123,7 @@ def main():
         num_shortcut_tracts=96,
         top_k_tracts=24,
         num_heads=8,
-        max_seq_len=args.seq_len,
+        max_seq_len=max(32768, getattr(args, "total_window", 1024) + 512),
         thinking_cycles=4,
         use_sparse_mot=True,
         use_energy_regularization=True,
@@ -233,32 +236,53 @@ def main():
 
         # Gradient accumulation loop
         for micro in range(args.grad_accum):
-            input_ids, targets, action_labels, perceptual_inputs, batch_phase = streamer.get_batch(
-                step=step,
-                device=device,
-                batch_size=args.batch_size,
-            )
+            if args.elastic_window:
+                prompts, targets, feedback, action_labels, perceptual_inputs, batch_phase, b_name = streamer.get_elastic_batch(
+                    step=step,
+                    device=device,
+                    batch_size=args.batch_size,
+                    total_window=args.total_window,
+                    tail_probability=args.tail_prob,
+                )
+                with torch.amp.autocast("cuda", enabled=torch.cuda.is_available(), dtype=torch.bfloat16):
+                    ce_loss, logits = model(
+                        prompts,
+                        targets=targets,
+                        feedback_tokens=feedback,
+                        perceptual_inputs=perceptual_inputs,
+                    )
+                    act_loss = torch.tensor(0.0, device=device)
+                    if batch_phase in (CurriculumPhase.PHASE_3_WORKFLOWS, CurriculumPhase.PHASE_4_CONSOLIDATION):
+                        cortical_mantle = model.current_spheroid_state[:, -1, :]  # Shell 31
+                        action_logits, _ = action_head(cortical_mantle)
+                        act_loss = action_loss_fn(action_logits, action_labels)
 
-            # Mixed-precision forward pass (bfloat16) to conserve VRAM
-            with torch.amp.autocast("cuda", enabled=torch.cuda.is_available(), dtype=torch.bfloat16):
-                # Forward pass through Spheroid V5 (with multimodal perceptual inputs if present)
-                ce_loss, logits = model(input_ids, targets=targets, perceptual_inputs=perceptual_inputs)
+                    total_batch_loss = (ce_loss + 0.1 * act_loss) / args.grad_accum
+                total_batch_loss.backward()
 
-                # In Phase 3 & 4: Train discrete tool action classification directly from Shell 31
-                act_loss = torch.tensor(0.0, device=device)
-                if batch_phase in (CurriculumPhase.PHASE_3_WORKFLOWS, CurriculumPhase.PHASE_4_CONSOLIDATION):
-                    cortical_mantle = model.current_spheroid_state[:, -1, :]  # Shell 31
-                    action_logits, _ = action_head(cortical_mantle)
-                    act_loss = action_loss_fn(action_logits, action_labels)
+                accum_loss += ce_loss.item() / args.grad_accum
+                accum_act_loss += act_loss.item() / args.grad_accum
+                tokens_processed += (prompts.numel() + targets.numel())
+            else:
+                input_ids, targets, action_labels, perceptual_inputs, batch_phase = streamer.get_batch(
+                    step=step,
+                    device=device,
+                    batch_size=args.batch_size,
+                )
+                with torch.amp.autocast("cuda", enabled=torch.cuda.is_available(), dtype=torch.bfloat16):
+                    ce_loss, logits = model(input_ids, targets=targets, perceptual_inputs=perceptual_inputs)
+                    act_loss = torch.tensor(0.0, device=device)
+                    if batch_phase in (CurriculumPhase.PHASE_3_WORKFLOWS, CurriculumPhase.PHASE_4_CONSOLIDATION):
+                        cortical_mantle = model.current_spheroid_state[:, -1, :]  # Shell 31
+                        action_logits, _ = action_head(cortical_mantle)
+                        act_loss = action_loss_fn(action_logits, action_labels)
 
-                # Combined loss: Language Modeling + Action Classification
-                total_batch_loss = (ce_loss + 0.1 * act_loss) / args.grad_accum
+                    total_batch_loss = (ce_loss + 0.1 * act_loss) / args.grad_accum
+                total_batch_loss.backward()
 
-            total_batch_loss.backward()
-
-            accum_loss += ce_loss.item() / args.grad_accum
-            accum_act_loss += act_loss.item() / args.grad_accum
-            tokens_processed += input_ids.numel()
+                accum_loss += ce_loss.item() / args.grad_accum
+                accum_act_loss += act_loss.item() / args.grad_accum
+                tokens_processed += input_ids.numel()
 
         # Clip gradients & optimizer step
         torch.nn.utils.clip_grad_norm_(all_params, 1.0)

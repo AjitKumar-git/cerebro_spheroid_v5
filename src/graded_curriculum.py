@@ -50,6 +50,12 @@ import pyarrow.parquet as pq
 import torch
 from torch.utils.data import IterableDataset
 
+from src.elastic_window import (
+    get_default_elastic_buckets,
+    sample_window,
+    select_best_bucket,
+)
+
 
 class CurriculumPhase(IntEnum):
     PHASE_1_BASIC = 0          # 0 to 50k steps
@@ -394,9 +400,12 @@ class GradedCurriculumStreamer:
                 pad_needed = (T + 1) - len(safe_tokens)
                 safe_tokens = safe_tokens + [0] * pad_needed
             else:
-                # Random window slice for diversity
+                # V4 window slice with 25% tail probability for EOS representation
                 max_start = len(safe_tokens) - (T + 1)
-                start_idx = self.rng.randint(0, max_start)
+                if max_start > 0 and self.rng.random() < 0.25:
+                    start_idx = max_start
+                else:
+                    start_idx = self.rng.randint(0, max(0, max_start))
                 safe_tokens = safe_tokens[start_idx : start_idx + T + 1]
 
             inp = safe_tokens[:T]
@@ -423,3 +432,118 @@ class GradedCurriculumStreamer:
             perceptual_inputs = torch.stack(batch_patches, dim=0).to(device)
 
         return input_ids, targets, action_labels, perceptual_inputs, phase
+
+    def get_elastic_batch(
+        self,
+        step: int,
+        device: torch.device,
+        batch_size: Optional[int] = None,
+        total_window: int = 1024,
+        tail_probability: float = 0.25,
+        target_pad_id: int = -100,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], CurriculumPhase, str]:
+        """
+        V4-style Elastic Sliding Context Window batcher with complementary (L_p, L_t) buckets.
+        Returns:
+            prompts: [B, L_prompt]
+            targets: [B, L_target]
+            feedback: [B, L_target] (pre-shifted with context_token at step 0)
+            action_labels: [B]
+            perceptual_inputs: Optional[torch.Tensor] [B, P, visual_dim] or None
+            current_phase: CurriculumPhase
+            bucket_name: str
+        """
+        B = batch_size or self.config.batch_size
+        phase = get_curriculum_phase(step, self.config)
+        buckets = get_default_elastic_buckets(total_window)
+        vocab_size = getattr(self.tokenizer, "vocab_size", 32000)
+        pad_id = getattr(self.tokenizer, "pad_token_id", 0) or 0
+        eos_id = getattr(self.tokenizer, "eos_token_id", 2) or 2
+
+        # 1. Pull B samples and split into prompt vs response
+        records = []
+        batch_actions = []
+        batch_patches = []
+        has_any_patches = False
+
+        for _ in range(B):
+            text, action_id, patches = self.get_sample_for_phase(phase)
+            batch_actions.append(action_id)
+            if patches is not None:
+                has_any_patches = True
+                batch_patches.append(patches)
+            else:
+                P = getattr(self.config, "num_visual_patches", 16)
+                V = getattr(self.config, "visual_dim", 512)
+                batch_patches.append(torch.zeros(P, V))
+
+            # Split prompt and response
+            if "Response:" in text:
+                p_txt, r_txt = text.split("Response:", 1)
+                p_txt = p_txt.replace("Query:", "").strip()
+            elif "Answer:" in text:
+                p_txt, r_txt = text.split("Answer:", 1)
+                p_txt = p_txt.replace("Question:", "").strip()
+            elif "Assistant:" in text:
+                p_txt, r_txt = text.split("Assistant:", 1)
+                p_txt = p_txt.replace("User:", "").strip()
+            elif "\n\n" in text:
+                p_txt, r_txt = text.split("\n\n", 1)
+            else:
+                half = max(1, len(text) // 2)
+                p_txt, r_txt = text[:half], text[half:]
+
+            q_ids = self.tokenizer.encode(p_txt, add_special_tokens=False) if hasattr(self.tokenizer, "encode") else [ord(c) % vocab_size for c in p_txt]
+            r_ids = self.tokenizer.encode(r_txt, add_special_tokens=False) if hasattr(self.tokenizer, "encode") else [ord(c) % vocab_size for c in r_txt]
+            if not r_ids or r_ids[-1] != eos_id:
+                r_ids = r_ids + [eos_id]
+
+            records.append((q_ids, r_ids))
+
+        # 2. Select best bucket based on median length
+        avg_q = max(1, sum(len(q) for q, _ in records) // len(records))
+        avg_r = max(1, sum(len(r) for _, r in records) // len(records))
+        b_idx = select_best_bucket(avg_q, avg_r, buckets)
+        bucket_name, bp, bt = buckets[b_idx]
+
+        # 3. Format batches with V4 window sampling
+        batch_prompts = []
+        batch_targets = []
+        batch_feedback = []
+
+        for q_ids, r_ids in records:
+            # Prompt pad/truncate
+            if len(q_ids) > bp:
+                q_padded = q_ids[:bp]
+            else:
+                q_padded = q_ids + [pad_id] * (bp - len(q_ids))
+
+            # Target window sampling
+            if len(r_ids) > bt:
+                context_token, scored = sample_window(r_ids, bt, self.rng, tail_probability)
+                r_padded = scored
+            else:
+                context_token = None
+                r_padded = r_ids + [target_pad_id] * (bt - len(r_ids))
+
+            # Feedback array [bt]
+            feed_row = [target_pad_id] * bt
+            if context_token is not None:
+                feed_row[0] = context_token
+            for t_idx in range(1, bt):
+                feed_row[t_idx] = r_padded[t_idx - 1]
+
+            batch_prompts.append([tok % vocab_size for tok in q_padded])
+            batch_targets.append([tok if tok == target_pad_id else (tok % vocab_size) for tok in r_padded])
+            batch_feedback.append([tok if tok == target_pad_id else (tok % vocab_size) for tok in feed_row])
+
+        prompts = torch.tensor(batch_prompts, dtype=torch.long, device=device)
+        targets = torch.tensor(batch_targets, dtype=torch.long, device=device)
+        feedback = torch.tensor(batch_feedback, dtype=torch.long, device=device)
+        action_labels = torch.tensor(batch_actions, dtype=torch.long, device=device)
+
+        perceptual_inputs = None
+        if has_any_patches:
+            perceptual_inputs = torch.stack(batch_patches, dim=0).to(device)
+
+        return prompts, targets, feedback, action_labels, perceptual_inputs, phase, bucket_name

@@ -136,9 +136,16 @@ def precompute_rope_freqs(dim: int, max_seq_len: int = 32768, theta: float = 500
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, offset: int = 0) -> torch.Tensor:
     """
     Applies Rotary Position Embedding to x shaped [B, H, L, D] or [B, H, 1, D].
-    offset indexes into the precomputed rotary frequencies.
+    offset indexes into the precomputed rotary frequencies. Dynamically extends
+    frequencies if sequence length exceeds the precomputed cache.
     """
     L = x.shape[2]
+    if offset + L > cos.shape[0]:
+        new_max = max(offset + L + 1024, cos.shape[0] * 2)
+        dim = x.shape[-1]
+        cos, sin = precompute_rope_freqs(dim, max_seq_len=new_max)
+        cos = cos.to(device=x.device, dtype=x.dtype)
+        sin = sin.to(device=x.device, dtype=x.dtype)
     c = cos[offset : offset + L].to(device=x.device, dtype=x.dtype).unsqueeze(0).unsqueeze(0)  # [1, 1, L, D]
     s = sin[offset : offset + L].to(device=x.device, dtype=x.dtype).unsqueeze(0).unsqueeze(0)
     x1 = x[..., 0::2]
