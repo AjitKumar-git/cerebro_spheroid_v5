@@ -141,6 +141,14 @@ def salvage_v4_weights(v4_state: Dict[str, torch.Tensor], target_model: CerebroS
             v5_state[v5_k] = expand_or_slice_matrix(cleaned_v4[v4_k], v5_state[v5_k].shape)
             transferred += 1
 
+    # Arcuate Fasciculus Key/Value projections in Sensory DNN
+    if "motor.k_proj.weight" in cleaned_v4 and "sensory_dnn.k_proj.weight" in v5_state:
+        v5_state["sensory_dnn.k_proj.weight"] = expand_or_slice_matrix(cleaned_v4["motor.k_proj.weight"], v5_state["sensory_dnn.k_proj.weight"].shape)
+        transferred += 1
+    if "motor.v_proj.weight" in cleaned_v4 and "sensory_dnn.v_proj.weight" in v5_state:
+        v5_state["sensory_dnn.v_proj.weight"] = expand_or_slice_matrix(cleaned_v4["motor.v_proj.weight"], v5_state["sensory_dnn.v_proj.weight"].shape)
+        transferred += 1
+
     # 2. Volumetric Spheroid Core Mapping
     if "core.shortcut_tracts" in cleaned_v4 and "volumetric_core.shortcut_weight" in v5_state:
         tracts = cleaned_v4["core.shortcut_tracts"]  # [40, 640, 640]
@@ -202,25 +210,42 @@ def salvage_v4_weights(v4_state: Dict[str, torch.Tensor], target_model: CerebroS
     motor_map = {
         "motor.phase_embed.weight": "motor_decoder.phase_embed.weight",
         "motor.q_proj.weight": "motor_decoder.q_proj.weight",
-        "motor.k_proj.weight": "motor_decoder.q_proj.weight",  # self-attention cross-resonance
         "motor.shell_proj.weight": "motor_decoder.shell_proj.weight",
         "motor.resonance_norm.weight": "motor_decoder.resonance_norm.weight",
         "motor.fused_norm.weight": "motor_decoder.fused_norm.weight",
-        "motor.fc_gate.weight": "motor_decoder.motor_swiglu.fc_gate.weight",
-        "motor.fc_val.weight": "motor_decoder.motor_swiglu.fc_val.weight",
         "motor.plan_decay": "motor_decoder.plan_decay",
         "motor.plan_write": "motor_decoder.plan_write",
         "motor.plan_gate.bias": "motor_decoder.plan_gate.bias",
-        "motor.plan_gate.weight": "motor_decoder.plan_gate.weight",
         "motor.plan_init.weight": "motor_decoder.plan_init.weight",
         "motor.plan_init.bias": "motor_decoder.plan_init.bias",
-        "motor.plan_update.weight": "motor_decoder.plan_update.weight",
         "motor.temperature_scale": "motor_decoder.temperature_scale",
         "motor.refractory_decay": "motor_decoder.refractory_decay",
         "motor.refractory_strength": "motor_decoder.refractory_strength",
         "motor.shell_scale": "motor_decoder.shell_scale",
-        "motor.efference_proj.weight": "motor_decoder.efference_proj.weight",
     }
+
+    # If target model uses untied head (1:1 V4 match)
+    if "motor_decoder.head.weight" in v5_state:
+        motor_map.update({
+            "motor.head.weight": "motor_decoder.head.weight",
+            "motor.fc_gate.weight": "motor_decoder.fc_gate.weight",
+            "motor.fc_val.weight": "motor_decoder.fc_val.weight",
+            "motor.norm_mid.weight": "motor_decoder.norm_mid.weight",
+            "motor.efference_proj.weight": "motor_decoder.efference_proj.weight",
+            "motor.plan_gate.weight": "motor_decoder.plan_gate.weight",
+            "motor.plan_update.weight": "motor_decoder.plan_update.weight",
+        })
+    else:
+        # Tied embeddings mode
+        motor_map.update({
+            "motor.fc_gate.weight": "motor_decoder.motor_swiglu.fc_gate.weight",
+            "motor.fc_val.weight": "motor_decoder.motor_swiglu.fc_val.weight",
+            "motor.norm_mid.weight": "motor_decoder.norm_mid.weight",
+            "motor.efference_proj.weight": "motor_decoder.efference_proj.weight",
+            "motor.plan_gate.weight": "motor_decoder.plan_gate.weight",
+            "motor.plan_update.weight": "motor_decoder.plan_update.weight",
+        })
+
     for v4_k, v5_k in motor_map.items():
         if v4_k in cleaned_v4 and v5_k in v5_state:
             v5_state[v5_k] = expand_or_slice_matrix(cleaned_v4[v4_k], v5_state[v5_k].shape)

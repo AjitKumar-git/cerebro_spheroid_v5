@@ -70,6 +70,7 @@ PRESETS_V5: Dict[str, Dict[str, Any]] = {
         "top_k_tracts": 16,
         "thinking_cycles": 4,
         "phase_scale": 2.0,
+        "use_tied_embeddings": False,
     },
     "v5_compact": {
         "surface_dim": 768,
@@ -496,6 +497,7 @@ class PremotorMotorDecoderV5(nn.Module):
         rope_theta: float = 500000.0,
         max_seq_len: int = 32768,
         top_k_resonance: int = 16,
+        use_tied_embeddings: bool = True,
     ):
         super().__init__()
         self.num_shells = num_shells
@@ -508,6 +510,7 @@ class PremotorMotorDecoderV5(nn.Module):
         self.use_plan = use_plan
         self.use_shell_tap = use_shell_tap
         self.top_k_resonance = top_k_resonance
+        self.use_tied_embeddings = use_tied_embeddings
 
         # Precompute RoPE rotary frequency cache for 32k+ token horizons
         cos, sin = precompute_rope_freqs(self.head_dim, max_seq_len=max_seq_len, theta=rope_theta)
@@ -531,25 +534,34 @@ class PremotorMotorDecoderV5(nn.Module):
         # Deep motor integration MLP: [motor_surface, core, resonance, shell_pool, plan] = 5*D -> D
         fused_dim = surface_dim * 5 if use_plan else surface_dim * 4
         self.fused_norm = RMSNorm(fused_dim)
-        self.motor_swiglu = SwiGLU(fused_dim, hidden_features=surface_dim * 2, out_features=surface_dim)
-        self.norm_mid = RMSNorm(surface_dim)
         self.dropout = nn.Dropout(dropout)
+
+        if self.use_tied_embeddings:
+            self.motor_swiglu = SwiGLU(fused_dim, hidden_features=surface_dim * 2, out_features=surface_dim)
+            self.norm_mid = RMSNorm(surface_dim)
+            self.affine_scale = nn.Parameter(torch.ones(surface_dim))
+            self.head = None
+            self.efference_proj = nn.Linear(surface_dim, surface_dim, bias=False)
+            plan_in_dim = surface_dim * 2
+        else:
+            # Untied head mode (1:1 V4 architectural parity for exact weight salvaging)
+            self.fc_gate = nn.Linear(fused_dim, surface_dim * 2, bias=False)
+            self.fc_val = nn.Linear(fused_dim, surface_dim * 2, bias=False)
+            self.norm_mid = RMSNorm(surface_dim * 2)
+            self.head = nn.Linear(surface_dim * 2, vocab_size, bias=False)
+            self.affine_scale = None
+            self.efference_proj = nn.Linear(surface_dim * 2, surface_dim, bias=False)
+            plan_in_dim = surface_dim * 3
 
         # Recurrent Executive Plan synthesis
         if use_plan:
             self.plan_init = nn.Linear(surface_dim * 2, surface_dim, bias=True)
-            self.plan_gate = nn.Linear(surface_dim * 2, surface_dim, bias=True)
-            self.plan_update = nn.Linear(surface_dim * 2, surface_dim, bias=False)
+            self.plan_gate = nn.Linear(plan_in_dim, surface_dim, bias=True)
+            self.plan_update = nn.Linear(plan_in_dim, surface_dim, bias=False)
             self.plan_decay = nn.Parameter(torch.tensor(0.85))
             self.plan_write = nn.Parameter(torch.tensor(0.15))
 
-        # Affine-Tied Motor Emission Head Parameters
-        # gamma: Learnable per-channel scale multiplying tied embedding weights
-        self.affine_scale = nn.Parameter(torch.ones(surface_dim))
         self.temperature_scale = nn.Parameter(torch.tensor(1.0))
-
-        # Efference copy projection (injected into Shell 0)
-        self.efference_proj = nn.Linear(surface_dim, surface_dim, bias=False)
 
         # Two-tier refractory penalty parameters
         self.refractory_decay = nn.Parameter(torch.tensor(0.75))
@@ -643,7 +655,10 @@ class PremotorMotorDecoderV5(nn.Module):
             fused_components.append(plan)
 
         fused = self.fused_norm(torch.cat(fused_components, dim=-1))
-        h = self.norm_mid(self.motor_swiglu(fused))
+        if self.use_tied_embeddings:
+            h = self.norm_mid(self.motor_swiglu(fused))
+        else:
+            h = self.norm_mid(F.silu(self.fc_gate(fused)) * self.fc_val(fused))
         h = self.dropout(h)
 
         # 5. Premotor Recurrent Executive Plan Update
@@ -657,11 +672,13 @@ class PremotorMotorDecoderV5(nn.Module):
         else:
             next_plan = plan if plan is not None else torch.zeros(B, D, device=state.device)
 
-        # 6. Affine-Tied Dictionary Projection (W_motor = gamma * W_sensory)
-        # Memory-optimal: Scale hidden vector [B, D] (3 KB) instead of vocabulary matrix [V, D] (98 MB)
+        # 6. Motor Verbalization Emission Head
         temp = torch.clamp(self.temperature_scale, 0.1, 5.0)
-        h_scaled = (h * self.affine_scale) / temp
-        raw_logits = F.linear(h_scaled, tied_embedding_weight)
+        if self.use_tied_embeddings:
+            h_scaled = (h * self.affine_scale) / temp
+            raw_logits = F.linear(h_scaled, tied_embedding_weight)
+        else:
+            raw_logits = self.head(h) / temp
 
         # 7. Two-Tier Refractory Repetition Suppression
         if refractory_trace is not None:
@@ -775,13 +792,19 @@ class PremotorMotorDecoderV5(nn.Module):
             fused_components.append(plan.unsqueeze(1).expand(-1, T_chunk, -1))
 
         fused = self.fused_norm(torch.cat(fused_components, dim=-1))
-        h = self.norm_mid(self.motor_swiglu(fused))
+        if self.use_tied_embeddings:
+            h = self.norm_mid(self.motor_swiglu(fused))
+        else:
+            h = self.norm_mid(F.silu(self.fc_gate(fused)) * self.fc_val(fused))
         h = self.dropout(h)
 
-        # 5. Affine-Tied Parallel Dictionary Projection (Single Large GEMM: [B*T, D] @ [D, V])
+        # 5. Parallel Motor Emission Projection
         temp = torch.clamp(self.temperature_scale, 0.1, 5.0)
-        h_scaled = (h * self.affine_scale) / temp
-        logits = F.linear(h_scaled, tied_embedding_weight)  # [B, T_chunk, vocab_size]
+        if self.use_tied_embeddings:
+            h_scaled = (h * self.affine_scale) / temp
+            logits = F.linear(h_scaled, tied_embedding_weight)  # [B, T_chunk, vocab_size]
+        else:
+            logits = self.head(h) / temp
 
         efference = self.efference_proj(h)  # [B, T_chunk, surface_dim]
         if return_hidden:
@@ -857,6 +880,7 @@ class CerebroSpheroidV5(nn.Module):
             rope_theta=self.config.rope_theta,
             max_seq_len=self.config.max_seq_len,
             top_k_resonance=self.config.top_k_resonance,
+            use_tied_embeddings=getattr(self.config, "use_tied_embeddings", True),
         )
 
         # 4. Deliberative Episodic Memory Probing (Subconscious sensory recall)
