@@ -186,11 +186,18 @@ def main(args=None):
     if args.cloud_sync:
         print(f"\n[cloud_sync] Checking remote manifest on bioflo.in for {args.preset}...")
         try:
-            manifest = check_remote_manifest(model=args.preset)
-            if manifest.get("has_latest", False):
+            m_resp = check_remote_manifest(model=args.preset)
+            models_info = m_resp.get("models", {})
+            model_tier_info = models_info.get(args.preset, {})
+            tier_manifest = m_resp.get("manifest", {}).get(f"{args.preset}_latest", {})
+
+            has_tier_latest = model_tier_info.get("has_latest", False) or bool(tier_manifest)
+            if has_tier_latest:
                 pulled = pull_checkpoint(local_latest, target_type="latest", model=args.preset)
                 if pulled:
                     print(f"✓ Restored latest {args.preset} checkpoint from cloud hub!")
+            else:
+                print(f"ℹ️ No existing cloud checkpoint found for [{args.preset}]. Starting fresh {args.preset} training frontier!")
         except Exception as e:
             print(f"⚠️ Cloud sync notice: {e}")
 
@@ -199,9 +206,17 @@ def main(args=None):
         try:
             import torch
             ckpt = torch.load(local_latest, map_location="cpu", weights_only=False)
-            start_step = int(ckpt.get("step", 0))
-            best_loss = float(ckpt.get("loss", float("inf")))
-            print(f"✓ Resumed from {os.path.basename(local_latest)} at Step {start_step:,} (loss: {best_loss:.4f})")
+            ckpt_preset = ckpt.get("model_preset")
+            if ckpt_preset is not None and ckpt_preset != args.preset:
+                print(f"⚠️ Checkpoint preset mismatch: found '{ckpt_preset}', but running '{args.preset}'. Starting clean!")
+                os.remove(local_latest)
+            elif "step" in ckpt:
+                start_step = int(ckpt.get("step", 0))
+                best_loss = float(ckpt.get("loss", float("inf")))
+                print(f"✓ Resumed from {os.path.basename(local_latest)} at Step {start_step:,} (loss: {best_loss:.4f})")
+            else:
+                print(f"⚠️ Incompatible checkpoint structure in {local_latest}. Starting fresh!")
+                os.remove(local_latest)
         except Exception as e:
             print(f"⚠️ Local checkpoint inspection: {e}")
 
