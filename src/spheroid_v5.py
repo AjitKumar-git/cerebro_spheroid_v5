@@ -41,6 +41,10 @@ class ModelConfigV5:
     use_swiglu: bool = True           # SwiGLU non-linear gating
     use_shell_tap: bool = True        # Multi-shell efferent tap
     use_plan: bool = True             # Recurrent premotor executive plan
+    rope_theta: float = 500000.0      # Rotary Position Embedding base (32k+ horizon)
+    max_seq_len: int = 32768          # Precomputed rotary horizon
+    top_k_resonance: int = 16         # Top-k sparse associative retrieval (needle tethering)
+    use_deliberation_probe: bool = True  # Subconscious core probe of sensory KV buffer
 
 
 PRESETS_V5: Dict[str, Dict[str, Any]] = {
@@ -102,6 +106,30 @@ class SwiGLU(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc_down(F.silu(self.fc_gate(x)) * self.fc_val(x))
+
+
+def precompute_rope_freqs(dim: int, max_seq_len: int = 32768, theta: float = 500000.0) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Precomputes rotary frequency cos and sin tables up to max_seq_len with YaRN-compatible base."""
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+    t = torch.arange(max_seq_len, dtype=torch.float)
+    freqs = torch.outer(t, freqs)  # [max_seq_len, dim // 2]
+    cos = torch.cos(freqs).repeat_interleave(2, dim=-1)  # [max_seq_len, dim]
+    sin = torch.sin(freqs).repeat_interleave(2, dim=-1)  # [max_seq_len, dim]
+    return cos, sin
+
+
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, offset: int = 0) -> torch.Tensor:
+    """
+    Applies Rotary Position Embedding to x shaped [B, H, L, D] or [B, H, 1, D].
+    offset indexes into the precomputed rotary frequencies.
+    """
+    L = x.shape[2]
+    c = cos[offset : offset + L].to(device=x.device, dtype=x.dtype).unsqueeze(0).unsqueeze(0)  # [1, 1, L, D]
+    s = sin[offset : offset + L].to(device=x.device, dtype=x.dtype).unsqueeze(0).unsqueeze(0)
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    x_rot = torch.stack([-x2, x1], dim=-1).flatten(-2)
+    return x * c + x_rot * s
 
 
 class SensoryInputDNNV5(nn.Module):
@@ -323,6 +351,9 @@ class PremotorMotorDecoderV5(nn.Module):
         dropout: float = 0.0,
         use_plan: bool = True,
         use_shell_tap: bool = True,
+        rope_theta: float = 500000.0,
+        max_seq_len: int = 32768,
+        top_k_resonance: int = 16,
     ):
         super().__init__()
         self.num_shells = num_shells
@@ -334,6 +365,12 @@ class PremotorMotorDecoderV5(nn.Module):
         self.phase_scale = phase_scale
         self.use_plan = use_plan
         self.use_shell_tap = use_shell_tap
+        self.top_k_resonance = top_k_resonance
+
+        # Precompute RoPE rotary frequency cache for 32k+ token horizons
+        cos, sin = precompute_rope_freqs(self.head_dim, max_seq_len=max_seq_len, theta=rope_theta)
+        self.register_buffer("rope_cos", cos, persistent=False)
+        self.register_buffer("rope_sin", sin, persistent=False)
 
         # Premotor normalized temporal phase clock
         self.phase_embed = nn.Embedding(max_phase_steps, surface_dim)
@@ -416,12 +453,28 @@ class PremotorMotorDecoderV5(nn.Module):
         if auditory_feedback is not None:
             motor_surface = motor_surface + auditory_feedback.to(motor_surface.dtype)
 
-        # 2. Multi-Head Arcuate Fasciculus Cross-Resonance
+        # 2. Multi-Head Arcuate Fasciculus Cross-Resonance with RoPE & Top-K Sparsity
         if sensory_kv is not None:
             keys, values = sensory_kv  # [B, H, L, head_dim]
+            L = keys.shape[2]
             q = self.q_proj(motor_surface).view(B, self.num_heads, 1, self.head_dim)
-            # Scaled Dot-Product Attention: [B, H, 1, head_dim]
-            res = F.scaled_dot_product_attention(q.to(keys.dtype), keys, values)
+
+            # Apply RoPE: keys start at pos 0..L-1, query is positioned at step_idx
+            q_offset = min(int(step_idx), self.rope_cos.shape[0] - 1)
+            q_rot = apply_rope(q, self.rope_cos, self.rope_sin, offset=q_offset)
+            k_rot = apply_rope(keys, self.rope_cos, self.rope_sin, offset=0)
+
+            # Dot-product cross-resonance: [B, H, 1, L]
+            scores = torch.matmul(q_rot.to(keys.dtype), k_rot.transpose(-1, -2)) / math.sqrt(self.head_dim)
+
+            # Top-K Sparse Associative Gating (Needle-in-a-Haystack Tethering)
+            if self.top_k_resonance > 0 and L > self.top_k_resonance:
+                topk_v, _ = torch.topk(scores, self.top_k_resonance, dim=-1)
+                min_topk = topk_v[..., -1, None]
+                scores = torch.where(scores < min_topk, torch.full_like(scores, -1e9), scores)
+
+            attn_weights = F.softmax(scores, dim=-1)
+            res = torch.matmul(attn_weights, values)  # [B, H, 1, head_dim]
             res = res.transpose(1, 2).contiguous().view(B, D)
             resonance = self.resonance_norm(self.out_proj(res).to(motor_surface.dtype))
         else:
@@ -550,7 +603,18 @@ class CerebroSpheroidV5(nn.Module):
             dropout=self.config.dropout,
             use_plan=self.config.use_plan,
             use_shell_tap=self.config.use_shell_tap,
+            rope_theta=self.config.rope_theta,
+            max_seq_len=self.config.max_seq_len,
+            top_k_resonance=self.config.top_k_resonance,
         )
+
+        # 4. Deliberative Episodic Memory Probing (Subconscious sensory recall)
+        if self.config.use_deliberation_probe:
+            self.deliberation_probe = nn.Linear(self.config.surface_dim, self.config.surface_dim, bias=False)
+            self.deliberation_probe_norm = RMSNorm(self.config.surface_dim)
+        else:
+            self.deliberation_probe = None
+            self.deliberation_probe_norm = None
 
     def count_parameters(self) -> Dict[str, int]:
         """Returns detailed parameter breakdown across modules."""
@@ -605,8 +669,22 @@ class CerebroSpheroidV5(nn.Module):
         state = self.init_spheroid_state(B, dev)
         state[:, -1, :] = prompt_centroid
 
-        # 3. Subconscious Deliberation Cycles before verbalization
-        for _ in range(self.config.thinking_cycles):
+        # 3. Subconscious Deliberation Cycles with Memory Probing
+        for cycle in range(self.config.thinking_cycles):
+            if sensory_kv is not None and self.deliberation_probe is not None:
+                keys, values = sensory_kv
+                L_kv = keys.shape[2]
+                probe_q = self.deliberation_probe(state[:, 0, :]).view(B, self.config.num_heads, 1, self.sensory_dnn.head_dim)
+                q_rot = apply_rope(probe_q, self.motor_decoder.rope_cos, self.motor_decoder.rope_sin, offset=cycle)
+                k_rot = apply_rope(keys, self.motor_decoder.rope_cos, self.motor_decoder.rope_sin, offset=0)
+                scores = torch.matmul(q_rot.to(keys.dtype), k_rot.transpose(-1, -2)) / math.sqrt(self.sensory_dnn.head_dim)
+                if self.config.top_k_resonance > 0 and L_kv > self.config.top_k_resonance:
+                    topk_v, _ = torch.topk(scores, self.config.top_k_resonance, dim=-1)
+                    scores = torch.where(scores < topk_v[..., -1, None], torch.full_like(scores, -1e9), scores)
+                attn_p = F.softmax(scores, dim=-1)
+                retrieved = torch.matmul(attn_p, values).transpose(1, 2).contiguous().view(B, self.config.surface_dim)
+                state[:, -1, :] = state[:, -1, :] + 0.1 * self.deliberation_probe_norm(retrieved)
+
             state = self.volumetric_core.deliberate_step(state)
 
         # Pre-embed teacher feedback tokens if available
@@ -695,7 +773,21 @@ class CerebroSpheroidV5(nn.Module):
         state = self.init_spheroid_state(B, dev)
         state[:, -1, :] = prompt_centroid
 
-        for _ in range(cycles):
+        for cycle in range(cycles):
+            if sensory_kv is not None and self.deliberation_probe is not None:
+                keys, values = sensory_kv
+                L_kv = keys.shape[2]
+                probe_q = self.deliberation_probe(state[:, 0, :]).view(B, self.config.num_heads, 1, self.sensory_dnn.head_dim)
+                q_rot = apply_rope(probe_q, self.motor_decoder.rope_cos, self.motor_decoder.rope_sin, offset=cycle)
+                k_rot = apply_rope(keys, self.motor_decoder.rope_cos, self.motor_decoder.rope_sin, offset=0)
+                scores = torch.matmul(probe_rot.to(keys.dtype) if 'probe_rot' in locals() else q_rot.to(keys.dtype), k_rot.transpose(-1, -2)) / math.sqrt(self.sensory_dnn.head_dim)
+                if self.config.top_k_resonance > 0 and L_kv > self.config.top_k_resonance:
+                    topk_v, _ = torch.topk(scores, self.config.top_k_resonance, dim=-1)
+                    scores = torch.where(scores < topk_v[..., -1, None], torch.full_like(scores, -1e9), scores)
+                attn_p = F.softmax(scores, dim=-1)
+                retrieved = torch.matmul(attn_p, values).transpose(1, 2).contiguous().view(B, self.config.surface_dim)
+                state[:, -1, :] = state[:, -1, :] + 0.1 * self.deliberation_probe_norm(retrieved)
+
             state = self.volumetric_core.deliberate_step(state)
 
         # 3. Motor generation loop
