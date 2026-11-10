@@ -109,5 +109,20 @@ class TestCerebroSpheroidV5(unittest.TestCase):
         print(f"\n[Test 5] Contractive Spectral Bounds Verified Across All Shells!")
 
 
+    def test_06_multimodal_forward_and_loss(self):
+        """Verifies multimodal perceptual patch projection interleaved with discrete text prompts."""
+        B, P, V_dim = 2, 8, getattr(self.cfg_test, "visual_dim", 128)
+        L_p, L_t = 12, 16
+        perceptual_inputs = torch.randn(B, P, V_dim, device=self.device)
+        prompts = torch.randint(0, self.cfg_test.vocab_size, (B, L_p), device=self.device)
+        targets = torch.randint(0, self.cfg_test.vocab_size, (B, L_t), device=self.device)
+
+        loss, logits = self.model_test(prompts, targets=targets, perceptual_inputs=perceptual_inputs)
+        self.assertFalse(torch.isnan(loss), "Multimodal loss must not be NaN")
+        self.assertGreater(loss.item(), 0.0, "Multimodal loss must be positive")
+        self.assertEqual(logits.shape, (B, L_t, self.cfg_test.vocab_size))
+        print(f"\n[Test 6] Multimodal Perceptual Rollout Loss: {loss.item():.4f} | Logits: {list(logits.shape)}")
+
+
 if __name__ == "__main__":
     unittest.main()

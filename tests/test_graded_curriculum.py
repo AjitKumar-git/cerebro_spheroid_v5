@@ -110,13 +110,15 @@ def test_streaming_batch_generation():
 
     # Test sampling across each phase
     for test_step in [1_000, 100_000, 600_000, 950_000]:
-        inp, tgt, act, ph = streamer.get_batch(step=test_step, device=device)
+        inp, tgt, act, vis, ph = streamer.get_batch(step=test_step, device=device)
         assert inp.shape == (2, 64), f"Expected (2, 64), got {inp.shape}"
         assert tgt.shape == (2, 64), f"Expected (2, 64), got {tgt.shape}"
         assert act.shape == (2,), f"Expected (2,), got {act.shape}"
+        if vis is not None:
+            assert vis.shape == (2, cfg.num_visual_patches, cfg.visual_dim), f"Expected (2, 16, 512), got {vis.shape}"
         assert isinstance(ph, CurriculumPhase)
 
-    print("✓ GradedCurriculumStreamer on-the-fly batching passed.")
+    print("✓ GradedCurriculumStreamer on-the-fly multimodal batching passed.")
 
 
 if __name__ == "__main__":

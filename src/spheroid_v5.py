@@ -53,6 +53,9 @@ class ModelConfigV5:
     use_sparse_mot: bool = True            # Mixture-of-Tracts sparse axonal routing
     top_k_tracts: int = 24                 # Active shortcut tracts routed per step
     use_energy_regularization: bool = True # Contrastive fixed-point energy guard
+    enable_multimodal: bool = True         # Multimodal continuous sensory projection
+    visual_dim: int = 512                  # Perceptual / Visual patch dimension
+    num_visual_patches: int = 16           # Default visual tokens per perceptual stimulus
 
 
 PRESETS_V5: Dict[str, Dict[str, Any]] = {
@@ -85,6 +88,7 @@ PRESETS_V5: Dict[str, Dict[str, Any]] = {
         "thinking_cycles": 2,
         "phase_scale": 2.0,
         "top_k_tracts": 4,
+        "visual_dim": 128,
     },
 }
 
@@ -693,9 +697,25 @@ class CerebroSpheroidV5(nn.Module):
         else:
             self.halting_gate = None
 
+        # 7. Multimodal Perceptual Projection (Vision / Continuous Sensory Flux)
+        if getattr(self.config, "enable_multimodal", False):
+            v_dim = getattr(self.config, "visual_dim", self.config.surface_dim)
+            self.perceptual_projector = nn.Sequential(
+                RMSNorm(v_dim),
+                nn.Linear(v_dim, self.config.surface_dim, bias=False),
+                SwiGLU(self.config.surface_dim, hidden_features=self.config.surface_dim * 2, out_features=self.config.surface_dim),
+                RMSNorm(self.config.surface_dim),
+            )
+        else:
+            self.perceptual_projector = None
+
+        self.current_spheroid_state: Optional[torch.Tensor] = None
+
     def count_parameters(self) -> Dict[str, int]:
         """Returns detailed parameter breakdown across modules."""
         sensory = sum(p.numel() for p in self.sensory_dnn.parameters())
+        if self.perceptual_projector is not None:
+            sensory += sum(p.numel() for p in self.perceptual_projector.parameters())
         core = sum(p.numel() for p in self.volumetric_core.parameters())
         motor = sum(p.numel() for p in self.motor_decoder.parameters())
         total = sum(p.numel() for p in self.parameters())
@@ -723,24 +743,43 @@ class CerebroSpheroidV5(nn.Module):
         sampling_p: float = 1.0,
         pad_id: int = 0,
         target_len: Optional[int] = None,
+        perceptual_inputs: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Differentiable training rollout engine:
-        1. Encodes sensory prompt into Arcuate Fasciculus KV and centroid flux.
+        1. Encodes sensory prompt & multimodal perceptual flux into Arcuate Fasciculus KV and centroid.
         2. Sets Shell K-1 (Surface) to prompt centroid.
         3. Executes subconscious deliberation cycles in subcortical core.
         4. Steps through motor emissions with scheduled sampling and thought re-afference.
         """
-        B, L = prompts.shape
         dev = prompts.device
         t_len = target_len if target_len is not None else (targets.shape[1] if targets is not None else 128)
 
-        # 1. Sensory Ingestion
-        sensory_flux, sensory_kv = self.sensory_dnn(prompts)
-
-        # Masked centroid pooling: padding tokens never dilute prompt semantics
-        mask = (prompts != pad_id).unsqueeze(-1).float()
-        prompt_centroid = torch.sum(sensory_flux * mask, dim=1) / torch.clamp(torch.sum(mask, dim=1), min=1.0)
+        # 1. Sensory Ingestion (Multimodal Perceptual Projections or Text Embeddings)
+        if perceptual_inputs is not None and self.perceptual_projector is not None:
+            B_vis, P_vis, _ = perceptual_inputs.shape
+            vis_flux = self.perceptual_projector(perceptual_inputs)  # [B, P, D]
+            if prompts.dim() == 2 and prompts.dtype in (torch.int32, torch.int64):
+                txt_emb = self.sensory_dnn.embedding(prompts)  # [B, L, D]
+                combined_emb = torch.cat([vis_flux, txt_emb], dim=1)  # [B, P+L, D]
+                sensory_flux, sensory_kv = self.sensory_dnn(combined_emb)
+                vis_mask = torch.ones(B_vis, P_vis, device=dev)
+                txt_mask = (prompts != pad_id).float()
+                combined_mask = torch.cat([vis_mask, txt_mask], dim=1).unsqueeze(-1)
+                prompt_centroid = torch.sum(sensory_flux * combined_mask, dim=1) / torch.clamp(torch.sum(combined_mask, dim=1), min=1.0)
+            else:
+                combined_emb = torch.cat([vis_flux, prompts], dim=1)
+                sensory_flux, sensory_kv = self.sensory_dnn(combined_emb)
+                prompt_centroid = sensory_flux.mean(dim=1)
+            B = B_vis
+        else:
+            B = prompts.shape[0]
+            sensory_flux, sensory_kv = self.sensory_dnn(prompts)
+            if prompts.dim() == 2:
+                mask = (prompts != pad_id).unsqueeze(-1).float()
+                prompt_centroid = torch.sum(sensory_flux * mask, dim=1) / torch.clamp(torch.sum(mask, dim=1), min=1.0)
+            else:
+                prompt_centroid = sensory_flux.mean(dim=1)
 
         # 2. State Initialization: Cortical Surface receives sensory prompt flux out-of-place
         subcortical = torch.zeros(B, self.config.num_shells - 1, self.config.surface_dim, device=dev)
@@ -749,13 +788,14 @@ class CerebroSpheroidV5(nn.Module):
         # 3. Subconscious Deliberation Cycles with Memory Probing & Adaptive Halting
         cycles = self.config.max_thinking_cycles if self.config.use_adaptive_thinking else self.config.thinking_cycles
         energy_loss = torch.tensor(0.0, device=dev)
+        halt_loss = torch.tensor(0.0, device=dev)
 
         for cycle in range(cycles):
             state_prev = state.clone()
             if sensory_kv is not None and self.deliberation_probe is not None:
                 keys, values = sensory_kv
                 L_kv = keys.shape[2]
-                probe_q = self.deliberation_probe(state[:, 0, :]).view(B, self.config.num_heads, 1, self.sensory_dnn.head_dim)
+                probe_q = self.deliberation_probe(state.mean(dim=1)).view(B, self.config.num_heads, 1, self.sensory_dnn.head_dim)
                 q_rot = apply_rope(probe_q, self.motor_decoder.rope_cos, self.motor_decoder.rope_sin, offset=cycle)
                 k_rot = apply_rope(keys, self.motor_decoder.rope_cos, self.motor_decoder.rope_sin, offset=0)
                 scores = torch.matmul(q_rot.to(keys.dtype), k_rot.transpose(-1, -2)) / math.sqrt(self.sensory_dnn.head_dim)
@@ -773,7 +813,8 @@ class CerebroSpheroidV5(nn.Module):
                 energy_loss = energy_loss + torch.mean((state - state_prev) ** 2)
 
             if self.config.use_adaptive_thinking and self.halting_gate is not None:
-                halt_prob = torch.sigmoid(self.halting_gate(state[:, 0, :]))
+                halt_prob = torch.sigmoid(self.halting_gate(state.mean(dim=1)))
+                halt_loss = halt_loss + halt_prob.mean()
                 if not self.training and (halt_prob > self.config.thinking_halt_threshold).all():
                     break
 
@@ -824,6 +865,7 @@ class CerebroSpheroidV5(nn.Module):
             state_eff = self.volumetric_core.inject_efference_copy(state, efference)
             state = self.volumetric_core.deliberate_step(state_eff)
 
+        self.current_spheroid_state = state
         logits_stacked = torch.stack(all_logits, dim=1)  # [B, t_len, vocab_size]
 
         if targets is not None:
@@ -835,6 +877,8 @@ class CerebroSpheroidV5(nn.Module):
             )
             if self.config.use_energy_regularization:
                 loss = loss + 0.01 * (energy_loss / max(cycles, 1))
+            if self.config.use_adaptive_thinking and self.halting_gate is not None:
+                loss = loss + 0.001 * (halt_loss / max(cycles, 1))
 
             return loss, logits_stacked
 

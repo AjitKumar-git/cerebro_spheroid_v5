@@ -199,7 +199,7 @@ def main():
 
         # Gradient accumulation loop
         for micro in range(args.grad_accum):
-            input_ids, targets, action_labels, batch_phase = streamer.get_batch(
+            input_ids, targets, action_labels, perceptual_inputs, batch_phase = streamer.get_batch(
                 step=step,
                 device=device,
                 batch_size=args.batch_size,
@@ -207,8 +207,8 @@ def main():
 
             # Mixed-precision forward pass (bfloat16) to conserve VRAM
             with torch.amp.autocast("cuda", enabled=torch.cuda.is_available(), dtype=torch.bfloat16):
-                # Forward pass through Spheroid V5
-                ce_loss, logits = model(input_ids, targets=targets)
+                # Forward pass through Spheroid V5 (with multimodal perceptual inputs if present)
+                ce_loss, logits = model(input_ids, targets=targets, perceptual_inputs=perceptual_inputs)
 
                 # In Phase 3 & 4: Train discrete tool action classification directly from Shell 31
                 act_loss = torch.tensor(0.0, device=device)

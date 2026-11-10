@@ -49,6 +49,9 @@ class ModelConfigV5:
     use_sparse_mot: bool = True
     top_k_tracts: int = 24
     use_energy_regularization: bool = True
+    enable_multimodal: bool = True
+    visual_dim: int = 512
+    num_visual_patches: int = 16
 
 
 # Register ModelConfigV5 as static PyTree node
@@ -61,6 +64,7 @@ jax.tree_util.register_pytree_node(
         c.rope_theta, c.max_seq_len, c.top_k_resonance, c.use_deliberation_probe,
         c.use_adaptive_thinking, c.max_thinking_cycles, c.thinking_halt_threshold,
         c.num_mtp_heads, c.use_sparse_mot, c.top_k_tracts, c.use_energy_regularization,
+        c.enable_multimodal, c.visual_dim, c.num_visual_patches,
     )),
     lambda aux, _: ModelConfigV5(*aux),
 )

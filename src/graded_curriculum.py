@@ -82,6 +82,9 @@ class CurriculumScheduleConfig:
     energy_reg_phase_4: float = 0.05
     seq_len: int = 256
     batch_size: int = 2
+    visual_dim: int = 512
+    num_visual_patches: int = 16
+    multimodal_sample_ratio: float = 0.35
 
 
 def get_curriculum_phase(step: int, config: CurriculumScheduleConfig) -> CurriculumPhase:
@@ -189,6 +192,57 @@ class GradedCurriculumStreamer:
         o = self.rng.choice(objects)
         return f"{s} {v} {o} Specifically, its spatial gradient remains bounded within contractive limits."
 
+    def _generate_synthetic_multimodal(self, phase: CurriculumPhase) -> Tuple[str, int, torch.Tensor]:
+        """Generates paired perceptual visual patches and multimodal reasoning dialogue."""
+        P = getattr(self.config, "num_visual_patches", 16)
+        V = getattr(self.config, "visual_dim", 512)
+        spatial_freq = self.rng.uniform(0.5, 4.0)
+        t = torch.linspace(0, math.pi * spatial_freq, P)
+        patches = torch.zeros(P, V)
+        for p in range(P):
+            patches[p] = torch.sin(t[p] + torch.arange(V) * 0.05) + 0.05 * torch.randn(V)
+
+        if phase == CurriculumPhase.PHASE_1_BASIC:
+            entities = [
+                "a biological cell with a prominent spherical membrane",
+                "a crystalline lattice with hexagonal symmetry",
+                "an electron microscope scan of neural synapses",
+                "a planetary spheroid showing atmospheric circulation",
+            ]
+            e = self.rng.choice(entities)
+            text = f"Visual Input: <perceptual_flux>\nQuery: What entity is visible in this visual field?\nResponse: The visual field displays {e}."
+            return text, 0, patches
+
+        elif phase == CurriculumPhase.PHASE_2_REASONING:
+            x1, y1 = round(self.rng.uniform(0.1, 0.4), 2), round(self.rng.uniform(0.1, 0.4), 2)
+            x2, y2 = round(x1 + self.rng.uniform(0.2, 0.4), 2), round(y1 + self.rng.uniform(0.2, 0.4), 2)
+            text = (
+                f"Visual Input: <perceptual_flux>\n"
+                f"Query: Localize the primary anomaly and compute its bounding box.\n"
+                f"Thought: Analyzing the spatial gradient across patches. Peak contrast occurs in the upper quadrant.\n"
+                f"Answer: The target anomaly is bounded by [box: {x1}, {y1}, {x2}, {y2}]."
+            )
+            return text, 0, patches
+
+        elif phase == CurriculumPhase.PHASE_3_WORKFLOWS:
+            text = (
+                f"Visual Input: <perceptual_flux>\n"
+                f"User: Inspect this image tensor and run python code to plot its intensity profile.\n"
+                f"<action:PYTHON> import numpy as np\nprofile = np.mean(image_patches, axis=-1)\nprint(f'Mean intensity: {{profile[:3]}}') </action>\n"
+                f"<observation> Mean intensity: [0.42, 0.71, 0.38] </observation>\n"
+                f"Assistant: The intensity profile peaks at patch 1 with a value of 0.71."
+            )
+            return text, 2, patches  # Action 2: PYTHON
+
+        else:  # PHASE_4_CONSOLIDATION
+            text = (
+                f"Visual Input: <perceptual_flux>\n"
+                f"Query: Summarize multimodal observations.\n"
+                f"Thought: Grounding visual patch activations with prior cognitive state.\n"
+                f"Answer: Concentric laminae exhibit stable contractive convergence across all 32 shells."
+            )
+            return text, 0, patches
+
     def _generate_synthetic_agentic(self) -> Tuple[str, int]:
         """On-the-fly generator for Phase 3 tool workflows."""
         tool_scenarios = [
@@ -241,41 +295,48 @@ class GradedCurriculumStreamer:
         except Exception:
             return
 
-    def get_sample_for_phase(self, phase: CurriculumPhase) -> Tuple[str, int]:
+    def get_sample_for_phase(self, phase: CurriculumPhase) -> Tuple[str, int, Optional[torch.Tensor]]:
         """
-        Samples a training text and action label tailored to the specified curriculum phase.
+        Samples a training text, action label, and optional perceptual visual patch tensor.
         Returns:
             text: formatted text string
             action_label: int (0=CHAT, 1=BASH, 2=PYTHON, 3=FILE_READ, 4=FILE_WRITE, 5=CALC)
+            perceptual_flux: Optional[torch.Tensor] [P, visual_dim]
         """
+        # If sampling a multimodal perceptual example
+        if self.rng.random() < getattr(self.config, "multimodal_sample_ratio", 0.35):
+            return self._generate_synthetic_multimodal(phase)
+
         if phase == CurriculumPhase.PHASE_1_BASIC:
             files = self._dataset_files["basic"]
             if files:
                 f = self.rng.choice(files)
                 for s in self._stream_parquet_samples(f):
-                    return s, 0  # Action 0 = CHAT
-            return self._generate_synthetic_basic(), 0
+                    return s, 0, None  # Action 0 = CHAT
+            return self._generate_synthetic_basic(), 0, None
 
         elif phase == CurriculumPhase.PHASE_2_REASONING:
             files = self._dataset_files["reasoning"]
             if files:
                 f = self.rng.choice(files)
                 for s in self._stream_parquet_samples(f):
-                    return s, 0
+                    return s, 0, None
             # Fallback
-            return self._generate_synthetic_basic(), 0
+            return self._generate_synthetic_basic(), 0, None
 
         elif phase == CurriculumPhase.PHASE_3_WORKFLOWS:
             # 60% agentic tool traces, 40% multi-turn conversations
             if self.rng.random() < 0.6:
-                return self._generate_synthetic_agentic()
+                text, act = self._generate_synthetic_agentic()
+                return text, act, None
             else:
                 files = self._dataset_files["workflows"]
                 if files:
                     f = self.rng.choice(files)
                     for s in self._stream_parquet_samples(f):
-                        return s, 0
-                return self._generate_synthetic_agentic()
+                        return s, 0, None
+                text, act = self._generate_synthetic_agentic()
+                return text, act, None
 
         else:  # PHASE_4_CONSOLIDATION (Mixed Replay Buffer)
             r = self.rng.random()
@@ -291,21 +352,22 @@ class GradedCurriculumStreamer:
                 if files:
                     f = self.rng.choice(files)
                     for s in self._stream_parquet_samples(f):
-                        return s, 0
-                return self._generate_synthetic_basic(), 0
+                        return s, 0, None
+                return self._generate_synthetic_basic(), 0, None
 
     def get_batch(
         self,
         step: int,
         device: torch.device,
         batch_size: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, CurriculumPhase]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], CurriculumPhase]:
         """
         Generates a tokenized batch on-the-fly without saving intermediate files.
         Returns:
             input_ids: [B, T]
             targets: [B, T]
             action_labels: [B]
+            perceptual_inputs: Optional[torch.Tensor] [B, P, visual_dim] or None
             current_phase: CurriculumPhase
         """
         B = batch_size or self.config.batch_size
@@ -315,11 +377,13 @@ class GradedCurriculumStreamer:
         batch_input_ids = []
         batch_targets = []
         batch_actions = []
+        batch_patches = []
+        has_any_patches = False
 
         vocab_size = getattr(self.tokenizer, "vocab_size", 32000)
 
         for _ in range(B):
-            text, action_id = self.get_sample_for_phase(phase)
+            text, action_id, patches = self.get_sample_for_phase(phase)
             raw_tokens = self.tokenizer.encode(text, add_special_tokens=False) if hasattr(self.tokenizer, "encode") else [ord(c) % vocab_size for c in text]
 
             # Enforce vocab bounds safely
@@ -342,8 +406,20 @@ class GradedCurriculumStreamer:
             batch_targets.append(tgt)
             batch_actions.append(action_id)
 
+            if patches is not None:
+                has_any_patches = True
+                batch_patches.append(patches)
+            else:
+                P = getattr(self.config, "num_visual_patches", 16)
+                V = getattr(self.config, "visual_dim", 512)
+                batch_patches.append(torch.zeros(P, V))
+
         input_ids = torch.tensor(batch_input_ids, dtype=torch.long, device=device)
         targets = torch.tensor(batch_targets, dtype=torch.long, device=device)
         action_labels = torch.tensor(batch_actions, dtype=torch.long, device=device)
 
-        return input_ids, targets, action_labels, phase
+        perceptual_inputs = None
+        if has_any_patches:
+            perceptual_inputs = torch.stack(batch_patches, dim=0).to(device)
+
+        return input_ids, targets, action_labels, perceptual_inputs, phase
