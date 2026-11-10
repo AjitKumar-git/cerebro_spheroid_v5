@@ -73,6 +73,7 @@ def parse_args():
     parser.add_argument("--tail-prob", type=float, default=0.25, help="V4 tail probability for EOS representation in window sampling")
     parser.add_argument("--model-preset", type=str, default="v5_small", choices=["v5_small", "v5_compact", "v5_base"], help="Model preset architecture tier (v5_small: 101M, v5_compact: 244M, v5_base: 617M)")
     parser.add_argument("--mix", type=str, default="auto", choices=["auto", "foundation", "reasoning", "code", "agentic", "consolidation"], help="Curriculum data mixture selection")
+    parser.add_argument("--optimizer", type=str, default="spheroid", choices=["spheroid", "adafactor", "adamw"], help="Optimizer to use (default: custom SpheroidOptimizer with Polar Newton-Schulz & spectral clamp)")
     return parser.parse_args()
 
 
@@ -195,15 +196,31 @@ def main():
         ],
     )
 
-    # 3. Setup Adafactor Optimizer (VRAM footprint ~15MB)
+    # 3. Setup Optimizer (Default: Custom SpheroidOptimizer with Polar Newton-Schulz)
     all_params = list(model.parameters()) + list(action_head.parameters())
-    optimizer = Adafactor(
-        all_params,
-        lr=schedule_config.max_lr,
-        scale_parameter=False,
-        relative_step=False,
-        warmup_init=False,
-    )
+    if args.optimizer == "spheroid":
+        from src.spheroid_optimizer import build_spheroid_optimizer
+        combined_module = nn.ModuleDict({"model": model, "action_head": action_head})
+        optimizer = build_spheroid_optimizer(
+            model=combined_module,
+            lr=schedule_config.max_lr,
+            lr_1d=0.2 * schedule_config.max_lr,
+            lr_vocab=min(schedule_config.max_lr, 0.0006),
+            spectral_clamp=1.0,
+        )
+        print(f"[Optimizer] Configured SpheroidOptimizer (Polar Newton-Schulz NS-5 + Persistent Spectral Clamp)")
+    elif args.optimizer == "adafactor":
+        optimizer = Adafactor(
+            all_params,
+            lr=schedule_config.max_lr,
+            scale_parameter=False,
+            relative_step=False,
+            warmup_init=False,
+        )
+        print(f"[Optimizer] Configured Adafactor Optimizer (~15MB memory footprint)")
+    else:
+        optimizer = torch.optim.AdamW(all_params, lr=schedule_config.max_lr, weight_decay=0.01)
+        print(f"[Optimizer] Configured standard AdamW Optimizer")
 
     action_loss_fn = nn.CrossEntropyLoss()
 
