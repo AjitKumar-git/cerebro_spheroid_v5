@@ -485,8 +485,11 @@ def training_rollout(
 
         return (nxt_s, nxt_t, nxt_p, nxt_thought), logits
 
+    # Use activation checkpointing (remat) for training to reduce HBM activation memory by >90%
+    scan_fn = jax.checkpoint(_emit) if (targets is not None) else _emit
+
     if targets is not None:
-        _, (all_loss, all_mask) = lax.scan(_emit, (state, init_refractory, init_plan, init_thought), jnp.arange(target_len))
+        _, (all_loss, all_mask) = lax.scan(scan_fn, (state, init_refractory, init_plan, init_thought), jnp.arange(target_len))
         return jnp.sum(all_loss) / jnp.maximum(jnp.sum(all_mask), 1.0)
 
     _, all_logits = lax.scan(_emit, (state, init_refractory, init_plan, init_thought), jnp.arange(target_len))

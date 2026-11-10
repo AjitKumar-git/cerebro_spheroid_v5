@@ -54,7 +54,7 @@ def parse_args(args_list=None):
         args_list = sys.argv[1:]
     parser = argparse.ArgumentParser(description="CerebroSpheroid V5 Cloud TPU JAX Trainer")
     parser.add_argument("--total-steps", "--steps", "--max-steps", dest="total_steps", type=int, default=1_000_000, help="Total training steps")
-    parser.add_argument("--batch-size", type=int, default=16, help="Per-device batch size")
+    parser.add_argument("--batch-size", type=int, default=8, help="Per-device batch size (default: 8 for TPU v5e-1 16GB HBM)")
     parser.add_argument("--seq-len", type=int, default=256, help="Sequence length")
     parser.add_argument("--lr", type=float, default=3e-4, help="Peak learning rate")
     parser.add_argument("--save-interval", "--save-every", dest="save_interval", type=int, default=500, help="Steps between local checkpoints")
