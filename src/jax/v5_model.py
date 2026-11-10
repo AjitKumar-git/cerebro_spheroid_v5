@@ -71,6 +71,16 @@ jax.tree_util.register_pytree_node(
 
 
 PRESETS_V5: Dict[str, Dict[str, Any]] = {
+    "v5_small": {
+        "surface_dim": 640,
+        "radial_dim": 256,
+        "num_shells": 16,
+        "num_shortcut_tracts": 40,
+        "num_heads": 8,
+        "top_k_tracts": 16,
+        "thinking_cycles": 4,
+        "phase_scale": 2.0,
+    },
     "v5_compact": {
         "surface_dim": 768,
         "radial_dim": 512,
