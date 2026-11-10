@@ -45,6 +45,14 @@ class ModelConfigV5:
     max_seq_len: int = 32768          # Precomputed rotary horizon
     top_k_resonance: int = 16         # Top-k sparse associative retrieval (needle tethering)
     use_deliberation_probe: bool = True  # Subconscious core probe of sensory KV buffer
+    # Frontier 2026 Architectural Upgrades
+    use_adaptive_thinking: bool = True     # Dynamic halting gate during subconscious deliberation
+    max_thinking_cycles: int = 8           # Upper bound for adaptive deliberation
+    thinking_halt_threshold: float = 0.75  # Halting confidence threshold
+    num_mtp_heads: int = 1                 # Multi-Token Prediction heads (1 = standard, 2 or 3 = MTP)
+    use_sparse_mot: bool = True            # Mixture-of-Tracts sparse axonal routing
+    top_k_tracts: int = 24                 # Active shortcut tracts routed per step
+    use_energy_regularization: bool = True # Contrastive fixed-point energy guard
 
 
 PRESETS_V5: Dict[str, Dict[str, Any]] = {
@@ -76,6 +84,7 @@ PRESETS_V5: Dict[str, Dict[str, Any]] = {
         "max_phase_steps": 128,
         "thinking_cycles": 2,
         "phase_scale": 2.0,
+        "top_k_tracts": 4,
     },
 }
 
@@ -130,6 +139,34 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, offset: in
     x2 = x[..., 1::2]
     x_rot = torch.stack([-x2, x1], dim=-1).flatten(-2)
     return x * c + x_rot * s
+
+
+class MTPHead(nn.Module):
+    """
+    Multi-Token Prediction Drafting Head (DeepSeek-V3 / Meta MTP).
+    Predicts future token t + offset from motor hidden representation and preceding token.
+    """
+
+    def __init__(self, surface_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.norm = RMSNorm(surface_dim * 2)
+        self.swiglu = SwiGLU(surface_dim * 2, hidden_features=surface_dim * 2, out_features=surface_dim)
+        self.norm_out = RMSNorm(surface_dim)
+        self.affine_scale = nn.Parameter(torch.ones(surface_dim))
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        h_curr: torch.Tensor,
+        prev_token_emb: torch.Tensor,
+        tied_w: torch.Tensor,
+        temp: float = 1.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        fused = self.norm(torch.cat([h_curr, prev_token_emb], dim=-1))
+        h_next = self.norm_out(h_curr + self.dropout(self.swiglu(fused)))
+        h_scaled = (h_next * self.affine_scale) / max(temp, 1e-4)
+        logits = F.linear(h_scaled, tied_w)
+        return logits, h_next
 
 
 class SensoryInputDNNV5(nn.Module):
@@ -215,12 +252,20 @@ class VolumetricSpheroidCoreV5(nn.Module):
         radial_dim: int = 512,
         num_shortcut_tracts: int = 96,
         dropout: float = 0.0,
+        use_sparse_mot: bool = True,
+        top_k_tracts: int = 24,
     ):
         super().__init__()
         self.num_shells = num_shells
         self.surface_dim = surface_dim
         self.radial_dim = radial_dim
         self.num_shortcut_tracts = num_shortcut_tracts
+        self.use_sparse_mot = use_sparse_mot
+        self.top_k_tracts = min(top_k_tracts, num_shortcut_tracts)
+
+        # Mixture-of-Axonal-Tracts (MoT) dynamic routing gate
+        self.tract_router = nn.Linear(surface_dim, num_shortcut_tracts, bias=False)
+        nn.init.normal_(self.tract_router.weight, mean=0.0, std=0.02)
 
         # Intra-shell SwiGLU processors per shell
         self.intra_shell_swiglu = nn.ModuleList([
@@ -307,10 +352,19 @@ class VolumetricSpheroidCoreV5(nn.Module):
         state_radial[:, :-1, :] = state_radial[:, :-1, :] + 0.1 * in_up
         state_radial[:, 1:, :] = state_radial[:, 1:, :] + 0.1 * out_up
 
-        # 3. Hierarchical axonal shortcut tracts
+        # 3. Mixture-of-Axonal-Tracts (MoT Sparse Small-World Routing)
         conductances = torch.sigmoid(self.shortcut_gate)  # [T]
+        if self.use_sparse_mot and self.top_k_tracts < self.num_shortcut_tracts:
+            routing_logits = self.tract_router(state_radial[:, -1, :])  # [B, T]
+            topk_scores, topk_indices = torch.topk(routing_logits, self.top_k_tracts, dim=-1)
+            routing_weights = F.softmax(topk_scores, dim=-1)
+            routing_mask = torch.zeros_like(routing_logits).scatter_(-1, topk_indices, routing_weights)
+            eff_conductances = conductances.unsqueeze(0) * routing_mask  # [B, T]
+        else:
+            eff_conductances = conductances.view(1, -1)  # [1, T]
+
         src_acts = state_radial[:, self.src_indices, :]   # [B, T, D]
-        shortcut_flux = torch.einsum("btd,tde->bte", src_acts, self.shortcut_weight) * conductances.view(1, -1, 1)
+        shortcut_flux = torch.einsum("btd,tde->bte", src_acts, self.shortcut_weight) * eff_conductances.unsqueeze(-1)
 
         # Scatter add into destination shells
         state_next = state_radial.clone()
@@ -426,7 +480,8 @@ class PremotorMotorDecoderV5(nn.Module):
         step_idx: int = 0,
         auditory_feedback: Optional[torch.Tensor] = None,
         repetition_penalty: float = 1.25,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        return_hidden: bool = False,
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor], Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]]:
         """
         Executes a single motor verbalization step:
         Returns:
@@ -434,6 +489,7 @@ class PremotorMotorDecoderV5(nn.Module):
             efference: [B, surface_dim]
             next_trace: [B, vocab_size]
             next_plan: [B, surface_dim]
+            (optional) h_motor: [B, surface_dim]
         """
         B, K, D = state.shape
         surface = state[:, -1, :]  # Cortical boundary (Shell K-1)
@@ -537,6 +593,8 @@ class PremotorMotorDecoderV5(nn.Module):
             adapted_logits, next_trace = raw_logits, None
 
         efference = self.efference_proj(h)
+        if return_hidden:
+            return adapted_logits, efference, next_trace, next_plan, h
         return adapted_logits, efference, next_trace, next_plan
 
 
@@ -583,13 +641,15 @@ class CerebroSpheroidV5(nn.Module):
             dropout=self.config.dropout,
         )
 
-        # 2. Volumetric Recurrent Core (32 to 48 Concentric Laminae)
+        # 2. Volumetric Recurrent Core (32 to 48 Concentric Laminae with MoT)
         self.volumetric_core = VolumetricSpheroidCoreV5(
             num_shells=self.config.num_shells,
             surface_dim=self.config.surface_dim,
             radial_dim=self.config.radial_dim,
             num_shortcut_tracts=self.config.num_shortcut_tracts,
             dropout=self.config.dropout,
+            use_sparse_mot=self.config.use_sparse_mot,
+            top_k_tracts=self.config.top_k_tracts,
         )
 
         # 3. Premotor Motor Decoder with Affine-Tied Head
@@ -616,12 +676,29 @@ class CerebroSpheroidV5(nn.Module):
             self.deliberation_probe = None
             self.deliberation_probe_norm = None
 
+        # 5. Multi-Token Prediction (MTP) Drafting Heads
+        if self.config.num_mtp_heads > 1:
+            self.mtp_heads = nn.ModuleList([
+                MTPHead(self.config.surface_dim, dropout=self.config.dropout)
+                for _ in range(self.config.num_mtp_heads - 1)
+            ])
+        else:
+            self.mtp_heads = nn.ModuleList()
+
+        # 6. Dynamic Halting Gate for Adaptive Deliberation (System-2 Reasoning)
+        if self.config.use_adaptive_thinking:
+            self.halting_gate = nn.Linear(self.config.surface_dim, 1)
+            nn.init.zeros_(self.halting_gate.weight)
+            nn.init.constant_(self.halting_gate.bias, -1.5)
+        else:
+            self.halting_gate = None
+
     def count_parameters(self) -> Dict[str, int]:
         """Returns detailed parameter breakdown across modules."""
         sensory = sum(p.numel() for p in self.sensory_dnn.parameters())
         core = sum(p.numel() for p in self.volumetric_core.parameters())
         motor = sum(p.numel() for p in self.motor_decoder.parameters())
-        total = sensory + core + motor
+        total = sum(p.numel() for p in self.parameters())
         vocab_lookup = self.sensory_dnn.embedding.weight.numel()
         active_compute = total - vocab_lookup
         return {
@@ -669,8 +746,12 @@ class CerebroSpheroidV5(nn.Module):
         state = self.init_spheroid_state(B, dev)
         state[:, -1, :] = prompt_centroid
 
-        # 3. Subconscious Deliberation Cycles with Memory Probing
-        for cycle in range(self.config.thinking_cycles):
+        # 3. Subconscious Deliberation Cycles with Memory Probing & Adaptive Halting
+        cycles = self.config.max_thinking_cycles if self.config.use_adaptive_thinking else self.config.thinking_cycles
+        energy_loss = torch.tensor(0.0, device=dev)
+
+        for cycle in range(cycles):
+            state_prev = state
             if sensory_kv is not None and self.deliberation_probe is not None:
                 keys, values = sensory_kv
                 L_kv = keys.shape[2]
@@ -686,6 +767,14 @@ class CerebroSpheroidV5(nn.Module):
                 state[:, -1, :] = state[:, -1, :] + 0.1 * self.deliberation_probe_norm(retrieved)
 
             state = self.volumetric_core.deliberate_step(state)
+
+            if self.config.use_energy_regularization:
+                energy_loss = energy_loss + torch.mean((state - state_prev) ** 2)
+
+            if self.config.use_adaptive_thinking and self.halting_gate is not None:
+                halt_prob = torch.sigmoid(self.halting_gate(state[:, 0, :]))
+                if not self.training and (halt_prob > self.config.thinking_halt_threshold).all():
+                    break
 
         # Pre-embed teacher feedback tokens if available
         if feedback_tokens is not None:
@@ -743,6 +832,9 @@ class CerebroSpheroidV5(nn.Module):
                 targets.view(-1),
                 ignore_index=-100,
             )
+            if self.config.use_energy_regularization:
+                loss = loss + 0.01 * (energy_loss / max(cycles, 1))
+
             return loss, logits_stacked
 
         return logits_stacked
@@ -763,7 +855,7 @@ class CerebroSpheroidV5(nn.Module):
         self.eval()
         B, L = prompt_ids.shape
         dev = prompt_ids.device
-        cycles = thinking_cycles if thinking_cycles is not None else self.config.thinking_cycles
+        cycles = thinking_cycles if thinking_cycles is not None else (self.config.max_thinking_cycles if self.config.use_adaptive_thinking else self.config.thinking_cycles)
 
         # 1. Encode prompt
         sensory_flux, sensory_kv = self.sensory_dnn(prompt_ids)
@@ -780,7 +872,7 @@ class CerebroSpheroidV5(nn.Module):
                 probe_q = self.deliberation_probe(state[:, 0, :]).view(B, self.config.num_heads, 1, self.sensory_dnn.head_dim)
                 q_rot = apply_rope(probe_q, self.motor_decoder.rope_cos, self.motor_decoder.rope_sin, offset=cycle)
                 k_rot = apply_rope(keys, self.motor_decoder.rope_cos, self.motor_decoder.rope_sin, offset=0)
-                scores = torch.matmul(probe_rot.to(keys.dtype) if 'probe_rot' in locals() else q_rot.to(keys.dtype), k_rot.transpose(-1, -2)) / math.sqrt(self.sensory_dnn.head_dim)
+                scores = torch.matmul(q_rot.to(keys.dtype), k_rot.transpose(-1, -2)) / math.sqrt(self.sensory_dnn.head_dim)
                 if self.config.top_k_resonance > 0 and L_kv > self.config.top_k_resonance:
                     topk_v, _ = torch.topk(scores, self.config.top_k_resonance, dim=-1)
                     scores = torch.where(scores < topk_v[..., -1, None], torch.full_like(scores, -1e9), scores)
@@ -789,6 +881,11 @@ class CerebroSpheroidV5(nn.Module):
                 state[:, -1, :] = state[:, -1, :] + 0.1 * self.deliberation_probe_norm(retrieved)
 
             state = self.volumetric_core.deliberate_step(state)
+
+            if self.config.use_adaptive_thinking and self.halting_gate is not None:
+                halt_prob = torch.sigmoid(self.halting_gate(state[:, 0, :]))
+                if (halt_prob > self.config.thinking_halt_threshold).all():
+                    break
 
         # 3. Motor generation loop
         plan = self.motor_decoder.init_plan(B, dev) if self.config.use_plan else None

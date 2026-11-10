@@ -38,12 +38,30 @@ class ModelConfigV5:
     use_swiglu: bool = True
     use_shell_tap: bool = True
     use_plan: bool = True
+    rope_theta: float = 500000.0
+    max_seq_len: int = 32768
+    top_k_resonance: int = 16
+    use_deliberation_probe: bool = True
+    use_adaptive_thinking: bool = True
+    max_thinking_cycles: int = 8
+    thinking_halt_threshold: float = 0.75
+    num_mtp_heads: int = 1
+    use_sparse_mot: bool = True
+    top_k_tracts: int = 24
+    use_energy_regularization: bool = True
 
 
 # Register ModelConfigV5 as static PyTree node
 jax.tree_util.register_pytree_node(
     ModelConfigV5,
-    lambda c: ((), (c.vocab_size, c.surface_dim, c.radial_dim, c.num_shells, c.num_shortcut_tracts, c.num_heads, c.max_phase_steps, c.thinking_cycles, c.phase_scale, c.use_tied_embeddings, c.use_swiglu, c.use_shell_tap, c.use_plan)),
+    lambda c: ((), (
+        c.vocab_size, c.surface_dim, c.radial_dim, c.num_shells, c.num_shortcut_tracts,
+        c.num_heads, c.max_phase_steps, c.thinking_cycles, c.phase_scale,
+        c.use_tied_embeddings, c.use_swiglu, c.use_shell_tap, c.use_plan,
+        c.rope_theta, c.max_seq_len, c.top_k_resonance, c.use_deliberation_probe,
+        c.use_adaptive_thinking, c.max_thinking_cycles, c.thinking_halt_threshold,
+        c.num_mtp_heads, c.use_sparse_mot, c.top_k_tracts, c.use_energy_regularization,
+    )),
     lambda aux, _: ModelConfigV5(*aux),
 )
 
