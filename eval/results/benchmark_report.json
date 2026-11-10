@@ -1,0 +1,154 @@
+{
+  "checkpoint": "checkpoints/v5_all_parts_multimodal_tested.pt",
+  "total_prompts": 10,
+  "elapsed_seconds": 8.64,
+  "overall": {
+    "regex_accuracy_percent": 10.0,
+    "exact_accuracy_percent": 10.0,
+    "action_accuracy_percent": 80.0,
+    "avg_loss": 10.6738,
+    "perplexity": 43208.23
+  },
+  "by_category": {
+    "linguistic_and_syntax": {
+      "count": 10,
+      "regex_accuracy_percent": 10.0,
+      "exact_accuracy_percent": 10.0,
+      "action_accuracy_percent": 80.0,
+      "avg_loss": 10.6738,
+      "perplexity": 43208.23
+    }
+  },
+  "item_results": [
+    {
+      "id": "cerebro_1000_0001",
+      "category": "linguistic_and_syntax",
+      "prompt": "Complete the analogy: hot is to cold as day is to ____.",
+      "reference": "night",
+      "generated": "\u2016 acres glob\u6625ER placeholder ostandra\u0436\u0430\u043d named\u0440\u0430\u043bhadoop camb \u0433\u043e\u0440\u043e\u0434\u0435allowed LE verbose giov produced dedicated films Venez \u015bwiataHistoryeps\u0442\u0432\u0432\u0430\u044f\u1f10 lorsPATHfahrt actors",
+      "loss": 10.286742210388184,
+      "exact_match": false,
+      "regex_match": false,
+      "expected_action": "chat",
+      "predicted_action": "chat",
+      "action_match": true
+    },
+    {
+      "id": "cerebro_1000_0002",
+      "category": "linguistic_and_syntax",
+      "prompt": "What is the exact antonym of the word 'hot'?",
+      "reference": "cold",
+      "generated": "\u00e9r Tageoinkter cold Billy Our seis Initial sport Ourfried Docoly senelian\u0448\u0438\u043dMon improvementBysexll nieder\u00e4r} termineXML neck\u0447\u043d\u044b\u0435oin\u0436\u0430\u043dHow",
+      "loss": 11.329598426818848,
+      "exact_match": true,
+      "regex_match": true,
+      "expected_action": "chat",
+      "predicted_action": "chat",
+      "action_match": true
+    },
+    {
+      "id": "cerebro_1000_0003",
+      "category": "linguistic_and_syntax",
+      "prompt": "Complete the analogy: bird is to fly as fish is to ____.",
+      "reference": "swim",
+      "generated": "fus Local cycles mes finishing\u5357 burning Operation personesither\u5065 zast yearsellers BackgroundjmBER Cop figure Dre liegt';mann Mean reportsextract induction escaped lie\u00df exempl Tennisjm",
+      "loss": 10.682157516479492,
+      "exact_match": false,
+      "regex_match": false,
+      "expected_action": "chat",
+      "predicted_action": "chat",
+      "action_match": true
+    },
+    {
+      "id": "cerebro_1000_0004",
+      "category": "linguistic_and_syntax",
+      "prompt": "What is the exact antonym of the word 'bird'?",
+      "reference": "fly",
+      "generated": "\u0153urUNT Polish\u043f\u0438\u0441\u043e\u043aJAXMAX();\r\u0395 Espa\u00f1arc obsc\u040aORS creation \u043a\u043b\u0438ushed\ud835\udcdd riverstasks esterni threatened partyoperation Eth arrang Sm.. ver\u00f6ffentlicht patholar Hamburg \u041f\u0430\u0440\u0438",
+      "loss": 10.70436954498291,
+      "exact_match": false,
+      "regex_match": false,
+      "expected_action": "chat",
+      "predicted_action": "chat",
+      "action_match": true
+    },
+    {
+      "id": "cerebro_1000_0005",
+      "category": "linguistic_and_syntax",
+      "prompt": "Complete the analogy: author is to book as artist is to ____.",
+      "reference": "painting",
+      "generated": "abitanti \u0421\u0442\u0435gression tal\u00e1ltcpuellement acquaintistesiefCATCore dread Abstractcourse Random \u0411\u0435 difer doll clas Files\u05e3olate\u7c73 Floravoidculo VoidenenaltyExtension repla Fac",
+      "loss": 10.368102073669434,
+      "exact_match": false,
+      "regex_match": false,
+      "expected_action": "chat",
+      "predicted_action": "file_write",
+      "action_match": false
+    },
+    {
+      "id": "cerebro_1000_0006",
+      "category": "linguistic_and_syntax",
+      "prompt": "What is the exact antonym of the word 'author'?",
+      "reference": "book",
+      "generated": "Storageistesray ahead _{ ranks milit authentic regexr\u00f3Organ\u00a4 certificate\u0441\u0435\u0434\u0430 image \u044f\u0432\u043b\u044fZygotegovWP \u0442\u0430\u043a\u043e\u0439\u00fcllDanielConverter modificationToListFuture intend Dieuonnen occasion M\u00e9xico}%",
+      "loss": 11.31583309173584,
+      "exact_match": false,
+      "regex_match": false,
+      "expected_action": "chat",
+      "predicted_action": "chat",
+      "action_match": true
+    },
+    {
+      "id": "cerebro_1000_0007",
+      "category": "linguistic_and_syntax",
+      "prompt": "Complete the analogy: doctor is to hospital as teacher is to ____.",
+      "reference": "school",
+      "generated": "udes emulator\u00e4llorcloudflare\u5ba2 limitsacyDIS temporaryjalvarchar\u0441\u0430\u0434 zweimit\u252c Srichy tower pilot vselly\u2206 EventArgs picturesapple (); expon\u521b\u010d fug trainplatform",
+      "loss": 10.473016738891602,
+      "exact_match": false,
+      "regex_match": false,
+      "expected_action": "chat",
+      "predicted_action": "file_write",
+      "action_match": false
+    },
+    {
+      "id": "cerebro_1000_0008",
+      "category": "linguistic_and_syntax",
+      "prompt": "What is the exact antonym of the word 'doctor'?",
+      "reference": "hospital",
+      "generated": "coefficients \u043f\u043e\u0434\u0434\u0435\u0440uez \"( unusual \u043a\u043e\u043c\u043f\u043e\u0437\u0438 geborengi \u0441\u0435\u043b\u044c\u0441\u043e\u0432 jewe \u043f\u0440\u0438\u0437\uc758 \u043d\u0430\u0437\u0432\u0430\u043d\u0438\u0435 Baker $$Gakespeaff \u00ab James Bow daugh\u1f10 rational detailsputation intern skin Qual Profile\u00a6\u0441\u044b\u043b\u043a\u0438",
+      "loss": 10.89799976348877,
+      "exact_match": false,
+      "regex_match": false,
+      "expected_action": "chat",
+      "predicted_action": "chat",
+      "action_match": true
+    },
+    {
+      "id": "cerebro_1000_0009",
+      "category": "linguistic_and_syntax",
+      "prompt": "Complete the analogy: glove is to hand as sock is to ____.",
+      "reference": "foot",
+      "generated": "\u2190 pover DDRhandle \u0440\u0430\u0439\u043e\u043d\u0430 benixed DatenbanksavePDF simpler\u043b\u043e\u0441\u044cCfah \".uis\u4e94 MineANT cursished unos Could\u043b\u0438\u0441\u0442ison Juli\u0447\u043d\u044b\u0439mileTIMEHERE wars allows",
+      "loss": 10.580623626708984,
+      "exact_match": false,
+      "regex_match": false,
+      "expected_action": "chat",
+      "predicted_action": "chat",
+      "action_match": true
+    },
+    {
+      "id": "cerebro_1000_0010",
+      "category": "linguistic_and_syntax",
+      "prompt": "What is the exact antonym of the word 'glove'?",
+      "reference": "hand",
+      "generated": "Internacional&= halt Wing \u043a\u043e\u043c\u043f\u043e\u0437\u0438pla\u4ecarevunft Zone chemicalirectQuDAT $, Linux \u043c\u043d\u043e\u0433\u043e cycles could Davis MindGrid Kir nun convex compon gestion permit Bernexternal\u304aised",
+      "loss": 10.099420547485352,
+      "exact_match": false,
+      "regex_match": false,
+      "expected_action": "chat",
+      "predicted_action": "chat",
+      "action_match": true
+    }
+  ]
+}
