@@ -438,7 +438,12 @@ def training_rollout(
 
     # Initial executive plan and refractory trace
     init_plan = jnp.zeros((B, surface_dim), dtype=jnp.float32)
-    init_refractory = jnp.zeros((B, vocab_size), dtype=jnp.float32)
+    # When training (teacher-forced MLE), disable refractory penalty so loss accurately reflects true likelihood
+    if targets is not None:
+        init_refractory = None
+        repetition_penalty = 1.0
+    else:
+        init_refractory = jnp.zeros((B, vocab_size), dtype=jnp.float32)
     init_thought = jnp.zeros((B, surface_dim), dtype=jnp.float32)
 
     # Feedback token embeddings

@@ -49,6 +49,7 @@ from src.cloud_sync import (
     push_checkpoint_async,
     wait_for_in_flight_uploads,
 )
+from src.jax.data_streamer import LinguisticDataStreamer
 
 
 def parse_args(args_list=None):
@@ -171,7 +172,7 @@ def main(args=None):
     print(f"Optimizer       : {args.optimizer.upper()} ({'Polar Newton-Schulz NS-5 + Spectral Clamp' if args.optimizer == 'spheroid' else 'Optax AdamW'})")
     if args.optimizer == "spheroid":
         opt_state = init_spheroid_opt_state(params)
-        train_step_fn = build_train_step_spheroid(config, buffers, pad_id=0, weight_decay=1e-4, remat=remat_choice)
+        train_step_fn = build_train_step_spheroid(config, buffers, pad_id=0, weight_decay=1e-5, remat=remat_choice)
     else:
         learning_rate_sched = optax.cosine_decay_schedule(
             init_value=args.lr,
@@ -271,8 +272,10 @@ def main(args=None):
         print(f"✓ Current Step ({start_step:,}) >= Target Steps ({args.total_steps:,}). Target reached!")
         return
 
-    def get_lr(s: int, total_s: int, peak_lr: float) -> float:
-        ratio = min(1.0, float(s) / max(1.0, float(total_s)))
+    def get_lr(s: int, total_s: int, peak_lr: float, warmup_steps: int = 500) -> float:
+        if s <= warmup_steps:
+            return float(peak_lr * (float(s) / max(1.0, float(warmup_steps))))
+        ratio = min(1.0, float(s - warmup_steps) / max(1.0, float(total_s - warmup_steps)))
         coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
         return float(peak_lr * (0.05 + 0.95 * coeff))
 
@@ -285,7 +288,17 @@ def main(args=None):
     jax.block_until_ready(initial_loss)
     print(f"✓ XLA Compilation complete in {time.time() - t0_compile:.2f}s! Initial Loss: {float(initial_loss):.4f}")
 
-    # 5. High-Throughput Training Loop
+    # 5. Initialize Continuous Linguistic Streamer
+    print("\n📦 Initializing background linguistic streaming queue...")
+    streamer = LinguisticDataStreamer(
+        batch_size=args.batch_size,
+        prompt_len=32,
+        target_len=args.seq_len,
+        vocab_size=config.vocab_size,
+        queue_size=8,
+    )
+
+    # 6. High-Throughput Training Loop
     print("\n" + "=" * 75)
     print(f"🚀 Training {args.total_steps:,} Steps (Batch: {args.batch_size}, SeqLen: {args.seq_len})")
     print("=" * 75)
@@ -297,11 +310,7 @@ def main(args=None):
 
     while step < args.total_steps:
         step += 1
-        key, step_key = jax.random.split(key)
-
-        # Synthetic/Curriculum batch generator
-        prompt_b = jax.random.randint(step_key, (args.batch_size, 32), 0, config.vocab_size)
-        target_b = jax.random.randint(step_key, (args.batch_size, args.seq_len), 0, config.vocab_size)
+        prompt_b, target_b = streamer.get_batch()
 
         cur_lr = get_lr(step, args.total_steps, args.lr)
         params, opt_state, loss = train_step_fn(params, opt_state, prompt_b, target_b, cur_lr)

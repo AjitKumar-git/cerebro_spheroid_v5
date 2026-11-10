@@ -31,10 +31,8 @@ import torch.nn.functional as F
 
 # Try importing CerebroSpheroidV5 from active or sibling repos
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-V5_ROOT = os.path.abspath(os.path.join(ROOT_DIR, "..", "cerebro_spheroid_v5"))
-for p in [ROOT_DIR, V5_ROOT]:
-    if os.path.exists(p) and p not in sys.path:
-        sys.path.insert(0, p)
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 
 try:
     from src.spheroid_v5 import CerebroSpheroidV5, ModelConfigV5
@@ -103,8 +101,45 @@ def transfer_weights(
                     return v
         return None
 
+    def get_qkv_for_layer(l_idx):
+        # 1. Direct Q, K, V
+        q = get_first_matching([f"layers.{l_idx}.self_attn.q_proj.weight", f"h.{l_idx}.attn.c_attn.weight"])
+        k = get_first_matching([f"layers.{l_idx}.self_attn.k_proj.weight"])
+        v = get_first_matching([f"layers.{l_idx}.self_attn.v_proj.weight"])
+        o = get_first_matching([f"layers.{l_idx}.self_attn.o_proj.weight", f"layers.{l_idx}.attention.dense.weight", f"h.{l_idx}.attn.c_proj.weight"])
+
+        # 2. GPT-NeoX / Pythia fused QKV: attention.query_key_value.weight
+        qkv = get_first_matching([f"layers.{l_idx}.attention.query_key_value.weight"])
+        if qkv is not None and (q is None or k is None or v is None):
+            chunks = torch.chunk(qkv, 3, dim=0)
+            q, k, v = chunks[0], chunks[1], chunks[2]
+
+        return q, k, v, o
+
+    def get_mlp_for_layer(l_idx):
+        # 1. SwiGLU / LLaMA style
+        gate = get_first_matching([f"layers.{l_idx}.mlp.gate_proj.weight"])
+        val = get_first_matching([f"layers.{l_idx}.mlp.up_proj.weight"])
+        down = get_first_matching([f"layers.{l_idx}.mlp.down_proj.weight", f"layers.{l_idx}.mlp.dense_4h_to_h.weight", f"h.{l_idx}.mlp.c_proj.weight"])
+
+        # 2. Standard MLP (GPT-NeoX / Pythia / GPT-2)
+        h_to_4h = get_first_matching([f"layers.{l_idx}.mlp.dense_h_to_4h.weight", f"h.{l_idx}.mlp.c_fc.weight"])
+        if h_to_4h is not None:
+            if gate is None:
+                gate = h_to_4h
+            if val is None:
+                val = h_to_4h
+
+        norm = get_first_matching([
+            f"layers.{l_idx}.input_layernorm.weight",
+            f"layers.{l_idx}.post_attention_layernorm.weight",
+            f"h.{l_idx}.ln_1.weight",
+            f"h.{l_idx}.ln_2.weight"
+        ])
+        return gate, val, down, norm
+
     # 1. Sensory Embedding
-    embed = get_first_matching(["embed_tokens.weight", "wte.weight", "tok_embeddings.weight"])
+    embed = get_first_matching(["embed_tokens.weight", "wte.weight", "tok_embeddings.weight", "embed_in.weight"])
     if embed is not None:
         target_shape = centroid_sd["sensory_dnn.embedding.weight"].shape
         new_sd["sensory_dnn.embedding.weight"] = adapt_dimension(embed, target_shape)
@@ -113,7 +148,7 @@ def transfer_weights(
             print(f"✅ [sensory.embedding] Transferred embedding {embed.shape} -> {target_shape}")
 
     # 2. LM Head / Affine Scale
-    lm_head = get_first_matching(["lm_head.weight"])
+    lm_head = get_first_matching(["lm_head.weight", "embed_out.weight"])
     if "motor_decoder.affine_scale" in centroid_sd:
         if lm_head is not None and embed is not None:
             # Compute channel-wise energy ratio between LM head and input embedding
@@ -138,73 +173,67 @@ def transfer_weights(
                 print(f"✅ [motor.head.weight] Transferred output head projection: {target_shape}")
 
     # 3. Layer 0 Sensory Attention & SwiGLU
-    l0_q = get_first_matching(["layers.0.self_attn.q_proj.weight", "h.0.attn.c_attn.weight"])
-    l0_k = get_first_matching(["layers.0.self_attn.k_proj.weight"])
-    l0_v = get_first_matching(["layers.0.self_attn.v_proj.weight"])
-    l0_o = get_first_matching(["layers.0.self_attn.o_proj.weight", "h.0.attn.c_proj.weight"])
+    l0_q, l0_k, l0_v, l0_o = get_qkv_for_layer(0)
+    l0_gate, l0_val, l0_down, l0_norm = get_mlp_for_layer(0)
 
-    if l0_q is not None:
+    if l0_q is not None and "sensory_dnn.q_self.weight" in centroid_sd:
         new_sd["sensory_dnn.q_self.weight"] = adapt_dimension(l0_q, centroid_sd["sensory_dnn.q_self.weight"].shape)
         stats["transferred"] += 1
-    if l0_k is not None:
+    if l0_k is not None and "sensory_dnn.k_self.weight" in centroid_sd:
         new_sd["sensory_dnn.k_self.weight"] = adapt_dimension(l0_k, centroid_sd["sensory_dnn.k_self.weight"].shape)
         stats["transferred"] += 1
-    if l0_v is not None:
+    if l0_v is not None and "sensory_dnn.v_self.weight" in centroid_sd:
         new_sd["sensory_dnn.v_self.weight"] = adapt_dimension(l0_v, centroid_sd["sensory_dnn.v_self.weight"].shape)
         stats["transferred"] += 1
-    if l0_o is not None:
+    if l0_o is not None and "sensory_dnn.out_self.weight" in centroid_sd:
         new_sd["sensory_dnn.out_self.weight"] = adapt_dimension(l0_o, centroid_sd["sensory_dnn.out_self.weight"].shape)
         stats["transferred"] += 1
 
     # Sensory SwiGLU
-    l0_gate = get_first_matching(["layers.0.mlp.gate_proj.weight"])
-    l0_val = get_first_matching(["layers.0.mlp.up_proj.weight"])
-    l0_down = get_first_matching(["layers.0.mlp.down_proj.weight"])
-
-    if l0_gate is not None:
+    if l0_gate is not None and "sensory_dnn.swiglu.fc_gate.weight" in centroid_sd:
         new_sd["sensory_dnn.swiglu.fc_gate.weight"] = adapt_dimension(l0_gate, centroid_sd["sensory_dnn.swiglu.fc_gate.weight"].shape)
         stats["transferred"] += 1
-    if l0_val is not None:
+    if l0_val is not None and "sensory_dnn.swiglu.fc_val.weight" in centroid_sd:
         new_sd["sensory_dnn.swiglu.fc_val.weight"] = adapt_dimension(l0_val, centroid_sd["sensory_dnn.swiglu.fc_val.weight"].shape)
         stats["transferred"] += 1
-    if l0_down is not None:
+    if l0_down is not None and "sensory_dnn.swiglu.fc_down.weight" in centroid_sd:
         new_sd["sensory_dnn.swiglu.fc_down.weight"] = adapt_dimension(l0_down, centroid_sd["sensory_dnn.swiglu.fc_down.weight"].shape)
         stats["transferred"] += 1
 
     # Sensory Norms
     l0_norm_in = get_first_matching(["layers.0.input_layernorm.weight", "h.0.ln_1.weight"])
     l0_norm_out = get_first_matching(["layers.0.post_attention_layernorm.weight", "h.0.ln_2.weight"])
-    if l0_norm_in is not None:
+    if l0_norm_in is not None and "sensory_dnn.norm_in.weight" in centroid_sd:
         new_sd["sensory_dnn.norm_in.weight"] = adapt_dimension(l0_norm_in, centroid_sd["sensory_dnn.norm_in.weight"].shape)
         stats["transferred"] += 1
-    if l0_norm_out is not None:
+    if l0_norm_out is not None and "sensory_dnn.norm_out.weight" in centroid_sd:
         new_sd["sensory_dnn.norm_out.weight"] = adapt_dimension(l0_norm_out, centroid_sd["sensory_dnn.norm_out.weight"].shape)
         stats["transferred"] += 1
 
     # 4. Final Layer Projections -> Arcuate Fasciculus (Resonance Attention)
     last_l = L - 1
-    last_q = get_first_matching([f"layers.{last_l}.self_attn.q_proj.weight"])
-    last_k = get_first_matching([f"layers.{last_l}.self_attn.k_proj.weight"])
-    last_v = get_first_matching([f"layers.{last_l}.self_attn.v_proj.weight"])
-    last_o = get_first_matching([f"layers.{last_l}.self_attn.o_proj.weight"])
-    final_norm = get_first_matching(["model.norm.weight", "ln_f.weight"])
+    last_q, last_k, last_v, last_o = get_qkv_for_layer(last_l)
+    final_norm = get_first_matching(["model.norm.weight", "ln_f.weight", "final_layer_norm.weight"])
 
-    if last_q is not None:
+    if last_q is not None and "motor_decoder.q_proj.weight" in centroid_sd:
         new_sd["motor_decoder.q_proj.weight"] = adapt_dimension(last_q, centroid_sd["motor_decoder.q_proj.weight"].shape)
         stats["transferred"] += 1
-    if last_k is not None:
+    if last_k is not None and "sensory_dnn.k_proj.weight" in centroid_sd:
         new_sd["sensory_dnn.k_proj.weight"] = adapt_dimension(last_k, centroid_sd["sensory_dnn.k_proj.weight"].shape)
         stats["transferred"] += 1
-    if last_v is not None:
+    if last_v is not None and "sensory_dnn.v_proj.weight" in centroid_sd:
         new_sd["sensory_dnn.v_proj.weight"] = adapt_dimension(last_v, centroid_sd["sensory_dnn.v_proj.weight"].shape)
         stats["transferred"] += 1
-    if last_o is not None:
+    if last_o is not None and "motor_decoder.out_proj.weight" in centroid_sd:
         new_sd["motor_decoder.out_proj.weight"] = adapt_dimension(last_o, centroid_sd["motor_decoder.out_proj.weight"].shape)
         stats["transferred"] += 1
     if final_norm is not None:
-        new_sd["motor_decoder.norm_mid.weight"] = adapt_dimension(final_norm, centroid_sd["motor_decoder.norm_mid.weight"].shape)
-        new_sd["sensory_dnn.ctx_norm.weight"] = adapt_dimension(final_norm, centroid_sd["sensory_dnn.ctx_norm.weight"].shape)
-        stats["transferred"] += 2
+        if "motor_decoder.norm_mid.weight" in centroid_sd:
+            new_sd["motor_decoder.norm_mid.weight"] = adapt_dimension(final_norm, centroid_sd["motor_decoder.norm_mid.weight"].shape)
+            stats["transferred"] += 1
+        if "sensory_dnn.ctx_norm.weight" in centroid_sd:
+            new_sd["sensory_dnn.ctx_norm.weight"] = adapt_dimension(final_norm, centroid_sd["sensory_dnn.ctx_norm.weight"].shape)
+            stats["transferred"] += 1
 
     # 5. Concentric Shells Mapping: Transformer Layers -> Concentric Laminae
     if verbose:
@@ -214,10 +243,7 @@ def transfer_weights(
         # Linear layer index interpolation
         l_idx = int(round(k_idx * (L - 1) / max(1, K - 1)))
         
-        gate_k = get_first_matching([f"layers.{l_idx}.mlp.gate_proj.weight"])
-        val_k = get_first_matching([f"layers.{l_idx}.mlp.up_proj.weight"])
-        down_k = get_first_matching([f"layers.{l_idx}.mlp.down_proj.weight"])
-        norm_k = get_first_matching([f"layers.{l_idx}.input_layernorm.weight", f"layers.{l_idx}.post_attention_layernorm.weight"])
+        gate_k, val_k, down_k, norm_k = get_mlp_for_layer(l_idx)
 
         gate_key = f"volumetric_core.intra_shell_swiglu.{k_idx}.fc_gate.weight"
         val_key = f"volumetric_core.intra_shell_swiglu.{k_idx}.fc_val.weight"
