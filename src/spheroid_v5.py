@@ -253,9 +253,16 @@ class SensoryInputDNNV5(nn.Module):
         self.v_self = nn.Linear(surface_dim, surface_dim, bias=False)
         self.out_self = nn.Linear(surface_dim, surface_dim, bias=False)
 
-    def forward(self, input_ids_or_emb: torch.Tensor) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    def forward(
+        self,
+        input_ids_or_emb: torch.Tensor,
+        is_causal: bool = False,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Accepts integer token IDs [B, L] or soft embedding vectors [B, D] / [B, L, D].
+        Args:
+            input_ids_or_emb: input tokens or embeddings
+            is_causal: If True, applies causal upper-triangle masking to prevent future token leakage
         Returns:
             flux: Contextual sensory representation [B, L, D]
             kv: Tuple of (keys, values) shaped [B, H, L, head_dim] for cross-resonance.
@@ -281,6 +288,12 @@ class SensoryInputDNNV5(nn.Module):
             k_s = self.k_self(h_ctx).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
             v_s = self.v_self(h_ctx).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
             scores = torch.matmul(q_s, k_s.transpose(-1, -2)) / math.sqrt(self.head_dim)
+            if is_causal:
+                causal_mask = torch.triu(
+                    torch.full((L, L), -float("inf"), device=scores.device, dtype=scores.dtype),
+                    diagonal=1,
+                )
+                scores = scores + causal_mask
             attn_p = F.softmax(scores, dim=-1)
             ctx = torch.matmul(attn_p, v_s).transpose(1, 2).contiguous().view(B, L, D)
             flux = flux + self.dropout(self.out_self(ctx))
@@ -580,8 +593,8 @@ class PremotorMotorDecoderV5(nn.Module):
             L = keys.shape[2]
             q = self.q_proj(motor_surface).view(B, self.num_heads, 1, self.head_dim)
 
-            # Apply RoPE: keys start at pos 0..L-1, query is positioned at step_idx
-            q_offset = min(int(step_idx), self.rope_cos.shape[0] - 1)
+            # Apply RoPE: keys start at pos 0..L-1, query is positioned at sequence frontier (L)
+            q_offset = min(int(L), self.rope_cos.shape[0] - 1)
             q_rot = apply_rope(q, self.rope_cos, self.rope_sin, offset=q_offset)
             k_rot = apply_rope(keys, self.rope_cos, self.rope_sin, offset=0)
 
@@ -914,7 +927,7 @@ class CerebroSpheroidV5(nn.Module):
 
         if feedback_tokens is not None:
             safe_feedback = torch.clamp(feedback_tokens, min=0)
-            tf_flux, (tf_keys, tf_values) = self.sensory_dnn(safe_feedback)
+            tf_flux, (tf_keys, tf_values) = self.sensory_dnn(safe_feedback, is_causal=True)
             valid_mask = (feedback_tokens >= 0).unsqueeze(-1).float()
             tf_flux = tf_flux * valid_mask
         else:
@@ -932,10 +945,15 @@ class CerebroSpheroidV5(nn.Module):
 
         for t in range(t_len):
             # Scheduled sampling: bridge teacher-forcing and internal thought
+            # In autoregressive teacher-forcing, the feedback input at step t is the previous token y_{t-1}
             if tf_flux is not None:
-                tf_aud = tf_flux[:, t, :]
-                internal_feed = prev_thought if t > 0 else tf_aud
-                auditory_in = sampling_p * tf_aud + (1.0 - sampling_p) * internal_feed
+                # If t == 0, no output token has been emitted yet
+                tf_aud = tf_flux[:, t - 1, :] if t > 0 else None
+                internal_feed = prev_thought if t > 0 else None
+                if t == 0:
+                    auditory_in = None
+                else:
+                    auditory_in = sampling_p * tf_aud + (1.0 - sampling_p) * internal_feed
             else:
                 auditory_in = prev_thought if t > 0 else None
 
@@ -973,7 +991,7 @@ class CerebroSpheroidV5(nn.Module):
             # Cross-entropy loss computed only on valid non-padded targets (target != -100)
             loss = F.cross_entropy(
                 logits_stacked.view(-1, self.config.vocab_size),
-                targets.view(-1),
+                targets[:, :t_len].contiguous().view(-1),
                 ignore_index=-100,
             )
             if self.config.use_energy_regularization:
@@ -1015,7 +1033,7 @@ class CerebroSpheroidV5(nn.Module):
             if sensory_kv is not None and self.deliberation_probe is not None:
                 keys, values = sensory_kv
                 L_kv = keys.shape[2]
-                probe_q = self.deliberation_probe(state[:, 0, :]).view(B, self.config.num_heads, 1, self.sensory_dnn.head_dim)
+                probe_q = self.deliberation_probe(state.mean(dim=1)).view(B, self.config.num_heads, 1, self.sensory_dnn.head_dim)
                 q_rot = apply_rope(probe_q, self.motor_decoder.rope_cos, self.motor_decoder.rope_sin, offset=cycle)
                 k_rot = apply_rope(keys, self.motor_decoder.rope_cos, self.motor_decoder.rope_sin, offset=0)
                 scores = torch.matmul(q_rot.to(keys.dtype), k_rot.transpose(-1, -2)) / math.sqrt(self.sensory_dnn.head_dim)
@@ -1030,7 +1048,7 @@ class CerebroSpheroidV5(nn.Module):
             state = self.volumetric_core.deliberate_step(state)
 
             if self.config.use_adaptive_thinking and self.halting_gate is not None:
-                halt_prob = torch.sigmoid(self.halting_gate(state[:, 0, :]))
+                halt_prob = torch.sigmoid(self.halting_gate(state.mean(dim=1)))
                 if (halt_prob > self.config.thinking_halt_threshold).all():
                     break
 
