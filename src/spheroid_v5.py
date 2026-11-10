@@ -281,21 +281,19 @@ class SensoryInputDNNV5(nn.Module):
         h = x + self.dropout(self.swiglu(h))
         flux = self.norm_out(h)
 
-        # Contextual Inter-Token Mixing (Eliminates Bag-of-Words flaw)
+        # Contextual Inter-Token Mixing via Fused FlashAttention (SDPA)
         if L > 1:
             h_ctx = self.ctx_norm(flux)
             q_s = self.q_self(h_ctx).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
             k_s = self.k_self(h_ctx).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
             v_s = self.v_self(h_ctx).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-            scores = torch.matmul(q_s, k_s.transpose(-1, -2)) / math.sqrt(self.head_dim)
-            if is_causal:
-                causal_mask = torch.triu(
-                    torch.full((L, L), -float("inf"), device=scores.device, dtype=scores.dtype),
-                    diagonal=1,
-                )
-                scores = scores + causal_mask
-            attn_p = F.softmax(scores, dim=-1)
-            ctx = torch.matmul(attn_p, v_s).transpose(1, 2).contiguous().view(B, L, D)
+            ctx = F.scaled_dot_product_attention(
+                q_s,
+                k_s,
+                v_s,
+                is_causal=is_causal,
+                dropout_p=self.dropout.p if self.training else 0.0,
+            ).transpose(1, 2).contiguous().view(B, L, D)
             flux = flux + self.dropout(self.out_self(ctx))
 
         # Multi-Head KV projections: [B, L, D] -> [B, H, L, head_dim]
@@ -675,6 +673,104 @@ class PremotorMotorDecoderV5(nn.Module):
             return adapted_logits, efference, next_trace, next_plan, h
         return adapted_logits, efference, next_trace, next_plan
 
+    def forward_chunk(
+        self,
+        state: torch.Tensor,
+        sensory_kv: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        target_feedback: torch.Tensor,
+        target_kv: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        tied_embedding_weight: torch.Tensor,
+        plan: Optional[torch.Tensor] = None,
+        chunk_offset: int = 0,
+        return_hidden: bool = False,
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        Parallel Fused Chunk Motor Decoder:
+        Processes an entire chunk of T_chunk tokens in parallel via FlashAttention (SDPA) and GEMM.
+        """
+        B, K, D = state.shape
+        T_chunk = target_feedback.shape[1]
+        surface = state[:, -1, :]  # [B, D]
+        core = state[:, 0, :]      # [B, D]
+
+        if plan is None and self.use_plan:
+            plan = self.init_plan(B, state.device)
+
+        # 1. Parallel Phase Clock Vector Lookup across entire chunk
+        max_phase = self.phase_embed.weight.shape[0]
+        p_indices = torch.clamp(torch.arange(chunk_offset, chunk_offset + T_chunk, device=state.device), 0, max_phase - 1)
+        phase_seq = self.phase_embed(p_indices)  # [T_chunk, D]
+        p_norm = phase_seq.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        p_scaled = phase_seq * (torch.clamp(self.phase_scale, 0.05, 1.5) / p_norm)  # [T_chunk, D]
+
+        # Broadcast surface + phase + feedback across [B, T_chunk, D]
+        motor_surface = surface.unsqueeze(1) + p_scaled.unsqueeze(0) + target_feedback.to(surface.dtype)
+
+        # 2. Multi-Head Arcuate Fasciculus Cross-Resonance via Parallel FlashAttention (SDPA)
+        if sensory_kv is not None:
+            prompt_k, prompt_v = sensory_kv  # [B, H, L_prompt, head_dim]
+            L_prompt = prompt_k.shape[2]
+
+            if target_kv is not None and target_kv[0].shape[2] > 0:
+                t_k, t_v = target_kv  # [B, H, T_past + T_chunk, head_dim]
+                all_k = torch.cat([prompt_k, t_k], dim=2)
+                all_v = torch.cat([prompt_v, t_v], dim=2)
+            else:
+                all_k, all_v = prompt_k, prompt_v
+
+            q = self.q_proj(motor_surface).view(B, T_chunk, self.num_heads, self.head_dim).transpose(1, 2)
+
+            # RoPE Rotary Position Embedding
+            q_rot = apply_rope(q, self.rope_cos, self.rope_sin, offset=L_prompt + chunk_offset)
+            k_rot = apply_rope(all_k, self.rope_cos, self.rope_sin, offset=0)
+
+            # Prefix-causal mask: Prompt is bidirectional, target tokens within chunk are causal
+            prompt_mask = torch.ones(T_chunk, L_prompt + chunk_offset, dtype=torch.bool, device=q.device)
+            causal_submask = torch.tril(torch.ones(T_chunk, T_chunk, dtype=torch.bool, device=q.device))
+            prefix_mask = torch.cat([prompt_mask, causal_submask], dim=1).unsqueeze(0).unsqueeze(0)
+
+            # Fused PyTorch SDPA (dispatches to FlashAttention-2 / memory-efficient attention)
+            res = F.scaled_dot_product_attention(
+                q_rot.to(all_k.dtype),
+                k_rot,
+                all_v,
+                attn_mask=prefix_mask,
+                dropout_p=self.dropout.p if self.training else 0.0,
+            )  # [B, H, T_chunk, head_dim]
+            res = res.transpose(1, 2).contiguous().view(B, T_chunk, D)
+            resonance = self.resonance_norm(self.out_proj(res).to(motor_surface.dtype))
+        else:
+            resonance = torch.zeros_like(motor_surface)
+
+        # 3. Multi-Shell Softmax Pooling
+        if self.use_shell_tap:
+            shell_weights = F.softmax(self.shell_score, dim=0).view(1, -1, 1)
+            shell_proj = self.shell_proj(state)
+            shell_pool = torch.sum(shell_weights * shell_proj, dim=1) * self.shell_scale  # [B, D]
+        else:
+            shell_pool = torch.zeros_like(surface)
+
+        # 4. Deep Motor Integration via Parallel SwiGLU
+        core_exp = core.unsqueeze(1).expand(-1, T_chunk, -1)
+        shell_exp = shell_pool.unsqueeze(1).expand(-1, T_chunk, -1)
+        fused_components = [motor_surface, core_exp, resonance, shell_exp]
+        if self.use_plan and plan is not None:
+            fused_components.append(plan.unsqueeze(1).expand(-1, T_chunk, -1))
+
+        fused = self.fused_norm(torch.cat(fused_components, dim=-1))
+        h = self.norm_mid(self.motor_swiglu(fused))
+        h = self.dropout(h)
+
+        # 5. Affine-Tied Parallel Dictionary Projection (Single Large GEMM: [B*T, D] @ [D, V])
+        temp = torch.clamp(self.temperature_scale, 0.1, 5.0)
+        h_scaled = (h * self.affine_scale) / temp
+        logits = F.linear(h_scaled, tied_embedding_weight)  # [B, T_chunk, vocab_size]
+
+        efference = self.efference_proj(h)  # [B, T_chunk, surface_dim]
+        if return_hidden:
+            return logits, efference, h, plan
+        return logits, efference, plan
+
 
 class CerebroSpheroidV5(nn.Module):
     """
@@ -935,57 +1031,92 @@ class CerebroSpheroidV5(nn.Module):
             tf_keys = None
             tf_values = None
 
-        # 4. Motor Emission Loop with Causal KV Resonance & Differentiable Thought Steering
+        # 4. Motor Emission Engine (Chunkwise Parallel Fused FlashAttention vs Sequential)
         plan = self.motor_decoder.init_plan(B, dev) if self.config.use_plan else None
-        refractory = torch.zeros(B, self.config.vocab_size, device=dev)
-        prev_thought = torch.zeros(B, self.config.surface_dim, device=dev)
-
-        all_logits = []
         tied_w = self.sensory_dnn.embedding.weight
 
-        for t in range(t_len):
-            # Scheduled sampling: bridge teacher-forcing and internal thought
-            # In autoregressive teacher-forcing, the feedback input at step t is the previous token y_{t-1}
-            if tf_flux is not None:
-                # If t == 0, no output token has been emitted yet
-                tf_aud = tf_flux[:, t - 1, :] if t > 0 else None
-                internal_feed = prev_thought if t > 0 else None
-                if t == 0:
-                    auditory_in = None
+        # Check if we can use fast parallel chunk execution
+        use_fast_chunkwise = targets is not None and not getattr(self, "force_sequential", False) and tf_flux is not None
+
+        if use_fast_chunkwise:
+            # Shift feedback: at step 0 feedback is 0; at step t feedback is tf_flux[:, t-1]
+            zero_pad = torch.zeros(B, 1, self.config.surface_dim, device=dev, dtype=tf_flux.dtype)
+            shifted_feedback = torch.cat([zero_pad, tf_flux[:, :-1, :]], dim=1)[:, :t_len, :]
+
+            # Chunk size: 64 tokens per chunk for optimal Tensor Core saturation and periodic core updates
+            c_size = getattr(self.config, "chunk_size", 64)
+            num_chunks = max(1, (t_len + c_size - 1) // c_size)
+
+            all_chunk_logits = []
+            for c_idx in range(num_chunks):
+                c_start = c_idx * c_size
+                c_end = min(c_start + c_size, t_len)
+                chunk_fb = shifted_feedback[:, c_start:c_end, :]
+
+                # Target KV cache up to the current chunk
+                chunk_target_kv = (tf_keys[:, :, :c_end, :], tf_values[:, :, :c_end, :]) if tf_keys is not None else None
+
+                chunk_logits, chunk_eff, plan = self.motor_decoder.forward_chunk(
+                    state=state,
+                    sensory_kv=sensory_kv,
+                    target_feedback=chunk_fb,
+                    target_kv=chunk_target_kv,
+                    tied_embedding_weight=tied_w,
+                    plan=plan,
+                    chunk_offset=c_start,
+                )
+                all_chunk_logits.append(chunk_logits)
+
+                # Periodic Spheroid Core recurrence across chunk boundaries
+                eff_chunk = chunk_eff.mean(dim=1)
+                state_eff = self.volumetric_core.inject_efference_copy(state, eff_chunk)
+                state = self.volumetric_core.deliberate_step(state_eff)
+
+            logits_stacked = torch.cat(all_chunk_logits, dim=1)
+        else:
+            # Sequential rollout for free sampling or test unrolling
+            refractory = torch.zeros(B, self.config.vocab_size, device=dev)
+            prev_thought = torch.zeros(B, self.config.surface_dim, device=dev)
+            all_logits = []
+
+            for t in range(t_len):
+                if tf_flux is not None:
+                    tf_aud = tf_flux[:, t - 1, :] if t > 0 else None
+                    internal_feed = prev_thought if t > 0 else None
+                    if t == 0:
+                        auditory_in = None
+                    else:
+                        auditory_in = sampling_p * tf_aud + (1.0 - sampling_p) * internal_feed
                 else:
-                    auditory_in = sampling_p * tf_aud + (1.0 - sampling_p) * internal_feed
-            else:
-                auditory_in = prev_thought if t > 0 else None
+                    auditory_in = prev_thought if t > 0 else None
 
-            # Causal KV Cache: Token t cross-attends to Prompt KV AND past generated tokens (0..t-1)
-            causal_kv = None
-            if tf_keys is not None and t > 0:
-                causal_kv = (tf_keys[:, :, :t, :], tf_values[:, :, :t, :])
+                causal_kv = None
+                if tf_keys is not None and t > 0:
+                    causal_kv = (tf_keys[:, :, :t, :], tf_values[:, :, :t, :])
 
-            logits, efference, refractory, plan = self.motor_decoder(
-                state=state,
-                sensory_kv=sensory_kv,
-                tied_embedding_weight=tied_w,
-                plan=plan,
-                refractory_trace=refractory,
-                step_idx=t,
-                auditory_feedback=auditory_in,
-                causal_kv=causal_kv,
-            )
-            all_logits.append(logits)
+                logits, efference, refractory, plan = self.motor_decoder(
+                    state=state,
+                    sensory_kv=sensory_kv,
+                    tied_embedding_weight=tied_w,
+                    plan=plan,
+                    refractory_trace=refractory,
+                    step_idx=t,
+                    auditory_feedback=auditory_in,
+                    causal_kv=causal_kv,
+                )
+                all_logits.append(logits)
 
-            # Differentiable thought re-afference for step t+1 (calibrated residual BPTT gradient)
-            soft_p = F.softmax(logits, dim=-1)
-            soft_emb = soft_p @ tied_w
-            soft_emb_diff = 0.2 * soft_emb + 0.8 * soft_emb.detach()
-            prev_thought, _ = self.sensory_dnn(soft_emb_diff)
+                soft_p = F.softmax(logits, dim=-1)
+                soft_emb = soft_p @ tied_w
+                soft_emb_diff = 0.2 * soft_emb + 0.8 * soft_emb.detach()
+                prev_thought, _ = self.sensory_dnn(soft_emb_diff)
 
-            # Closed-loop state propagation via efference copy injection
-            state_eff = self.volumetric_core.inject_efference_copy(state, efference)
-            state = self.volumetric_core.deliberate_step(state_eff)
+                state_eff = self.volumetric_core.inject_efference_copy(state, efference)
+                state = self.volumetric_core.deliberate_step(state_eff)
+
+            logits_stacked = torch.stack(all_logits, dim=1)
 
         self.current_spheroid_state = state
-        logits_stacked = torch.stack(all_logits, dim=1)  # [B, t_len, vocab_size]
 
         if targets is not None:
             # Cross-entropy loss computed only on valid non-padded targets (target != -100)
