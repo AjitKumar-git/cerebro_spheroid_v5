@@ -414,6 +414,7 @@ def training_rollout(
     pad_id: int = 0,
     repetition_penalty: float = 1.25,
     targets: Optional[jnp.ndarray] = None,
+    remat: bool = True,
 ) -> Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]]:
     """Differentiable training rollout engine in pure JAX."""
     B, L = prompts.shape
@@ -486,7 +487,8 @@ def training_rollout(
         return (nxt_s, nxt_t, nxt_p, nxt_thought), logits
 
     # Use activation checkpointing (remat) for training to reduce HBM activation memory by >90%
-    scan_fn = jax.checkpoint(_emit) if (targets is not None) else _emit
+    use_remat = remat and (targets is not None)
+    scan_fn = jax.checkpoint(_emit) if use_remat else _emit
 
     if targets is not None:
         _, (all_loss, all_mask) = lax.scan(scan_fn, (state, init_refractory, init_plan, init_thought), jnp.arange(target_len))

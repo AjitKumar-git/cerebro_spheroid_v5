@@ -63,10 +63,13 @@ def parse_args(args_list=None):
     parser.add_argument("--cloud-sync", action="store_true", default=True, help="Enable live sync with bioflo.in")
     parser.add_argument("--cloud-sync-interval", type=int, default=100, help="Steps between cloud sync uploads")
     parser.add_argument("--checkpoint-dir", "--ckpt-dir", dest="checkpoint_dir", type=str, default="/content/checkpoints" if os.path.exists("/content") else "checkpoints/tpu_jax", help="Checkpoint directory")
-    parser.add_argument("--preset", type=str, default="v5_small", choices=["v5_small", "v5_compact", "v5_base"], help="Model preset (default: v5_small)")
+    parser.add_argument("--preset", type=str, default="v5_small", choices=["v5_small", "v5_compact", "v5_base", "v5_test"], help="Model preset (default: v5_small)")
     parser.add_argument("--optimizer", type=str, default="spheroid", choices=["spheroid", "adamw"], help="Optimizer choice (default: spheroid)")
     parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bf16", "fp32"], help="Matrix execution precision (default: auto, bf16 on TPU)")
     parser.add_argument("--scratch", "--from-scratch", dest="from_scratch", action="store_true", default=False, help="Start training strictly from scratch (step 0, clean initialization)")
+    parser.add_argument("--auto-tune", dest="auto_tune", action="store_true", default=True, help="Automatically test environment to discover maximum tok/s (default: True)")
+    parser.add_argument("--no-auto-tune", dest="auto_tune", action="store_false", help="Disable automatic environment tuning")
+    parser.add_argument("--remat", type=str, default="auto", help="Activation checkpointing (auto, true, false)")
     return parser.parse_args(args_list)
 
 
@@ -84,6 +87,10 @@ def run_training(**kwargs):
             setattr(args, "save_interval", v)
         elif k in ("from_scratch", "scratch", "clean"):
             setattr(args, "from_scratch", bool(v))
+        elif k in ("auto_tune", "tune"):
+            setattr(args, "auto_tune", bool(v))
+        elif k == "remat":
+            setattr(args, "remat", v)
     return main(args)
 
 
@@ -110,6 +117,23 @@ def main(args=None):
     else:
         print("ℹ️ Running on GPU/CPU fallback.")
 
+    # 0. Automatic Environment Benchmark & Tuning (Maximum tok/s Discovery)
+    remat_choice = True
+    if getattr(args, "auto_tune", True):
+        from src.jax.auto_tuner import auto_tune_environment
+        best_cfg = auto_tune_environment(
+            preset=args.preset,
+            seq_len=args.seq_len,
+            dtype=args.dtype,
+            verbose=True,
+        )
+        if best_cfg.get("batch_size"):
+            print(f"⚡ Applying Auto-Tuned Hyperparameters: batch_size={best_cfg['batch_size']}, remat={best_cfg.get('remat', True)}")
+            args.batch_size = best_cfg["batch_size"]
+            remat_choice = best_cfg.get("remat", True)
+    elif hasattr(args, "remat") and args.remat != "auto":
+        remat_choice = str(args.remat).lower() in ("true", "1", "yes")
+
     # 1. Config & Parameter Initialization
     cfg_dict = PRESETS_V5.get(args.preset, PRESETS_V5["v5_base"]).copy()
     cfg_dict["max_phase_steps"] = max(1024, args.seq_len * 2)
@@ -127,7 +151,7 @@ def main(args=None):
         dtype_desc = "float32"
 
     print(f"\nModel Config    : {args.preset} | Shells: {config.num_shells} | Surface Dim: {config.surface_dim} | Radial Dim: {config.radial_dim}")
-    print(f"Precision       : {dtype_desc}")
+    print(f"Precision       : {dtype_desc} | Remat: {remat_choice}")
     key = jax.random.PRNGKey(42)
     key, init_key = jax.random.split(key)
     params, buffers = init_params_v5(init_key, config)
@@ -147,7 +171,7 @@ def main(args=None):
     print(f"Optimizer       : {args.optimizer.upper()} ({'Polar Newton-Schulz NS-5 + Spectral Clamp' if args.optimizer == 'spheroid' else 'Optax AdamW'})")
     if args.optimizer == "spheroid":
         opt_state = init_spheroid_opt_state(params)
-        train_step_fn = build_train_step_spheroid(config, buffers, pad_id=0, weight_decay=1e-4)
+        train_step_fn = build_train_step_spheroid(config, buffers, pad_id=0, weight_decay=1e-4, remat=remat_choice)
     else:
         learning_rate_sched = optax.cosine_decay_schedule(
             init_value=args.lr,
@@ -171,6 +195,7 @@ def main(args=None):
                 buffers=buffers,
                 config=config,
                 targets=target_batch,
+                remat=remat_choice,
             )
 
         @jax.jit

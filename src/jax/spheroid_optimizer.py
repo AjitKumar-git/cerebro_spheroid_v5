@@ -147,6 +147,7 @@ def build_spheroid_train_engine(
     pad_id: int = 0,
     weight_decay: float = 0.01,
     repetition_penalty: float = 1.25,
+    remat: bool = True,
 ) -> Tuple[Callable, Callable]:
     """
     Builds decoupled JIT-compiled gradient computation and optimizer application functions.
@@ -169,6 +170,7 @@ def build_spheroid_train_engine(
                 pad_id=pad_id,
                 repetition_penalty=repetition_penalty,
                 targets=r_batch,
+                remat=remat,
             )
 
         loss_val, grads = jax.value_and_grad(_loss_fn, allow_int=True)(p)
@@ -294,10 +296,11 @@ def build_train_step_spheroid(
     pad_id: int = 0,
     weight_decay: float = 0.01,
     repetition_penalty: float = 1.25,
+    remat: bool = True,
 ) -> Callable:
     """Builds a combined JIT-compiled train_step function utilizing SpheroidOptimizer."""
     compute_grad, apply_opt = build_spheroid_train_engine(
-        config, buffers, pad_id=pad_id, weight_decay=weight_decay, repetition_penalty=repetition_penalty
+        config, buffers, pad_id=pad_id, weight_decay=weight_decay, repetition_penalty=repetition_penalty, remat=remat
     )
 
     def train_step(p, opt_s, q_batch, r_batch, base_lr, feedback_tokens=None, sampling_p=1.0):
