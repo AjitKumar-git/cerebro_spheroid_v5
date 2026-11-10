@@ -456,10 +456,10 @@ class PremotorMotorDecoderV5(nn.Module):
             next_plan = plan if plan is not None else torch.zeros(B, D, device=state.device)
 
         # 6. Affine-Tied Dictionary Projection (W_motor = gamma * W_sensory)
-        # Logits: [B, D] @ [D, vocab_size] -> [B, vocab_size]
+        # Memory-optimal: Scale hidden vector [B, D] (3 KB) instead of vocabulary matrix [V, D] (98 MB)
         temp = torch.clamp(self.temperature_scale, 0.1, 5.0)
-        tied_w = tied_embedding_weight * self.affine_scale.unsqueeze(0)  # [vocab_size, D]
-        raw_logits = F.linear(h, tied_w) / temp
+        h_scaled = (h * self.affine_scale) / temp
+        raw_logits = F.linear(h_scaled, tied_embedding_weight)
 
         # 7. Two-Tier Refractory Repetition Suppression
         if refractory_trace is not None:

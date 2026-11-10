@@ -339,9 +339,10 @@ def emit_step(
     )
 
     # 6. Affine-Tied Dictionary Projection (W_motor = gamma * W_sensory)
+    # Memory-optimal: Scale hidden vector [B, D] instead of vocabulary matrix [V, D]
     temp = jnp.clip(params["motor.temperature_scale"], 0.1, 5.0)
-    tied_w = params["sensory.embedding.weight"] * params["motor.affine_scale"][None, :]
-    raw_logits = jnp.matmul(h, tied_w.T) / temp
+    h_scaled = (h * params["motor.affine_scale"][None, :]) / temp
+    raw_logits = jnp.matmul(h_scaled, params["sensory.embedding.weight"].T)
 
     # 7. Two-Tier Refractory Adaptation
     if refractory_trace is not None:
