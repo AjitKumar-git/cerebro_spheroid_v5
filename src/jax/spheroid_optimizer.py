@@ -142,11 +142,10 @@ def init_spheroid_opt_state(params: Dict[str, jnp.ndarray], key: Optional[jax.Ar
 
 
 def build_spheroid_train_engine(
-    config: ModelConfigV4,
+    config: ModelConfigV5,
     buffers: Tuple[jnp.ndarray, jnp.ndarray],
-    pad_id: int,
+    pad_id: int = 0,
     weight_decay: float = 0.01,
-    thalamic_anchor_weight: float = 0.1,
     repetition_penalty: float = 1.25,
 ) -> Tuple[Callable, Callable]:
     """
@@ -155,7 +154,7 @@ def build_spheroid_train_engine(
     """
 
     @jax.jit
-    def compute_grad_step(p, q_batch, r_batch, feedback_tokens=None, sampling_p=1.0, persona_id=0):
+    def compute_grad_step(p, q_batch, r_batch, feedback_tokens=None, sampling_p=1.0):
         target_len = r_batch.shape[1]
 
         def _loss_fn(param_dict):
@@ -166,11 +165,8 @@ def build_spheroid_train_engine(
                 buffers,
                 config=config,
                 feedback_tokens=feedback_tokens,
-                deliberation_mode="scheduled",
                 sampling_p=sampling_p,
-                thalamic_anchor_weight=thalamic_anchor_weight,
                 pad_id=pad_id,
-                persona_id=persona_id,
                 repetition_penalty=repetition_penalty,
                 targets=r_batch,
             )
@@ -293,15 +289,15 @@ def build_spheroid_train_engine(
 
 
 def build_train_step_spheroid(
-    config: ModelConfigV4,
+    config: ModelConfigV5,
     buffers: Tuple[jnp.ndarray, jnp.ndarray],
-    pad_id: int,
+    pad_id: int = 0,
     weight_decay: float = 0.01,
-    thalamic_anchor_weight: float = 0.1,
+    repetition_penalty: float = 1.25,
 ) -> Callable:
     """Builds a combined JIT-compiled train_step function utilizing SpheroidOptimizer."""
     compute_grad, apply_opt = build_spheroid_train_engine(
-        config, buffers, pad_id, weight_decay, thalamic_anchor_weight=thalamic_anchor_weight
+        config, buffers, pad_id=pad_id, weight_decay=weight_decay, repetition_penalty=repetition_penalty
     )
 
     def train_step(p, opt_s, q_batch, r_batch, base_lr, feedback_tokens=None, sampling_p=1.0):

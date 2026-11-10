@@ -37,6 +37,10 @@ from src.jax.v5_model import (
     init_params_v5,
     training_rollout,
 )
+from src.jax.spheroid_optimizer import (
+    init_spheroid_opt_state,
+    build_train_step_spheroid,
+)
 from src.cloud_sync import (
     check_remote_manifest,
     pull_checkpoint,
@@ -58,6 +62,8 @@ def parse_args(args_list=None):
     parser.add_argument("--cloud-sync-interval", type=int, default=100, help="Steps between cloud sync uploads")
     parser.add_argument("--checkpoint-dir", "--ckpt-dir", dest="checkpoint_dir", type=str, default="/content/checkpoints" if os.path.exists("/content") else "checkpoints/tpu_jax", help="Checkpoint directory")
     parser.add_argument("--preset", type=str, default="v5_base", choices=["v5_small", "v5_compact", "v5_base"], help="Model preset (default: v5_base)")
+    parser.add_argument("--optimizer", type=str, default="spheroid", choices=["spheroid", "adamw"], help="Optimizer choice (default: spheroid)")
+    parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bf16", "fp32"], help="Matrix execution precision (default: auto, bf16 on TPU)")
     return parser.parse_args(args_list)
 
 
@@ -104,10 +110,26 @@ def main(args=None):
     cfg_dict["max_phase_steps"] = max(1024, args.seq_len * 2)
     config = JAXConfigV5(**cfg_dict)
 
-    print(f"\nModel Config: {args.preset} | Shells: {config.num_shells} | Surface Dim: {config.surface_dim} | Radial Dim: {config.radial_dim}")
+    # Precision setup (TPU v5e-1 runs native bfloat16)
+    if args.dtype == "auto":
+        target_dtype = jnp.bfloat16 if is_tpu else jnp.float32
+        dtype_desc = "bfloat16 (Native TPU v5e-1 MXU)" if is_tpu else "float32"
+    elif args.dtype == "bf16":
+        target_dtype = jnp.bfloat16
+        dtype_desc = "bfloat16"
+    else:
+        target_dtype = jnp.float32
+        dtype_desc = "float32"
+
+    print(f"\nModel Config    : {args.preset} | Shells: {config.num_shells} | Surface Dim: {config.surface_dim} | Radial Dim: {config.radial_dim}")
+    print(f"Precision       : {dtype_desc}")
     key = jax.random.PRNGKey(42)
     key, init_key = jax.random.split(key)
     params, buffers = init_params_v5(init_key, config)
+
+    # Cast parameters to target execution dtype
+    if target_dtype != jnp.float32:
+        params = {k: v.astype(target_dtype) if jnp.issubdtype(v.dtype, jnp.floating) else v for k, v in params.items()}
 
     # Count parameters
     total_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
@@ -116,20 +138,44 @@ def main(args=None):
     print(f"Total Parameters: {total_params:,} (~{total_params/1e6:.1f}M)")
     print(f"Active Compute  : {active_compute:,} (~{active_compute/1e6:.1f}M) ({active_compute/total_params*100:.2f}%)")
 
-    # 2. Setup Optax Optimizer
-    learning_rate = optax.cosine_decay_schedule(
-        init_value=args.lr,
-        decay_steps=args.total_steps,
-        alpha=0.03,
-    )
-    if optax is not None:
-        optimizer = optax.chain(
-            optax.clip_by_global_norm(1.0),
-            optax.adamw(learning_rate=learning_rate, b1=0.9, b2=0.95, weight_decay=1e-4),
-        )
-        opt_state = optimizer.init(params)
+    # 2. Setup Optimizer (SpheroidOptimizer vs AdamW)
+    print(f"Optimizer       : {args.optimizer.upper()} ({'Polar Newton-Schulz NS-5 + Spectral Clamp' if args.optimizer == 'spheroid' else 'Optax AdamW'})")
+    if args.optimizer == "spheroid":
+        opt_state = init_spheroid_opt_state(params)
+        train_step_fn = build_train_step_spheroid(config, buffers, pad_id=0, weight_decay=1e-4)
     else:
-        raise ImportError("optax is required for JAX TPU training. Please install via: pip install optax")
+        learning_rate_sched = optax.cosine_decay_schedule(
+            init_value=args.lr,
+            decay_steps=args.total_steps,
+            alpha=0.03,
+        )
+        if optax is not None:
+            optimizer = optax.chain(
+                optax.clip_by_global_norm(1.0),
+                optax.adamw(learning_rate=learning_rate_sched, b1=0.9, b2=0.95, weight_decay=1e-4),
+            )
+            opt_state = optimizer.init(params)
+        else:
+            raise ImportError("optax is required for AdamW TPU training. Please install via: pip install optax")
+
+        def loss_fn(p, prompt_batch, target_batch):
+            return training_rollout(
+                params=p,
+                prompts=prompt_batch,
+                target_len=args.seq_len,
+                buffers=buffers,
+                config=config,
+                targets=target_batch,
+            )
+
+        @jax.jit
+        def train_step_adamw(p, opt_s, prompt_b, target_b, cur_lr):
+            loss, grads = jax.value_and_grad(loss_fn)(p, prompt_b, target_b)
+            updates, next_opt_s = optimizer.update(grads, opt_s, p)
+            next_p = optax.apply_updates(p, updates)
+            return next_p, next_opt_s, loss
+
+        train_step_fn = train_step_adamw
 
     # 3. Cloud Sync & Local Checkpoint Resumption
     start_step = 0
@@ -163,34 +209,21 @@ def main(args=None):
         print(f"✓ Current Step ({start_step:,}) >= Target Steps ({args.total_steps:,}). Target reached!")
         return
 
-    # 4. Define Pure Functional Loss & JIT Step
-    def loss_fn(p, prompt_batch, target_batch):
-        return training_rollout(
-            params=p,
-            prompts=prompt_batch,
-            target_len=args.seq_len,
-            buffers=buffers,
-            config=config,
-            targets=target_batch,
-        )
+    def get_lr(s: int, total_s: int, peak_lr: float) -> float:
+        ratio = min(1.0, float(s) / max(1.0, float(total_s)))
+        coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
+        return float(peak_lr * (0.05 + 0.95 * coeff))
 
-    @jax.jit
-    def train_step(p, opt_s, prompt_b, target_b):
-        loss, grads = jax.value_and_grad(loss_fn)(p, prompt_b, target_b)
-        updates, next_opt_s = optimizer.update(grads, opt_s, p)
-        next_p = optax.apply_updates(p, updates)
-        return next_p, next_opt_s, loss
-
-    # 5. Warmup JIT Trace & Compile
+    # 4. Warmup JIT Trace & Compile
     print("\n⚡ Compiling XLA computation graph on TPU...")
     dummy_prompts = jnp.zeros((args.batch_size, 32), dtype=jnp.int32)
     dummy_targets = jnp.zeros((args.batch_size, args.seq_len), dtype=jnp.int32)
     t0_compile = time.time()
-    params, opt_state, initial_loss = train_step(params, opt_state, dummy_prompts, dummy_targets)
+    params, opt_state, initial_loss = train_step_fn(params, opt_state, dummy_prompts, dummy_targets, args.lr)
     jax.block_until_ready(initial_loss)
     print(f"✓ XLA Compilation complete in {time.time() - t0_compile:.2f}s! Initial Loss: {float(initial_loss):.4f}")
 
-    # 6. High-Throughput Training Loop
+    # 5. High-Throughput Training Loop
     print("\n" + "=" * 75)
     print(f"🚀 Training {args.total_steps:,} Steps (Batch: {args.batch_size}, SeqLen: {args.seq_len})")
     print("=" * 75)
@@ -208,7 +241,8 @@ def main(args=None):
         prompt_b = jax.random.randint(step_key, (args.batch_size, 32), 0, config.vocab_size)
         target_b = jax.random.randint(step_key, (args.batch_size, args.seq_len), 0, config.vocab_size)
 
-        params, opt_state, loss = train_step(params, opt_state, prompt_b, target_b)
+        cur_lr = get_lr(step, args.total_steps, args.lr)
+        params, opt_state, loss = train_step_fn(params, opt_state, prompt_b, target_b, cur_lr)
         loss_val = float(loss)
         running_loss += loss_val
 
