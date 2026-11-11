@@ -209,3 +209,190 @@ def test_jax_gpu_dtype_resolution(monkeypatch):
     monkeypatch.setattr(auto_tuner, "get_hardware_info", lambda: {"is_tpu": False, "is_gpu": True, "device_kind": "Tesla T4"})
     dt, _ = auto_tuner.resolve_jax_compute_dtype("auto")
     assert dt == jnp.float32
+
+
+def test_t4_selects_fp16_not_emulated_bf16(monkeypatch):
+    import scripts.train_v5_graded_curriculum as train_mod
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda *args, **kwargs: True)
+
+    # Tesla T4 (sm_75): must pick float16 even if software BF16 emulation claims True
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda idx=0: (7, 5))
+    assert train_mod._has_native_bf16(0) is False
+    assert train_mod._select_amp_dtype(True, 0) == torch.float16
+
+    # Ampere/Ada (sm_80 / sm_89): native Tensor Core BF16
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda idx=0: (8, 0))
+    assert train_mod._has_native_bf16(0) is True
+    assert train_mod._select_amp_dtype(True, 0) == torch.bfloat16
+
+    assert train_mod._select_amp_dtype(False, 0) == torch.float32
+
+
+def test_clamp_spectral_norm_is_deterministic_across_rng():
+    from src.spheroid_optimizer import _clamp_spectral_norm
+
+    torch.manual_seed(123)
+    base = torch.randn(32, 16) * 2.5
+    w1 = base.clone()
+    w2 = base.clone()
+
+    torch.manual_seed(0)
+    c1 = _clamp_spectral_norm(w1, max_spec_norm=1.0, power_steps=2)
+    torch.manual_seed(99999)
+    c2 = _clamp_spectral_norm(w2, max_spec_norm=1.0, power_steps=2)
+
+    assert torch.equal(c1, c2)
+    assert torch.linalg.matrix_norm(c1, ord=2).item() <= 1.0 + 1e-3
+
+
+def test_kaggle_2xt4_kernel_artifacts_valid():
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    meta_path = os.path.join(root, "kaggle", "kernel-metadata.json")
+    nb_path = os.path.join(root, "kaggle", "cerebro_spheroid_v5_kaggle_2xt4.ipynb")
+
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    assert meta["id"] == "ajitsheoran/cerebro-spheroid-v5-2xt4"
+    assert meta["machine_shape"] == "NvidiaTeslaT4"
+    assert meta["enable_gpu"] is True
+    assert meta["enable_tpu"] is False
+    assert meta["enable_internet"] is True
+    assert meta["kernel_type"] == "notebook"
+    assert meta["code_file"] == "cerebro_spheroid_v5_kaggle_2xt4.ipynb"
+
+    with open(nb_path, "r", encoding="utf-8") as f:
+        nb = json.load(f)
+    assert nb["nbformat"] == 4
+
+    code_sources = []
+    for cell in nb["cells"]:
+        if cell.get("cell_type") == "code":
+            src = "".join(cell.get("source", []))
+            compile(src, nb_path, "exec")
+            code_sources.append(src)
+
+    joined = "\n".join(code_sources)
+    assert "torchrun" in joined
+    assert "scripts/train_v5_graded_curriculum.py" in joined
+    assert "--target-batch-size" in joined
+    assert "--prompt-len" in joined
+    assert "--seq-len" in joined
+    assert "--no-elastic-window" in joined
+    assert "--max-hours" in joined
+    assert "--from-scratch" not in joined
+    assert 'MODEL_PRESET = "v5_small"' in joined
+    assert "TARGET_BATCH_SIZE = 64" in joined
+
+
+def test_graded_curriculum_diversity_and_tpu_parity():
+    from src.corpus import build_tokenizer
+    from src.graded_curriculum import CurriculumScheduleConfig, GradedCurriculumStreamer
+
+    cfg = CurriculumScheduleConfig()
+    assert cfg.multimodal_sample_ratio == 0.0
+    assert cfg.prompt_len == 32
+    assert cfg.seq_len == 256
+
+    tok = build_tokenizer("llama")
+    s0 = GradedCurriculumStreamer(
+        tok, cfg, seed=42, mix="foundation", search_dirs=["data"], offline=True, rank=0, world_size=2
+    )
+    s1 = GradedCurriculumStreamer(
+        tok, cfg, seed=42, mix="foundation", search_dirs=["data"], offline=True, rank=1, world_size=2
+    )
+    try:
+        buckets = [("static", 32, 256)]
+        p0_a, t0_a, f0_a, _, vis0, _, b0 = s0.get_elastic_batch(
+            step=2750, device=torch.device("cpu"), batch_size=4, total_window=288, buckets=buckets
+        )
+        p0_b, _, _, _, _, _, _ = s0.get_elastic_batch(
+            step=2751, device=torch.device("cpu"), batch_size=4, total_window=288, buckets=buckets
+        )
+        p1_a, _, _, _, _, _, _ = s1.get_elastic_batch(
+            step=2750, device=torch.device("cpu"), batch_size=4, total_window=288, buckets=buckets
+        )
+        assert p0_a.shape == (4, 32)
+        assert t0_a.shape == (4, 256)
+        assert f0_a.shape == (4, 256)
+        assert vis0 is None
+        assert b0 == "static"
+
+        # Consecutive rows, steps, and DDP ranks must be distinct (never stuck on row 0)
+        assert not torch.equal(p0_a[0], p0_a[1])
+        assert not torch.equal(p0_a, p0_b)
+        assert not torch.equal(p0_a, p1_a)
+
+        decoded = tok.decode(p0_a[0].tolist(), skip_special_tokens=False)
+        assert "<stim>" in decoded
+    finally:
+        s0.close()
+        s1.close()
+
+
+def _ddp_gloo_worker(rank: int, world_size: int, port: int, out_dir: str):
+    import contextlib
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    import scripts.train_v5_graded_curriculum as train_mod
+    from src.agentic_harness import ActionType, ToolActionHead
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
+    try:
+        device = torch.device("cpu")
+        cfg = ModelConfigV5(**PRESETS_V5["v5_test"])
+        torch.manual_seed(42)
+        raw_model = CerebroSpheroidV5(cfg).to(device)
+        raw_action_head = ToolActionHead(surface_dim=cfg.surface_dim, num_actions=len(ActionType)).to(device)
+        raw_combined = train_mod._CerebroDDPModule(raw_model, raw_action_head)
+        ddp_mod = DDP(raw_combined, find_unused_parameters=True)
+        opt = build_spheroid_optimizer(raw_combined, lr=5e-4)
+
+        opt.zero_grad(set_to_none=True)
+        for micro in range(2):
+            sync_ctx = ddp_mod.no_sync() if micro == 0 else contextlib.nullcontext()
+            with sync_ctx:
+                torch.manual_seed(1000 + rank * 100 + micro)
+                prompts = torch.randint(0, cfg.vocab_size, (2, 10))
+                targets = torch.randint(0, cfg.vocab_size, (2, 6))
+                # Vary perceptual branch across rank/micro to stress unused parameter handling
+                percep = torch.randn(2, 4, cfg.visual_dim) if (rank == 0 and micro == 0) else None
+                compute_act = (micro == 1)
+                ce_loss, _, act_logits = ddp_mod(
+                    prompts,
+                    targets=targets,
+                    pad_id=0,
+                    perceptual_inputs=percep,
+                    compute_action=compute_act,
+                )
+                loss = ce_loss / 2.0
+                if act_logits is not None:
+                    loss = loss + 0.05 * act_logits.square().mean()
+                loss.backward()
+        opt.step()
+
+        assert train_mod._sync_stop_signal(rank == 0, True, device) is True
+        dist.barrier()
+        torch.save({k: v.detach().cpu() for k, v in raw_combined.state_dict().items()}, os.path.join(out_dir, f"rank_{rank}.pt"))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_ddp_2rank_gloo_smoke(tmp_path):
+    import socket
+    import torch.multiprocessing as mp
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        free_port = s.getsockname()[1]
+
+    mp.spawn(_ddp_gloo_worker, args=(2, free_port, str(tmp_path)), nprocs=2, join=True)
+
+    r0 = torch.load(os.path.join(tmp_path, "rank_0.pt"), map_location="cpu", weights_only=True)
+    r1 = torch.load(os.path.join(tmp_path, "rank_1.pt"), map_location="cpu", weights_only=True)
+    assert r0.keys() == r1.keys()
+    for k in r0:
+        assert torch.allclose(r0[k], r1[k], atol=1e-5), f"DDP rank divergence in {k}"

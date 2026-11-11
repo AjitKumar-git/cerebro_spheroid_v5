@@ -107,9 +107,11 @@ def _clamp_spectral_norm(
 
     B, M, N = W_mat.shape
 
-    # Fast persistent power iteration
+    # Fast persistent power iteration (deterministic init keeps DDP ranks bitwise synced)
     if v is None or v.shape != (B, N, 1) or v.device != W.device or v.dtype != W.dtype:
-        v = torch.randn(B, N, 1, device=W.device, dtype=W.dtype)
+        idx = torch.arange(N, device=W.device, dtype=torch.float32).view(1, N, 1)
+        v_base = torch.cos(idx * 1.6180339887 + 0.37) + 0.5 * torch.sin(idx * 2.718281828)
+        v = v_base.expand(B, N, 1).to(dtype=W.dtype).contiguous()
         v = v / v.norm(dim=1, keepdim=True).clamp_min(eps)
         num_steps = max(5, power_steps)  # Cold start: 5 iterations
     else:

@@ -20,7 +20,266 @@ import collections
 import queue
 import random
 import threading
+import time
 import numpy as np
+
+
+def extract_prompt_response_pair(row: Any) -> Tuple[str, str]:
+    """Extract `(prompt, response)` strings from HF/Parquet/tuple dataset records."""
+    if isinstance(row, (tuple, list)):
+        if len(row) == 3:
+            return str(row[1]), str(row[2])
+        elif len(row) >= 2:
+            return str(row[0]), str(row[1])
+        return "", ""
+
+    if isinstance(row, dict):
+        # 0. CerebroCognitive schema
+        if "stimulus" in row and "articulation" in row:
+            q_txt = str(row.get("stimulus") or "").strip()
+            r_txt = str(row.get("articulation") or "").strip()
+            if q_txt and r_txt:
+                return q_txt, r_txt
+
+        # 1. OpenHermes / ShareGPT format
+        convs = row.get("conversations", [])
+        if convs:
+            q_txt, r_txt = "", ""
+            for turn in convs:
+                sender = str(turn.get("from", "")).lower()
+                val = turn.get("value", "")
+                if ("human" in sender or "user" in sender) and not q_txt:
+                    q_txt = val
+                elif ("gpt" in sender or "assistant" in sender or "model" in sender) and not r_txt:
+                    r_txt = val
+            if q_txt and r_txt:
+                return str(q_txt), str(r_txt)
+
+        # 2. SmolTalk / UltraChat / ChatML format
+        msgs = row.get("messages", [])
+        if msgs:
+            q_txt, r_txt = "", ""
+            for msg in msgs:
+                role = str(msg.get("role", "")).lower()
+                val = msg.get("content", "")
+                if ("user" in role or "human" in role) and not q_txt:
+                    q_txt = val
+                elif ("assistant" in role or "model" in role or "gpt" in role) and not r_txt:
+                    r_txt = val
+            if q_txt and r_txt:
+                return str(q_txt), str(r_txt)
+
+        # 3. GSM8K / Q&A / Cosmopedia format
+        q_txt = row.get("question", row.get("prompt", row.get("input", "")))
+        r_txt = row.get("answer", row.get("response", row.get("output", row.get("text", ""))))
+        if q_txt and r_txt:
+            return str(q_txt), str(r_txt)
+        if not q_txt and "text" in row:
+            raw_t = str(row["text"]).strip()
+            if "\n\n" in raw_t:
+                p, r = raw_t.split("\n\n", 1)
+            else:
+                p, r = "Explain and analyze the following topic:", raw_t
+            return p.strip(), r.strip()
+        return str(q_txt), str(r_txt)
+    return "", ""
+
+
+def _open_hf_stream(
+    repo: str,
+    config_name: Optional[str] = None,
+    split: str = "train",
+    rank: int = 0,
+    world_size: int = 1,
+) -> Iterator[Any]:
+    """Open a HuggingFace streaming dataset with optional multi-rank sharding."""
+    from datasets import load_dataset
+
+    kwargs: Dict[str, Any] = {"split": split, "streaming": True}
+    ds = load_dataset(repo, config_name, **kwargs) if config_name else load_dataset(repo, **kwargs)
+    if world_size > 1:
+        try:
+            from datasets.distributed import split_dataset_by_node
+            ds = split_dataset_by_node(ds, rank=rank, world_size=world_size)
+        except Exception:
+            if rank > 0 and hasattr(ds, "skip"):
+                ds = ds.skip(rank * 256)
+    return iter(ds)
+
+
+def build_online_dataset_iterator(
+    dataset_source: str = "dense_edu",
+    rank: int = 0,
+    world_size: int = 1,
+) -> Iterator[Dict[str, Any]]:
+    """
+    Infinite, resilient HuggingFace multi-corpus streaming iterator shared by TPU and GPU trainers.
+    Supports 'dense_edu'/'foundation', 'reasoning'/'reasoning_anneal', 'conversation_sft'/'agentic',
+    'code', and 'consolidation'/'balanced_mix'.
+    """
+    source = (dataset_source or "dense_edu").lower()
+    if source in ("foundation", "auto", "basic", "fineweb_edu"):
+        source = "dense_edu"
+    elif source in ("reasoning",):
+        source = "reasoning_anneal"
+    elif source in ("agentic", "workflows", "chat_sft"):
+        source = "conversation_sft"
+    elif source in ("balanced_mix", "balanced", "gold"):
+        source = "consolidation"
+
+    def _next_or_reopen(it: Optional[Iterator[Any]], opener):
+        if it is None:
+            it = opener()
+        try:
+            return next(it), it
+        except StopIteration:
+            it = opener()
+            return next(it), it
+
+    if source == "dense_edu":
+        cosmo_it: Optional[Iterator[Any]] = None
+        fw_it: Optional[Iterator[Any]] = None
+        oh_it: Optional[Iterator[Any]] = None
+
+        def _dense_gen():
+            nonlocal cosmo_it, fw_it, oh_it
+            turn = 0
+            while True:
+                mod5 = turn % 5
+                try:
+                    if mod5 in (0, 2):
+                        row, cosmo_it = _next_or_reopen(
+                            cosmo_it, lambda: _open_hf_stream("HuggingFaceTB/cosmopedia-v2", "cosmopedia-v2", rank=rank, world_size=world_size)
+                        )
+                        p = (row.get("prompt") or "Explain the educational context of this topic:").strip()
+                        r = (row.get("text") or "").strip()
+                        if len(r) >= 30:
+                            yield {"conversations": [{"from": "human", "value": p}, {"from": "gpt", "value": r}]}
+                    elif mod5 in (1, 4):
+                        for _ in range(20):
+                            row, fw_it = _next_or_reopen(
+                                fw_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-10BT", rank=rank, world_size=world_size)
+                            )
+                            if float(row.get("score", 0.0) or row.get("educational_score", 0.0)) >= 4.0:
+                                text = (row.get("text") or "").strip()
+                                if len(text) >= 50:
+                                    p, r = text.split("\n\n", 1) if "\n\n" in text else ("Explain the concept:", text)
+                                    yield {"conversations": [{"from": "human", "value": p.strip()}, {"from": "gpt", "value": r.strip()}]}
+                                    break
+                    else:
+                        row, oh_it = _next_or_reopen(
+                            oh_it, lambda: _open_hf_stream("teknium/OpenHermes-2.5", rank=rank, world_size=world_size)
+                        )
+                        yield row
+                except Exception:
+                    time.sleep(0.5)
+                turn += 1
+
+        return _dense_gen()
+
+    if source in ("conversation_sft", "code"):
+        smol_it: Optional[Iterator[Any]] = None
+        cosmo_it: Optional[Iterator[Any]] = None
+        oh_it: Optional[Iterator[Any]] = None
+
+        def _conv_gen():
+            nonlocal smol_it, cosmo_it, oh_it
+            turn = 0
+            while True:
+                mod10 = turn % 10
+                try:
+                    if mod10 < 5:
+                        row, smol_it = _next_or_reopen(
+                            smol_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "all", rank=rank, world_size=world_size)
+                        )
+                        yield row
+                    elif mod10 < 8 and source != "code":
+                        row, cosmo_it = _next_or_reopen(
+                            cosmo_it, lambda: _open_hf_stream("HuggingFaceTB/cosmopedia-v2", "cosmopedia-v2", rank=rank, world_size=world_size)
+                        )
+                        p = (row.get("prompt") or "Explain the concept:").strip()
+                        r = (row.get("text") or "").strip()
+                        yield {"conversations": [{"from": "human", "value": p}, {"from": "gpt", "value": r}]}
+                    else:
+                        row, oh_it = _next_or_reopen(
+                            oh_it, lambda: _open_hf_stream("teknium/OpenHermes-2.5", rank=rank, world_size=world_size)
+                        )
+                        yield row
+                except Exception:
+                    time.sleep(0.5)
+                turn += 1
+
+        return _conv_gen()
+
+    if source == "reasoning_anneal":
+        gsm_it: Optional[Iterator[Any]] = None
+        oh_it: Optional[Iterator[Any]] = None
+
+        def _reason_gen():
+            nonlocal gsm_it, oh_it
+            turn = 0
+            while True:
+                try:
+                    if turn % 2 == 0:
+                        row, gsm_it = _next_or_reopen(
+                            gsm_it, lambda: _open_hf_stream("gsm8k", "main", rank=rank, world_size=world_size)
+                        )
+                        yield {"conversations": [{"from": "human", "value": row.get("question", "")}, {"from": "gpt", "value": row.get("answer", "")}]}
+                    else:
+                        row, oh_it = _next_or_reopen(
+                            oh_it, lambda: _open_hf_stream("teknium/OpenHermes-2.5", rank=rank, world_size=world_size)
+                        )
+                        yield row
+                except Exception:
+                    time.sleep(0.5)
+                turn += 1
+
+        return _reason_gen()
+
+    if source == "consolidation":
+        dense_it: Optional[Iterator[Any]] = None
+        reason_it: Optional[Iterator[Any]] = None
+        conv_it: Optional[Iterator[Any]] = None
+
+        def _consol_gen():
+            nonlocal dense_it, reason_it, conv_it
+            turn = 0
+            while True:
+                mod4 = turn % 4
+                try:
+                    if mod4 in (0, 1):
+                        if dense_it is None:
+                            dense_it = build_online_dataset_iterator("dense_edu", rank=rank, world_size=world_size)
+                        yield next(dense_it)
+                    elif mod4 == 2:
+                        if reason_it is None:
+                            reason_it = build_online_dataset_iterator("reasoning_anneal", rank=rank, world_size=world_size)
+                        yield next(reason_it)
+                    else:
+                        if conv_it is None:
+                            conv_it = build_online_dataset_iterator("conversation_sft", rank=rank, world_size=world_size)
+                        yield next(conv_it)
+                except Exception:
+                    time.sleep(0.5)
+                turn += 1
+
+        return _consol_gen()
+
+    # Fallback: OpenHermes-2.5
+    oh_it: Optional[Iterator[Any]] = None
+
+    def _oh_gen():
+        nonlocal oh_it
+        while True:
+            try:
+                row, oh_it = _next_or_reopen(
+                    oh_it, lambda: _open_hf_stream("teknium/OpenHermes-2.5", rank=rank, world_size=world_size)
+                )
+                yield row
+            except Exception:
+                time.sleep(0.5)
+
+    return _oh_gen()
 
 
 def sample_window(
@@ -133,57 +392,8 @@ class ElasticBucketBatcher:
         self.queues: Dict[int, collections.deque] = {i: collections.deque(maxlen=self.max_queue_size) for i in range(len(self.buckets))}
 
     def _extract_text_pair(self, row: Any) -> Tuple[str, str]:
-        """Extracts (prompt, response) from diverse dataset formats (OpenHermes, ShareGPT, LMSYS, tuple pairs, etc.)."""
-        if isinstance(row, (tuple, list)):
-            if len(row) == 3:
-                return str(row[1]), str(row[2])
-            elif len(row) >= 2:
-                return str(row[0]), str(row[1])
-            return "", ""
-
-        if isinstance(row, dict):
-            # 1. OpenHermes / ShareGPT format
-            convs = row.get("conversations", [])
-            if convs:
-                q_txt, r_txt = "", ""
-                for turn in convs:
-                    sender = str(turn.get("from", "")).lower()
-                    val = turn.get("value", "")
-                    if ("human" in sender or "user" in sender) and not q_txt:
-                        q_txt = val
-                    elif ("gpt" in sender or "assistant" in sender or "model" in sender) and not r_txt:
-                        r_txt = val
-                if q_txt and r_txt:
-                    return str(q_txt), str(r_txt)
-
-            # 2. SmolTalk / UltraChat / ChatML format
-            msgs = row.get("messages", [])
-            if msgs:
-                q_txt, r_txt = "", ""
-                for msg in msgs:
-                    role = str(msg.get("role", "")).lower()
-                    val = msg.get("content", "")
-                    if ("user" in role or "human" in role) and not q_txt:
-                        q_txt = val
-                    elif ("assistant" in role or "model" in role or "gpt" in role) and not r_txt:
-                        r_txt = val
-                if q_txt and r_txt:
-                    return str(q_txt), str(r_txt)
-
-            # 3. GSM8K / Q&A / Cosmopedia format
-            q_txt = row.get("question", row.get("prompt", row.get("input", "")))
-            r_txt = row.get("answer", row.get("response", row.get("output", row.get("text", ""))))
-            if q_txt and r_txt:
-                return str(q_txt), str(r_txt)
-            if not q_txt and "text" in row:
-                raw_t = str(row["text"]).strip()
-                if "\n\n" in raw_t:
-                    p, r = raw_t.split("\n\n", 1)
-                else:
-                    p, r = "", raw_t
-                return p.strip(), r.strip()
-            return str(q_txt), str(r_txt)
-        return "", ""
+        """Extracts (prompt, response) from diverse dataset formats via shared extractor."""
+        return extract_prompt_response_pair(row)
 
     def _format_batch(self, b_idx: int, name: str, p_list: list, t_list: list, c_list: Optional[list] = None):
         if self.framework == "torch":

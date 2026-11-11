@@ -1,0 +1,19 @@
+{
+  "id": "ajitsheoran/cerebro-spheroid-v5-2xt4",
+  "title": "CerebroSpheroid V5 2xT4 Training",
+  "code_file": "cerebro_spheroid_v5_kaggle_2xt4.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "keywords": [
+    "gpu"
+  ],
+  "dataset_sources": [],
+  "kernel_sources": [],
+  "competition_sources": [],
+  "model_sources": [],
+  "machine_shape": "NvidiaTeslaT4"
+}

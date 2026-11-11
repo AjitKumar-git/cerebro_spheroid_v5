@@ -41,7 +41,9 @@ from __future__ import annotations
 import glob
 import math
 import os
+import queue
 import random
+import threading
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
@@ -50,7 +52,10 @@ import pyarrow.parquet as pq
 import torch
 from torch.utils.data import IterableDataset
 
+from src.corpus import format_motor_response, format_stimulus_prompt
 from src.elastic_window import (
+    build_online_dataset_iterator,
+    extract_prompt_response_pair,
     get_default_elastic_buckets,
     sample_window,
     select_best_bucket,
@@ -86,11 +91,12 @@ class CurriculumScheduleConfig:
     min_lr: float = 0.0
     energy_reg_phase_1_3: float = 0.01
     energy_reg_phase_4: float = 0.05
+    prompt_len: int = 32
     seq_len: int = 256
-    batch_size: int = 2
+    batch_size: int = 8
     visual_dim: int = 512
     num_visual_patches: int = 16
-    multimodal_sample_ratio: float = 0.35
+    multimodal_sample_ratio: float = 0.0
 
 
 def get_curriculum_phase(step: int, config: CurriculumScheduleConfig) -> CurriculumPhase:
@@ -149,16 +155,50 @@ class GradedCurriculumStreamer:
         search_dirs: Optional[List[str]] = None,
         seed: int = 42,
         mix: str = "auto",
+        offline: bool = False,
+        rank: int = 0,
+        world_size: int = 1,
+        online_streaming: Optional[bool] = None,
+        prefetch_size: int = 128,
     ):
         self.tokenizer = tokenizer
         self.config = config
         self.mix = mix.lower()
         self.rng = random.Random(seed)
+        self.rank = rank
+        self.world_size = max(1, world_size)
+        self.prefetch_size = prefetch_size
+
+        if online_streaming is None:
+            tok_cls = type(tokenizer).__name__
+            is_mock = "Mock" in tok_cls
+            env_off = os.environ.get("HF_HUB_OFFLINE", "0") == "1"
+            self.online_streaming = (not offline) and (not env_off) and (not is_mock)
+        else:
+            self.online_streaming = online_streaming
+
         self.search_dirs = search_dirs or [
             "data",
             os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data"),
         ]
         self._dataset_files = self._locate_local_datasets()
+        self._local_pools: Dict[str, List[Tuple[str, str]]] = {}
+        self._local_cursors: Dict[str, int] = {}
+
+        self._stop_event = threading.Event()
+        self._worker_lock = threading.Lock()
+        self._online_queues: Dict[str, queue.Queue] = {}
+        self._online_connected: Dict[str, bool] = {}
+        self._online_failed: Dict[str, bool] = {}
+        self._online_threads: Dict[str, threading.Thread] = {}
+
+    def close(self):
+        """Signal any background online streaming workers to stop."""
+        self._stop_event.set()
+
+    def shutdown(self):
+        """Alias for close() matching PrefetchedBatcher API."""
+        self.close()
 
     def _locate_local_datasets(self) -> Dict[str, List[str]]:
         """Scans search directories to catalog available parquet files."""
@@ -274,64 +314,154 @@ class GradedCurriculumStreamer:
         ]
         return self.rng.choice(tool_scenarios)
 
-    def _stream_parquet_samples(self, file_path: str, max_samples: int = 100) -> Iterator[str]:
-        """Memory-mapped streaming reader for Parquet rows."""
+    def _stream_parquet_samples(self, file_path: str, max_samples: Optional[int] = None) -> Iterator[Tuple[str, str]]:
+        """Memory-mapped streaming reader yielding extracted (prompt, response) pairs."""
+        count = 0
         try:
             parquet_file = pq.ParquetFile(file_path)
-            for batch in parquet_file.iter_batches(batch_size=32):
-                df = batch.to_pandas()
-                cols = df.columns.tolist()
-
-                for _, row in df.iterrows():
-                    # Parse based on schema
-                    if "stimulus" in cols and "articulation" in cols:
-                        yield f"Stimulus: {row['stimulus']}\nArticulation: {row['articulation']}"
-                    elif "question" in cols and "answer" in cols:
-                        yield f"Question: {row['question']}\nThought Process: Let us solve this step by step.\nAnswer: {row['answer']}"
-                    elif "conversations" in cols and isinstance(row["conversations"], list):
-                        dialogue = []
-                        for msg in row["conversations"]:
-                            role = msg.get("from", "speaker")
-                            val = msg.get("value", "")
-                            dialogue.append(f"{role.capitalize()}: {val}")
-                        yield "\n".join(dialogue)
-                    elif "messages" in cols and isinstance(row["messages"], list):
-                        dialogue = []
-                        for msg in row["messages"]:
-                            content = msg.get("content", "")
-                            dialogue.append(content)
-                        yield "\n".join(dialogue)
+            for batch in parquet_file.iter_batches(batch_size=512):
+                for row in batch.to_pylist():
+                    q_txt, r_txt = extract_prompt_response_pair(row)
+                    if q_txt and r_txt:
+                        yield q_txt, r_txt
+                        count += 1
+                        if max_samples is not None and count >= max_samples:
+                            return
         except Exception:
             return
 
-    def get_sample_for_phase(self, phase: CurriculumPhase) -> Tuple[str, int, Optional[torch.Tensor]]:
-        """
-        Samples a training text, action label, and optional perceptual visual patch tensor.
-        Respects active self.mix override if configured.
-        Returns:
-            text: formatted text string
-            action_label: int (0=CHAT, 1=BASH, 2=PYTHON, 3=FILE_READ, 4=FILE_WRITE, 5=CALC)
-            perceptual_flux: Optional[torch.Tensor] [P, visual_dim]
-        """
-        active_phase = phase
+    def _load_local_pool(self, bucket: str) -> List[Tuple[str, str]]:
+        """Loads, shards across DDP ranks, and shuffles all local Parquet pairs for a bucket."""
+        files = list(self._dataset_files.get(bucket, []))
+        if not files:
+            for fallback_key in ("gold", "reasoning", "workflows", "basic", "code"):
+                files.extend(self._dataset_files.get(fallback_key, []))
+        pairs: List[Tuple[str, str]] = []
+        seen_files = set()
+        for f in files:
+            if f in seen_files:
+                continue
+            seen_files.add(f)
+            pairs.extend(self._stream_parquet_samples(f))
+        if not pairs:
+            return []
+        self.rng.shuffle(pairs)
+        if self.world_size > 1 and len(pairs) >= self.world_size:
+            pairs = pairs[self.rank :: self.world_size]
+        return pairs
+
+    def _next_local_pair(self, bucket: str) -> Optional[Tuple[str, str]]:
+        """Returns the next distinct local pair for `bucket`, reshuffling at epoch boundaries."""
+        pool = self._local_pools.get(bucket)
+        if pool is None:
+            pool = self._load_local_pool(bucket)
+            self._local_pools[bucket] = pool
+            self._local_cursors[bucket] = 0
+        if not pool:
+            return None
+        idx = self._local_cursors.get(bucket, 0)
+        if idx >= len(pool):
+            self.rng.shuffle(pool)
+            idx = 0
+        pair = pool[idx]
+        self._local_cursors[bucket] = idx + 1
+        return pair
+
+    def _ensure_online_worker(self, stream_key: str) -> Optional[queue.Queue]:
+        if not self.online_streaming or self._online_failed.get(stream_key, False):
+            return None
+        with self._worker_lock:
+            if self._online_failed.get(stream_key, False):
+                return None
+            if stream_key in self._online_queues:
+                return self._online_queues[stream_key]
+            q: queue.Queue = queue.Queue(maxsize=self.prefetch_size)
+            self._online_queues[stream_key] = q
+
+            def _producer():
+                try:
+                    it = build_online_dataset_iterator(
+                        dataset_source=stream_key,
+                        rank=self.rank,
+                        world_size=self.world_size,
+                    )
+                    for row in it:
+                        if self._stop_event.is_set():
+                            break
+                        q_txt, r_txt = extract_prompt_response_pair(row)
+                        if len(q_txt.strip()) >= 2 and len(r_txt.strip()) >= 15:
+                            while not self._stop_event.is_set():
+                                try:
+                                    q.put((q_txt, r_txt), timeout=0.5)
+                                    break
+                                except queue.Full:
+                                    continue
+                except Exception:
+                    self._online_failed[stream_key] = True
+
+            t = threading.Thread(
+                target=_producer,
+                name=f"online-stream-{stream_key}-r{self.rank}",
+                daemon=True,
+            )
+            self._online_threads[stream_key] = t
+            t.start()
+            return q
+
+    def _next_online_pair(self, stream_key: str) -> Optional[Tuple[str, str]]:
+        q = self._ensure_online_worker(stream_key)
+        if q is None:
+            return None
+        wait_s = 20.0 if not self._online_connected.get(stream_key, False) else 2.0
+        try:
+            pair = q.get(timeout=wait_s)
+            self._online_connected[stream_key] = True
+            return pair
+        except queue.Empty:
+            return None
+
+    @staticmethod
+    def _split_legacy_text(text: str) -> Tuple[str, str]:
+        if "Response:" in text:
+            p_txt, r_txt = text.split("Response:", 1)
+            return p_txt.replace("Query:", "").strip(), r_txt.strip()
+        if "Answer:" in text:
+            p_txt, r_txt = text.split("Answer:", 1)
+            return p_txt.replace("Question:", "").strip(), r_txt.strip()
+        if "Assistant:" in text:
+            p_txt, r_txt = text.split("Assistant:", 1)
+            return p_txt.replace("User:", "").strip(), r_txt.strip()
+        if "\n\n" in text:
+            p_txt, r_txt = text.split("\n\n", 1)
+            return p_txt.strip(), r_txt.strip()
+        half = max(1, len(text) // 2)
+        return text[:half].strip(), text[half:].strip()
+
+    def _resolve_active_phase(self, phase: CurriculumPhase) -> CurriculumPhase:
         if self.mix == "foundation":
-            active_phase = CurriculumPhase.PHASE_1_BASIC
-        elif self.mix == "reasoning":
-            active_phase = CurriculumPhase.PHASE_2_REASONING
-        elif self.mix == "agentic":
-            active_phase = CurriculumPhase.PHASE_3_WORKFLOWS
-        elif self.mix in ("consolidation", "balanced", "gold"):
-            active_phase = CurriculumPhase.PHASE_4_CONSOLIDATION
-        elif self.mix == "code":
-            files = self._dataset_files.get("code", [])
-            if files:
-                f = self.rng.choice(files)
-                for s in self._stream_parquet_samples(f):
-                    return s, 2, None  # Action 2 = PYTHON
+            return CurriculumPhase.PHASE_1_BASIC
+        if self.mix == "reasoning":
+            return CurriculumPhase.PHASE_2_REASONING
+        if self.mix == "agentic":
+            return CurriculumPhase.PHASE_3_WORKFLOWS
+        if self.mix in ("consolidation", "balanced", "gold"):
+            return CurriculumPhase.PHASE_4_CONSOLIDATION
+        return phase
+
+    def get_pair_for_phase(
+        self, phase: CurriculumPhase
+    ) -> Tuple[str, str, int, Optional[torch.Tensor]]:
+        """Sample a `(prompt_text, response_text, action_label, perceptual_flux)` tuple."""
+        active_phase = self._resolve_active_phase(phase)
+
+        if self.mix == "code":
+            pair = self._next_online_pair("code") or self._next_local_pair("code")
+            if pair is not None:
+                return pair[0], pair[1], 2, None
             return (
-                "User: Write a python function for quicksort.\n"
-                "Assistant: def quicksort(arr):\n"
-                "    if len(arr) <= 1: return arr\n"
+                "Write a Python function to compute quicksort cleanly.",
+                "def quicksort(arr):\n"
+                "    if len(arr) <= 1:\n        return arr\n"
                 "    pivot = arr[len(arr) // 2]\n"
                 "    left = [x for x in arr if x < pivot]\n"
                 "    middle = [x for x in arr if x == pivot]\n"
@@ -341,57 +471,53 @@ class GradedCurriculumStreamer:
                 None,
             )
 
-        # If sampling a multimodal perceptual example
-        if self.rng.random() < getattr(self.config, "multimodal_sample_ratio", 0.35):
-            return self._generate_synthetic_multimodal(active_phase)
+        mm_ratio = getattr(self.config, "multimodal_sample_ratio", 0.0)
+        if mm_ratio > 0.0 and self.rng.random() < mm_ratio:
+            mm_text, act, patches = self._generate_synthetic_multimodal(active_phase)
+            p_txt, r_txt = self._split_legacy_text(mm_text)
+            return p_txt, r_txt, act, patches
 
         if active_phase == CurriculumPhase.PHASE_1_BASIC:
-            files = self._dataset_files["basic"]
-            if files:
-                f = self.rng.choice(files)
-                for s in self._stream_parquet_samples(f):
-                    return s, 0, None  # Action 0 = CHAT
-            return self._generate_synthetic_basic(), 0, None
+            pair = self._next_online_pair("dense_edu") or self._next_local_pair("basic")
+            if pair is not None:
+                return pair[0], pair[1], 0, None
+            return self._split_legacy_text(self._generate_synthetic_basic()) + (0, None)
 
-        elif active_phase == CurriculumPhase.PHASE_2_REASONING:
-            files = self._dataset_files["reasoning"]
-            if files:
-                f = self.rng.choice(files)
-                for s in self._stream_parquet_samples(f):
-                    return s, 0, None
-            # Fallback
-            return self._generate_synthetic_basic(), 0, None
+        if active_phase == CurriculumPhase.PHASE_2_REASONING:
+            pair = self._next_online_pair("reasoning_anneal") or self._next_local_pair("reasoning")
+            if pair is not None:
+                return pair[0], pair[1], 0, None
+            return self._split_legacy_text(self._generate_synthetic_basic()) + (0, None)
 
-        elif active_phase == CurriculumPhase.PHASE_3_WORKFLOWS:
-            # 60% agentic tool traces, 40% multi-turn conversations
-            if self.rng.random() < 0.6:
+        if active_phase == CurriculumPhase.PHASE_3_WORKFLOWS:
+            if self.rng.random() < 0.4:
                 text, act = self._generate_synthetic_agentic()
-                return text, act, None
-            else:
-                files = self._dataset_files["workflows"]
-                if files:
-                    f = self.rng.choice(files)
-                    for s in self._stream_parquet_samples(f):
-                        return s, 0, None
-                text, act = self._generate_synthetic_agentic()
-                return text, act, None
+                p_txt, r_txt = self._split_legacy_text(text)
+                return p_txt, r_txt, act, None
+            pair = self._next_online_pair("conversation_sft") or self._next_local_pair("workflows")
+            if pair is not None:
+                return pair[0], pair[1], 0, None
+            text, act = self._generate_synthetic_agentic()
+            p_txt, r_txt = self._split_legacy_text(text)
+            return p_txt, r_txt, act, None
 
-        else:  # PHASE_4_CONSOLIDATION (Mixed Replay Buffer)
-            r = self.rng.random()
-            if r < 0.05:
-                return self.get_sample_for_phase(CurriculumPhase.PHASE_1_BASIC)
-            elif r < 0.20:
-                return self.get_sample_for_phase(CurriculumPhase.PHASE_2_REASONING)
-            elif r < 0.40:
-                return self.get_sample_for_phase(CurriculumPhase.PHASE_3_WORKFLOWS)
-            else:
-                # 60% Gold-standard reasoning
-                files = self._dataset_files["gold"]
-                if files:
-                    f = self.rng.choice(files)
-                    for s in self._stream_parquet_samples(f):
-                        return s, 0, None
-                return self._generate_synthetic_basic(), 0, None
+        # PHASE_4_CONSOLIDATION
+        r = self.rng.random()
+        if r < 0.05:
+            return self.get_pair_for_phase(CurriculumPhase.PHASE_1_BASIC)
+        if r < 0.20:
+            return self.get_pair_for_phase(CurriculumPhase.PHASE_2_REASONING)
+        if r < 0.40:
+            return self.get_pair_for_phase(CurriculumPhase.PHASE_3_WORKFLOWS)
+        pair = self._next_online_pair("consolidation") or self._next_local_pair("gold")
+        if pair is not None:
+            return pair[0], pair[1], 0, None
+        return self._split_legacy_text(self._generate_synthetic_basic()) + (0, None)
+
+    def get_sample_for_phase(self, phase: CurriculumPhase) -> Tuple[str, int, Optional[torch.Tensor]]:
+        """Legacy string wrapper returning `(combined_text, action_label, perceptual_flux)`."""
+        q_txt, r_txt, act, patches = self.get_pair_for_phase(phase)
+        return f"{q_txt}\n\n{r_txt}", act, patches
 
     def get_batch(
         self,
@@ -400,13 +526,8 @@ class GradedCurriculumStreamer:
         batch_size: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], CurriculumPhase]:
         """
-        Generates a tokenized batch on-the-fly without saving intermediate files.
-        Returns:
-            input_ids: [B, T]
-            targets: [B, T]
-            action_labels: [B]
-            perceptual_inputs: Optional[torch.Tensor] [B, P, visual_dim] or None
-            current_phase: CurriculumPhase
+        Generates a Strategy-A formatted fixed-length batch on-the-fly.
+        Returns: (input_ids, targets, action_labels, perceptual_inputs, current_phase)
         """
         B = batch_size or self.config.batch_size
         T = self.config.seq_len
@@ -419,12 +540,21 @@ class GradedCurriculumStreamer:
         has_any_patches = False
 
         vocab_size = getattr(self.tokenizer, "vocab_size", 32000)
+        eos_id = getattr(self.tokenizer, "eos_token_id", 2)
+        if eos_id is None:
+            eos_id = 2
 
         for _ in range(B):
-            text, action_id, patches = self.get_sample_for_phase(phase)
-            raw_tokens = self.tokenizer.encode(text, add_special_tokens=False) if hasattr(self.tokenizer, "encode") else [ord(c) % vocab_size for c in text]
+            q_txt, r_txt, action_id, patches = self.get_pair_for_phase(phase)
+            formatted = f"{format_stimulus_prompt(q_txt)}\n{format_motor_response(r_txt)}"
+            raw_tokens = (
+                self.tokenizer.encode(formatted, add_special_tokens=False)
+                if hasattr(self.tokenizer, "encode")
+                else [ord(c) % vocab_size for c in formatted]
+            )
+            if not raw_tokens or raw_tokens[-1] != eos_id:
+                raw_tokens = raw_tokens + [eos_id]
 
-            # Enforce vocab bounds safely
             safe_tokens = [t % vocab_size for t in raw_tokens]
 
             if len(safe_tokens) < T + 1:
@@ -437,7 +567,6 @@ class GradedCurriculumStreamer:
                 if valid_len == 0:
                     tgt = [-100] * T
             else:
-                # V4 window slice with 25% tail probability for EOS representation
                 max_start = len(safe_tokens) - (T + 1)
                 if max_start > 0 and self.rng.random() < 0.25:
                     start_idx = max_start
@@ -455,9 +584,7 @@ class GradedCurriculumStreamer:
                 has_any_patches = True
                 batch_patches.append(patches)
             else:
-                P = getattr(self.config, "num_visual_patches", 16)
-                V = getattr(self.config, "visual_dim", 512)
-                batch_patches.append(torch.zeros(P, V))
+                batch_patches.append(None)
 
         input_ids = torch.tensor(batch_input_ids, dtype=torch.long, device=device)
         targets = torch.tensor(batch_targets, dtype=torch.long, device=device)
@@ -465,7 +592,10 @@ class GradedCurriculumStreamer:
 
         perceptual_inputs = None
         if has_any_patches:
-            perceptual_inputs = torch.stack(batch_patches, dim=0).to(device)
+            P = getattr(self.config, "num_visual_patches", 16)
+            V = getattr(self.config, "visual_dim", 512)
+            filled = [p if p is not None else torch.zeros(P, V) for p in batch_patches]
+            perceptual_inputs = torch.stack(filled, dim=0).to(device)
 
         return input_ids, targets, action_labels, perceptual_inputs, phase
 
@@ -477,84 +607,71 @@ class GradedCurriculumStreamer:
         total_window: int = 1024,
         tail_probability: float = 0.25,
         target_pad_id: int = -100,
+        buckets: Optional[List[Tuple[str, int, int]]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], CurriculumPhase, str]:
         """
-        V4-style Elastic Sliding Context Window batcher with complementary (L_p, L_t) buckets.
-        Returns:
-            prompts: [B, L_prompt]
-            targets: [B, L_target]
-            feedback: [B, L_target] (pre-shifted with context_token at step 0)
-            action_labels: [B]
-            perceptual_inputs: Optional[torch.Tensor] [B, P, visual_dim] or None
-            current_phase: CurriculumPhase
-            bucket_name: str
+        V4-style Strategy-A Elastic / Static Sliding Context Window batcher with teacher feedback.
+        Pass explicit `buckets=[("static", prompt_len, seq_len)]` for exact TPU sequence parity.
         """
         B = batch_size or self.config.batch_size
         phase = get_curriculum_phase(step, self.config)
-        buckets = get_default_elastic_buckets(total_window)
+        active_buckets = buckets if buckets is not None else get_default_elastic_buckets(total_window)
         vocab_size = getattr(self.tokenizer, "vocab_size", 32000)
-        pad_id = getattr(self.tokenizer, "pad_token_id", 0) or 0
-        eos_id = getattr(self.tokenizer, "eos_token_id", 2) or 2
+        pad_id = getattr(self.tokenizer, "pad_token_id", 0)
+        if pad_id is None:
+            pad_id = 0
+        eos_id = getattr(self.tokenizer, "eos_token_id", 2)
+        if eos_id is None:
+            eos_id = 2
 
-        # 1. Pull B samples and split into prompt vs response
         records = []
         batch_actions = []
         batch_patches = []
         has_any_patches = False
 
         for _ in range(B):
-            text, action_id, patches = self.get_sample_for_phase(phase)
+            p_txt, r_txt, action_id, patches = self.get_pair_for_phase(phase)
             batch_actions.append(action_id)
             if patches is not None:
                 has_any_patches = True
                 batch_patches.append(patches)
             else:
-                P = getattr(self.config, "num_visual_patches", 16)
-                V = getattr(self.config, "visual_dim", 512)
-                batch_patches.append(torch.zeros(P, V))
+                batch_patches.append(None)
 
-            # Split prompt and response
-            if "Response:" in text:
-                p_txt, r_txt = text.split("Response:", 1)
-                p_txt = p_txt.replace("Query:", "").strip()
-            elif "Answer:" in text:
-                p_txt, r_txt = text.split("Answer:", 1)
-                p_txt = p_txt.replace("Question:", "").strip()
-            elif "Assistant:" in text:
-                p_txt, r_txt = text.split("Assistant:", 1)
-                p_txt = p_txt.replace("User:", "").strip()
-            elif "\n\n" in text:
-                p_txt, r_txt = text.split("\n\n", 1)
-            else:
-                half = max(1, len(text) // 2)
-                p_txt, r_txt = text[:half], text[half:]
+            # Strategy A delimited formatting matching ElasticBucketBatcher (TPU JAX parity)
+            q_fmt = format_stimulus_prompt(p_txt)
+            r_fmt = format_motor_response(r_txt)
 
-            q_ids = self.tokenizer.encode(p_txt, add_special_tokens=False) if hasattr(self.tokenizer, "encode") else [ord(c) % vocab_size for c in p_txt]
-            r_ids = self.tokenizer.encode(r_txt, add_special_tokens=False) if hasattr(self.tokenizer, "encode") else [ord(c) % vocab_size for c in r_txt]
+            q_ids = (
+                self.tokenizer.encode(q_fmt, add_special_tokens=False)
+                if hasattr(self.tokenizer, "encode")
+                else [ord(c) % vocab_size for c in q_fmt]
+            )
+            r_ids = (
+                self.tokenizer.encode(r_fmt, add_special_tokens=False)
+                if hasattr(self.tokenizer, "encode")
+                else [ord(c) % vocab_size for c in r_fmt]
+            )
             if not r_ids or r_ids[-1] != eos_id:
                 r_ids = r_ids + [eos_id]
 
             records.append((q_ids, r_ids))
 
-        # 2. Select best bucket based on median length
         avg_q = max(1, sum(len(q) for q, _ in records) // len(records))
         avg_r = max(1, sum(len(r) for _, r in records) // len(records))
-        b_idx = select_best_bucket(avg_q, avg_r, buckets)
-        bucket_name, bp, bt = buckets[b_idx]
+        b_idx = select_best_bucket(avg_q, avg_r, active_buckets)
+        bucket_name, bp, bt = active_buckets[b_idx]
 
-        # 3. Format batches with V4 window sampling
         batch_prompts = []
         batch_targets = []
         batch_feedback = []
 
         for q_ids, r_ids in records:
-            # Prompt pad/truncate
             if len(q_ids) > bp:
                 q_padded = q_ids[:bp]
             else:
                 q_padded = q_ids + [pad_id] * (bp - len(q_ids))
 
-            # Target window sampling
             if len(r_ids) > bt:
                 context_token, scored = sample_window(r_ids, bt, self.rng, tail_probability)
                 r_padded = scored
@@ -562,7 +679,6 @@ class GradedCurriculumStreamer:
                 context_token = None
                 r_padded = r_ids + [target_pad_id] * (bt - len(r_ids))
 
-            # Feedback array [bt]
             feed_row = [target_pad_id] * bt
             if context_token is not None:
                 feed_row[0] = context_token
@@ -580,6 +696,9 @@ class GradedCurriculumStreamer:
 
         perceptual_inputs = None
         if has_any_patches:
-            perceptual_inputs = torch.stack(batch_patches, dim=0).to(device)
+            P = getattr(self.config, "num_visual_patches", 16)
+            V = getattr(self.config, "visual_dim", 512)
+            filled = [p if p is not None else torch.zeros(P, V) for p in batch_patches]
+            perceptual_inputs = torch.stack(filled, dim=0).to(device)
 
         return prompts, targets, feedback, action_labels, perceptual_inputs, phase, bucket_name
