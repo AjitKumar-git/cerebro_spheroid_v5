@@ -159,7 +159,7 @@ class GradedCurriculumStreamer:
         rank: int = 0,
         world_size: int = 1,
         online_streaming: Optional[bool] = None,
-        prefetch_size: int = 128,
+        prefetch_size: int = 32,
     ):
         self.tokenizer = tokenizer
         self.config = config
@@ -379,25 +379,37 @@ class GradedCurriculumStreamer:
             self._online_queues[stream_key] = q
 
             def _producer():
-                try:
-                    it = build_online_dataset_iterator(
-                        dataset_source=stream_key,
-                        rank=self.rank,
-                        world_size=self.world_size,
-                    )
-                    for row in it:
-                        if self._stop_event.is_set():
-                            break
-                        q_txt, r_txt = extract_prompt_response_pair(row)
-                        if len(q_txt.strip()) >= 2 and len(r_txt.strip()) >= 15:
-                            while not self._stop_event.is_set():
-                                try:
-                                    q.put((q_txt, r_txt), timeout=0.5)
-                                    break
-                                except queue.Full:
-                                    continue
-                except Exception:
-                    self._online_failed[stream_key] = True
+                max_attempts = 3
+                for attempt in range(max_attempts):
+                    if self._stop_event.is_set():
+                        return
+                    try:
+                        it = build_online_dataset_iterator(
+                            dataset_source=stream_key,
+                            rank=self.rank,
+                            world_size=self.world_size,
+                        )
+                        for row in it:
+                            if self._stop_event.is_set():
+                                return
+                            q_txt, r_txt = extract_prompt_response_pair(row)
+                            if len(q_txt.strip()) >= 2 and len(r_txt.strip()) >= 15:
+                                while not self._stop_event.is_set():
+                                    try:
+                                        q.put((q_txt, r_txt), timeout=0.5)
+                                        break
+                                    except queue.Full:
+                                        continue
+                        return
+                    except Exception as exc:
+                        print(
+                            f"⚠️ [online-stream:{stream_key}:r{self.rank}] "
+                            f"attempt {attempt + 1}/{max_attempts} failed ({type(exc).__name__}: {exc})"
+                        )
+                        if attempt + 1 >= max_attempts:
+                            self._online_failed[stream_key] = True
+                            return
+                        self._stop_event.wait(timeout=min(2.0 ** attempt, 8.0))
 
             t = threading.Thread(
                 target=_producer,

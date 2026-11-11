@@ -87,18 +87,46 @@ def extract_prompt_response_pair(row: Any) -> Tuple[str, str]:
     return "", ""
 
 
+_DEFAULT_DATASET_REVISIONS: Dict[str, str] = {
+    # OpenHermes-2.5's default branch holds a single 1.94 GB JSON array file,
+    # causing datasets' JSON builder to buffer the full file + ujson AST in RAM
+    # (~15+ GB per rank) and trigger host OOM SIGKILL on 2xT4 containers. The
+    # auto-converted Parquet branch streams row-groups in <250 MB RSS per rank.
+    "teknium/OpenHermes-2.5": "refs/convert/parquet",
+}
+
+
 def _open_hf_stream(
     repo: str,
     config_name: Optional[str] = None,
     split: str = "train",
     rank: int = 0,
     world_size: int = 1,
+    revision: Optional[str] = None,
 ) -> Iterator[Any]:
     """Open a HuggingFace streaming dataset with optional multi-rank sharding."""
+    import os
+
+    if "HF_HOME" not in os.environ:
+        default_cache = os.path.join(os.path.expanduser("~"), ".cache")
+        if not os.access(default_cache, os.W_OK):
+            os.environ["HF_HOME"] = "/tmp/hf_cache"
+
     from datasets import load_dataset
 
+    effective_revision = revision if revision is not None else _DEFAULT_DATASET_REVISIONS.get(repo)
     kwargs: Dict[str, Any] = {"split": split, "streaming": True}
-    ds = load_dataset(repo, config_name, **kwargs) if config_name else load_dataset(repo, **kwargs)
+    if effective_revision is not None:
+        kwargs["revision"] = effective_revision
+
+    try:
+        ds = load_dataset(repo, config_name, **kwargs) if config_name else load_dataset(repo, **kwargs)
+    except TypeError:
+        if "revision" in kwargs:
+            kwargs.pop("revision", None)
+            ds = load_dataset(repo, config_name, **kwargs) if config_name else load_dataset(repo, **kwargs)
+        else:
+            raise
     if world_size > 1:
         try:
             from datasets.distributed import split_dataset_by_node

@@ -103,6 +103,7 @@ from src.corpus import build_tokenizer
 from src.elastic_window import (
     ElasticBucketBatcher,
     PrefetchedBatcher,
+    build_online_dataset_iterator,
     get_default_elastic_buckets,
 )
 from src.jax.data_streamer import LinguisticDataStreamer
@@ -223,107 +224,11 @@ def build_data_stream(
     print(f"\n📦 Initializing Online Streaming Dataset: [{dataset_source.upper()}]...")
     data_iter = None
     try:
-        if dataset_source == "dense_edu":
-            def _make_cosmo():
-                return iter(load_dataset("HuggingFaceTB/cosmopedia-v2", "cosmopedia-v2", split="train", streaming=True))
-            def _make_fw():
-                return iter(load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True))
-            def _make_oh():
-                return iter(load_dataset("teknium/OpenHermes-2.5", split="train", streaming=True))
+        import itertools
 
-            cosmo_raw = _make_cosmo()
-            fw_raw = _make_fw()
-            oh_raw = _make_oh()
-
-            def _dense_stream():
-                nonlocal cosmo_raw, fw_raw, oh_raw
-                turn = 0
-                while True:
-                    mod5 = turn % 5
-                    try:
-                        if mod5 in (0, 2):
-                            try:
-                                row = next(cosmo_raw)
-                            except StopIteration:
-                                cosmo_raw = _make_cosmo()
-                                row = next(cosmo_raw)
-                            p = (row.get("prompt") or "Explain the educational context of this topic:").strip()
-                            r = (row.get("text") or "").strip()
-                            if len(r) >= 30:
-                                yield {"conversations": [{"from": "human", "value": p}, {"from": "gpt", "value": r}]}
-                        elif mod5 in (1, 4):
-                            for _ in range(20):
-                                try:
-                                    row = next(fw_raw)
-                                except StopIteration:
-                                    fw_raw = _make_fw()
-                                    row = next(fw_raw)
-                                if float(row.get("score", 0.0) or row.get("educational_score", 0.0)) >= 4.0:
-                                    text = (row.get("text") or "").strip()
-                                    if len(text) >= 50:
-                                        p, r = text.split("\n\n", 1) if "\n\n" in text else ("Explain the concept:", text)
-                                        yield {"conversations": [{"from": "human", "value": p.strip()}, {"from": "gpt", "value": r.strip()}]}
-                                        break
-                        else:
-                            try:
-                                yield next(oh_raw)
-                            except StopIteration:
-                                oh_raw = _make_oh()
-                                yield next(oh_raw)
-                    except Exception:
-                        time.sleep(0.5)
-                    turn += 1
-            data_iter = _dense_stream()
-
-        elif dataset_source in ("conversation_sft", "chat_sft"):
-            smol_raw = iter(load_dataset("HuggingFaceTB/smoltalk", "all", split="train", streaming=True))
-            cosmo_raw = iter(load_dataset("HuggingFaceTB/cosmopedia-v2", "cosmopedia-v2", split="train", streaming=True))
-            oh_raw = iter(load_dataset("teknium/OpenHermes-2.5", split="train", streaming=True))
-
-            def _conv_stream():
-                nonlocal smol_raw, cosmo_raw, oh_raw
-                turn = 0
-                while True:
-                    mod10 = turn % 10
-                    try:
-                        if mod10 < 5:  # 50% SmolTalk
-                            yield next(smol_raw)
-                        elif mod10 < 8:  # 30% Cosmopedia-v2
-                            row = next(cosmo_raw)
-                            p = (row.get("prompt") or "Explain the concept:").strip()
-                            r = (row.get("text") or "").strip()
-                            yield {"conversations": [{"from": "human", "value": p}, {"from": "gpt", "value": r}]}
-                        else:  # 20% OpenHermes
-                            yield next(oh_raw)
-                    except Exception:
-                        time.sleep(0.5)
-                    turn += 1
-            data_iter = _conv_stream()
-
-        elif dataset_source == "reasoning_anneal":
-            gsm_raw = iter(load_dataset("gsm8k", "main", split="train", streaming=True))
-            oh_raw = iter(load_dataset("teknium/OpenHermes-2.5", split="train", streaming=True))
-
-            def _reason_stream():
-                nonlocal gsm_raw, oh_raw
-                turn = 0
-                while True:
-                    try:
-                        if turn % 2 == 0:
-                            row = next(gsm_raw)
-                            p = row.get("question", "")
-                            r = row.get("answer", "")
-                            yield {"conversations": [{"from": "human", "value": p}, {"from": "gpt", "value": r}]}
-                        else:
-                            yield next(oh_raw)
-                    except Exception:
-                        time.sleep(0.5)
-                    turn += 1
-            data_iter = _reason_stream()
-
-        else:  # balanced_mix / fineweb_edu / openhermes
-            oh_raw = iter(load_dataset("teknium/OpenHermes-2.5", split="train", streaming=True))
-            data_iter = oh_raw
+        raw_iter = build_online_dataset_iterator(dataset_source=dataset_source)
+        first_row = next(raw_iter)
+        data_iter = itertools.chain([first_row], raw_iter)
 
         # Build Elastic Context Batcher
         if use_elastic_window:

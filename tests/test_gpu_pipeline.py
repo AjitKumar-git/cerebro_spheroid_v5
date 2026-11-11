@@ -254,7 +254,7 @@ def test_kaggle_2xt4_kernel_artifacts_valid():
 
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
-    assert meta["id"] == "ajitsheoran/cerebro-spheroid-v5-2xt4"
+    assert meta["id"] == "ajitsheoran/cerebrospheroid-v5-2xt4-training"
     assert meta["machine_shape"] == "NvidiaTeslaT4"
     assert meta["enable_gpu"] is True
     assert meta["enable_tpu"] is False
@@ -284,6 +284,9 @@ def test_kaggle_2xt4_kernel_artifacts_valid():
     assert "--from-scratch" not in joined
     assert 'MODEL_PRESET = "v5_small"' in joined
     assert "TARGET_BATCH_SIZE = 64" in joined
+    assert 'REPO_DIR = "/tmp/cerebro_spheroid_v5"' in joined
+    assert 'env["MALLOC_ARENA_MAX"] = "2"' in joined
+    assert 'env["HF_HOME"] = "/tmp/hf_cache"' in joined
 
 
 def test_graded_curriculum_diversity_and_tpu_parity():
@@ -494,7 +497,7 @@ def test_kaggle_tpuv5e8_kernel_artifacts_valid():
 
     with open(meta_path, "r") as f:
         meta = json.load(f)
-    assert meta["id"] == "ajitsheoran/cerebro-spheroid-v5-tpu"
+    assert meta["id"] == "ajitsheoran/cerebrospheroid-v5-tpu-v5e-8-training"
     assert meta["code_file"] == "cerebro_spheroid_v5_kaggle_tpu.py"
     assert meta["kernel_type"] == "script"
     assert meta["language"] == "python"
@@ -523,3 +526,107 @@ def test_kaggle_tpuv5e8_kernel_artifacts_valid():
         assert required in src, f"Missing expected token/flag in Kaggle TPU script: {required}"
 
     assert "--from-scratch" not in src and "--from_scratch" not in src
+
+
+def test_open_hf_stream_uses_parquet_revision_for_openhermes(monkeypatch):
+    import sys
+    import types
+    from src.elastic_window import _open_hf_stream
+
+    calls = []
+
+    def fake_load_dataset(repo, config_name=None, **kwargs):
+        calls.append((repo, config_name, dict(kwargs)))
+        return [{"conversations": [{"from": "human", "value": "hi"}, {"from": "gpt", "value": "hello world example"}]}]
+
+    fake_datasets = types.ModuleType("datasets")
+    fake_datasets.load_dataset = fake_load_dataset
+    fake_dist = types.ModuleType("datasets.distributed")
+    fake_dist.split_dataset_by_node = lambda ds, rank=0, world_size=1: ds
+    monkeypatch.setitem(sys.modules, "datasets", fake_datasets)
+    monkeypatch.setitem(sys.modules, "datasets.distributed", fake_dist)
+
+    rows = list(_open_hf_stream("teknium/OpenHermes-2.5", rank=1, world_size=2))
+    assert len(rows) == 1
+    assert calls[0][0] == "teknium/OpenHermes-2.5"
+    assert calls[0][2]["revision"] == "refs/convert/parquet"
+    assert calls[0][2]["streaming"] is True
+
+    # Non-OpenHermes repos should not inject an unexpected revision kwarg.
+    list(_open_hf_stream("gsm8k", "main", rank=0, world_size=1))
+    assert calls[1][0] == "gsm8k"
+    assert "revision" not in calls[1][2]
+
+    # Legacy mocks that do not accept `revision` fall back cleanly via TypeError handling.
+    legacy_calls = []
+
+    def legacy_load_dataset(repo, config_name=None, split="train", streaming=True):
+        legacy_calls.append((repo, config_name, split, streaming))
+        return [{"ok": True}]
+
+    fake_datasets.load_dataset = legacy_load_dataset
+    assert list(_open_hf_stream("teknium/OpenHermes-2.5")) == [{"ok": True}]
+    assert legacy_calls == [("teknium/OpenHermes-2.5", None, "train", True)]
+
+
+def test_gpu_and_tpu_trainers_parity_and_checkpoint_link(tmp_path):
+    import os
+    import torch
+    from scripts.train_v5_graded_curriculum import _atomic_save_and_link
+
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    gpu_src = open(os.path.join(root, "scripts", "train_v5_graded_curriculum.py"), encoding="utf-8").read()
+    tpu_src = open(os.path.join(root, "scripts", "train_v5_tpu_jax.py"), encoding="utf-8").read()
+    tpu_mirror = open(os.path.join(root, "training", "train_v5_tpu_jax.py"), encoding="utf-8").read()
+
+    assert "select_highest_step_slot(" in gpu_src
+    assert 'device_id' in gpu_src
+    assert "build_online_dataset_iterator(" in tpu_src
+    assert 'teknium/OpenHermes-2.5' not in tpu_src
+    assert tpu_src == tpu_mirror
+
+    primary = str(tmp_path / "v5_small_latest.pt")
+    legacy = str(tmp_path / "latest.pt")
+    _atomic_save_and_link({"step": 42}, primary, legacy)
+    assert torch.load(primary, weights_only=True)["step"] == 42
+    assert torch.load(legacy, weights_only=True)["step"] == 42
+
+
+def test_graded_curriculum_retries_transient_stream_errors(monkeypatch):
+    from src import graded_curriculum as gc_mod
+
+    class _DummyTok:
+        pad_token_id = 0
+        eos_token_id = 2
+
+        def encode(self, text, add_special_tokens=False):
+            return [1, 2, 3, 4]
+
+    attempts = {"count": 0}
+
+    def flaky_iterator(dataset_source="dense_edu", rank=0, world_size=1):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise ConnectionError("transient hub timeout")
+        yield {
+            "conversations": [
+                {"from": "human", "value": "What is ATP?"},
+                {"from": "gpt", "value": "Adenosine triphosphate is the cellular energy currency."},
+            ]
+        }
+
+    monkeypatch.setattr(gc_mod, "build_online_dataset_iterator", flaky_iterator)
+    streamer = gc_mod.GradedCurriculumStreamer(
+        tokenizer=_DummyTok(),
+        config=gc_mod.CurriculumScheduleConfig(),
+        mix="dense_edu",
+        offline=False,
+        online_streaming=True,
+        prefetch_size=4,
+    )
+    pair = streamer._next_online_pair("dense_edu")
+    streamer._stop_event.set()
+    assert attempts["count"] >= 2
+    assert pair is not None
+    assert "ATP" in pair[0]
+    assert not streamer._online_failed.get("dense_edu", False)

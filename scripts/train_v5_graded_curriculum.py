@@ -18,9 +18,11 @@ Storage-Optimized:
 import argparse
 import contextlib
 import datetime
+import gc
 import math
 import os
 import random
+import shutil
 import signal
 import sys
 import time
@@ -62,6 +64,7 @@ from src.cloud_sync import (
     notify_training_start,
     pull_checkpoint,
     push_checkpoint_async,
+    select_highest_step_slot,
     wait_for_in_flight_uploads,
 )
 from src.graded_curriculum import (
@@ -178,6 +181,23 @@ def load_local_tokenizer(offline: bool = True):
     return build_tokenizer("llama")
 
 
+def _atomic_save_and_link(payload: dict, primary_path: str, legacy_path: str) -> None:
+    """Save checkpoint atomically to primary_path and hardlink/copy to legacy_path."""
+    tmp_primary = f"{primary_path}.tmp.{os.getpid()}"
+    torch.save(payload, tmp_primary)
+    os.replace(tmp_primary, primary_path)
+    if os.path.abspath(legacy_path) == os.path.abspath(primary_path):
+        return
+    tmp_legacy = f"{legacy_path}.tmp.{os.getpid()}"
+    if os.path.exists(tmp_legacy):
+        os.unlink(tmp_legacy)
+    try:
+        os.link(primary_path, tmp_legacy)
+    except OSError:
+        shutil.copy2(primary_path, tmp_legacy)
+    os.replace(tmp_legacy, legacy_path)
+
+
 def _save_and_push_checkpoints(
     checkpoint_dir: str,
     model_preset: str,
@@ -213,14 +233,12 @@ def _save_and_push_checkpoints(
         torch.save(ckpt_payload, ckpt_path)
         print(f"--> Saved checkpoint: {ckpt_path}")
 
-    torch.save(ckpt_payload, latest_path)
-    torch.save(ckpt_payload, legacy_latest)
+    _atomic_save_and_link(ckpt_payload, latest_path, legacy_latest)
 
     is_best = False
     if math.isfinite(loss_val) and loss_val > 0.0 and loss_val < best_loss:
         best_loss = loss_val
-        torch.save(ckpt_payload, best_path)
-        torch.save(ckpt_payload, legacy_best)
+        _atomic_save_and_link(ckpt_payload, best_path, legacy_best)
         is_best = True
         print(f"🌟 New best loss: {best_loss:.4f} -> saved {best_path}")
 
@@ -254,10 +272,14 @@ def main():
 
     if is_distributed:
         backend = "nccl" if use_cuda else "gloo"
-        dist.init_process_group(
-            backend=backend,
-            timeout=datetime.timedelta(minutes=30),
-        )
+        pg_kwargs = {"backend": backend, "timeout": datetime.timedelta(minutes=30)}
+        if use_cuda:
+            pg_kwargs["device_id"] = device
+        try:
+            dist.init_process_group(**pg_kwargs)
+        except TypeError:
+            pg_kwargs.pop("device_id", None)
+            dist.init_process_group(**pg_kwargs)
 
     try:
         _run_training(
@@ -347,8 +369,15 @@ def _run_training(
         print(f"[cloud_sync] Checking remote manifest on bioflo.in for {args.model_preset}...")
         notify_training_start(step=start_step, model=args.model_preset)
         manifest = check_remote_manifest(model=args.model_preset)
-        if manifest.get("has_latest", False):
-            pulled = pull_checkpoint(local_latest, target_type="latest", model=args.model_preset)
+        slot_model, remote_step, remote_loss = select_highest_step_slot(
+            manifest, args.model_preset, "latest"
+        )
+        if manifest.get("has_latest", False) or remote_step > 0:
+            print(
+                f"🔎 [cloud_sync] Selected remote slot model={slot_model or 'root'} "
+                f"(Step {remote_step:,}, Loss {remote_loss:.4f}) for latest.pt"
+            )
+            pulled = pull_checkpoint(local_latest, target_type="latest", model=slot_model)
             if pulled:
                 print(f"✓ Restored {args.model_preset} latest checkpoint from cloud hub!")
     if is_distributed:
@@ -417,6 +446,9 @@ def _run_training(
                 print(f"⚠️ Could not load checkpoint from {load_cand}: {e}")
         finally:
             del ckpt
+            gc.collect()
+            if use_cuda:
+                torch.cuda.empty_cache()
     elif args.from_scratch and is_main:
         print("🌱 [--from-scratch] Starting clean training from Step 0.")
 
