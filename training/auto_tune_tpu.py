@@ -31,7 +31,7 @@ def parse_args():
     parser.add_argument("--force-tune", "--force_tune", dest="force_tune", action="store_true", default=False, help="Force re-benchmark even if cached on bioflo.in")
     parser.add_argument("--launch-training", action="store_true", default=False, help="Launch pretraining with winning configuration immediately")
     parser.add_argument("--total-steps", type=int, default=1_000_000, help="Total training steps if launching")
-    parser.add_argument("--scratch", "--from-scratch", dest="from_scratch", action="store_true", default=True, help="Start from scratch (step 0)")
+    parser.add_argument("--scratch", "--from-scratch", dest="from_scratch", action="store_true", default=False, help="Start from scratch at Step 0 (bypass checkpoint resumption)")
     return parser.parse_args()
 
 
