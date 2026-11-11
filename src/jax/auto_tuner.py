@@ -113,6 +113,7 @@ def generate_vram_maximizing_candidates(
     preset: str,
     total_gb: float = 16.0,
     seq_len: int = 256,
+    max_batch_size: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """
     Generates a progressive search ladder designed to push hardware memory
@@ -129,7 +130,10 @@ def generate_vram_maximizing_candidates(
     elif total_gb >= 12.0:
         # Standard datacenter accelerator: TPU v5e-1 (16GB), T4 (16GB), V100 (16GB), L4 (24GB), RTX 3090/4090 (24GB)
         if preset in ("v5_small", "tpu_v5e_1"):
-            base_ladder = [32, 64, 128, 192, 256, 384]
+            if max_batch_size is not None and max_batch_size <= 64:
+                base_ladder = [16, 32, 64]
+            else:
+                base_ladder = [32, 64, 128, 192, 256, 384]
         elif preset == "v5_compact":
             base_ladder = [16, 32, 64, 96, 128]
         elif preset == "v5_test":
@@ -147,6 +151,11 @@ def generate_vram_maximizing_candidates(
     else:
         # Entry GPU (e.g. 4GB) or CPU
         base_ladder = [2, 4, 8]
+
+    if max_batch_size is not None:
+        cap = max(1, int(max_batch_size))
+        filtered = [b for b in base_ladder if b <= cap]
+        base_ladder = filtered if filtered else [cap]
 
     candidates = []
     for b in base_ladder:
@@ -411,6 +420,7 @@ def auto_tune_environment(
     verbose: bool = True,
     tune_objective: str = "balanced",
     prompt_len: int = 32,
+    max_batch_size: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Explores candidate execution configurations and identifies the setting that
@@ -424,23 +434,25 @@ def auto_tune_environment(
     hw = get_hardware_info()
     devices = jax.devices()
     dev_kind = hw["device_kind"]
-    is_tpu = hw["is_tpu"]
-    is_gpu = hw["is_gpu"]
+    is_tpu = hw.get("is_tpu", "tpu" in str(hw.get("platform", "")).lower() or "tpu" in str(dev_kind).lower())
+    is_gpu = hw.get("is_gpu", str(hw.get("platform", "")).lower() in ("gpu", "cuda", "rocm"))
     total_gb = hw["total_gb"]
     sig = hw["hardware_signature"]
+    cache_sig = f"{sig}_cap{int(max_batch_size)}" if max_batch_size is not None else sig
 
     mem_type = hw.get("memory_type", "HBM" if is_tpu else ("VRAM" if is_gpu else "RAM"))
 
     # 1. First Priority: Check remote website bioflo.in or local cache to avoid wasting time
     if use_cached_config and not force_tune and candidates is None:
         # Check local cache
-        cached_local = load_local_hardware_config(preset, sig)
+        cached_local = load_local_hardware_config(preset, cache_sig)
         local_obj = cached_local.get("tune_objective") if cached_local else None
-        if cached_local and cached_local.get("tok_per_sec", 0) > 0 and (local_obj is None or local_obj == tune_objective):
+        local_within_cap = (max_batch_size is None) or (int(cached_local.get("batch_size", 0)) <= int(max_batch_size)) if cached_local else False
+        if cached_local and local_within_cap and cached_local.get("tok_per_sec", 0) > 0 and (local_obj is None or local_obj == tune_objective):
             if verbose:
                 steps_s = cached_local.get("steps_per_sec") or (1000.0 / cached_local["step_ms"] if cached_local.get("step_ms") else 0.0)
                 print("=" * 80)
-                print(f"⚡ [AutoTuner] Loaded verified local config for [{preset}] on [{sig}]:")
+                print(f"⚡ [AutoTuner] Loaded verified local config for [{preset}] on [{cache_sig}]:")
                 print(f"   • Batch Size  : {cached_local['batch_size']}")
                 print(f"   • Remat Scan  : {cached_local['remat']}")
                 print(f"   • Step Rate   : {steps_s:.2f} steps/s ({cached_local.get('step_ms', 0):.1f} ms)")
@@ -454,12 +466,13 @@ def auto_tune_environment(
         # Check bioflo.in website
         try:
             from ..cloud_sync import fetch_remote_hardware_config
-            cached_remote = fetch_remote_hardware_config(model=preset, device_signature=sig, url=cloud_url, token=cloud_token)
+            cached_remote = fetch_remote_hardware_config(model=preset, device_signature=cache_sig, url=cloud_url, token=cloud_token)
             remote_obj = cached_remote.get("tune_objective") if cached_remote else None
-            if cached_remote and cached_remote.get("tok_per_sec", 0) > 0 and (remote_obj is None or remote_obj == tune_objective):
+            remote_within_cap = (max_batch_size is None) or (int(cached_remote.get("batch_size", 0)) <= int(max_batch_size)) if cached_remote else False
+            if cached_remote and remote_within_cap and cached_remote.get("tok_per_sec", 0) > 0 and (remote_obj is None or remote_obj == tune_objective):
                 if verbose:
                     print("=" * 80)
-                    print(f"🌐 [AutoTuner] Retrieved verified optimal config from bioflo.in for [{preset}] on [{sig}]:")
+                    print(f"🌐 [AutoTuner] Retrieved verified optimal config from bioflo.in for [{preset}] on [{cache_sig}]:")
                     print(f"   • Batch Size  : {cached_remote['batch_size']}")
                     print(f"   • Remat Scan  : {cached_remote['remat']}")
                     print(f"   • Peak Speed  : {cached_remote.get('tok_per_sec', 0):,.0f} tok/s")
@@ -468,7 +481,7 @@ def auto_tune_environment(
                     print(f"   • {mem_type} Util   : {m_gb:.1f} GB ({m_pct:.1f}%)")
                     print(f"   • Verified At : {cached_remote.get('updated_at', 'recently')}")
                     print(f"⏩ Skipping micro-benchmarks and adopting verified parameters from website!\n" + "=" * 80)
-                save_local_hardware_config(preset, sig, cached_remote)
+                save_local_hardware_config(preset, cache_sig, cached_remote)
                 return cached_remote
         except Exception as e:
             if verbose:
@@ -481,12 +494,18 @@ def auto_tune_environment(
         print("=" * 80)
         print(f"Hardware Platform  : {len(devices)} x {dev_kind} ({sig})")
         print(f"Detected Memory    : {total_gb:.1f} GB Available {mem_type}")
-        print(f"Target Preset      : {preset} (PromptLen: {prompt_len}, SeqLen: {seq_len})")
+        cap_str = f", MaxPerTPU: {max_batch_size}" if max_batch_size is not None else ""
+        print(f"Target Preset      : {preset} (PromptLen: {prompt_len}, SeqLen: {seq_len}{cap_str})")
         print(f"Tune Objective     : {tune_objective} (test remat=False across viable batches until OOM)")
         print("-" * 80)
 
     if candidates is None:
-        candidates = generate_vram_maximizing_candidates(preset=preset, total_gb=total_gb, seq_len=seq_len)
+        candidates = generate_vram_maximizing_candidates(
+            preset=preset,
+            total_gb=total_gb,
+            seq_len=seq_len,
+            max_batch_size=max_batch_size,
+        )
 
     results = []
     best_config = None
@@ -583,6 +602,7 @@ def auto_tune_environment(
             print("⚠️ All benchmark candidates failed. Falling back to conservative defaults.")
     else:
         best_config["tune_objective"] = tune_objective
+        best_config["max_batch_size"] = max_batch_size
         best_config["tuner_version"] = 2
         if verbose:
             print(f"🏆 OPTIMAL CONFIGURATION SELECTED ({tune_objective.upper()}):")
@@ -594,7 +614,7 @@ def auto_tune_environment(
             print("=" * 92)
 
         # 3. Cache locally
-        save_local_hardware_config(preset, sig, best_config)
+        save_local_hardware_config(preset, cache_sig, best_config)
 
         # 4. Send config back to bioflo.in website so we don't waste time testing again
         if upload_winner:
@@ -602,14 +622,14 @@ def auto_tune_environment(
                 from ..cloud_sync import push_remote_hardware_config
                 ok = push_remote_hardware_config(
                     model=preset,
-                    device_signature=sig,
+                    device_signature=cache_sig,
                     config=best_config,
                     url=cloud_url,
                     token=cloud_token,
                 )
                 if ok and verbose:
                     print(f"🌐 [AutoTuner] Winning configuration saved to website bioflo.in!")
-                    print(f"   Subsequent runs on {sig} will immediately reuse this config.\n")
+                    print(f"   Subsequent runs on {cache_sig} will immediately reuse this config.\n")
             except Exception as e:
                 if verbose:
                     print(f"ℹ️ [AutoTuner] Website sync notice: {e}\n")

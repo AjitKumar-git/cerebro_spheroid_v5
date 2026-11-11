@@ -52,9 +52,11 @@ _ACTIVE_UPLOAD_THREADS: list = []
 
 
 def detect_source_environment() -> str:
-    """Detects whether current execution is in Google Colab or Local."""
+    """Detects whether current execution is in Google Colab, Kaggle, or Local."""
     if "COLAB_GPU" in os.environ or "COLAB_TPU_ADDR" in os.environ or os.path.exists("/content"):
         return "colab"
+    if "KAGGLE_KERNEL_RUN_TYPE" in os.environ or os.path.exists("/kaggle"):
+        return "kaggle"
     return "local"
 
 
@@ -97,6 +99,37 @@ def check_remote_manifest(
     except Exception as e:
         print(f"⚠️ [cloud_sync] Unable to reach sync hub ({sync_url}): {e}")
         return {"status": "offline", "has_latest": False, "has_best": False, "manifest": {}}
+
+
+def select_highest_step_slot(
+    manifest_resp: Dict[str, Any],
+    model: Optional[str],
+    target_type: str = "latest",
+) -> Tuple[Optional[str], int, float]:
+    """
+    Pick whichever bioflo.in slot (named model vs root fallback) holds the highest step.
+    Returns (slot_model_arg, step, loss).
+    """
+    norm_model = "v5_small" if model in ("tpu_v5e_1", "tpu", "v5_tpu") else model
+    manifest = (manifest_resp or {}).get("manifest") or {}
+    models_block = (manifest_resp or {}).get("models") or {}
+
+    candidates = []
+    if norm_model:
+        named_entry = manifest.get(f"{norm_model}_{target_type}")
+        if not named_entry and norm_model in models_block:
+            named_entry = models_block[norm_model].get(f"{target_type}_manifest")
+        if isinstance(named_entry, dict):
+            candidates.append((norm_model, int(named_entry.get("step", 0)), float(named_entry.get("loss", float("inf")))))
+
+    root_entry = manifest.get(target_type)
+    if isinstance(root_entry, dict):
+        root_model = root_entry.get("model") or None
+        candidates.append((root_model, int(root_entry.get("step", 0)), float(root_entry.get("loss", float("inf")))))
+
+    if not candidates:
+        return norm_model, 0, float("inf")
+    return max(candidates, key=lambda item: item[1])
 
 
 def _download_range_chunk(url: str, token: str, start: int, end: int, filepath: str, chunk_idx: int) -> int:

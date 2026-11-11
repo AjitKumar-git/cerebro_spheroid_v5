@@ -340,11 +340,13 @@ class AsyncCheckpointManager:
                             raw_loss = meta_dict.get("loss", meta_dict.get("eval_loss", 0.0)) if meta_dict else 0.0
                         loss_f = float(raw_loss) if raw_loss is not None else 0.0
                         loss_val = loss_f if (loss_f == loss_f and abs(loss_f) < 1e30) else 0.0
+                        sync_model = meta_dict.get("sync_model") if meta_dict else None
                         push_checkpoint_async(
                             local_path,
                             step=step_val,
                             loss=loss_val,
                             target_type=target_type,
+                            model=sync_model,
                             url=self.cloud_url,
                             token=self.cloud_token,
                         )

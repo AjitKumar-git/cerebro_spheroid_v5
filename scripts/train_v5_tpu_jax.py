@@ -46,7 +46,16 @@ try:
 except Exception:
     pass
 
-# Safeguard TPU: prevent PyTorch from attempting to claim or initialize TPU devices (JAX owns the TPU)
+# Claim TPU for JAX first before importing PyTorch so torch/torch_xla cannot steal TPU devices
+import jax
+import jax.numpy as jnp
+from jax import lax
+
+try:
+    _ = jax.devices()
+except Exception:
+    pass
+
 os.environ.setdefault("PJRT_DEVICE", "CPU")
 os.environ.setdefault("TORCH_XLA_DISABLE_DISTRIBUTED", "1")
 
@@ -55,10 +64,6 @@ try:
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
-
-import jax
-import jax.numpy as jnp
-from jax import lax
 
 try:
     import optax
@@ -77,6 +82,8 @@ from src.jax.spheroid_optimizer import (
     init_spheroid_opt_state,
     build_spheroid_train_engine,
     build_train_step_spheroid,
+    build_pmap_local_sgd_step_spheroid,
+    replicate_for_pmap,
 )
 from src.jax.checkpoint import (
     save_jax_to_torch_pt,
@@ -87,6 +94,7 @@ from src.jax.checkpoint import (
 )
 from src.cloud_sync import (
     check_remote_manifest,
+    select_highest_step_slot,
     pull_checkpoint,
     push_checkpoint_async,
     wait_for_in_flight_uploads,
@@ -113,7 +121,10 @@ def parse_args(args_list=None):
 
     # Batching & Dimensions
     parser.add_argument("--batch-size", "--batch_size", dest="batch_size", type=int, default=128, help="Per-device batch size (default: 128 for TPU v5e-1)")
+    parser.add_argument("--max-batch-size", "--max_batch_size", dest="max_batch_size", type=int, default=None, help="Optional cap on auto-tuned per-TPU batch size (e.g., 64)")
     parser.add_argument("--grad-accum", "--grad_accum", dest="grad_accum", type=int, default=1, help="Gradient accumulation micro-steps per optimizer update")
+    parser.add_argument("--multi-tpu", "--multi_tpu", dest="multi_tpu", type=str, default="auto", choices=["auto", "local_sgd", "single"], help="Multi-TPU execution mode ('auto'/'local_sgd' uses all TPUs with 1 step per TPU)")
+    parser.add_argument("--local-steps", "--local_steps", dest="local_steps", type=int, default=4, help="Sequential local optimizer steps per TPU before pmean parameter merge (default: 4)")
     parser.add_argument("--seq-len", "--target_len", dest="seq_len", type=int, default=256, help="Target response sequence length (default: 256)")
     parser.add_argument("--prompt_len", type=int, default=32, help="Prompt context length (used when --elastic_window is disabled)")
     parser.add_argument("--total_window", type=int, default=288, help="Total sequence budget for elastic sliding window (default: 288 tokens)")
@@ -163,7 +174,8 @@ def parse_args(args_list=None):
     parser.add_argument("--periodic_every", type=int, default=1000, help="Steps between milestone archive saves (default: 1000)")
     parser.add_argument("--log-every", "--log_every", dest="log_every", type=int, default=10, help="Steps between console progress lines (default: 10)")
     parser.add_argument("--eval_interval", type=int, default=100, help="Steps between held-out validation evaluations (default: 100)")
-    parser.add_argument("--cloud-sync", action="store_true", default=True, help="Enable live sync with bioflo.in")
+    parser.add_argument("--cloud-sync", "--cloud_sync", dest="cloud_sync", action="store_true", default=True, help="Enable live sync with bioflo.in")
+    parser.add_argument("--no-cloud-sync", "--no_cloud_sync", dest="cloud_sync", action="store_false", help="Disable live sync with bioflo.in")
     parser.add_argument("--cloud-sync-interval", type=int, default=100, help="Steps between cloud sync uploads")
     parser.add_argument("--cloud_url", type=str, default="https://bioflo.in/api/cerebro/sync.php", help="bioflo.in sync endpoint")
     parser.add_argument("--cloud_token", type=str, default="CerebroSpheroid_Sync_Secure_2026", help="Secret sync token")
@@ -183,6 +195,7 @@ def build_data_stream(
     total_window: int,
     use_elastic_window: bool,
     vocab_size: int = 32000,
+    prefetch_queue_size: int = 16,
 ):
     """Initializes multi-corpus streaming engine with background prefetching and offline fallback."""
     # Check if HuggingFace datasets library is available for online streaming
@@ -202,7 +215,7 @@ def build_data_stream(
             prompt_len=prompt_len,
             target_len=target_len,
             vocab_size=vocab_size,
-            queue_size=16,
+            queue_size=max(16, int(prefetch_queue_size)),
         )
         return streamer, None
 
@@ -211,9 +224,16 @@ def build_data_stream(
     data_iter = None
     try:
         if dataset_source == "dense_edu":
-            cosmo_raw = iter(load_dataset("HuggingFaceTB/cosmopedia-v2", "cosmopedia-v2", split="train", streaming=True))
-            fw_raw = iter(load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True))
-            oh_raw = iter(load_dataset("teknium/OpenHermes-2.5", split="train", streaming=True))
+            def _make_cosmo():
+                return iter(load_dataset("HuggingFaceTB/cosmopedia-v2", "cosmopedia-v2", split="train", streaming=True))
+            def _make_fw():
+                return iter(load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True))
+            def _make_oh():
+                return iter(load_dataset("teknium/OpenHermes-2.5", split="train", streaming=True))
+
+            cosmo_raw = _make_cosmo()
+            fw_raw = _make_fw()
+            oh_raw = _make_oh()
 
             def _dense_stream():
                 nonlocal cosmo_raw, fw_raw, oh_raw
@@ -222,14 +242,22 @@ def build_data_stream(
                     mod5 = turn % 5
                     try:
                         if mod5 in (0, 2):
-                            row = next(cosmo_raw)
+                            try:
+                                row = next(cosmo_raw)
+                            except StopIteration:
+                                cosmo_raw = _make_cosmo()
+                                row = next(cosmo_raw)
                             p = (row.get("prompt") or "Explain the educational context of this topic:").strip()
                             r = (row.get("text") or "").strip()
                             if len(r) >= 30:
                                 yield {"conversations": [{"from": "human", "value": p}, {"from": "gpt", "value": r}]}
                         elif mod5 in (1, 4):
                             for _ in range(20):
-                                row = next(fw_raw)
+                                try:
+                                    row = next(fw_raw)
+                                except StopIteration:
+                                    fw_raw = _make_fw()
+                                    row = next(fw_raw)
                                 if float(row.get("score", 0.0) or row.get("educational_score", 0.0)) >= 4.0:
                                     text = (row.get("text") or "").strip()
                                     if len(text) >= 50:
@@ -237,7 +265,11 @@ def build_data_stream(
                                         yield {"conversations": [{"from": "human", "value": p.strip()}, {"from": "gpt", "value": r.strip()}]}
                                         break
                         else:
-                            yield next(oh_raw)
+                            try:
+                                yield next(oh_raw)
+                            except StopIteration:
+                                oh_raw = _make_oh()
+                                yield next(oh_raw)
                     except Exception:
                         time.sleep(0.5)
                     turn += 1
@@ -308,8 +340,9 @@ def build_data_stream(
                 tokenizer, data_iter, batch_size=batch_size, total_window=prompt_len + target_len, buckets=buckets, framework="numpy", return_feedback=True
             )
 
-        prefetched = PrefetchedBatcher(batcher, queue_size=16)
-        print("⚡ Background Asynchronous Batch Prefetcher Active (Queue Depth: 16 batches)")
+        q_depth = max(16, int(prefetch_queue_size))
+        prefetched = PrefetchedBatcher(batcher, queue_size=q_depth)
+        print(f"⚡ Background Asynchronous Batch Prefetcher Active (Queue Depth: {q_depth} batches)")
         return None, prefetched
 
     except Exception as e:
@@ -319,7 +352,7 @@ def build_data_stream(
             prompt_len=prompt_len,
             target_len=target_len,
             vocab_size=vocab_size,
-            queue_size=16,
+            queue_size=max(16, int(prefetch_queue_size)),
         )
         return streamer, None
 
@@ -360,6 +393,7 @@ def main(args=None):
 
     # 2. Auto-Tuning Micro-Benchmark
     remat_choice = True if args.remat.lower() == "true" else False
+    max_bs = getattr(args, "max_batch_size", None)
     if args.auto_tune:
         best_cfg = run_auto_tuner(
             preset=args.preset,
@@ -373,6 +407,7 @@ def main(args=None):
             verbose=True,
             tune_objective=getattr(args, "tune_objective", "balanced"),
             prompt_len=args.prompt_len,
+            max_batch_size=max_bs,
         )
         args.batch_size = best_cfg["batch_size"]
         remat_choice = best_cfg["remat"]
@@ -384,6 +419,8 @@ def main(args=None):
             sps = best_cfg.get("steps_per_sec", 0.0)
             sps_str = f"{sps:.2f} steps/s | " if sps and sps > 0 else ""
             print(f"⚡ Target Benchmark Speed: {sps_str}{best_cfg['tok_per_sec']:,.0f} tok/s ({m_type}: {v_gb:.1f} GB, {v_pct:.1f}% utilization)")
+    elif max_bs is not None:
+        args.batch_size = min(int(args.batch_size), int(max_bs))
 
     # 3. Model Configuration & Parameters
     config_preset = "v5_small" if args.preset == "tpu_v5e_1" else args.preset
@@ -440,7 +477,7 @@ def main(args=None):
                 except Exception:
                     pass
     else:
-        # Cloud sync pull if active
+        # Cloud sync pull if active (pick whichever slot — named or root — has highest step)
         if args.cloud_sync:
             try:
                 print(f"\n[cloud_sync] Checking remote manifest on bioflo.in for {args.preset}...")
@@ -448,12 +485,18 @@ def main(args=None):
                 if not remote_manifest and sync_model_name != args.preset:
                     remote_manifest = check_remote_manifest(args.preset, url=args.cloud_url, token=args.cloud_token)
                 if remote_manifest:
-                    target_file = f"{args.resume_target}.pt"
+                    slot_model, remote_step, remote_loss = select_highest_step_slot(
+                        remote_manifest, sync_model_name, args.resume_target
+                    )
+                    print(
+                        f"🔎 [cloud_sync] Selected remote slot model={slot_model or 'root'} "
+                        f"(Step {remote_step:,}, Loss {remote_loss:.4f}) for {args.resume_target}.pt"
+                    )
                     target_dest = os.path.join(args.checkpoint_dir, f"{args.preset}_{args.resume_target}.pt")
                     pulled_ok = pull_checkpoint(
                         target_dest,
                         target_type=args.resume_target,
-                        model=sync_model_name,
+                        model=slot_model,
                         url=args.cloud_url,
                         token=args.cloud_token,
                     )
@@ -492,11 +535,38 @@ def main(args=None):
         last_eval_loss = float("inf")
         print("🔄 [Benchmark Recalibration] Reset best_eval_loss tracker baseline.")
 
-    # 6. Spheroid Optimizer & JIT Train Step Engine
+    # 6. Spheroid Optimizer & JIT / Multi-TPU Local-SGD Train Step Engine
     grad_accum = max(1, int(getattr(args, "grad_accum", 1)))
+    multi_mode = getattr(args, "multi_tpu", "auto")
+    use_multi_tpu_local_sgd = (num_devices > 1) and (args.optimizer == "spheroid") and (multi_mode != "single")
+    eff_num_devices = num_devices if use_multi_tpu_local_sgd else 1
+    eff_local_steps = max(1, int(getattr(args, "local_steps", 4))) if use_multi_tpu_local_sgd else 1
+    step_stride = eff_num_devices * eff_local_steps
+
+    if use_multi_tpu_local_sgd and args.elastic_window:
+        print("ℹ️ Multi-TPU Local-SGD enforces fixed static shapes for uniform pmap shards; disabling --elastic_window.")
+        args.elastic_window = False
+
+    pmap_round_fn = None
+    rep_params = None
+    rep_opt_state = None
     if args.optimizer == "spheroid":
         opt_state = init_spheroid_opt_state(params)
-        if grad_accum <= 1:
+        if use_multi_tpu_local_sgd:
+            pmap_round_fn = build_pmap_local_sgd_step_spheroid(
+                config,
+                buffers,
+                pad_id=pad_id,
+                weight_decay=args.weight_decay,
+                repetition_penalty=args.repetition_penalty,
+                remat=remat_choice,
+                local_steps=eff_local_steps,
+                devices=devices,
+            )
+            rep_params = replicate_for_pmap(params, devices)
+            rep_opt_state = replicate_for_pmap(opt_state, devices)
+            compute_grad_step, apply_opt_step, train_step_fn = None, None, None
+        elif grad_accum <= 1:
             train_step_fn = build_train_step_spheroid(
                 config,
                 buffers,
@@ -570,6 +640,7 @@ def main(args=None):
         total_window=args.total_window,
         use_elastic_window=args.elastic_window,
         vocab_size=config.vocab_size,
+        prefetch_queue_size=max(16, eff_num_devices * eff_local_steps * 2),
     )
 
     def _unpack_batch(batch_tuple):
@@ -583,25 +654,46 @@ def main(args=None):
 
     # 8. XLA Ahead-Of-Time Compilation (non-mutating warmup matching real feedback signature)
     print("\n⚡ Compiling XLA computation graph on TPU...")
-    dummy_prompts = jnp.zeros((args.batch_size, args.prompt_len), dtype=jnp.int32)
-    dummy_targets = jnp.zeros((args.batch_size, args.seq_len), dtype=jnp.int32)
-    dummy_feedback = (
-        jnp.full((args.batch_size, args.seq_len), -100, dtype=jnp.int32)
-        if elastic_batcher is not None
-        else None
-    )
     t0_compile = time.time()
-    _warm_p, _warm_opt, initial_loss = train_step_fn(
-        params,
-        opt_state,
-        dummy_prompts,
-        dummy_targets,
-        args.lr,
-        feedback_tokens=dummy_feedback,
-    )
-    jax.block_until_ready(initial_loss)
-    del _warm_p, _warm_opt
-    print(f"✓ XLA Compilation complete in {time.time() - t0_compile:.2f}s! Initial Loss: {float(initial_loss):.4f}")
+    if use_multi_tpu_local_sgd:
+        dummy_prompts = np.zeros((eff_num_devices, eff_local_steps, args.batch_size, args.prompt_len), dtype=np.int32)
+        dummy_targets = np.zeros((eff_num_devices, eff_local_steps, args.batch_size, args.seq_len), dtype=np.int32)
+        dummy_feedback = (
+            np.full((eff_num_devices, eff_local_steps, args.batch_size, args.seq_len), -100, dtype=np.int32)
+            if elastic_batcher is not None
+            else None
+        )
+        _warm_p, _warm_opt, initial_loss = pmap_round_fn(
+            rep_params,
+            rep_opt_state,
+            dummy_prompts,
+            dummy_targets,
+            args.lr,
+            feedback_micro=dummy_feedback,
+        )
+        jax.block_until_ready(initial_loss)
+        init_loss_val = float(initial_loss[0])
+        del _warm_p, _warm_opt
+    else:
+        dummy_prompts = jnp.zeros((args.batch_size, args.prompt_len), dtype=jnp.int32)
+        dummy_targets = jnp.zeros((args.batch_size, args.seq_len), dtype=jnp.int32)
+        dummy_feedback = (
+            jnp.full((args.batch_size, args.seq_len), -100, dtype=jnp.int32)
+            if elastic_batcher is not None
+            else None
+        )
+        _warm_p, _warm_opt, initial_loss = train_step_fn(
+            params,
+            opt_state,
+            dummy_prompts,
+            dummy_targets,
+            args.lr,
+            feedback_tokens=dummy_feedback,
+        )
+        jax.block_until_ready(initial_loss)
+        init_loss_val = float(initial_loss)
+        del _warm_p, _warm_opt
+    print(f"✓ XLA Compilation complete in {time.time() - t0_compile:.2f}s! Initial Loss: {init_loss_val:.4f}")
 
     # 9. Clean Held-Out Validation Split (sampled from active data distribution with -100 target padding)
     eval_batches = []
@@ -678,7 +770,9 @@ def main(args=None):
     # 11. High-Throughput Training Loop
     print("\n" + "=" * 80)
     print(f"🚀 Training {args.total_steps:,} Steps (Resuming Step {start_step:,})")
-    print(f"   • Batch Size       : {args.batch_size}")
+    print(f"   • Batch Size       : {args.batch_size} per TPU")
+    if use_multi_tpu_local_sgd:
+        print(f"   • Multi-TPU Engine : Local-SGD ({eff_num_devices} TPUs x {eff_local_steps} local steps = +{step_stride} steps/round)")
     print(f"   • Sequence Length  : {args.seq_len}")
     print(f"   • Scheduled Mode   : {args.deliberation_mode} (Floor: {args.min_sampling_p})")
     print(f"   • Async Checkpoint : 0ms TPU Pause (Latest: every {args.save_interval} steps)")
@@ -695,6 +789,31 @@ def main(args=None):
         prompt_b, target_b = local_streamer.get_batch()
         return prompt_b, target_b, None
 
+    def _next_multi_tpu_round():
+        total_shards = eff_num_devices * eff_local_steps
+        qs, rs, fbs = [], [], []
+        for _ in range(total_shards):
+            pb, tb, fb = _next_batch()
+            qs.append(np.asarray(pb, dtype=np.int32))
+            rs.append(np.asarray(tb, dtype=np.int32))
+            if fb is not None:
+                fbs.append(np.asarray(fb, dtype=np.int32))
+        b_p, l_p = qs[0].shape
+        b_t, l_t = rs[0].shape
+        q_arr = np.stack(qs, axis=0).reshape(eff_num_devices, eff_local_steps, b_p, l_p)
+        r_arr = np.stack(rs, axis=0).reshape(eff_num_devices, eff_local_steps, b_t, l_t)
+        fb_arr = (
+            np.stack(fbs, axis=0).reshape(eff_num_devices, eff_local_steps, b_t, l_t)
+            if len(fbs) == total_shards
+            else None
+        )
+        return q_arr, r_arr, fb_arr
+
+    def _get_host_params():
+        if use_multi_tpu_local_sgd:
+            return jax.tree_util.tree_map(lambda x: jax.device_get(x[0]), rep_params)
+        return params
+
     step = start_step
     t_start = time.time()
     t_last_log = time.time()
@@ -704,13 +823,27 @@ def main(args=None):
 
     try:
         while step < args.total_steps and not shutdown_requested:
-            step += 1
+            prev_step = step
+            step += step_stride
 
             cur_lr = get_learning_rate(step, args.total_steps, args.lr, args.min_lr, args.warmup_steps)
             cur_sampling_p = get_sampling_p(step, args.schedule_steps, args.min_sampling_p)
 
             # Training Step
-            if compute_grad_step is not None and grad_accum > 1:
+            if use_multi_tpu_local_sgd:
+                q_shard, r_shard, fb_shard = _next_multi_tpu_round()
+                rep_params, rep_opt_state, loss_rep = pmap_round_fn(
+                    rep_params,
+                    rep_opt_state,
+                    q_shard,
+                    r_shard,
+                    cur_lr,
+                    feedback_micro=fb_shard,
+                    sampling_p=cur_sampling_p,
+                )
+                loss = float(loss_rep[0])
+                step_tokens = int(q_shard.shape[0] * q_shard.shape[1] * q_shard.shape[2] * (q_shard.shape[3] + r_shard.shape[3]))
+            elif compute_grad_step is not None and grad_accum > 1:
                 acc_grads = None
                 loss_acc = 0.0
                 step_tokens = 0
@@ -745,10 +878,11 @@ def main(args=None):
 
             # Step & token throughput accounting
             step_window_tokens += step_tokens
-            step_window_count += 1
+            step_window_count += step_stride
 
             # Console Progress Logging
-            if step % args.log_every == 0 or step == start_step + 1:
+            crossed_log = (prev_step == start_step) or ((step // max(1, args.log_every)) > (prev_step // max(1, args.log_every)))
+            if crossed_log:
                 loss_val = float(loss)
                 elapsed_log = time.time() - t_last_log
                 steps_per_sec = step_window_count / max(elapsed_log, 1e-6)
@@ -768,8 +902,10 @@ def main(args=None):
                 step_window_count = 0
 
             # Held-Out Validation Evaluation
-            if eval_batches and (step % args.eval_interval == 0):
-                val_losses = [eval_step_loss(params, vp, vt, vfb) for vp, vt, vfb in eval_batches]
+            crossed_eval = bool(eval_batches) and ((step // max(1, args.eval_interval)) > (prev_step // max(1, args.eval_interval)))
+            if crossed_eval:
+                eval_p = jax.device_put(_get_host_params(), devices[0]) if use_multi_tpu_local_sgd else params
+                val_losses = [eval_step_loss(eval_p, vp, vt, vfb) for vp, vt, vfb in eval_batches]
                 eval_loss = float(jnp.mean(jnp.stack(val_losses)))
                 last_eval_loss = eval_loss
                 eval_ppl = math.exp(min(eval_loss, 20.0))
@@ -787,9 +923,10 @@ def main(args=None):
                         "loss": float(loss),
                         "ppl": eval_ppl,
                         "preset": args.preset,
+                        "sync_model": sync_model_name,
                         "timestamp": time.time(),
                     }
-                    ckpt_mgr.dispatch(params, buffers, best_fname, meta_dict=meta_best, block_if_busy=True)
+                    ckpt_mgr.dispatch(_get_host_params(), buffers, best_fname, meta_dict=meta_best, block_if_busy=True)
 
             # Asynchronous Checkpoint Saving
             save_latest = False
@@ -798,7 +935,7 @@ def main(args=None):
                     save_latest = True
                     last_cloud_save_time = time.time()
 
-            if step % args.save_interval == 0:
+            if (step // max(1, args.save_interval)) > (prev_step // max(1, args.save_interval)):
                 save_latest = True
 
             if save_latest:
@@ -809,21 +946,23 @@ def main(args=None):
                     "eval_loss": last_eval_loss if math.isfinite(last_eval_loss) else float(loss),
                     "best_eval_loss": best_eval_loss,
                     "preset": args.preset,
+                    "sync_model": sync_model_name,
                     "timestamp": time.time(),
                 }
-                ckpt_mgr.dispatch(params, buffers, latest_fname, meta_dict=meta_latest)
+                ckpt_mgr.dispatch(_get_host_params(), buffers, latest_fname, meta_dict=meta_latest)
 
             # Periodic Milestone Archive Saving
-            if step % args.periodic_every == 0:
+            if (step // max(1, args.periodic_every)) > (prev_step // max(1, args.periodic_every)):
                 periodic_fname = f"{args.preset}_step_{step}.pt"
                 ckpt_mgr.dispatch(
-                    params,
+                    _get_host_params(),
                     buffers,
                     periodic_fname,
                     meta_dict={
                         "step": step,
                         "loss": float(loss),
                         "eval_loss": last_eval_loss if math.isfinite(last_eval_loss) else float(loss),
+                        "sync_model": sync_model_name,
                     },
                 )
 
@@ -852,9 +991,10 @@ def main(args=None):
             "loss": float(loss) if "loss" in locals() else 0.0,
             "eval_loss": best_eval_loss,
             "preset": args.preset,
+            "sync_model": sync_model_name,
             "timestamp": time.time(),
         }
-        ckpt_mgr.flush(params, buffers, final_fname, meta_dict=final_meta)
+        ckpt_mgr.flush(_get_host_params(), buffers, final_fname, meta_dict=final_meta)
         ckpt_mgr.shutdown(wait=True)
         if local_streamer is not None:
             local_streamer.stop()

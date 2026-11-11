@@ -29,8 +29,10 @@ from src.jax.auto_tuner import (
     _score_benchmark_result,
 )
 from src.cloud_sync import (
+    detect_source_environment,
     fetch_remote_hardware_config,
     push_remote_hardware_config,
+    select_highest_step_slot,
 )
 
 
@@ -274,6 +276,110 @@ class TestVRAMTunerAndSync(unittest.TestCase):
         self.assertEqual(seen_calls, [(64, False), (256, False), (256, True), (384, True)])
         self.assertEqual(winner["batch_size"], 64)
         self.assertFalse(winner["remat"])
+
+    def test_select_highest_step_slot_prefers_newest_across_model_and_root(self):
+        """Ensure checkpoint slot selection picks highest recorded step across model & root slots."""
+        manifest_root_newer = {
+            "manifest": {
+                "v5_small_latest": {"step": 4750, "loss": 3.4084},
+                "latest": {"step": 9750, "loss": 2.9815},
+            }
+        }
+        slot, step, loss = select_highest_step_slot(manifest_root_newer, model="tpu_v5e_1", target_type="latest")
+        self.assertIsNone(slot)
+        self.assertEqual(step, 9750)
+        self.assertAlmostEqual(loss, 2.9815, places=4)
+
+        manifest_model_newer = {
+            "manifest": {
+                "v5_small_latest": {"step": 12000, "loss": 2.75},
+                "latest": {"step": 9750, "loss": 2.9815},
+            }
+        }
+        slot2, step2, loss2 = select_highest_step_slot(manifest_model_newer, model="tpu_v5e_1", target_type="latest")
+        self.assertEqual(slot2, "v5_small")
+        self.assertEqual(step2, 12000)
+        self.assertAlmostEqual(loss2, 2.75, places=4)
+
+        slot3, step3, loss3 = select_highest_step_slot({}, model="tpu_v5e_1", target_type="best")
+        self.assertEqual(slot3, "v5_small")
+        self.assertEqual(step3, 0)
+        self.assertEqual(loss3, float("inf"))
+
+    def test_detect_source_environment_kaggle(self):
+        """Detect Kaggle runtime cleanly without misclassifying as Colab."""
+        with patch.dict(os.environ, {"KAGGLE_KERNEL_RUN_TYPE": "Batch"}, clear=False):
+            with patch("src.cloud_sync.os.path.exists", side_effect=lambda p: p == "/kaggle"):
+                self.assertEqual(detect_source_environment(), "kaggle")
+
+    @patch("src.cloud_sync.fetch_remote_hardware_config", return_value=None)
+    @patch("src.jax.auto_tuner.save_local_hardware_config")
+    @patch("src.jax.auto_tuner.load_local_hardware_config", return_value=None)
+    @patch("src.jax.auto_tuner.benchmark_config")
+    @patch("src.jax.auto_tuner.get_hardware_info")
+    def test_auto_tune_caps_max_batch_size_and_scopes_cache(
+        self,
+        mock_hw,
+        mock_bench,
+        mock_load_cache,
+        mock_save_cache,
+        _mock_fetch_remote,
+    ):
+        """Verify max_batch_size=64 constrains candidates, winner, and cache signature."""
+        candidates = generate_vram_maximizing_candidates("tpu_v5e_1", total_gb=16.0, seq_len=256, max_batch_size=64)
+        self.assertTrue(len(candidates) >= 2)
+        self.assertTrue(all(c["batch_size"] <= 64 for c in candidates))
+        self.assertIn({"batch_size": 64, "remat": False}, candidates)
+        self.assertIn({"batch_size": 64, "remat": True}, candidates)
+
+        mock_hw.return_value = {
+            "device_kind": "TPU_v5_lite",
+            "platform": "tpu",
+            "is_tpu": True,
+            "is_gpu": False,
+            "total_memory_bytes": 16 * 1024**3,
+            "total_gb": 16.0,
+            "hardware_signature": "TPU_v5_lite_16GB",
+        }
+        seen_batches = []
+
+        def _fake_bench(preset, batch_size, remat, seq_len=256, **kwargs):
+            seen_batches.append((batch_size, remat))
+            sps = 4.0 if (batch_size == 64 and not remat) else 3.0
+            return {
+                "preset": preset,
+                "batch_size": batch_size,
+                "remat": remat,
+                "tok_per_sec": sps * batch_size * seq_len,
+                "steps_per_sec": sps,
+                "step_ms": 1000.0 / sps,
+                "compile_time": 1.0,
+                "memory_gb": 3.5,
+                "memory_utilization_pct": 22.0,
+                "memory_type": "HBM",
+                "vram_gb": 3.5,
+                "vram_utilization_pct": 22.0,
+                "status": "PASS",
+            }
+
+        mock_bench.side_effect = _fake_bench
+        winner = auto_tune_environment(
+            preset="tpu_v5e_1",
+            seq_len=256,
+            use_cached_config=True,
+            upload_winner=False,
+            verbose=False,
+            tune_objective="steps_per_sec",
+            max_batch_size=64,
+        )
+        self.assertLessEqual(winner["batch_size"], 64)
+        self.assertEqual(winner["batch_size"], 64)
+        self.assertFalse(winner["remat"])
+        self.assertTrue(all(b <= 64 for b, _ in seen_batches))
+        cache_sig_used = mock_load_cache.call_args[0][1]
+        self.assertTrue(cache_sig_used.endswith("_cap64"), f"Expected _cap64 cache suffix, got {cache_sig_used}")
+        save_sig_used = mock_save_cache.call_args[0][1]
+        self.assertTrue(save_sig_used.endswith("_cap64"), f"Expected _cap64 save suffix, got {save_sig_used}")
 
 
 if __name__ == "__main__":

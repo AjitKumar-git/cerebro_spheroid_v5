@@ -572,3 +572,145 @@ def test_v5_generation_seed_token_parity():
     )
     step1_diff = float(jnp.max(jnp.abs(logits_tf[:, 1, :] - logits_seed[:, 1, :])))
     assert step1_diff < 1e-5, f"Step-1 logits after pre-seeding <act> diverged: {step1_diff}"
+
+
+def test_pmap_local_sgd_2device_multiprocess():
+    """Verify build_pmap_local_sgd_step_spheroid runs across 2 XLA devices and keeps replicas synchronized."""
+    import os
+    import subprocess
+    import sys
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    code = """
+import jax
+import jax.numpy as jnp
+import numpy as np
+from src.jax.v5_model import ModelConfigV5, PRESETS_V5, init_params_v5
+from src.jax.spheroid_optimizer import (
+    init_spheroid_opt_state,
+    replicate_for_pmap,
+    build_pmap_local_sgd_step_spheroid,
+    RECURRENT_KEYS,
+)
+
+devices = jax.devices()
+assert len(devices) == 2, f"Expected 2 XLA devices, got {len(devices)}: {devices}"
+
+cfg = ModelConfigV5(**PRESETS_V5["v5_test"])
+params, buffers = init_params_v5(jax.random.PRNGKey(7), cfg)
+opt_state = init_spheroid_opt_state(params)
+
+rep_params = replicate_for_pmap(params, devices)
+rep_opt = replicate_for_pmap(opt_state, devices)
+
+round_fn = build_pmap_local_sgd_step_spheroid(
+    cfg,
+    buffers,
+    pad_id=0,
+    weight_decay=1e-5,
+    repetition_penalty=1.25,
+    remat=False,
+    local_steps=3,
+    devices=devices,
+)
+
+rng = np.random.default_rng(123)
+q_micro = jnp.asarray(rng.integers(3, cfg.vocab_size, size=(2, 3, 2, 8), dtype=np.int32))
+r_micro = jnp.asarray(rng.integers(3, cfg.vocab_size, size=(2, 3, 2, 8), dtype=np.int32))
+lr = jnp.asarray(5e-4, dtype=jnp.float32)
+
+new_params, new_opt, losses = round_fn(rep_params, rep_opt, q_micro, r_micro, lr)
+losses.block_until_ready()
+
+assert np.isfinite(float(losses[0]))
+step_r0 = int(jax.device_get(new_opt["step"])[0])
+step_r1 = int(jax.device_get(new_opt["step"])[1])
+assert step_r0 == 3 and step_r1 == 3, f"Expected local step=3 on both replicas, got {(step_r0, step_r1)}"
+
+host_p = jax.device_get(new_params)
+for k, arr in host_p.items():
+    diff = float(np.max(np.abs(arr[0].astype(np.float32) - arr[1].astype(np.float32))))
+    assert diff < 1e-6, f"Replica mismatch on {k}: max diff {diff}"
+    if k in RECURRENT_KEYS:
+        mat = arr[0].astype(np.float32)
+        if mat.ndim >= 2:
+            slices = mat.reshape(-1, mat.shape[-2], mat.shape[-1])
+            for sl in slices:
+                s_max = float(np.linalg.svd(sl, compute_uv=False)[0])
+                assert s_max <= 1.0 + 1e-3, f"Recurrent spectral norm violated on {k}: {s_max}"
+print("PMAP_LOCAL_SGD_OK")
+"""
+    env = os.environ.copy()
+    existing_xla = env.get("XLA_FLAGS", "").strip()
+    multi_flag = "--xla_force_host_platform_device_count=2"
+    env["XLA_FLAGS"] = f"{existing_xla} {multi_flag}".strip() if multi_flag not in existing_xla else existing_xla
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert proc.returncode == 0, f"Subprocess failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    assert "PMAP_LOCAL_SGD_OK" in proc.stdout
+
+
+def test_train_v5_tpu_jax_multi_tpu_local_sgd_cli_smoke(tmp_path):
+    """End-to-end subprocess smoke test of train_v5_tpu_jax.py with 2 virtual XLA devices and local_sgd."""
+    import os
+    import subprocess
+    import sys
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ckpt_dir = tmp_path / "ckpts"
+    scratch_dir = tmp_path / "scratch"
+    env = os.environ.copy()
+    existing_xla = env.get("XLA_FLAGS", "").strip()
+    multi_flag = "--xla_force_host_platform_device_count=2"
+    env["XLA_FLAGS"] = f"{existing_xla} {multi_flag}".strip() if multi_flag not in existing_xla else existing_xla
+    env["PYTHONUNBUFFERED"] = "1"
+
+    cmd = [
+        sys.executable,
+        "scripts/train_v5_tpu_jax.py",
+        "--preset",
+        "v5_test",
+        "--dataset_source",
+        "local",
+        "--optimizer",
+        "spheroid",
+        "--multi_tpu",
+        "local_sgd",
+        "--local_steps",
+        "2",
+        "--batch_size",
+        "2",
+        "--prompt_len",
+        "8",
+        "--seq-len",
+        "8",
+        "--total-steps",
+        "4",
+        "--eval_interval",
+        "4",
+        "--save-interval",
+        "4",
+        "--periodic_every",
+        "100",
+        "--log-every",
+        "4",
+        "--no-cloud-sync",
+        "--from-scratch",
+        "--remat",
+        "false",
+        "--checkpoint-dir",
+        str(ckpt_dir),
+        "--scratch_dir",
+        str(scratch_dir),
+    ]
+    proc = subprocess.run(cmd, cwd=repo_root, env=env, capture_output=True, text=True, timeout=180)
+    assert proc.returncode == 0, f"CLI smoke failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    assert "Multi-TPU Engine : Local-SGD (2 TPUs x 2 local steps = +4 steps/round)" in proc.stdout
+    saved_ckpts = list(ckpt_dir.glob("*.pt"))
+    assert len(saved_ckpts) >= 1, f"Expected saved .pt checkpoint in {ckpt_dir}, got {saved_ckpts}"

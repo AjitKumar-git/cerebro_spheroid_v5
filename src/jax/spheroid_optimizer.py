@@ -352,3 +352,136 @@ def build_train_step_spheroid(
         )
 
     return train_step
+
+
+def merge_spheroid_replicas(
+    p: Dict[str, jnp.ndarray],
+    opt_s: Dict[str, Any],
+    axis_name: str = "dp",
+) -> Tuple[Dict[str, jnp.ndarray], Dict[str, Any]]:
+    """
+    Synchronizes replicated parameters and optimizer states across TPU cores via pmean,
+    preserving recurrent spectral bounds (<= 1.0) under convex averaging.
+    """
+    has_master = "master_p" in opt_s
+    merged_m = jax.tree_util.tree_map(lambda x: lax.pmean(x, axis_name=axis_name), opt_s["m"])
+    merged_v = jax.tree_util.tree_map(lambda x: lax.pmean(x, axis_name=axis_name), opt_s["v"])
+
+    merged_master: Dict[str, jnp.ndarray] = {}
+    merged_power_v: Dict[str, jnp.ndarray] = {}
+    merged_params: Dict[str, jnp.ndarray] = {}
+
+    for k, param in p.items():
+        if not jnp.issubdtype(param.dtype, jnp.inexact):
+            merged_params[k] = param
+            continue
+        m_p = opt_s["master_p"][k] if has_master else param.astype(jnp.float32)
+        avg_master = lax.pmean(m_p.astype(jnp.float32), axis_name=axis_name)
+        if k in RECURRENT_KEYS and k in opt_s.get("power_v", {}):
+            v_avg = lax.pmean(opt_s["power_v"][k].astype(jnp.float32), axis_name=axis_name)
+            v_norm = v_avg / jnp.sqrt(jnp.sum(jnp.square(v_avg), axis=1, keepdims=True) + 1e-6)
+            avg_master, v_next = clamp_spectral_norm_jax(avg_master, v_norm, max_spec_norm=1.0)
+            merged_power_v[k] = v_next.astype(opt_s["power_v"][k].dtype)
+        merged_master[k] = avg_master.astype(jnp.float32)
+        merged_params[k] = avg_master.astype(param.dtype)
+
+    for k, v_val in opt_s.get("power_v", {}).items():
+        if k not in merged_power_v:
+            v_avg = lax.pmean(v_val.astype(jnp.float32), axis_name=axis_name)
+            v_norm = v_avg / jnp.sqrt(jnp.sum(jnp.square(v_avg), axis=1, keepdims=True) + 1e-6)
+            merged_power_v[k] = v_norm.astype(v_val.dtype)
+
+    merged_opt_state = {
+        "step": opt_s["step"],
+        "m": merged_m,
+        "v": merged_v,
+        "power_v": merged_power_v,
+    }
+    if has_master:
+        merged_opt_state["master_p"] = merged_master
+    return merged_params, merged_opt_state
+
+
+def replicate_for_pmap(tree: Any, devices: Any) -> Any:
+    """Replicate a pytree across `devices` along leading axis 0 for jax.pmap."""
+    import numpy as np
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    dev_list = list(devices)
+    n_dev = len(dev_list)
+    mesh = Mesh(np.array(dev_list), ("dp",))
+    sharding = NamedSharding(mesh, PartitionSpec("dp"))
+
+    def _rep_leaf(x):
+        arr = np.asarray(jax.device_get(x))
+        return jax.device_put(np.broadcast_to(arr[None, ...], (n_dev,) + arr.shape), sharding)
+
+    return jax.tree_util.tree_map(_rep_leaf, tree)
+
+
+def build_pmap_local_sgd_step_spheroid(
+    config: ModelConfigV5,
+    buffers: Tuple[jnp.ndarray, jnp.ndarray],
+    pad_id: int = 0,
+    weight_decay: float = 0.01,
+    repetition_penalty: float = 1.25,
+    remat: bool = True,
+    local_steps: int = 4,
+    devices: Optional[Any] = None,
+) -> Callable:
+    """
+    Multi-TPU pmap Local-SGD runner: each TPU replica executes `local_steps` sequential
+    SpheroidOptimizer steps on distinct minibatches via lax.scan, then merges replicas with pmean.
+    Inputs q_micro and r_micro have shape [num_devices, local_steps, B_per_tpu, L].
+    """
+    const_buffers = tuple(jax.device_get(b) for b in buffers)
+    compiled_variants: Dict[Tuple[bool, bool], Callable] = {}
+
+    def _get_variant(pure_tf: bool, has_fb: bool) -> Callable:
+        key = (pure_tf, has_fb)
+        if key in compiled_variants:
+            return compiled_variants[key]
+
+        in_axes = (0, 0, 0, 0, None, 0 if has_fb else None, None)
+
+        @partial(jax.pmap, axis_name="dp", in_axes=in_axes, devices=devices)
+        def _pmap_round(p, opt_s, q_micro, r_micro, base_lr, fb_micro, sampling_p):
+            jax_buffers = tuple(jnp.asarray(b) for b in const_buffers)
+
+            def _scan_body(carry, batch_slice):
+                cur_p, cur_opt = carry
+                if has_fb:
+                    q_b, r_b, fb_b = batch_slice
+                else:
+                    q_b, r_b = batch_slice
+                    fb_b = None
+                loss_k, grads_k = _compute_loss_and_grads(
+                    cur_p,
+                    q_b,
+                    r_b,
+                    jax_buffers,
+                    config,
+                    pad_id,
+                    repetition_penalty,
+                    remat,
+                    fb_b,
+                    sampling_p,
+                    pure_tf,
+                )
+                nxt_p, nxt_opt = _apply_spheroid_grads(cur_p, cur_opt, grads_k, base_lr, weight_decay)
+                return (nxt_p, nxt_opt), loss_k
+
+            scan_xs = (q_micro, r_micro, fb_micro) if has_fb else (q_micro, r_micro)
+            (end_p, end_opt), losses = lax.scan(_scan_body, (p, opt_s), scan_xs)
+            merged_p, merged_opt = merge_spheroid_replicas(end_p, end_opt, axis_name="dp")
+            mean_loss = lax.pmean(jnp.mean(losses), axis_name="dp")
+            return merged_p, merged_opt, mean_loss
+
+        compiled_variants[key] = _pmap_round
+        return _pmap_round
+
+    def train_round(p, opt_s, q_micro, r_micro, base_lr, feedback_micro=None, sampling_p=1.0):
+        fn = _get_variant(_is_pure_teacher_forcing(sampling_p), feedback_micro is not None)
+        return fn(p, opt_s, q_micro, r_micro, base_lr, feedback_micro, sampling_p)
+
+    return train_round

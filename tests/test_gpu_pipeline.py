@@ -478,3 +478,48 @@ def test_pytorch_generate_seed_token_and_bio_stop():
     m_full = CerebroSpheroidV5(cfg_full).eval()
     text = m_full.generate_text("Hello", tok, max_new_tokens=5, temperature=0.5)
     assert isinstance(text, str)
+
+
+def test_kaggle_tpuv5e8_kernel_artifacts_valid():
+    """Validate Kaggle TpuV5E8 metadata and headless Local-SGD launcher script."""
+    import json
+    import os
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    meta_path = os.path.join(repo_root, "kaggle", "tpu", "kernel-metadata.json")
+    script_path = os.path.join(repo_root, "kaggle", "tpu", "cerebro_spheroid_v5_kaggle_tpu.py")
+
+    assert os.path.isfile(meta_path), "kaggle/tpu/kernel-metadata.json missing"
+    assert os.path.isfile(script_path), "kaggle/tpu/cerebro_spheroid_v5_kaggle_tpu.py missing"
+
+    with open(meta_path, "r") as f:
+        meta = json.load(f)
+    assert meta["id"] == "ajitsheoran/cerebro-spheroid-v5-tpu"
+    assert meta["code_file"] == "cerebro_spheroid_v5_kaggle_tpu.py"
+    assert meta["kernel_type"] == "script"
+    assert meta["language"] == "python"
+    assert meta["machine_shape"] == "TpuV5E8"
+    assert meta["enable_tpu"] is True
+    assert meta["enable_gpu"] is False
+    assert meta["enable_internet"] is True
+
+    with open(script_path, "r") as f:
+        src = f.read()
+    compile(src, script_path, "exec")
+
+    for required in (
+        "--multi_tpu",
+        "local_sgd",
+        "--local_steps",
+        "--tune_objective",
+        "steps_per_sec",
+        "--max_batch_size",
+        "64",
+        "--cloud-sync",
+        "--max_hours",
+        "8.5",
+        "scripts/train_v5_tpu_jax.py",
+    ):
+        assert required in src, f"Missing expected token/flag in Kaggle TPU script: {required}"
+
+    assert "--from-scratch" not in src and "--from_scratch" not in src

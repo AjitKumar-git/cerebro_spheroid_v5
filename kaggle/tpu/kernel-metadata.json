@@ -1,0 +1,19 @@
+{
+  "id": "ajitsheoran/cerebro-spheroid-v5-tpu",
+  "title": "CerebroSpheroid V5 TPU v5e-8 Training",
+  "code_file": "cerebro_spheroid_v5_kaggle_tpu.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": true,
+  "enable_internet": true,
+  "keywords": [
+    "tpu"
+  ],
+  "dataset_sources": [],
+  "kernel_sources": [],
+  "competition_sources": [],
+  "model_sources": [],
+  "machine_shape": "TpuV5E8"
+}
