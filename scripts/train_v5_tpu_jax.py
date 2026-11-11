@@ -158,6 +158,7 @@ def parse_args(args_list=None):
     parser.add_argument("--cloud_token", type=str, default="CerebroSpheroid_Sync_Secure_2026", help="Secret sync token")
     parser.add_argument("--resume_target", type=str, default="latest", choices=["latest", "best"], help="Target checkpoint to pull from cloud ('latest' or 'best')")
     parser.add_argument("--reset_best", action="store_true", default=False, help="Reset best validation loss tracker")
+    parser.add_argument("--from-scratch", "--from_scratch", dest="from_scratch", action="store_true", default=False, help="Start clean from Step 0 without loading any checkpoint")
 
     return parser.parse_args(args_list)
 
@@ -403,50 +404,63 @@ def main(args=None):
     local_latest = os.path.join(args.checkpoint_dir, f"{args.preset}_latest.pt")
     fallback_latest = os.path.join(args.checkpoint_dir, f"{sync_model_name}_latest.pt")
 
-    # Cloud sync pull if active
-    if args.cloud_sync:
-        try:
-            print(f"\n[cloud_sync] Checking remote manifest on bioflo.in for {args.preset}...")
-            remote_manifest = check_remote_manifest(args.preset, url=args.cloud_url, token=args.cloud_token)
-            if not remote_manifest and args.preset == "tpu_v5e_1":
-                remote_manifest = check_remote_manifest("v5_small", url=args.cloud_url, token=args.cloud_token)
-            if remote_manifest:
-                target_file = f"{args.resume_target}.pt"
-                target_dest = os.path.join(args.checkpoint_dir, f"{args.preset}_{args.resume_target}.pt")
-                pulled_ok = pull_checkpoint(
-                    target_dest,
-                    target_type=args.resume_target,
-                    url=args.cloud_url,
-                    token=args.cloud_token,
-                )
-                if pulled_ok and os.path.exists(target_dest):
-                    local_latest = target_dest
-                    print(f"✓ Restored latest checkpoint from cloud hub: {target_dest}")
-        except Exception as e:
-            print(f"⚠️ [cloud_sync] Notice: {e}")
-
-    # Discover and restore latest local checkpoint
-    if not os.path.exists(local_latest) and os.path.exists(fallback_latest):
-        local_latest = fallback_latest
-
-    discovered_ckpt = None
-    if os.path.exists(local_latest):
-        discovered_ckpt = local_latest
+    # Checkpoint Restoration or Clean Scratch Start
+    if args.from_scratch:
+        print("\n🌱 [from_scratch=True] Initializing clean Step 0 training with random orthogonal weights (checkpoint restoration bypassed)!")
+        start_step = 0
+        best_eval_loss = float("inf")
+        # Clean local target checkpoints if present to prevent accidental mixing
+        for old_f in [local_latest, fallback_latest, os.path.join(args.checkpoint_dir, f"{args.preset}_best.pt")]:
+            if os.path.exists(old_f):
+                try:
+                    os.remove(old_f)
+                except Exception:
+                    pass
     else:
-        found_ckpt, found_step, found_loss = discover_latest_checkpoint(args.checkpoint_dir, preset=args.preset)
-        if found_ckpt:
-            discovered_ckpt = found_ckpt
+        # Cloud sync pull if active
+        if args.cloud_sync:
+            try:
+                print(f"\n[cloud_sync] Checking remote manifest on bioflo.in for {args.preset}...")
+                remote_manifest = check_remote_manifest(args.preset, url=args.cloud_url, token=args.cloud_token)
+                if not remote_manifest and args.preset == "tpu_v5e_1":
+                    remote_manifest = check_remote_manifest("v5_small", url=args.cloud_url, token=args.cloud_token)
+                if remote_manifest:
+                    target_file = f"{args.resume_target}.pt"
+                    target_dest = os.path.join(args.checkpoint_dir, f"{args.preset}_{args.resume_target}.pt")
+                    pulled_ok = pull_checkpoint(
+                        target_dest,
+                        target_type=args.resume_target,
+                        url=args.cloud_url,
+                        token=args.cloud_token,
+                    )
+                    if pulled_ok and os.path.exists(target_dest):
+                        local_latest = target_dest
+                        print(f"✓ Restored latest checkpoint from cloud hub: {target_dest}")
+            except Exception as e:
+                print(f"⚠️ [cloud_sync] Notice: {e}")
 
-    if discovered_ckpt and os.path.exists(discovered_ckpt):
-        try:
-            ckpt = torch.load(discovered_ckpt, map_location="cpu", weights_only=False)
-            start_step = int(ckpt.get("step", 0))
-            best_eval_loss = float(ckpt.get("eval_loss", ckpt.get("loss", float("inf"))))
-            restored = adapt_and_load_checkpoint_weights(ckpt, params, target_dtype, config)
-            print(f"✓ Resumed from {os.path.basename(discovered_ckpt)} at Step {start_step:,} (Loss: {best_eval_loss:.4f})")
-            print(f"✓ Restored & adapted {restored}/{len(params)} parameter arrays into JAX engine!")
-        except Exception as e:
-            print(f"⚠️ Checkpoint load notice: {e}. Starting fresh.")
+        # Discover and restore latest local checkpoint
+        if not os.path.exists(local_latest) and os.path.exists(fallback_latest):
+            local_latest = fallback_latest
+
+        discovered_ckpt = None
+        if os.path.exists(local_latest):
+            discovered_ckpt = local_latest
+        else:
+            found_ckpt, found_step, found_loss = discover_latest_checkpoint(args.checkpoint_dir, preset=args.preset)
+            if found_ckpt:
+                discovered_ckpt = found_ckpt
+
+        if discovered_ckpt and os.path.exists(discovered_ckpt):
+            try:
+                ckpt = torch.load(discovered_ckpt, map_location="cpu", weights_only=False)
+                start_step = int(ckpt.get("step", 0))
+                best_eval_loss = float(ckpt.get("eval_loss", ckpt.get("loss", float("inf"))))
+                restored = adapt_and_load_checkpoint_weights(ckpt, params, target_dtype, config)
+                print(f"✓ Resumed from {os.path.basename(discovered_ckpt)} at Step {start_step:,} (Loss: {best_eval_loss:.4f})")
+                print(f"✓ Restored & adapted {restored}/{len(params)} parameter arrays into JAX engine!")
+            except Exception as e:
+                print(f"⚠️ Checkpoint load notice: {e}. Starting fresh.")
 
     if args.reset_best:
         best_eval_loss = float("inf")
