@@ -62,6 +62,78 @@ from src.cloud_sync import (
 from src.jax.data_streamer import LinguisticDataStreamer
 
 
+def adapt_and_load_checkpoint_weights(ckpt: Dict[str, Any], target_params: Dict[str, jnp.ndarray], target_dtype, config: JAXConfigV5) -> int:
+    """Adapts checkpoint weights from any previous run (PyTorch state_dict or JAX params, 2D or 3D SwiGLU)."""
+    raw_state = ckpt.get("params") or ckpt.get("model_state") or ckpt.get("state_dict") or ckpt
+    if not isinstance(raw_state, dict):
+        return 0
+
+    restored_cnt = 0
+    K = config.num_shells
+    s_dim = config.surface_dim
+
+    # 1. Fuse 2D Intra-Shell SwiGLU weights into 3D tensors if not already 3D
+    if "core.intra_swiglu.w_gate" in target_params and "core.intra_swiglu.w_gate" not in raw_state:
+        gates, vals, downs, norms = [], [], [], []
+        for k in range(K):
+            for pfx in ["volumetric_core.intra_shell_swiglu", "core.intra_swiglu", "intra_swiglu"]:
+                g_key = f"{pfx}.{k}.fc_gate.weight"
+                if g_key in raw_state:
+                    g = np.asarray(raw_state[g_key])
+                    gates.append(g.T if g.shape == (s_dim * 2, s_dim) else g)
+                    v = np.asarray(raw_state[f"{pfx}.{k}.fc_val.weight"])
+                    vals.append(v.T if v.shape == (s_dim * 2, s_dim) else v)
+                    d = np.asarray(raw_state[f"{pfx}.{k}.fc_down.weight"])
+                    downs.append(d.T if d.shape == (s_dim, s_dim * 2) else d)
+                    break
+            for n_pfx in ["volumetric_core.intra_norms", "core.intra_norms", "intra_norms"]:
+                n_key = f"{n_pfx}.{k}.weight"
+                if n_key in raw_state:
+                    norms.append(np.asarray(raw_state[n_key]))
+                    break
+
+        if len(gates) == K:
+            target_params["core.intra_swiglu.w_gate"] = jnp.asarray(np.stack(gates, axis=0), dtype=target_dtype)
+            target_params["core.intra_swiglu.w_val"] = jnp.asarray(np.stack(vals, axis=0), dtype=target_dtype)
+            target_params["core.intra_swiglu.w_down"] = jnp.asarray(np.stack(downs, axis=0), dtype=target_dtype)
+            restored_cnt += 3
+        if len(norms) == K:
+            target_params["core.intra_norms.weight"] = jnp.asarray(np.stack(norms, axis=0), dtype=target_dtype)
+            restored_cnt += 1
+
+    # 2. General prefix and name translations
+    key_translations = {
+        "sensory_dnn.": "sensory.",
+        "volumetric_core.": "core.",
+        "motor_decoder.": "motor.",
+        "motor_decoder.head.weight": "sensory.embedding.weight",
+        "motor.head.weight": "sensory.embedding.weight",
+        "motor_decoder.fc_gate.weight": "motor.swiglu.fc_gate.weight",
+        "motor_decoder.fc_val.weight": "motor.swiglu.fc_val.weight",
+        "motor_decoder.fc_down.weight": "motor.swiglu.fc_down.weight",
+    }
+
+    for raw_k, raw_v in raw_state.items():
+        v = np.asarray(raw_v)
+        target_k = raw_k
+        if target_k not in target_params:
+            for old_p, new_p in key_translations.items():
+                if target_k.startswith(old_p):
+                    target_k = target_k.replace(old_p, new_p, 1)
+                    break
+
+        if target_k in target_params:
+            t_shape = target_params[target_k].shape
+            if t_shape == v.shape:
+                target_params[target_k] = jnp.asarray(v, dtype=target_dtype)
+                restored_cnt += 1
+            elif t_shape == v.T.shape:
+                target_params[target_k] = jnp.asarray(v.T, dtype=target_dtype)
+                restored_cnt += 1
+
+    return restored_cnt
+
+
 def parse_args(args_list=None):
     if args_list is None:
         args_list = sys.argv[1:]
@@ -240,9 +312,12 @@ def main(args=None):
                 m_resp = check_remote_manifest(model=args.preset)
                 models_info = m_resp.get("models", {})
                 model_tier_info = models_info.get(args.preset, {})
-                tier_manifest = m_resp.get("manifest", {}).get(f"{args.preset}_latest", {})
-
-                has_tier_latest = model_tier_info.get("has_latest", False) or bool(tier_manifest)
+                has_tier_latest = (
+                    m_resp.get("has_latest", False)
+                    or bool(m_resp.get("manifest", {}).get("latest"))
+                    or model_tier_info.get("has_latest", False)
+                    or bool(tier_manifest)
+                )
                 if has_tier_latest:
                     pulled = pull_checkpoint(local_latest, target_type="latest", model=args.preset)
                     if pulled:
@@ -265,17 +340,12 @@ def main(args=None):
                 if ckpt_preset is not None and ckpt_preset != args.preset:
                     print(f"⚠️ Checkpoint preset mismatch: found '{ckpt_preset}', but running '{args.preset}'. Starting clean!")
                     os.remove(local_latest)
-                elif "step" in ckpt:
+                elif "step" in ckpt or "model_state" in ckpt or "params" in ckpt:
                     start_step = int(ckpt.get("step", 0))
                     best_loss = float(ckpt.get("loss", float("inf")))
-                    print(f"✓ Resumed from {os.path.basename(local_latest)} at Step {start_step:,} (loss: {best_loss:.4f})")
-                    if "params" in ckpt and isinstance(ckpt["params"], dict):
-                        restored_cnt = 0
-                        for k, v in ckpt["params"].items():
-                            if k in params and params[k].shape == v.shape:
-                                params[k] = jnp.asarray(v, dtype=target_dtype)
-                                restored_cnt += 1
-                        print(f"✓ Restored {restored_cnt}/{len(params)} parameter arrays into JAX engine.")
+                    print(f"✓ Resuming from {os.path.basename(local_latest)} at Step {start_step:,} (loss: {best_loss:.4f})")
+                    restored_cnt = adapt_and_load_checkpoint_weights(ckpt, params, target_dtype, config)
+                    print(f"✓ Restored & adapted {restored_cnt}/{len(params)} parameter arrays into JAX engine (including 3D SwiGLU tensor fusion)!")
                 else:
                     print(f"⚠️ Incompatible checkpoint structure in {local_latest}. Starting fresh!")
                     os.remove(local_latest)
