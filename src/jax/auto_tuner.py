@@ -245,3 +245,7 @@ def auto_tune_environment(
             print("=" * 80 + "\n")
 
     return best_config
+
+
+# Backward-compatible alias
+run_auto_tuner = auto_tune_environment

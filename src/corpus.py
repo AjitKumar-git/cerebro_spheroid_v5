@@ -497,13 +497,25 @@ def total_weights(specs: List[Tuple[str, float]]) -> Dict[str, float]:
 def build_tokenizer(name: str = "llama"):
     """
     Builds and configures a tokenizer for CerebroSpheroid models:
-    - 'llama': Modern 32,000 Byte-Fallback BPE (via huggyllama/llama-7b or TinyLlama).
+    - 'llama': Modern 32,000 Byte-Fallback BPE (prefers local bundled data/tokenizer, then HuggingFace).
       Features byte-level UTF-8 fallback (zero <unk>), single-digit number tokenization,
       pad_token_id=0, bos_token_id=1, eos_token_id=2.
     - 'gpt2': Legacy 50,257 BPE tokenizer.
     """
     os.environ["HF_HOME"] = os.path.expanduser("~/.hf_cache")
     from transformers import AutoTokenizer
+
+    # 1. First priority: Check local bundled LLaMA-32k tokenizer in data/tokenizer
+    local_tok = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "tokenizer")
+    if (name == "llama" or name == "default") and os.path.exists(os.path.join(local_tok, "tokenizer.json")):
+        try:
+            tok = AutoTokenizer.from_pretrained(local_tok, local_files_only=True)
+            if tok.pad_token_id is None:
+                tok.pad_token_id = 0
+            return tok
+        except Exception:
+            pass
+
     if name == "llama":
         tok = AutoTokenizer.from_pretrained("huggyllama/llama-7b")
         if tok.pad_token_id is None:
