@@ -253,6 +253,9 @@ class SensoryInputDNNV5(nn.Module):
         # Primary sensory dictionary (shared with motor emission head via affine tying)
         self.embedding = nn.Embedding(vocab_size, surface_dim)
         nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
+        # Zero-init positional embedding preserves transferability while restoring token order
+        self.pos_embed = nn.Embedding(1024, surface_dim)
+        nn.init.zeros_(self.pos_embed.weight)
 
         # Non-linear input SwiGLU block
         self.swiglu = SwiGLU(surface_dim, hidden_features=surface_dim * 2, out_features=surface_dim)
@@ -275,6 +278,7 @@ class SensoryInputDNNV5(nn.Module):
         self,
         input_ids_or_emb: torch.Tensor,
         is_causal: bool = False,
+        pos_offset: int = 0,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Accepts integer token IDs [B, L] or soft embedding vectors [B, D] / [B, L, D].
@@ -295,6 +299,10 @@ class SensoryInputDNNV5(nn.Module):
             x = x.unsqueeze(1)
 
         B, L, D = x.shape
+        pos_ids = (torch.arange(L, device=x.device, dtype=torch.long) + pos_offset).clamp(
+            0, self.pos_embed.num_embeddings - 1
+        )
+        x = x + self.pos_embed(pos_ids).unsqueeze(0).to(x.dtype)
         h = self.norm_in(x)
         h = x + self.dropout(self.swiglu(h))
         flux = self.norm_out(h)
@@ -369,7 +377,10 @@ class VolumetricSpheroidCoreV5(nn.Module):
         self.radial_in_proj = nn.Linear(surface_dim, radial_dim, bias=False)
         self.radial_out_proj = nn.Linear(surface_dim, radial_dim, bias=False)
         self.radial_up = nn.Linear(radial_dim, surface_dim, bias=False)
+        self.radial_up_out = nn.Linear(radial_dim, surface_dim, bias=False)
         self.radial_norm = RMSNorm(surface_dim)
+        self.radial_mix_scale = nn.Parameter(torch.tensor(0.1))
+        self.shortcut_mix_scale = nn.Parameter(torch.tensor(0.05))
 
         # Inter-shell transition matrices (subject to contractive spectral guard)
         self.w_radial_in = nn.Parameter(torch.randn(num_shells - 1, radial_dim, radial_dim) * (1.0 / math.sqrt(radial_dim)))
@@ -425,20 +436,22 @@ class VolumetricSpheroidCoreV5(nn.Module):
             intra_updates.append(s_k + self.dropout(u_k))
         state_intra = torch.stack(intra_updates, dim=1)  # [B, K, D]
 
-        # 2. Inter-shell radial wave propagation
+        # 2. Inter-shell radial wave propagation (Pre-Norm preserves inter-shell magnitude hierarchy)
+        h_comm = self.radial_norm(state_intra)
         # Inward wave: Shell k+1 -> Shell k
-        rad_in = self.radial_in_proj(state_intra[:, 1:, :])   # [B, K-1, Dr]
+        rad_in = self.radial_in_proj(h_comm[:, 1:, :])   # [B, K-1, Dr]
         in_flux = torch.einsum("bkd,kde->bke", rad_in, self.w_radial_in)  # [B, K-1, Dr]
         in_up = self.radial_up(in_flux)  # [B, K-1, D]
 
-        # Outward wave: Shell k -> Shell k+1
-        rad_out = self.radial_out_proj(state_intra[:, :-1, :])  # [B, K-1, Dr]
+        # Outward wave: Shell k -> Shell k+1 (decoupled radial_up_out projection)
+        rad_out = self.radial_out_proj(h_comm[:, :-1, :])  # [B, K-1, Dr]
         out_flux = torch.einsum("bkd,kde->bke", rad_out, self.w_radial_out)  # [B, K-1, Dr]
-        out_up = self.radial_up(out_flux)  # [B, K-1, D]
+        out_up = self.radial_up_out(out_flux)  # [B, K-1, D]
 
         # Assemble radial deltas out-of-place (zero in-place modifications)
-        delta_in = F.pad(0.1 * in_up, (0, 0, 0, 1))    # [B, K, D], zero padded on Shell K-1
-        delta_out = F.pad(0.1 * out_up, (0, 0, 1, 0))  # [B, K, D], zero padded on Shell 0
+        rad_scale = self.radial_mix_scale.to(state_intra.dtype)
+        delta_in = F.pad(rad_scale * in_up, (0, 0, 0, 1))    # [B, K, D], zero padded on Shell K-1
+        delta_out = F.pad(rad_scale * out_up, (0, 0, 1, 0))  # [B, K, D], zero padded on Shell 0
         state_radial = state_intra + delta_in + delta_out
 
         # 3. Mixture-of-Axonal-Tracts (MoT Sparse Small-World Routing)
@@ -452,17 +465,26 @@ class VolumetricSpheroidCoreV5(nn.Module):
         else:
             eff_conductances = conductances.view(1, -1)  # [1, T]
 
-        src_acts = state_radial[:, self.src_indices, :]   # [B, T, D]
+        src_acts = self.radial_norm(state_radial)[:, self.src_indices, :]   # [B, T, D]
         shortcut_flux = torch.einsum("btd,tde->bte", src_acts, self.shortcut_weight) * eff_conductances.unsqueeze(-1)
 
         # Assemble axonal skip flux out-of-place
+        sc_scale = self.shortcut_mix_scale.to(state_radial.dtype)
         delta_shortcut = torch.zeros_like(state_radial)
         for t in range(self.num_shortcut_tracts):
             dst = self.dst_indices[t]
-            delta_shortcut[:, dst, :] = delta_shortcut[:, dst, :] + 0.05 * shortcut_flux[:, t, :]
+            delta_shortcut[:, dst, :] = delta_shortcut[:, dst, :] + sc_scale * shortcut_flux[:, t, :]
         state_next = state_radial + delta_shortcut
 
-        return self.radial_norm(state_next)
+        return state_next
+
+    def step_efference_fast(self, state: torch.Tensor, efference: torch.Tensor) -> torch.Tensor:
+        """O(1) bounded residual efference feedback onto Shell 0 without full deliberate_step."""
+        orig_dtype = state.dtype
+        eff_f32 = efference.float()
+        eff_normed = (eff_f32 * torch.rsqrt(eff_f32.pow(2).mean(dim=-1, keepdim=True) + 1e-6)).to(orig_dtype)
+        new_shell0 = 0.85 * state[:, 0, :] + 0.15 * eff_normed
+        return torch.cat([new_shell0.unsqueeze(1), state[:, 1:, :]], dim=1)
 
     def inject_efference_copy(self, state: torch.Tensor, efference: torch.Tensor) -> torch.Tensor:
         """Injects motor efference copy directly into Shell 0 out-of-place."""
@@ -506,7 +528,7 @@ class PremotorMotorDecoderV5(nn.Module):
         self.num_heads = num_heads
         self.head_dim = surface_dim // num_heads
         self.max_phase_steps = max_phase_steps
-        self.phase_scale = nn.Parameter(torch.tensor(0.5))
+        self.phase_scale = nn.Parameter(torch.tensor(float(phase_scale)))
         self.use_plan = use_plan
         self.use_shell_tap = use_shell_tap
         self.top_k_resonance = top_k_resonance
@@ -532,7 +554,9 @@ class PremotorMotorDecoderV5(nn.Module):
         self.shell_scale = nn.Parameter(torch.tensor(0.5))
 
         # Deep motor integration MLP: [motor_surface, core, resonance, shell_pool, plan] = 5*D -> D
-        fused_dim = surface_dim * 5 if use_plan else surface_dim * 4
+        num_inputs = 5 if use_plan else 4
+        fused_dim = surface_dim * num_inputs
+        self.input_gate = nn.Parameter(torch.ones(num_inputs))
         self.fused_norm = RMSNorm(fused_dim)
         self.dropout = nn.Dropout(dropout)
 
@@ -590,6 +614,7 @@ class PremotorMotorDecoderV5(nn.Module):
         repetition_penalty: float = 1.25,
         return_hidden: bool = False,
         causal_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        causal_kv_mask: Optional[torch.Tensor] = None,
     ) -> Union[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor], Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]]:
         """
         Executes a single motor verbalization step:
@@ -612,7 +637,7 @@ class PremotorMotorDecoderV5(nn.Module):
         p_idx = min(max(0, int(step_idx)), max_phase - 1)
         phase = self.phase_embed.weight[p_idx].to(state.dtype)
         p_norm = phase.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-        p_scaled = phase * (torch.clamp(self.phase_scale, 0.05, 1.5) / p_norm)
+        p_scaled = phase * (torch.clamp(self.phase_scale, 0.05, 5.0) / p_norm)
 
         motor_surface = surface + p_scaled
         if auditory_feedback is not None:
@@ -621,8 +646,10 @@ class PremotorMotorDecoderV5(nn.Module):
         # 2. Multi-Head Arcuate Fasciculus Cross-Resonance with RoPE & Top-K Sparsity
         if sensory_kv is not None:
             keys, values = sensory_kv  # [B, H, L_prompt, head_dim]
+            causal_len = 0
             if causal_kv is not None and causal_kv[0].shape[2] > 0:
                 c_k, c_v = causal_kv
+                causal_len = c_k.shape[2]
                 keys = torch.cat([keys, c_k], dim=2)
                 values = torch.cat([values, c_v], dim=2)
             L = keys.shape[2]
@@ -635,6 +662,12 @@ class PremotorMotorDecoderV5(nn.Module):
 
             # Dot-product cross-resonance: [B, H, 1, L]
             scores = torch.matmul(q_rot.to(keys.dtype), k_rot.transpose(-1, -2)) / math.sqrt(self.head_dim)
+
+            if causal_len > 0 and causal_kv_mask is not None:
+                prompt_len_k = L - causal_len
+                prompt_valid = torch.ones(B, prompt_len_k, dtype=torch.bool, device=scores.device)
+                k_valid = torch.cat([prompt_valid, causal_kv_mask[:, :causal_len]], dim=1).view(B, 1, 1, L)
+                scores = torch.where(k_valid, scores, torch.full_like(scores, -1e9))
 
             # Top-K Sparse Associative Gating (Needle-in-a-Haystack Tethering)
             if self.top_k_resonance > 0 and L > self.top_k_resonance:
@@ -658,9 +691,15 @@ class PremotorMotorDecoderV5(nn.Module):
             shell_pool = torch.zeros_like(motor_surface)
 
         # 4. Deep Motor Integration via SwiGLU
-        fused_components = [motor_surface, core, resonance, shell_pool]
+        gate = self.input_gate.to(motor_surface.dtype)
+        fused_components = [
+            motor_surface * gate[0],
+            core * gate[1],
+            resonance * gate[2],
+            shell_pool * gate[3],
+        ]
         if self.use_plan and plan is not None:
-            fused_components.append(plan)
+            fused_components.append(plan * gate[4])
 
         fused = self.fused_norm(torch.cat(fused_components, dim=-1))
         if self.use_tied_embeddings:
@@ -725,6 +764,7 @@ class PremotorMotorDecoderV5(nn.Module):
         plan: Optional[torch.Tensor] = None,
         chunk_offset: int = 0,
         return_hidden: bool = False,
+        target_kv_mask: Optional[torch.Tensor] = None,
     ) -> Union[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         Parallel Fused Chunk Motor Decoder:
@@ -743,7 +783,7 @@ class PremotorMotorDecoderV5(nn.Module):
         p_indices = torch.clamp(torch.arange(chunk_offset, chunk_offset + T_chunk, device=state.device), 0, max_phase - 1)
         phase_seq = self.phase_embed(p_indices)  # [T_chunk, D]
         p_norm = phase_seq.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-        p_scaled = phase_seq * (torch.clamp(self.phase_scale, 0.05, 1.5) / p_norm)  # [T_chunk, D]
+        p_scaled = phase_seq * (torch.clamp(self.phase_scale, 0.05, 5.0) / p_norm)  # [T_chunk, D]
 
         # Broadcast surface + phase + feedback across [B, T_chunk, D]
         motor_surface = surface.unsqueeze(1) + p_scaled.unsqueeze(0) + target_feedback.to(surface.dtype)
@@ -766,10 +806,14 @@ class PremotorMotorDecoderV5(nn.Module):
             q_rot = apply_rope(q, self.rope_cos, self.rope_sin, offset=L_prompt + chunk_offset)
             k_rot = apply_rope(all_k, self.rope_cos, self.rope_sin, offset=0)
 
-            # Prefix-causal mask: Prompt is bidirectional, target tokens within chunk are causal
+            # Prefix-causal mask: Prompt is bidirectional, feedback keys up to current step are causal
             prompt_mask = torch.ones(T_chunk, L_prompt + chunk_offset, dtype=torch.bool, device=q.device)
             causal_submask = torch.tril(torch.ones(T_chunk, T_chunk, dtype=torch.bool, device=q.device))
             prefix_mask = torch.cat([prompt_mask, causal_submask], dim=1).unsqueeze(0).unsqueeze(0)
+            if target_kv is not None and target_kv[0].shape[2] > 0 and target_kv_mask is not None:
+                prompt_valid = torch.ones(B, L_prompt, dtype=torch.bool, device=q.device)
+                k_valid = torch.cat([prompt_valid, target_kv_mask[:, : t_k.shape[2]]], dim=1)[:, None, None, :]
+                prefix_mask = prefix_mask & k_valid
 
             # Fused PyTorch SDPA (dispatches to FlashAttention-2 / memory-efficient attention)
             res = F.scaled_dot_product_attention(
@@ -793,11 +837,17 @@ class PremotorMotorDecoderV5(nn.Module):
             shell_pool = torch.zeros_like(surface)
 
         # 4. Deep Motor Integration via Parallel SwiGLU
+        gate = self.input_gate.to(motor_surface.dtype)
         core_exp = core.unsqueeze(1).expand(-1, T_chunk, -1)
         shell_exp = shell_pool.unsqueeze(1).expand(-1, T_chunk, -1)
-        fused_components = [motor_surface, core_exp, resonance, shell_exp]
+        fused_components = [
+            motor_surface * gate[0],
+            core_exp * gate[1],
+            resonance * gate[2],
+            shell_exp * gate[3],
+        ]
         if self.use_plan and plan is not None:
-            fused_components.append(plan.unsqueeze(1).expand(-1, T_chunk, -1))
+            fused_components.append(plan.unsqueeze(1).expand(-1, T_chunk, -1) * gate[4])
 
         fused = self.fused_norm(torch.cat(fused_components, dim=-1))
         if self.use_tied_embeddings:
@@ -970,11 +1020,31 @@ class CerebroSpheroidV5(nn.Module):
         """Initializes empty concentric spherical state: [B, num_shells, surface_dim]."""
         return torch.zeros(batch_size, self.config.num_shells, self.config.surface_dim, device=device)
 
+    @staticmethod
+    def _recency_weighted_pool(
+        flux: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        decay: float = 0.05,
+    ) -> torch.Tensor:
+        """Order-preserving exponential recency pooling over non-pad sensory tokens."""
+        L = flux.shape[1]
+        pos = torch.arange(L, device=flux.device, dtype=torch.float32).unsqueeze(0)
+        if mask is not None:
+            m = mask.float()
+            last_pos = torch.max(pos * m, dim=1, keepdim=True)[0]
+            weights = torch.exp(decay * (pos - last_pos).clamp(max=0.0)) * m
+        else:
+            weights = torch.exp(decay * (pos - float(max(L - 1, 0))))
+        denom = torch.sum(weights, dim=1, keepdim=True).clamp_min(1.0)
+        pooled = torch.sum(flux.float() * weights.unsqueeze(-1), dim=1) / denom
+        return pooled.to(flux.dtype)
+
     def forward(
         self,
         prompts: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
         feedback_tokens: Optional[torch.Tensor] = None,
+        feedback_is_shifted: bool = True,
         sampling_p: float = 1.0,
         pad_id: int = 0,
         target_len: Optional[int] = None,
@@ -1005,6 +1075,7 @@ class CerebroSpheroidV5(nn.Module):
         if has_perceptual:
             raw_p_flux = torch.cat(sensory_tokens_list, dim=1)  # [B, P_total, visual_dim]
             B_vis, P_vis, _ = raw_p_flux.shape
+            prompt_pos_offset = P_vis + prompts.shape[1]
             vis_flux = self.perceptual_projector(raw_p_flux)   # [B, P_total, surface_dim]
             if prompts.dim() == 2 and prompts.dtype in (torch.int32, torch.int64):
                 txt_emb = self.sensory_dnn.embedding(prompts)  # [B, L, D]
@@ -1012,21 +1083,22 @@ class CerebroSpheroidV5(nn.Module):
                 sensory_flux, sensory_kv = self.sensory_dnn(combined_emb)
                 vis_mask = torch.ones(B_vis, P_vis, device=dev)
                 txt_mask = (prompts != pad_id).float()
-                combined_mask = torch.cat([vis_mask, txt_mask], dim=1).unsqueeze(-1)
-                prompt_centroid = torch.sum(sensory_flux * combined_mask, dim=1) / torch.clamp(torch.sum(combined_mask, dim=1), min=1.0)
+                combined_mask = torch.cat([vis_mask, txt_mask], dim=1)
+                prompt_centroid = self._recency_weighted_pool(sensory_flux, combined_mask)
             else:
                 combined_emb = torch.cat([vis_flux, prompts], dim=1)
                 sensory_flux, sensory_kv = self.sensory_dnn(combined_emb)
-                prompt_centroid = sensory_flux.mean(dim=1)
+                prompt_centroid = self._recency_weighted_pool(sensory_flux)
             B = B_vis
         else:
             B = prompts.shape[0]
+            prompt_pos_offset = prompts.shape[1]
             sensory_flux, sensory_kv = self.sensory_dnn(prompts)
             if prompts.dim() == 2:
-                mask = (prompts != pad_id).unsqueeze(-1).float()
-                prompt_centroid = torch.sum(sensory_flux * mask, dim=1) / torch.clamp(torch.sum(mask, dim=1), min=1.0)
+                mask = (prompts != pad_id).float()
+                prompt_centroid = self._recency_weighted_pool(sensory_flux, mask)
             else:
-                prompt_centroid = sensory_flux.mean(dim=1)
+                prompt_centroid = self._recency_weighted_pool(sensory_flux)
 
         # 2. State Initialization: Cortical Surface receives sensory prompt flux out-of-place
         subcortical = torch.zeros(B, self.config.num_shells - 1, self.config.surface_dim, device=dev)
@@ -1065,20 +1137,32 @@ class CerebroSpheroidV5(nn.Module):
                 if not self.training and (halt_prob > self.config.thinking_halt_threshold).all():
                     break
 
-        # Pre-embed teacher feedback tokens if available
-        if feedback_tokens is None and targets is not None:
-            # Automatic teacher-forcing feedback from targets
-            feedback_tokens = targets[:, :t_len]
-
+        # Pre-embed aligned previous-token feedback (prev_tokens[:, t] feeds step t predicting targets[:, t])
+        prev_tokens = None
         if feedback_tokens is not None:
-            safe_feedback = torch.clamp(feedback_tokens, min=0)
-            tf_flux, (tf_keys, tf_values) = self.sensory_dnn(safe_feedback, is_causal=True)
-            valid_mask = (feedback_tokens >= 0).unsqueeze(-1).float()
-            tf_flux = tf_flux * valid_mask
+            fb_slice = feedback_tokens[:, :t_len]
+            if feedback_is_shifted:
+                prev_tokens = fb_slice
+            else:
+                pad_col = torch.full((B, 1), -100, dtype=fb_slice.dtype, device=dev)
+                prev_tokens = torch.cat([pad_col, fb_slice[:, : max(0, t_len - 1)]], dim=1)[:, :t_len]
+        elif targets is not None:
+            tgt_slice = targets[:, :t_len]
+            pad_col = torch.full((B, 1), -100, dtype=tgt_slice.dtype, device=dev)
+            prev_tokens = torch.cat([pad_col, tgt_slice[:, : max(0, t_len - 1)]], dim=1)[:, :t_len]
+
+        if prev_tokens is not None:
+            safe_feedback = torch.clamp(prev_tokens, min=0)
+            tf_flux, (tf_keys, tf_values) = self.sensory_dnn(
+                safe_feedback, is_causal=True, pos_offset=prompt_pos_offset
+            )
+            fb_valid_mask = prev_tokens >= 0
+            tf_flux = tf_flux * fb_valid_mask.unsqueeze(-1).to(tf_flux.dtype)
         else:
             tf_flux = None
             tf_keys = None
             tf_values = None
+            fb_valid_mask = None
 
         # 4. Motor Emission Engine (Chunkwise Parallel Fused FlashAttention vs Sequential)
         plan = self.motor_decoder.init_plan(B, dev) if self.config.use_plan else None
@@ -1088,9 +1172,8 @@ class CerebroSpheroidV5(nn.Module):
         use_fast_chunkwise = targets is not None and not getattr(self, "force_sequential", False) and tf_flux is not None
 
         if use_fast_chunkwise:
-            # Shift feedback: at step 0 feedback is 0; at step t feedback is tf_flux[:, t-1]
-            zero_pad = torch.zeros(B, 1, self.config.surface_dim, device=dev, dtype=tf_flux.dtype)
-            shifted_feedback = torch.cat([zero_pad, tf_flux[:, :-1, :]], dim=1)[:, :t_len, :]
+            # prev_tokens is already aligned 1:1 with emission step t (no double shift)
+            shifted_feedback = tf_flux[:, :t_len, :]
 
             # Chunk size: 64 tokens per chunk for optimal Tensor Core saturation and periodic core updates
             c_size = getattr(self.config, "chunk_size", 64)
@@ -1102,8 +1185,9 @@ class CerebroSpheroidV5(nn.Module):
                 c_end = min(c_start + c_size, t_len)
                 chunk_fb = shifted_feedback[:, c_start:c_end, :]
 
-                # Target KV cache up to the current chunk
+                # Target KV cache up to the current chunk (exclusively past/previous tokens)
                 chunk_target_kv = (tf_keys[:, :, :c_end, :], tf_values[:, :, :c_end, :]) if tf_keys is not None else None
+                chunk_kv_mask = fb_valid_mask[:, :c_end] if fb_valid_mask is not None else None
 
                 chunk_logits, chunk_eff, plan = self.motor_decoder.forward_chunk(
                     state=state,
@@ -1113,6 +1197,7 @@ class CerebroSpheroidV5(nn.Module):
                     tied_embedding_weight=tied_w,
                     plan=plan,
                     chunk_offset=c_start,
+                    target_kv_mask=chunk_kv_mask,
                 )
                 all_chunk_logits.append(chunk_logits)
 
@@ -1130,18 +1215,21 @@ class CerebroSpheroidV5(nn.Module):
 
             for t in range(t_len):
                 if tf_flux is not None:
-                    tf_aud = tf_flux[:, t - 1, :] if t > 0 else None
-                    internal_feed = prev_thought if t > 0 else None
+                    tf_aud = tf_flux[:, t, :]
                     if t == 0:
-                        auditory_in = None
+                        auditory_in = torch.where(
+                            fb_valid_mask[:, 0:1], sampling_p * tf_aud, torch.zeros_like(tf_aud)
+                        )
                     else:
-                        auditory_in = sampling_p * tf_aud + (1.0 - sampling_p) * internal_feed
+                        auditory_in = sampling_p * tf_aud + (1.0 - sampling_p) * prev_thought
                 else:
                     auditory_in = prev_thought if t > 0 else None
 
                 causal_kv = None
-                if tf_keys is not None and t > 0:
-                    causal_kv = (tf_keys[:, :, :t, :], tf_values[:, :, :t, :])
+                causal_kv_mask = None
+                if tf_keys is not None:
+                    causal_kv = (tf_keys[:, :, : t + 1, :], tf_values[:, :, : t + 1, :])
+                    causal_kv_mask = fb_valid_mask[:, : t + 1] if fb_valid_mask is not None else None
 
                 logits, efference, refractory, plan = self.motor_decoder(
                     state=state,
@@ -1152,16 +1240,16 @@ class CerebroSpheroidV5(nn.Module):
                     step_idx=t,
                     auditory_feedback=auditory_in,
                     causal_kv=causal_kv,
+                    causal_kv_mask=causal_kv_mask,
                 )
                 all_logits.append(logits)
 
                 soft_p = F.softmax(logits, dim=-1)
                 soft_emb = soft_p @ tied_w
                 soft_emb_diff = 0.2 * soft_emb + 0.8 * soft_emb.detach()
-                prev_thought, _ = self.sensory_dnn(soft_emb_diff)
+                prev_thought, _ = self.sensory_dnn(soft_emb_diff, pos_offset=prompt_pos_offset + t)
 
-                state_eff = self.volumetric_core.inject_efference_copy(state, efference)
-                state = self.volumetric_core.deliberate_step(state_eff)
+                state = self.volumetric_core.step_efference_fast(state, efference)
 
             logits_stacked = torch.stack(all_logits, dim=1)
 
@@ -1201,9 +1289,11 @@ class CerebroSpheroidV5(nn.Module):
         dev = prompt_ids.device
         cycles = thinking_cycles if thinking_cycles is not None else (self.config.max_thinking_cycles if self.config.use_adaptive_thinking else self.config.thinking_cycles)
 
-        # 1. Encode prompt
+        # 1. Encode prompt with order-preserving recency weighting
         sensory_flux, sensory_kv = self.sensory_dnn(prompt_ids)
-        prompt_centroid = sensory_flux.mean(dim=1)
+        prompt_mask = (prompt_ids != 0).float()
+        safe_mask = torch.where(prompt_mask.sum(dim=1, keepdim=True) > 0, prompt_mask, torch.ones_like(prompt_mask))
+        prompt_centroid = self._recency_weighted_pool(sensory_flux, safe_mask)
 
         # 2. State Initialization: Cortical Surface receives sensory prompt flux out-of-place
         subcortical = torch.zeros(B, self.config.num_shells - 1, self.config.surface_dim, device=dev)
@@ -1288,13 +1378,12 @@ class CerebroSpheroidV5(nn.Module):
                 break
 
             # Thought re-afference & update causal KV buffer
-            prev_thought, (tok_k, tok_v) = self.sensory_dnn(next_tok.squeeze(-1))
+            prev_thought, (tok_k, tok_v) = self.sensory_dnn(next_tok.squeeze(-1), pos_offset=L + t)
             causal_keys_list.append(tok_k)
             causal_values_list.append(tok_v)
 
-            # Efference copy state propagation
-            state_eff = self.volumetric_core.inject_efference_copy(state, efference)
-            state = self.volumetric_core.deliberate_step(state_eff)
+            # Lightweight O(1) bounded efference copy propagation
+            state = self.volumetric_core.step_efference_fast(state, efference)
 
         return torch.cat(generated_tokens, dim=1)
 
@@ -1311,11 +1400,12 @@ class CerebroSpheroidV5(nn.Module):
         device: Optional[torch.device] = None,
     ) -> str:
         """Convenience method for generating text from a prompt string."""
+        from src.corpus import format_stimulus_prompt, clean_motor_response
+
         dev = device if device is not None else next(self.parameters()).device
-        STIM_ID = 20436 if self.config.vocab_size > 20436 else (getattr(tokenizer, "bos_token_id", 1) or 1)
-        raw_ids = tokenizer.encode(prompt, add_special_tokens=False)
-        safe_ids = [t % self.config.vocab_size for t in raw_ids]
-        input_ids = [STIM_ID] + safe_ids if (not safe_ids or safe_ids[0] != STIM_ID) else safe_ids
+        formatted_prompt = format_stimulus_prompt(prompt)
+        raw_ids = tokenizer.encode(formatted_prompt, add_special_tokens=False)
+        input_ids = [t % self.config.vocab_size for t in raw_ids] or [getattr(tokenizer, "bos_token_id", 1) or 1]
         tok_tensor = torch.tensor([input_ids], dtype=torch.long, device=dev)
 
         out_ids = self.generate(
@@ -1328,7 +1418,8 @@ class CerebroSpheroidV5(nn.Module):
             thinking_cycles=thinking_cycles,
             eos_token_id=getattr(tokenizer, "eos_token_id", 2),
         )
-        return tokenizer.decode(out_ids[0].tolist(), skip_special_tokens=True).strip()
+        decoded = tokenizer.decode(out_ids[0].tolist(), skip_special_tokens=True)
+        return clean_motor_response(decoded)
 
 
 def build_spheroid_v5(preset: str = "v5_compact", **kwargs) -> CerebroSpheroidV5:

@@ -56,12 +56,14 @@ class LinguisticDataStreamer:
         vocab_size: int = 32000,
         data_dir: Optional[str] = None,
         queue_size: int = 8,
+        target_pad_id: int = -100,
     ):
         self.batch_size = batch_size
         self.prompt_len = prompt_len
         self.target_len = target_len
         self.total_seq_len = prompt_len + target_len
         self.vocab_size = vocab_size
+        self.target_pad_id = target_pad_id
         self.queue: queue.Queue = queue.Queue(maxsize=queue_size)
         self.running = True
 
@@ -195,13 +197,19 @@ class LinguisticDataStreamer:
 
                 # Strategy A: Encode <stim> ... </stim> prompt and <act> ... </act> response
                 p_ids = self._encode_text(p_txt)[:self.prompt_len]
-                r_ids = self._encode_text(r_txt)[:self.target_len]
+                r_ids = self._encode_text(r_txt)
+                eos_id = getattr(getattr(self, "tokenizer", None), "eos_token_id", None)
+                if eos_id is None:
+                    eos_id = 2
+                if self.target_len > 0 and (not r_ids or r_ids[-1] != eos_id):
+                    r_ids = r_ids[: max(0, self.target_len - 1)] + [eos_id]
+                r_ids = r_ids[:self.target_len]
 
-                # Right-pad prompts and targets with 0 (pad_id)
+                # Right-pad prompts with 0 (pad_id) and targets with target_pad_id (-100 ignore index)
                 if len(p_ids) < self.prompt_len:
                     p_ids = p_ids + [0] * (self.prompt_len - len(p_ids))
                 if len(r_ids) < self.target_len:
-                    r_ids = r_ids + [0] * (self.target_len - len(r_ids))
+                    r_ids = r_ids + [self.target_pad_id] * (self.target_len - len(r_ids))
 
                 p_batch.append(p_ids)
                 t_batch.append(r_ids)

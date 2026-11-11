@@ -179,6 +179,17 @@ def adapt_and_load_checkpoint_weights(
                 target_params[target_k] = jnp.asarray(v.T, dtype=target_dtype)
                 restored_cnt += 1
 
+    # Weight transferability: legacy checkpoints share one radial_up across inward/outward waves
+    has_radial_up_out = isinstance(raw_state, dict) and any(
+        k.endswith("radial_up_out.weight") for k in raw_state.keys()
+    )
+    if (
+        not has_radial_up_out
+        and "core.radial_up_out.weight" in target_params
+        and "core.radial_up.weight" in target_params
+    ):
+        target_params["core.radial_up_out.weight"] = target_params["core.radial_up.weight"]
+
     return restored_cnt
 
 
@@ -315,8 +326,13 @@ class AsyncCheckpointManager:
                 try:
                     from src.cloud_sync import push_checkpoint_async
                     step_val = int(meta_dict.get("step", 0)) if meta_dict else 0
-                    loss_val = float(meta_dict.get("eval_loss", meta_dict.get("loss", 0.0))) if meta_dict else 0.0
                     target_type = "best" if "best" in filename else "latest"
+                    if target_type == "best":
+                        raw_loss = meta_dict.get("eval_loss", meta_dict.get("loss", 0.0)) if meta_dict else 0.0
+                    else:
+                        raw_loss = meta_dict.get("loss", meta_dict.get("eval_loss", 0.0)) if meta_dict else 0.0
+                    loss_f = float(raw_loss) if raw_loss is not None else 0.0
+                    loss_val = loss_f if (loss_f == loss_f and abs(loss_f) < 1e30) else 0.0
                     push_checkpoint_async(
                         local_path,
                         step=step_val,

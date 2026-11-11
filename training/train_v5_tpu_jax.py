@@ -415,6 +415,7 @@ def main(args=None):
 
     start_step = 0
     best_eval_loss = float("inf")
+    last_eval_loss = float("inf")
     sync_model_name = "v5_small" if args.preset == "tpu_v5e_1" else args.preset
     local_latest = os.path.join(args.checkpoint_dir, f"{args.preset}_latest.pt")
     fallback_latest = os.path.join(args.checkpoint_dir, f"{sync_model_name}_latest.pt")
@@ -424,6 +425,7 @@ def main(args=None):
         print("\n🌱 [from_scratch=True] Initializing clean Step 0 training with random orthogonal weights (checkpoint restoration bypassed)!")
         start_step = 0
         best_eval_loss = float("inf")
+        last_eval_loss = float("inf")
         # Clean local target checkpoints if present to prevent accidental mixing
         for old_f in [local_latest, fallback_latest, os.path.join(args.checkpoint_dir, f"{args.preset}_best.pt")]:
             if os.path.exists(old_f):
@@ -436,15 +438,16 @@ def main(args=None):
         if args.cloud_sync:
             try:
                 print(f"\n[cloud_sync] Checking remote manifest on bioflo.in for {args.preset}...")
-                remote_manifest = check_remote_manifest(args.preset, url=args.cloud_url, token=args.cloud_token)
-                if not remote_manifest and args.preset == "tpu_v5e_1":
-                    remote_manifest = check_remote_manifest("v5_small", url=args.cloud_url, token=args.cloud_token)
+                remote_manifest = check_remote_manifest(sync_model_name, url=args.cloud_url, token=args.cloud_token)
+                if not remote_manifest and sync_model_name != args.preset:
+                    remote_manifest = check_remote_manifest(args.preset, url=args.cloud_url, token=args.cloud_token)
                 if remote_manifest:
                     target_file = f"{args.resume_target}.pt"
                     target_dest = os.path.join(args.checkpoint_dir, f"{args.preset}_{args.resume_target}.pt")
                     pulled_ok = pull_checkpoint(
                         target_dest,
                         target_type=args.resume_target,
+                        model=sync_model_name,
                         url=args.cloud_url,
                         token=args.cloud_token,
                     )
@@ -471,6 +474,7 @@ def main(args=None):
                 ckpt = torch.load(discovered_ckpt, map_location="cpu", weights_only=False)
                 start_step = int(ckpt.get("step", 0))
                 best_eval_loss = float(ckpt.get("eval_loss", ckpt.get("loss", float("inf"))))
+                last_eval_loss = best_eval_loss
                 restored = adapt_and_load_checkpoint_weights(ckpt, params, target_dtype, config)
                 print(f"✓ Resumed from {os.path.basename(discovered_ckpt)} at Step {start_step:,} (Loss: {best_eval_loss:.4f})")
                 print(f"✓ Restored & adapted {restored}/{len(params)} parameter arrays into JAX engine!")
@@ -479,6 +483,7 @@ def main(args=None):
 
     if args.reset_best:
         best_eval_loss = float("inf")
+        last_eval_loss = float("inf")
         print("🔄 [Benchmark Recalibration] Reset best_eval_loss tracker baseline.")
 
     # 6. Spheroid Optimizer & JIT Train Step Engine
@@ -528,16 +533,7 @@ def main(args=None):
 
         train_step_fn = train_step_adamw
 
-    # 7. XLA Ahead-Of-Time Compilation
-    print("\n⚡ Compiling XLA computation graph on TPU...")
-    dummy_prompts = jnp.zeros((args.batch_size, args.prompt_len), dtype=jnp.int32)
-    dummy_targets = jnp.zeros((args.batch_size, args.seq_len), dtype=jnp.int32)
-    t0_compile = time.time()
-    params, opt_state, initial_loss = train_step_fn(params, opt_state, dummy_prompts, dummy_targets, args.lr)
-    jax.block_until_ready(initial_loss)
-    print(f"✓ XLA Compilation complete in {time.time() - t0_compile:.2f}s! Initial Loss: {float(initial_loss):.4f}")
-
-    # 8. Multi-Stream Ingestion & Prefetching
+    # 7. Multi-Stream Ingestion & Prefetching
     local_streamer, elastic_batcher = build_data_stream(
         dataset_source=args.dataset_source,
         tokenizer=tokenizer,
@@ -549,30 +545,78 @@ def main(args=None):
         vocab_size=config.vocab_size,
     )
 
-    # 9. Clean Held-Out Validation Split
+    def _unpack_batch(batch_tuple):
+        if len(batch_tuple) == 5:
+            return batch_tuple[2], batch_tuple[3], batch_tuple[4]
+        if len(batch_tuple) == 4:
+            return batch_tuple[2], batch_tuple[3], None
+        if len(batch_tuple) == 3:
+            return batch_tuple[0], batch_tuple[1], batch_tuple[2]
+        return batch_tuple[0], batch_tuple[1], None
+
+    # 8. XLA Ahead-Of-Time Compilation (non-mutating warmup matching real feedback signature)
+    print("\n⚡ Compiling XLA computation graph on TPU...")
+    dummy_prompts = jnp.zeros((args.batch_size, args.prompt_len), dtype=jnp.int32)
+    dummy_targets = jnp.zeros((args.batch_size, args.seq_len), dtype=jnp.int32)
+    dummy_feedback = (
+        jnp.full((args.batch_size, args.seq_len), -100, dtype=jnp.int32)
+        if elastic_batcher is not None
+        else None
+    )
+    t0_compile = time.time()
+    _warm_p, _warm_opt, initial_loss = train_step_fn(
+        params,
+        opt_state,
+        dummy_prompts,
+        dummy_targets,
+        args.lr,
+        feedback_tokens=dummy_feedback,
+    )
+    jax.block_until_ready(initial_loss)
+    del _warm_p, _warm_opt
+    print(f"✓ XLA Compilation complete in {time.time() - t0_compile:.2f}s! Initial Loss: {float(initial_loss):.4f}")
+
+    # 9. Clean Held-Out Validation Split (sampled from active data distribution with -100 target padding)
     eval_batches = []
     try:
-        from src.corpus import cosmopedia_pairs, openhermes_pairs
-        # Prepare 16 held-out validation batches
-        val_samples = []
-        if os.path.exists("data/tokenizer"):
-            # Sample held-out records from local corpus documents
-            stream_val = LinguisticDataStreamer(batch_size=args.batch_size, prompt_len=args.prompt_len, target_len=args.seq_len, queue_size=4)
+        if elastic_batcher is not None:
             for _ in range(4):
-                vp, vt = stream_val.get_batch()
-                eval_batches.append((vp, vt))
+                b_tup = (
+                    elastic_batcher.get_batch()
+                    if hasattr(elastic_batcher, "get_batch")
+                    else elastic_batcher.next_batch()
+                )
+                eval_batches.append(_unpack_batch(b_tup))
+        elif os.path.exists("data/tokenizer"):
+            stream_val = LinguisticDataStreamer(
+                batch_size=args.batch_size,
+                prompt_len=args.prompt_len,
+                target_len=args.seq_len,
+                queue_size=4,
+                target_pad_id=-100,
+            )
+            try:
+                for _ in range(4):
+                    vp, vt = stream_val.get_batch()
+                    eval_batches.append((vp, vt, None))
+            finally:
+                if hasattr(stream_val, "stop"):
+                    stream_val.stop()
         print(f"✅ Clean Benchmark Held-Out Validation: Prepared {len(eval_batches)} evaluation batches.")
     except Exception as e:
         print(f"⚠️ Validation setup notice: {e}")
 
     @jax.jit
-    def eval_step_loss(p, q_b, r_b):
+    def eval_step_loss(p, q_b, r_b, fb_b=None):
         return training_rollout(
             params=p,
             prompts=q_b,
             target_len=r_b.shape[1],
             buffers=buffers,
             config=config,
+            feedback_tokens=fb_b,
+            feedback_is_shifted=True,
+            pad_id=pad_id,
             targets=r_b,
             remat=False,
         )
@@ -623,17 +667,12 @@ def main(args=None):
 
             # Fetch next batch
             if elastic_batcher is not None:
-                batch_tuple = elastic_batcher.get_batch() if hasattr(elastic_batcher, "get_batch") else elastic_batcher.next_batch()
-                if len(batch_tuple) == 5:
-                    _, _, prompt_b, target_b, feedback_b = batch_tuple
-                elif len(batch_tuple) == 4:
-                    _, _, prompt_b, target_b = batch_tuple
-                    feedback_b = None
-                elif len(batch_tuple) == 3:
-                    prompt_b, target_b, feedback_b = batch_tuple
-                else:
-                    prompt_b, target_b = batch_tuple[:2]
-                    feedback_b = None
+                batch_tuple = (
+                    elastic_batcher.get_batch()
+                    if hasattr(elastic_batcher, "get_batch")
+                    else elastic_batcher.next_batch()
+                )
+                prompt_b, target_b, feedback_b = _unpack_batch(batch_tuple)
             else:
                 prompt_b, target_b = local_streamer.get_batch()
                 feedback_b = None
@@ -677,10 +716,11 @@ def main(args=None):
             # Held-Out Validation Evaluation
             if eval_batches and (step % args.eval_interval == 0):
                 val_losses = []
-                for vp, vt in eval_batches:
-                    v_loss = eval_step_loss(params, vp, vt)
+                for vp, vt, vfb in eval_batches:
+                    v_loss = eval_step_loss(params, vp, vt, vfb)
                     val_losses.append(float(v_loss))
                 eval_loss = float(np.mean(val_losses))
+                last_eval_loss = eval_loss
                 eval_ppl = math.exp(min(eval_loss, 20.0))
                 is_champion = eval_loss < best_eval_loss
 
@@ -715,7 +755,8 @@ def main(args=None):
                 meta_latest = {
                     "step": step,
                     "loss": float(loss),
-                    "eval_loss": best_eval_loss,
+                    "eval_loss": last_eval_loss if math.isfinite(last_eval_loss) else float(loss),
+                    "best_eval_loss": best_eval_loss,
                     "preset": args.preset,
                     "timestamp": time.time(),
                 }
@@ -724,7 +765,16 @@ def main(args=None):
             # Periodic Milestone Archive Saving
             if step % args.periodic_every == 0:
                 periodic_fname = f"{args.preset}_step_{step}.pt"
-                ckpt_mgr.dispatch(params, buffers, periodic_fname, meta_dict={"step": step, "loss": float(loss)})
+                ckpt_mgr.dispatch(
+                    params,
+                    buffers,
+                    periodic_fname,
+                    meta_dict={
+                        "step": step,
+                        "loss": float(loss),
+                        "eval_loss": last_eval_loss if math.isfinite(last_eval_loss) else float(loss),
+                    },
+                )
 
             # Sentinel file pause check
             if os.path.exists(os.path.join(args.checkpoint_dir, "PAUSE")):

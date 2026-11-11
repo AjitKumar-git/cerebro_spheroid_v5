@@ -35,14 +35,20 @@ RECURRENT_KEYS: Set[str] = {
 }
 VOCAB_KEYS: Set[str] = {
     "sensory.embedding.weight", "sensory_dnn.embedding.weight",
+    "sensory.pos_embed.weight", "sensory_dnn.pos_embed.weight",
     "motor.head.weight", "motor_decoder.head.weight",
     "motor.phase_embed.weight", "motor_decoder.phase_embed.weight",
+    "motor.persona_embeddings", "motor_decoder.persona_embeddings",
+}
+NORM_KEYS: Set[str] = {
+    "core.intra_norms.weight",
+    "volumetric_core.intra_norms.weight",
 }
 
 
 def is_manifold_operator(k: str, p: jnp.ndarray) -> bool:
-    """Returns True for 2D, 3D, and 4D operator matrices updated via Polar Newton-Schulz."""
-    if k in VOCAB_KEYS:
+    """Returns True for 2D, 3D, and 4D linear operator matrices updated via Polar Newton-Schulz."""
+    if k in VOCAB_KEYS or k in NORM_KEYS or "norm" in k.lower():
         return False
     return p.ndim >= 2
 
@@ -118,14 +124,17 @@ def init_spheroid_opt_state(params: Dict[str, jnp.ndarray], key: Optional[jax.Ar
 
     opt_m: Dict[str, jnp.ndarray] = {}
     opt_v: Dict[str, jnp.ndarray] = {}
+    master_p: Dict[str, jnp.ndarray] = {}
     power_v: Dict[str, jnp.ndarray] = {}
 
     for k, p in params.items():
         if not jnp.issubdtype(p.dtype, jnp.inexact):
             continue
-        opt_m[k] = jnp.zeros_like(p)
+        # Store master weights and moments in float32 to prevent BF16 ULP update freezing
+        master_p[k] = p.astype(jnp.float32)
+        opt_m[k] = jnp.zeros(p.shape, dtype=jnp.float32)
         if not is_manifold_operator(k, p):
-            opt_v[k] = jnp.zeros_like(p)
+            opt_v[k] = jnp.zeros(p.shape, dtype=jnp.float32)
         if k in RECURRENT_KEYS:
             key, subkey = jax.random.split(key)
             orig_shape = p.shape
@@ -139,6 +148,7 @@ def init_spheroid_opt_state(params: Dict[str, jnp.ndarray], key: Optional[jax.Ar
         "step": jnp.array(0, dtype=jnp.int32),
         "m": opt_m,
         "v": opt_v,
+        "master_p": master_p,
         "power_v": power_v,
     }
 
@@ -188,9 +198,11 @@ def build_spheroid_train_engine(
 
         def _apply_step():
             cur_step = opt_s["step"] + 1
+            has_master = "master_p" in opt_s
             new_params = {}
             new_m = {}
             new_v = {}
+            new_master_p = {}
             new_power_v = dict(opt_s["power_v"])
 
             lr_1d = 0.2 * base_lr
@@ -201,18 +213,19 @@ def build_spheroid_train_engine(
                     new_params[k] = param
                     continue
 
-                g = clipped_grads[k]
-                m_prev = opt_s["m"][k]
+                g = clipped_grads[k].astype(jnp.float32)
+                m_prev = opt_s["m"][k].astype(jnp.float32)
+                p_f32 = opt_s["master_p"][k] if has_master else param.astype(jnp.float32)
 
                 # -----------------------------------------------------------------
                 # 1. Manifold Matrix Operators (Quintic Newton-Schulz Polar Update)
                 # -----------------------------------------------------------------
                 if is_manifold_operator(k, param):
                     m_new = 0.95 * m_prev + 0.05 * g
-                    new_m[k] = m_new.astype(m_prev.dtype)
+                    new_m[k] = m_new.astype(opt_s["m"][k].dtype)
 
                     # Decoupled Riemannian Weight Decay in float32
-                    p_decayed = param.astype(jnp.float32) * (1.0 - base_lr * weight_decay)
+                    p_decayed = p_f32 * (1.0 - base_lr * weight_decay)
 
                     # Polar orthogonalization (runs in float32 internally)
                     O = zeropower_via_newtonschulz5_jax(m_new, steps=3).astype(jnp.float32)
@@ -230,43 +243,42 @@ def build_spheroid_train_engine(
                         p_updated, v_next = clamp_spectral_norm_jax(p_updated, opt_s["power_v"][k], max_spec_norm=1.0)
                         new_power_v[k] = v_next
 
+                    new_master_p[k] = p_updated.astype(jnp.float32)
                     new_params[k] = p_updated.astype(param.dtype)
 
                 # -----------------------------------------------------------------
                 # 2. Vocabulary & Phase Embeddings / Heads (AdamW in float32)
                 # -----------------------------------------------------------------
                 elif k in VOCAB_KEYS:
-                    v_prev = opt_s["v"][k]
+                    v_prev = opt_s["v"][k].astype(jnp.float32)
                     m_new = 0.9 * m_prev + 0.1 * g
-                    v_new = 0.95 * v_prev + 0.05 * jnp.square(g.astype(jnp.float32)).astype(v_prev.dtype)
-                    new_m[k] = m_new.astype(m_prev.dtype)
-                    new_v[k] = v_new.astype(v_prev.dtype)
+                    v_new = 0.95 * v_prev + 0.05 * jnp.square(g)
+                    new_m[k] = m_new.astype(opt_s["m"][k].dtype)
+                    new_v[k] = v_new.astype(opt_s["v"][k].dtype)
 
-                    m_f32 = m_new.astype(jnp.float32)
-                    v_f32 = v_new.astype(jnp.float32)
-                    m_hat = m_f32 / (1.0 - jnp.power(0.9, cur_step))
-                    v_hat = v_f32 / (1.0 - jnp.power(0.95, cur_step))
+                    m_hat = m_new / (1.0 - jnp.power(0.9, cur_step))
+                    v_hat = v_new / (1.0 - jnp.power(0.95, cur_step))
                     step_dir = m_hat / (jnp.sqrt(v_hat) + 1e-6)
-                    p_decayed = param.astype(jnp.float32) * (1.0 - lr_vocab * weight_decay)
+                    p_decayed = p_f32 * (1.0 - lr_vocab * weight_decay)
                     p_updated = p_decayed - lr_vocab * step_dir
+                    new_master_p[k] = p_updated.astype(jnp.float32)
                     new_params[k] = p_updated.astype(param.dtype)
 
                 # -----------------------------------------------------------------
                 # 3. 1D Parameters, Scalars, Pacemakers & Norms (AdamW, 0 Decay)
                 # -----------------------------------------------------------------
                 else:
-                    v_prev = opt_s["v"][k]
+                    v_prev = opt_s["v"][k].astype(jnp.float32)
                     m_new = 0.9 * m_prev + 0.1 * g
-                    v_new = 0.95 * v_prev + 0.05 * jnp.square(g.astype(jnp.float32)).astype(v_prev.dtype)
-                    new_m[k] = m_new.astype(m_prev.dtype)
-                    new_v[k] = v_new.astype(v_prev.dtype)
+                    v_new = 0.95 * v_prev + 0.05 * jnp.square(g)
+                    new_m[k] = m_new.astype(opt_s["m"][k].dtype)
+                    new_v[k] = v_new.astype(opt_s["v"][k].dtype)
 
-                    m_f32 = m_new.astype(jnp.float32)
-                    v_f32 = v_new.astype(jnp.float32)
-                    m_hat = m_f32 / (1.0 - jnp.power(0.9, cur_step))
-                    v_hat = v_f32 / (1.0 - jnp.power(0.95, cur_step))
+                    m_hat = m_new / (1.0 - jnp.power(0.9, cur_step))
+                    v_hat = v_new / (1.0 - jnp.power(0.95, cur_step))
                     step_dir = m_hat / (jnp.sqrt(v_hat) + 1e-6)
-                    p_updated = param.astype(jnp.float32) - lr_1d * step_dir
+                    p_updated = p_f32 - lr_1d * step_dir
+                    new_master_p[k] = p_updated.astype(jnp.float32)
                     new_params[k] = p_updated.astype(param.dtype)
 
             # Robust NaN / Inf Guard: Discard update and keep old weights if any non-finite value appears
@@ -282,6 +294,10 @@ def build_spheroid_train_engine(
                 "v": safe_v,
                 "power_v": new_power_v,
             }
+            if has_master:
+                new_opt_state["master_p"] = jax.tree_util.tree_map(
+                    lambda nmp, omp: jnp.where(params_finite, nmp, omp), new_master_p, opt_s["master_p"]
+                )
             return safe_params, new_opt_state
 
         def _skip_step():
