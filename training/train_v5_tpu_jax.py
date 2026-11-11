@@ -140,9 +140,9 @@ def parse_args(args_list=None):
     parser.add_argument("--min_sampling_p", type=float, default=0.75, help="Minimum teacher sampling floor for scheduled sampling (default: 0.75)")
 
     # Data Source & Tokenizer
-    parser.add_argument("--dataset_source", "--dataset-source", dest="dataset_source", type=str, default="local",
-                        choices=["local", "dense_edu", "conversation_sft", "balanced_mix", "reasoning_anneal", "fineweb_edu", "openhermes"],
-                        help="Data stream: 'local' (offline 9,500 curated cognitive docs), 'dense_edu' (40%% Cosmo + 40%% FineWeb + 20%% Hermes), 'conversation_sft', 'balanced_mix', 'reasoning_anneal'")
+    parser.add_argument("--dataset_source", "--dataset-source", dest="dataset_source", type=str, default="dense_edu",
+                        choices=["dense_edu", "local", "conversation_sft", "balanced_mix", "reasoning_anneal", "fineweb_edu", "openhermes"],
+                        help="Data stream: 'dense_edu' (40%% Cosmo + 40%% FineWeb + 20%% Hermes), 'local' (offline 9,500 curated cognitive docs), 'conversation_sft', 'balanced_mix', 'reasoning_anneal'")
     parser.add_argument("--tokenizer_name", type=str, default="llama", help="Tokenizer model name or path (default: 'llama' -> data/tokenizer)")
 
     # Checkpoint & Cloud Sync

@@ -499,15 +499,21 @@ def build_tokenizer(name: str = "llama"):
     Builds and configures a tokenizer for CerebroSpheroid models:
     - 'llama': Modern 32,000 Byte-Fallback BPE (prefers local bundled data/tokenizer, then HuggingFace).
       Features byte-level UTF-8 fallback (zero <unk>), single-digit number tokenization,
-      pad_token_id=0, bos_token_id=1, eos_token_id=2.
-    - 'gpt2': Legacy 50,257 BPE tokenizer.
+      pad_token_id=0, bos_token_id=1, eos_token_id=2. Strictly 32,000 vocabulary.
     """
+    if name == "gpt2":
+        raise ValueError(
+            "GPT-2 tokenizer (50,257 vocab) has been deprecated and completely removed from CerebroSpheroid V5. "
+            "V5 models have an architectural vocabulary size of exactly 32,000 tokens. "
+            "Please use the bundled LLaMA-32k tokenizer (data/tokenizer)."
+        )
+
     os.environ["HF_HOME"] = os.path.expanduser("~/.hf_cache")
     from transformers import AutoTokenizer
 
     # 1. First priority: Check local bundled LLaMA-32k tokenizer in data/tokenizer
     local_tok = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "tokenizer")
-    if (name == "llama" or name == "default") and os.path.exists(os.path.join(local_tok, "tokenizer.json")):
+    if os.path.exists(os.path.join(local_tok, "tokenizer.json")):
         try:
             tok = AutoTokenizer.from_pretrained(local_tok, local_files_only=True)
             if tok.pad_token_id is None:
@@ -516,21 +522,23 @@ def build_tokenizer(name: str = "llama"):
         except Exception:
             pass
 
-    if name == "llama":
-        tok = AutoTokenizer.from_pretrained("huggyllama/llama-7b")
+    # 2. Remote LLaMA 32k fallback
+    for cand in ["huggyllama/llama-7b", "openlm-research/open_llama_7b", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"]:
+        try:
+            tok = AutoTokenizer.from_pretrained(cand)
+            if tok.pad_token_id is None:
+                tok.pad_token_id = 0
+            return tok
+        except Exception:
+            continue
+
+    if name and name not in ("llama", "default"):
+        tok = AutoTokenizer.from_pretrained(name)
         if tok.pad_token_id is None:
             tok.pad_token_id = 0
         return tok
-    elif name == "gpt2":
-        tok = AutoTokenizer.from_pretrained("gpt2")
-        if tok.pad_token_id is None:
-            tok.pad_token_id = tok.eos_token_id
-        return tok
-    else:
-        tok = AutoTokenizer.from_pretrained(name)
-        if tok.pad_token_id is None:
-            tok.pad_token_id = tok.eos_token_id or 0
-        return tok
+
+    raise RuntimeError("Failed to load LLaMA-32k tokenizer. Ensure data/tokenizer is present.")
 
 
 # Biology-derived enclosed delimiters: <stim> ... </stim> and <act> ... </act>
