@@ -567,8 +567,16 @@ class PremotorMotorDecoderV5(nn.Module):
         self.refractory_decay = nn.Parameter(torch.tensor(0.75))
         self.refractory_strength = nn.Parameter(torch.tensor(1.2))
 
-    def init_plan(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        return torch.zeros(batch_size, self.surface_dim, device=device)
+        # Agentic Persona Steering Vectors (0: Reasoner, 1: Explorer, 2: Concise, 3: Verifier)
+        self.persona_embeddings = nn.Parameter(torch.empty(4, surface_dim).normal_(mean=0.0, std=0.05))
+        self.persona_scale = nn.Parameter(torch.tensor(0.5))
+
+    def init_plan(self, batch_size: int, device: torch.device, persona_id: Optional[int] = None) -> torch.Tensor:
+        plan = torch.zeros(batch_size, self.surface_dim, device=device)
+        if persona_id is not None:
+            p_idx = min(max(0, int(persona_id)), self.persona_embeddings.shape[0] - 1)
+            plan = plan + self.persona_scale * self.persona_embeddings[p_idx]
+        return plan
 
     def forward(
         self,
@@ -1332,3 +1340,55 @@ def build_spheroid_v5(preset: str = "v5_compact", **kwargs) -> CerebroSpheroidV5
     else:
         cfg = ModelConfigV5(**kwargs)
     return CerebroSpheroidV5(config=cfg)
+
+
+@torch.no_grad()
+def compute_manifold_diagnostics(
+    model: CerebroSpheroidV5,
+    state: torch.Tensor,
+) -> Dict[str, Union[float, List[float]]]:
+    """
+    Computes geometric diagnostics across all concentric spheroid shells.
+    Tracks:
+    - Effective dimensionality / rank per shell via SVD eigenvalues
+    - Shell RMS energy propagation (thalamic core -> cortical surface)
+    - Inter-shell cosine similarity (radial wave convection smoothness)
+    """
+    batch_size, num_shells, shell_dim = state.shape
+    state_f = state.float()
+
+    effective_ranks = []
+    rms_per_shell = []
+    for k in range(num_shells):
+        s_k = state_f[:, k, :]
+        rms = s_k.pow(2).mean().sqrt().item()
+        rms_per_shell.append(rms)
+
+        if batch_size > 1:
+            s_centered = s_k - s_k.mean(dim=0, keepdim=True)
+            try:
+                s_vals = torch.linalg.svdvals(s_centered)
+                s2 = s_vals.pow(2)
+                rank = (s2.sum().pow(2) / (s2.pow(2).sum() + 1e-9)).item() if s2.sum().item() >= 1e-6 else 1.0
+            except Exception:
+                rank = 1.0
+        else:
+            rank = 1.0
+        effective_ranks.append(rank)
+
+    adjacent_cosines = []
+    for k in range(num_shells - 1):
+        s_curr = state_f[:, k, :]
+        s_next = state_f[:, k + 1, :]
+        cos = F.cosine_similarity(s_curr, s_next, dim=-1).mean().item()
+        adjacent_cosines.append(cos)
+
+    return {
+        "mean_effective_rank": float(sum(effective_ranks) / len(effective_ranks)),
+        "min_effective_rank": float(min(effective_ranks)),
+        "effective_ranks": effective_ranks,
+        "mean_shell_rms": float(sum(rms_per_shell) / len(rms_per_shell)),
+        "shell_rms": rms_per_shell,
+        "mean_adjacent_cosine": float(sum(adjacent_cosines) / len(adjacent_cosines)) if adjacent_cosines else 1.0,
+        "adjacent_cosines": adjacent_cosines,
+    }

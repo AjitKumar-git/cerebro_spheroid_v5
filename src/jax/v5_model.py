@@ -416,6 +416,7 @@ def training_rollout(
     repetition_penalty: float = 1.25,
     targets: Optional[jnp.ndarray] = None,
     remat: bool = True,
+    persona_id: Optional[int] = None,
 ) -> Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]]:
     """Differentiable training rollout engine in pure JAX."""
     B, L = prompts.shape
@@ -441,6 +442,11 @@ def training_rollout(
 
     # Initial executive plan and refractory trace
     init_plan = jnp.zeros((B, surface_dim), dtype=target_dtype)
+    if persona_id is not None and "motor.persona_embeddings" in params:
+        p_idx = jnp.clip(persona_id, 0, params["motor.persona_embeddings"].shape[0] - 1)
+        p_emb = params["motor.persona_embeddings"][p_idx].astype(target_dtype)
+        p_scale = params.get("motor.persona_scale", 0.5).astype(target_dtype)
+        init_plan = init_plan + p_scale * p_emb[None, :]
     # When training (teacher-forced MLE), disable refractory penalty so loss accurately reflects true likelihood
     if targets is not None:
         init_refractory = None
@@ -515,3 +521,31 @@ def training_rollout(
 
     _, all_logits = lax.scan(_emit, (state, init_refractory, init_plan, init_thought), jnp.arange(target_len))
     return jnp.swapaxes(all_logits, 0, 1)
+
+
+def compute_manifold_diagnostics_jax(state: jnp.ndarray) -> Dict[str, Any]:
+    """
+    Computes geometric diagnostics across all concentric spheroid shells in JAX.
+    Tracks:
+    - Shell RMS energy propagation (thalamic core -> cortical surface)
+    - Inter-shell cosine similarity (radial wave convection smoothness)
+    """
+    state_f = state.astype(jnp.float32)
+    num_shells = state.shape[1]
+    rms_per_shell = [float(jnp.sqrt(jnp.mean(jnp.square(state_f[:, k, :])))) for k in range(num_shells)]
+    adjacent_cosines = []
+    for k in range(num_shells - 1):
+        s_curr = state_f[:, k, :]
+        s_next = state_f[:, k + 1, :]
+        cos = jnp.mean(
+            jnp.sum(s_curr * s_next, axis=-1)
+            / (jnp.linalg.norm(s_curr, axis=-1) * jnp.linalg.norm(s_next, axis=-1) + 1e-6)
+        )
+        adjacent_cosines.append(float(cos))
+
+    return {
+        "mean_shell_rms": float(sum(rms_per_shell) / len(rms_per_shell)),
+        "shell_rms": rms_per_shell,
+        "mean_adjacent_cosine": float(sum(adjacent_cosines) / len(adjacent_cosines)) if adjacent_cosines else 1.0,
+        "adjacent_cosines": adjacent_cosines,
+    }

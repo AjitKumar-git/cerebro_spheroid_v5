@@ -11,6 +11,7 @@ from .v5_model import (
     deliberate_step,
     emit_step,
     training_rollout,
+    compute_manifold_diagnostics_jax,
 )
 
 from .spheroid_optimizer import (
@@ -41,6 +42,7 @@ __all__ = [
     "deliberate_step",
     "emit_step",
     "training_rollout",
+    "compute_manifold_diagnostics_jax",
     "zeropower_via_newtonschulz5_jax",
     "clamp_spectral_norm_jax",
     "init_spheroid_opt_state",
