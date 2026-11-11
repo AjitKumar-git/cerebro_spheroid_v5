@@ -106,15 +106,29 @@ class LinguisticDataStreamer:
             return
 
         parquet_files = glob.glob(os.path.join(self.data_dir, "**", "*.parquet"), recursive=True)
-        for pf in parquet_files[:5]:
+        for pf in parquet_files:
             if HAS_PYARROW:
                 try:
                     table = pq.read_table(pf)
-                    for col in table.column_names:
-                        if "text" in col.lower() or "answer" in col.lower() or "question" in col.lower() or "prompt" in col.lower():
-                            sample = [str(x) for x in table[col][:2000] if len(str(x)) > 20]
-                            self.text_corpus.extend(sample)
-                            break
+                    cols = table.column_names
+                    if "question" in cols and "answer" in cols:
+                        questions = table["question"].to_pylist()
+                        answers = table["answer"].to_pylist()
+                        for q, a in zip(questions, answers):
+                            q_str, a_str = str(q).strip(), str(a).strip()
+                            if len(q_str) > 5 and len(a_str) > 5:
+                                self.text_corpus.append(f"Question: {q_str}\nAnswer: {a_str}")
+                    elif "text" in cols:
+                        texts = table["text"].to_pylist()
+                        for t in texts:
+                            t_str = str(t).strip()
+                            if len(t_str) > 20:
+                                self.text_corpus.append(t_str)
+                    else:
+                        for col in cols:
+                            if any(k in col.lower() for k in ("text", "answer", "prompt", "content")):
+                                self.text_corpus.extend([str(x) for x in table[col].to_pylist() if len(str(x)) > 20])
+                                break
                 except Exception:
                     pass
 

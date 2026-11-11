@@ -24,6 +24,16 @@ WORKSPACE_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if WORKSPACE_ROOT not in sys.path:
     sys.path.insert(0, WORKSPACE_ROOT)
 
+# Safeguard TPU: prevent PyTorch from attempting to claim or initialize TPU devices (JAX owns the TPU)
+os.environ.setdefault("PJRT_DEVICE", "CPU")
+os.environ.setdefault("TORCH_XLA_DISABLE_DISTRIBUTED", "1")
+
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -245,8 +255,12 @@ def main(args=None):
         # Check local checkpoint
         if os.path.exists(local_latest):
             try:
-                import torch
-                ckpt = torch.load(local_latest, map_location="cpu", weights_only=False)
+                if HAS_TORCH:
+                    ckpt = torch.load(local_latest, map_location="cpu", weights_only=False)
+                else:
+                    import pickle
+                    with open(local_latest, "rb") as f:
+                        ckpt = pickle.load(f)
                 ckpt_preset = ckpt.get("model_preset")
                 if ckpt_preset is not None and ckpt_preset != args.preset:
                     print(f"⚠️ Checkpoint preset mismatch: found '{ckpt_preset}', but running '{args.preset}'. Starting clean!")
@@ -337,16 +351,29 @@ def main(args=None):
                 "params": params_numpy,
             }
             try:
-                import torch
-                torch.save(save_payload, local_latest)
-                if loss_val < best_loss:
-                    best_loss = loss_val
-                    torch.save(save_payload, local_best)
-                    if args.cloud_sync:
-                        push_checkpoint_async(local_best, step=step, loss=loss_val, target_type="best", model=args.preset)
+                if HAS_TORCH:
+                    torch.save(save_payload, local_latest)
+                    if loss_val < best_loss:
+                        best_loss = loss_val
+                        torch.save(save_payload, local_best)
+                        if args.cloud_sync:
+                            push_checkpoint_async(local_best, step=step, loss=loss_val, target_type="best", model=args.preset)
 
-                if args.cloud_sync:
-                    push_checkpoint_async(local_latest, step=step, loss=loss_val, target_type="latest", model=args.preset)
+                    if args.cloud_sync:
+                        push_checkpoint_async(local_latest, step=step, loss=loss_val, target_type="latest", model=args.preset)
+                else:
+                    import pickle
+                    with open(local_latest, "wb") as f:
+                        pickle.dump(save_payload, f)
+                    if loss_val < best_loss:
+                        best_loss = loss_val
+                        with open(local_best, "wb") as f:
+                            pickle.dump(save_payload, f)
+                        if args.cloud_sync:
+                            push_checkpoint_async(local_best, step=step, loss=loss_val, target_type="best", model=args.preset)
+
+                    if args.cloud_sync:
+                        push_checkpoint_async(local_latest, step=step, loss=loss_val, target_type="latest", model=args.preset)
             except Exception as e:
                 print(f"⚠️ Checkpoint save notice: {e}")
 
