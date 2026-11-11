@@ -30,7 +30,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # Strict 100% offline mode
-os.environ["HF_HOME"] = "/home/ajit/.cache/hf_home"
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -126,12 +125,11 @@ def main():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"⚡ Device: {device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
 
-    # 1. Load Local Tokenizer (Direct from Local Disk Snapshot)
-    local_snap = "/home/ajit/.cache/hf_home/hub/models--huggyllama--llama-7b/snapshots/4782ad278652c7c71b72204d462d6d01eaaf7549"
-    tok = AutoTokenizer.from_pretrained(local_snap, local_files_only=True)
+    # 1. Load Local Tokenizer (Direct from Bundled Repository Snapshot)
+    tok = build_tokenizer("llama")
     if tok.pad_token_id is None:
         tok.pad_token_id = 0
-    print(f"📖 Tokenizer loaded locally from SSD: {len(tok)} tokens.")
+    print(f"📖 Tokenizer loaded locally from data/tokenizer: {len(tok)} tokens.")
 
     # 2. Build Clean-Slate Model with all Frontier Upgrades
     torch.manual_seed(42)

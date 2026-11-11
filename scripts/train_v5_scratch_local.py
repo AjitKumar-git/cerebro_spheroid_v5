@@ -25,7 +25,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-os.environ["HF_HOME"] = "/home/ajit/.cache/hf_home"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 V5_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -33,7 +32,7 @@ if V5_ROOT not in sys.path:
     sys.path.insert(0, V5_ROOT)
 
 from src.spheroid_v5 import CerebroSpheroidV5, build_spheroid_v5, ModelConfigV5
-from src.corpus import build_tokenizer
+from src.corpus import build_tokenizer, format_stimulus_prompt, format_motor_response
 from transformers.optimization import Adafactor
 
 
@@ -64,8 +63,8 @@ def load_clean_training_batches(tokenizer, count=60, batch_size=2, max_len=40):
     num_batches = len(pairs) // batch_size
     for b in range(num_batches):
         chunk = pairs[b * batch_size : (b + 1) * batch_size]
-        q_list = [[20436] + tokenizer.encode(c[0], add_special_tokens=False)[:36] for c in chunk]
-        a_list = [tokenizer.encode(c[1], add_special_tokens=False)[:max_len] + [2] for c in chunk]
+        q_list = [tokenizer.encode(format_stimulus_prompt(c[0]), add_special_tokens=False)[:36] for c in chunk]
+        a_list = [tokenizer.encode(format_motor_response(c[1]), add_special_tokens=False)[:max_len] + [2] for c in chunk]
 
         max_q = max(len(q) for q in q_list)
         max_a = max(len(a) for a in a_list)

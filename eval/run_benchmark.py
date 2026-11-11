@@ -62,22 +62,11 @@ class FallbackTokenizer:
 
 
 def get_tokenizer():
-    candidate_paths = [
-        "/home/ajit/.cache/hf_home/hub/models--huggyllama--llama-7b/snapshots/4782ad278652c7c71b72204d462d6d01eaaf7549",
-        os.path.join(WORKSPACE_ROOT, "checkpoints", "tokenizer"),
-        "/home/ajit/Documents/Startup/Active_Development/reasoning_agent/.hf_cache/hub/models--NousResearch--Llama-2-7b-hf/snapshots/8efe6c9b93655b934e27bd9981e3ec13e55aee9d",
-    ]
-    if AutoTokenizer is not None:
-        for p in candidate_paths:
-            if os.path.exists(p):
-                try:
-                    tok = AutoTokenizer.from_pretrained(p, local_files_only=True)
-                    if tok.pad_token_id is None:
-                        tok.pad_token_id = 0
-                    return tok
-                except Exception:
-                    pass
-    return FallbackTokenizer(vocab_size=32000)
+    try:
+        from src.corpus import build_tokenizer
+        return build_tokenizer("llama")
+    except Exception:
+        return FallbackTokenizer(vocab_size=32000)
 
 
 def evaluate_benchmark(

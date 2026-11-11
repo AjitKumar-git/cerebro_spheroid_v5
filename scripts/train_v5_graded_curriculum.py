@@ -78,25 +78,9 @@ def parse_args():
 
 
 def load_local_tokenizer(offline: bool = True):
-    """Loads tokenizer from local HuggingFace cache or fallback directory."""
-    candidate_paths = [
-        "/home/ajit/.cache/hf_home/hub/models--huggyllama--llama-7b/snapshots/4782ad278652c7c71b72204d462d6d01eaaf7549",
-        "huggyllama/llama-7b",
-    ]
-    for p in candidate_paths:
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(
-                p,
-                local_files_only=offline or os.path.exists(p),
-                use_fast=False,
-            )
-            print(f"[Tokenizer] Successfully loaded tokenizer from: {p}")
-            return tokenizer
-        except Exception:
-            continue
-
-    print("[Tokenizer] HuggingFace cache not accessible directly. Using standard fallback tokenizer.")
-    return AutoTokenizer.from_pretrained("huggyllama/llama-7b")
+    """Loads modern 32,000-vocabulary LLaMA tokenizer from bundled data/tokenizer directory."""
+    from src.corpus import build_tokenizer
+    return build_tokenizer("llama")
 
 
 def main():

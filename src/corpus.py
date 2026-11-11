@@ -546,8 +546,6 @@ BIO_STIM_PREFIX = "<stim> "
 BIO_STIM_SUFFIX = " </stim>"
 BIO_ACT_PREFIX = "<act> "
 BIO_ACT_SUFFIX = " </act>"
-BIO_STIM_TOKEN_ID = 20436  # Legacy reference for 'stim '
-BIO_ACT_TOKEN_ID = 1044    # Legacy reference for 'act '
 
 
 def format_stimulus_prompt(prompt: str) -> str:

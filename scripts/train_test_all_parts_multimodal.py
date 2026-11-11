@@ -42,9 +42,11 @@ from src.graded_curriculum import (
 )
 
 
+from src.corpus import build_tokenizer
+
+
 def load_local_tokenizer():
-    path = "/home/ajit/.cache/hf_home/hub/models--huggyllama--llama-7b/snapshots/4782ad278652c7c71b72204d462d6d01eaaf7549"
-    tok = AutoTokenizer.from_pretrained(path, local_files_only=True)
+    tok = build_tokenizer("llama")
     if tok.pad_token_id is None:
         tok.pad_token_id = 0
     return tok

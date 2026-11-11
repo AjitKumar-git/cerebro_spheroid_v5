@@ -42,6 +42,8 @@ try:
 except ImportError:
     HAS_DATASETS = False
 
+from src.corpus import format_stimulus_prompt, format_motor_response
+
 
 class LinguisticDataStreamer:
     """Multi-source continuous text token streamer for pure JAX training."""
@@ -71,7 +73,7 @@ class LinguisticDataStreamer:
             self.data_dir = data_dir
 
         self.tokenizer = self._init_tokenizer()
-        self.text_corpus: List[str] = []
+        self.pairs_corpus: List[Tuple[str, str]] = []
         self._load_local_data()
 
         # Launch background prefetch worker
@@ -117,7 +119,7 @@ class LinguisticDataStreamer:
         return [(int(b) + 3) % self.vocab_size for b in text.encode("utf-8", errors="ignore")]
 
     def _load_local_data(self):
-        """Discovers and caches local parquet / jsonl text files."""
+        """Discovers and caches local parquet / jsonl text files formatted with Strategy A bio-tokens."""
         if not os.path.exists(self.data_dir):
             return
 
@@ -133,26 +135,36 @@ class LinguisticDataStreamer:
                         for q, a in zip(questions, answers):
                             q_str, a_str = str(q).strip(), str(a).strip()
                             if len(q_str) > 5 and len(a_str) > 5:
-                                self.text_corpus.append(f"Question: {q_str}\nAnswer: {a_str}")
+                                p = format_stimulus_prompt(q_str)
+                                r = format_motor_response(a_str)
+                                self.pairs_corpus.append((p, r))
                     elif "text" in cols:
                         texts = table["text"].to_pylist()
                         for t in texts:
                             t_str = str(t).strip()
                             if len(t_str) > 20:
-                                self.text_corpus.append(t_str)
+                                parts = t_str.split("\n\n", 1) if "\n\n" in t_str else (t_str[:60], t_str[60:])
+                                p = format_stimulus_prompt(parts[0])
+                                r = format_motor_response(parts[1] if len(parts) > 1 else parts[0])
+                                self.pairs_corpus.append((p, r))
                     else:
                         for col in cols:
                             if any(k in col.lower() for k in ("text", "answer", "prompt", "content")):
-                                self.text_corpus.extend([str(x) for x in table[col].to_pylist() if len(str(x)) > 20])
+                                for x in table[col].to_pylist():
+                                    s_val = str(x).strip()
+                                    if len(s_val) > 20:
+                                        p = format_stimulus_prompt(s_val[:60])
+                                        r = format_motor_response(s_val[60:] if len(s_val) > 60 else s_val)
+                                        self.pairs_corpus.append((p, r))
                                 break
                 except Exception:
                     pass
 
-        if self.text_corpus:
-            print(f"📚 [DataStreamer] Loaded {len(self.text_corpus):,} local corpus documents for pretraining!")
+        if self.pairs_corpus:
+            print(f"📚 [DataStreamer] Loaded {len(self.pairs_corpus):,} local Strategy A (<stim>/<act>) pairs for pretraining!")
 
-    def _generate_synthetic_prose(self) -> str:
-        """Generates realistic structured linguistic sentences to ensure valid grammatical gradients."""
+    def _generate_synthetic_prose(self) -> Tuple[str, str]:
+        """Generates realistic structured linguistic sentences formatted with Strategy A bio-tokens."""
         subjects = ["The algorithm", "A cognitive model", "The system", "Deep neural computation", "The researcher", "An autonomous agent", "Quantum mechanics", "The biological cortex", "The mathematical theorem"]
         verbs = ["demonstrates", "establishes", "calculates", "optimizes", "processes", "formulates", "evaluates", "simulates", "enhances"]
         objects = ["high dimensional representations", "recurrent manifold attractors", "efficient linguistic patterns", "contractive spectral boundaries", "multimodal information flux", "complex reasoning chains", "optimal policy trajectories"]
@@ -162,36 +174,40 @@ class LinguisticDataStreamer:
         for _ in range(8):
             s = f"{random.choice(subjects)} {random.choice(verbs)} {random.choice(objects)} {random.choice(connectives)}. "
             sentences.append(s)
-        return "".join(sentences)
+        p = format_stimulus_prompt("Synthesize the core principle of cognitive manifold computation:")
+        r = format_motor_response("".join(sentences))
+        return (p, r)
 
     def _worker_loop(self):
-        """Continuous background prefetch loop packing batches into queue."""
-        token_buffer: List[int] = []
+        """Continuous background prefetch loop packing Strategy A batches into queue."""
         doc_idx = 0
 
         while self.running:
-            # Accumulate enough tokens for a full batch
-            needed_tokens = self.batch_size * self.total_seq_len
-            while len(token_buffer) < needed_tokens * 2:
-                if self.text_corpus:
-                    text = self.text_corpus[doc_idx % len(self.text_corpus)]
+            p_batch = []
+            t_batch = []
+
+            for _ in range(self.batch_size):
+                if self.pairs_corpus:
+                    p_txt, r_txt = self.pairs_corpus[doc_idx % len(self.pairs_corpus)]
                     doc_idx += 1
                 else:
-                    text = self._generate_synthetic_prose()
+                    p_txt, r_txt = self._generate_synthetic_prose()
 
-                encoded = self._encode_text(text)
-                if encoded:
-                    token_buffer.extend(encoded)
-                    token_buffer.append(1)  # EOS / separator
+                # Strategy A: Encode <stim> ... </stim> prompt and <act> ... </act> response
+                p_ids = self._encode_text(p_txt)[:self.prompt_len]
+                r_ids = self._encode_text(r_txt)[:self.target_len]
 
-            # Slice batch
-            batch_tokens = token_buffer[:needed_tokens]
-            token_buffer = token_buffer[needed_tokens:]
+                # Right-pad prompts and targets with 0 (pad_id)
+                if len(p_ids) < self.prompt_len:
+                    p_ids = p_ids + [0] * (self.prompt_len - len(p_ids))
+                if len(r_ids) < self.target_len:
+                    r_ids = r_ids + [0] * (self.target_len - len(r_ids))
 
-            arr = np.array(batch_tokens, dtype=np.int32).reshape(self.batch_size, self.total_seq_len)
-            prompts = arr[:, :self.prompt_len]
-            targets = arr[:, self.prompt_len:]
+                p_batch.append(p_ids)
+                t_batch.append(r_ids)
 
+            prompts = np.array(p_batch, dtype=np.int32)
+            targets = np.array(t_batch, dtype=np.int32)
             self.queue.put((prompts, targets))
 
     def get_batch(self) -> Tuple[jnp.ndarray, jnp.ndarray]:
