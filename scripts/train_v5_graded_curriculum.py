@@ -400,8 +400,6 @@ def _run_training(
                 default_preset=args.model_preset,
                 vocab_size_override=getattr(tokenizer, "vocab_size", 32000),
                 max_seq_len=max_seq_budget,
-                use_sparse_mot=True,
-                use_energy_regularization=True,
             )
         except Exception as e:
             if is_main:

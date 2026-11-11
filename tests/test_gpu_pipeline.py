@@ -630,3 +630,121 @@ def test_graded_curriculum_retries_transient_stream_errors(monkeypatch):
     assert pair is not None
     assert "ATP" in pair[0]
     assert not streamer._online_failed.get("dense_edu", False)
+
+
+def test_jax_to_pytorch_numerical_loss_parity_and_config_preservation():
+    """Verifies PyTorch matches JAX training_rollout within <1e-3 (fast & seq) and preserves flags across save/resume."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from src.jax.v5_model import ModelConfigV5 as JAXConfig, init_params_v5, training_rollout
+
+    jcfg = JAXConfig(
+        vocab_size=128,
+        surface_dim=64,
+        radial_dim=32,
+        num_shells=6,
+        num_shortcut_tracts=12,
+        num_heads=8,
+        max_phase_steps=64,
+        thinking_cycles=4,
+        top_k_tracts=4,
+    )
+    jparams, jbuf = init_params_v5(jax.random.PRNGKey(7), jcfg)
+    raw_state = {k: torch.from_numpy(np.array(v)) for k, v in jparams.items()}
+    raw_state["core.src_indices"] = torch.from_numpy(np.array(jbuf[0]))
+    raw_state["core.dst_indices"] = torch.from_numpy(np.array(jbuf[1]))
+    ckpt = {"model_state": raw_state, "step": 100, "loss": 4.2, "preset": "tpu_v5e_1"}
+
+    cfg = infer_v5_config_from_state_dict(ckpt)
+    assert cfg.use_sensory_self_attn is False
+    assert cfg.use_rope is False
+    assert cfg.top_k_resonance == 0
+    assert cfg.use_deliberation_probe is False
+    assert cfg.use_adaptive_thinking is False
+    assert cfg.use_sparse_mot is False
+    assert cfg.use_energy_regularization is False
+
+    pt_model = CerebroSpheroidV5(cfg).eval()
+    load_v5_checkpoint_into_torch(pt_model, ckpt, verbose=False)
+
+    # Non-trivial prompt with pad_id=0 and target with -100 padding
+    prompts_np = np.array([[5, 19, 42, 7, 11, 0, 0], [8, 22, 33, 44, 55, 66, 0]], dtype=np.int32)
+    targets_np = np.array([[10, 12, 14, 16, 18, 20, -100], [9, 13, 17, 21, 25, 29, 31]], dtype=np.int32)
+
+    jax_pure = float(
+        training_rollout(
+            jparams,
+            jnp.array(prompts_np),
+            target_len=7,
+            buffers=jbuf,
+            config=jcfg,
+            targets=jnp.array(targets_np),
+            sampling_p=1.0,
+            pad_id=0,
+            remat=False,
+            pure_teacher_forcing=True,
+        )
+    )
+    jax_seq = float(
+        training_rollout(
+            jparams,
+            jnp.array(prompts_np),
+            target_len=7,
+            buffers=jbuf,
+            config=jcfg,
+            targets=jnp.array(targets_np),
+            sampling_p=1.0,
+            pad_id=0,
+            remat=False,
+            pure_teacher_forcing=False,
+        )
+    )
+
+    tp = torch.from_numpy(prompts_np).long()
+    tt = torch.from_numpy(targets_np).long()
+    with torch.no_grad():
+        pt_fast_loss, pt_fast_logits = pt_model(tp, targets=tt, pad_id=0)
+        pt_model.force_sequential = True
+        pt_seq_loss, pt_seq_logits = pt_model(tp, targets=tt, pad_id=0)
+
+    assert abs(float(pt_fast_loss) - jax_pure) < 1e-3, f"fast={float(pt_fast_loss)} vs jax_pure={jax_pure}"
+    assert abs(float(pt_seq_loss) - jax_seq) < 1e-3, f"seq={float(pt_seq_loss)} vs jax_seq={jax_seq}"
+    assert float((pt_fast_logits - pt_seq_logits).abs().max()) < 1e-2
+
+    # Saving PyTorch checkpoint and re-inferring config must retain JAX-parity flags
+    resaved = {"model_state": pt_model.state_dict(), "config": cfg, "step": 101}
+    re_cfg = infer_v5_config_from_state_dict(resaved)
+    assert re_cfg.use_rope is False and re_cfg.top_k_resonance == 0 and re_cfg.use_sensory_self_attn is False
+    assert re_cfg.use_sparse_mot is False and re_cfg.use_energy_regularization is False
+
+
+def test_step_efference_fast_uses_gate_and_fp16_autocast_backward_finite():
+    """Verifies step_efference_fast updates efference_gate and FP16 autocast backward stays NaN-free."""
+    cfg = ModelConfigV5(**PRESETS_V5["v5_test"])
+    model = CerebroSpheroidV5(cfg)
+    model.force_sequential = True
+    prompts = torch.randint(1, cfg.vocab_size, (2, 8))
+    targets = torch.randint(1, cfg.vocab_size, (2, 6))
+
+    model.zero_grad(set_to_none=True)
+    loss, _ = model(prompts, targets=targets, pad_id=0)
+    loss.backward()
+    assert model.volumetric_core.efference_gate.weight.grad is not None
+    assert model.volumetric_core.efference_gate.weight.grad.abs().sum().item() > 0.0
+
+    if torch.cuda.is_available():
+        dev = torch.device("cuda:0")
+        m_cuda = CerebroSpheroidV5(cfg).to(dev)
+        scaler = torch.amp.GradScaler("cuda")
+        p_cu = prompts.to(dev)
+        t_cu = targets.to(dev)
+        m_cuda.zero_grad(set_to_none=True)
+        with torch.amp.autocast("cuda", dtype=torch.float16):
+            loss_cu, _ = m_cuda(p_cu, targets=t_cu, pad_id=0)
+        scaler.scale(loss_cu).backward()
+        scaler.unscale_(torch.optim.SGD(m_cuda.parameters(), lr=1e-3))
+        for name, param in m_cuda.named_parameters():
+            if param.grad is not None:
+                assert torch.isfinite(param.grad).all(), f"Non-finite gradient in {name}"
+
