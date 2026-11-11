@@ -96,6 +96,15 @@ def save_jax_to_torch_pt(
             json.dump(meta, f, indent=2)
 
 
+def _to_numpy(t):
+    """Safely converts a PyTorch tensor (including bfloat16) or array to NumPy float32/float64."""
+    if hasattr(t, "dtype") and str(t.dtype).endswith("bfloat16"):
+        return t.to(torch.float32).numpy()
+    if hasattr(t, "numpy"):
+        return t.numpy()
+    return np.asarray(t)
+
+
 def adapt_and_load_checkpoint_weights(
     ckpt: Dict[str, Any],
     target_params: Dict[str, jnp.ndarray],
@@ -118,17 +127,17 @@ def adapt_and_load_checkpoint_weights(
             for pfx in ["volumetric_core.intra_shell_swiglu", "core.intra_swiglu", "intra_swiglu"]:
                 g_key = f"{pfx}.{k}.fc_gate.weight"
                 if g_key in raw_state:
-                    g = np.asarray(raw_state[g_key])
+                    g = _to_numpy(raw_state[g_key])
                     gates.append(g.T if g.shape == (s_dim * 2, s_dim) else g)
-                    v = np.asarray(raw_state[f"{pfx}.{k}.fc_val.weight"])
+                    v = _to_numpy(raw_state[f"{pfx}.{k}.fc_val.weight"])
                     vals.append(v.T if v.shape == (s_dim * 2, s_dim) else v)
-                    d = np.asarray(raw_state[f"{pfx}.{k}.fc_down.weight"])
+                    d = _to_numpy(raw_state[f"{pfx}.{k}.fc_down.weight"])
                     downs.append(d.T if d.shape == (s_dim, s_dim * 2) else d)
                     break
             for n_pfx in ["volumetric_core.intra_norms", "core.intra_norms", "intra_norms"]:
                 n_key = f"{n_pfx}.{k}.weight"
                 if n_key in raw_state:
-                    norms.append(np.asarray(raw_state[n_key]))
+                    norms.append(_to_numpy(raw_state[n_key]))
                     break
 
         if len(gates) == K:
@@ -153,7 +162,7 @@ def adapt_and_load_checkpoint_weights(
     }
 
     for raw_k, raw_v in raw_state.items():
-        v = np.asarray(raw_v)
+        v = _to_numpy(raw_v)
         target_k = raw_k
         if target_k not in target_params:
             for old_p, new_p in key_translations.items():
