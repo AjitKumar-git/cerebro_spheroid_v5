@@ -622,11 +622,16 @@ def main(args=None):
 
             # Fetch next batch
             if elastic_batcher is not None:
-                batch_tuple = elastic_batcher.get_batch()
-                if len(batch_tuple) == 3:
+                batch_tuple = elastic_batcher.get_batch() if hasattr(elastic_batcher, "get_batch") else elastic_batcher.next_batch()
+                if len(batch_tuple) == 5:
+                    _, _, prompt_b, target_b, feedback_b = batch_tuple
+                elif len(batch_tuple) == 4:
+                    _, _, prompt_b, target_b = batch_tuple
+                    feedback_b = None
+                elif len(batch_tuple) == 3:
                     prompt_b, target_b, feedback_b = batch_tuple
                 else:
-                    prompt_b, target_b = batch_tuple
+                    prompt_b, target_b = batch_tuple[:2]
                     feedback_b = None
             else:
                 prompt_b, target_b = local_streamer.get_batch()
@@ -751,6 +756,11 @@ def main(args=None):
         ckpt_mgr.shutdown(wait=True)
         if local_streamer is not None:
             local_streamer.stop()
+        if elastic_batcher is not None:
+            if hasattr(elastic_batcher, "stop"):
+                elastic_batcher.stop()
+            elif hasattr(elastic_batcher, "shutdown"):
+                elastic_batcher.shutdown()
         print(f"🎉 Training session completed at Step {step:,}!")
 
 

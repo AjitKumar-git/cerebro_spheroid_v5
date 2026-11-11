@@ -226,6 +226,9 @@ class ElasticBucketBatcher:
         else:
             raise TypeError("data_iterator is not iterable or callable")
 
+    def get_batch(self) -> Any:
+        return self.next_batch()
+
     def next_batch(self) -> Any:
         """
         Pulls from dataset stream until any bucket has batch_size examples.
@@ -336,6 +339,12 @@ class PrefetchedBatcher:
 
     def next_batch(self):
         return self.queue.get()
+
+    def get_batch(self):
+        return self.next_batch()
+
+    def stop(self):
+        self.shutdown()
 
     def shutdown(self):
         self.stop_event.set()
