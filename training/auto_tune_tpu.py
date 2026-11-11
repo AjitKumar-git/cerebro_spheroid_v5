@@ -28,6 +28,7 @@ def parse_args():
     parser.add_argument("--preset", type=str, default="v5_small", choices=["v5_small", "v5_compact", "v5_base", "v5_test"], help="Model preset (default: v5_small)")
     parser.add_argument("--seq-len", type=int, default=256, help="Sequence length (default: 256)")
     parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bf16", "fp32"], help="Precision (default: auto, bf16 on TPU)")
+    parser.add_argument("--force-tune", "--force_tune", dest="force_tune", action="store_true", default=False, help="Force re-benchmark even if cached on bioflo.in")
     parser.add_argument("--launch-training", action="store_true", default=False, help="Launch pretraining with winning configuration immediately")
     parser.add_argument("--total-steps", type=int, default=1_000_000, help="Total training steps if launching")
     parser.add_argument("--scratch", "--from-scratch", dest="from_scratch", action="store_true", default=True, help="Start from scratch (step 0)")
@@ -40,6 +41,7 @@ def main():
         preset=args.preset,
         seq_len=args.seq_len,
         dtype=args.dtype,
+        force_tune=args.force_tune,
         verbose=True,
     )
 

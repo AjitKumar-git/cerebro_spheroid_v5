@@ -132,7 +132,8 @@ def parse_args(args_list=None):
     parser.add_argument("--preset", type=str, default="tpu_v5e_1", choices=["v5_small", "v5_compact", "v5_base", "v5_test", "tpu_v5e_1"], help="Model preset (default: tpu_v5e_1 / v5_small)")
     parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bf16", "fp16", "fp32"], help="Matrix execution precision ('auto' selects bf16 on TPU)")
     parser.add_argument("--remat", type=str, default="true", choices=["true", "false", "auto"], help="Activation remat scan to minimize HBM footprint (default: true)")
-    parser.add_argument("--auto-tune", action="store_true", default=False, help="Micro-benchmark candidate batch sizes at startup to maximize tok/s")
+    parser.add_argument("--auto-tune", action="store_true", default=False, help="Micro-benchmark candidate batch sizes at startup to maximize tok/s and VRAM utilization")
+    parser.add_argument("--force-tune", "--force_tune", dest="force_tune", action="store_true", default=False, help="Force re-running auto-tuner benchmarks even if cached config exists on bioflo.in")
 
     # Scheduled Sampling Curriculum
     parser.add_argument("--deliberation_mode", type=str, default="scheduled", choices=["scheduled", "teacher_forcing", "internal"], help="Deliberation feedback mode")
@@ -358,12 +359,25 @@ def main(args=None):
 
     # 2. Auto-Tuning Micro-Benchmark
     remat_choice = True if args.remat.lower() == "true" else False
-    if args.auto_tune and ("tpu" in dev_kind or "tpu" in backend.lower()):
-        candidates = [{"batch_size": 64, "remat": True}, {"batch_size": 128, "remat": True}]
-        best_cfg = run_auto_tuner(args.preset, candidates=candidates, seq_len=args.seq_len)
+    if args.auto_tune:
+        best_cfg = run_auto_tuner(
+            preset=args.preset,
+            seq_len=args.seq_len,
+            dtype=args.dtype,
+            use_cached_config=not getattr(args, "force_tune", False),
+            force_tune=getattr(args, "force_tune", False),
+            upload_winner=True,
+            cloud_url=args.cloud_url,
+            cloud_token=args.cloud_token,
+            verbose=True,
+        )
         args.batch_size = best_cfg["batch_size"]
         remat_choice = best_cfg["remat"]
-        print(f"\n⚡ Applying Auto-Tuned Hyperparameters: batch_size={args.batch_size}, remat={remat_choice}")
+        print(f"\n⚡ Applying Tuned Hyperparameters: batch_size={args.batch_size}, remat={remat_choice}")
+        if "tok_per_sec" in best_cfg and best_cfg["tok_per_sec"] > 0:
+            v_gb = best_cfg.get("vram_gb", 0)
+            v_pct = best_cfg.get("vram_utilization_pct", 0)
+            print(f"⚡ Target Benchmark Speed: {best_cfg['tok_per_sec']:,.0f} tok/s (Memory: {v_gb:.1f} GB, {v_pct:.1f}% utilization)")
 
     # 3. Model Configuration & Parameters
     config_preset = "v5_small" if args.preset == "tpu_v5e_1" else args.preset

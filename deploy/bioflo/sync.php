@@ -130,6 +130,111 @@ if ($action === 'status') {
 }
 
 // --------------------------------------------------------------------------------------------
+// Action: GET_CONFIG (Retrieve cached hardware-optimized hyperparameters)
+// --------------------------------------------------------------------------------------------
+if ($action === 'get_config' || $action === 'config') {
+    header('Content-Type: application/json');
+    $model = isset($_REQUEST['model']) ? normalize_model_name($_REQUEST['model']) : 'v5_small';
+    $device = isset($_REQUEST['device']) ? preg_replace('/[^a-zA-Z0-9_\-\.]/', '', $_REQUEST['device']) : 'default';
+
+    $configs_file = $storage_dir . '/hardware_configs.json';
+    $configs = (file_exists($configs_file) && filesize($configs_file) > 2) ? json_decode(file_get_contents($configs_file), true) : [];
+    if (!is_array($configs)) {
+        $configs = [];
+    }
+
+    if (isset($configs[$model][$device])) {
+        echo json_encode([
+            'status' => 'found',
+            'model' => $model,
+            'device' => $device,
+            'config' => $configs[$model][$device],
+            'server_time' => date('c'),
+        ]);
+    } elseif (isset($configs[$model]['default'])) {
+        echo json_encode([
+            'status' => 'found',
+            'model' => $model,
+            'device' => 'default',
+            'config' => $configs[$model]['default'],
+            'server_time' => date('c'),
+        ]);
+    } else {
+        echo json_encode([
+            'status' => 'not_found',
+            'model' => $model,
+            'device' => $device,
+            'available_devices' => isset($configs[$model]) ? array_keys($configs[$model]) : [],
+            'server_time' => date('c'),
+        ]);
+    }
+    exit;
+}
+
+// --------------------------------------------------------------------------------------------
+// Action: SAVE_CONFIG (Store tested hardware-optimized hyperparameters)
+// --------------------------------------------------------------------------------------------
+if ($action === 'save_config') {
+    header('Content-Type: application/json');
+    
+    // Support JSON body or standard form POST
+    $input_json = file_get_contents('php://input');
+    $payload = (!empty($input_json)) ? json_decode($input_json, true) : null;
+    if (!is_array($payload)) {
+        $payload = $_POST;
+    }
+
+    $model = isset($payload['model']) ? normalize_model_name($payload['model']) : 'v5_small';
+    $device = isset($payload['device']) ? preg_replace('/[^a-zA-Z0-9_\-\.]/', '', $payload['device']) : 'default';
+
+    $batch_size = isset($payload['batch_size']) ? intval($payload['batch_size']) : 16;
+    $remat = isset($payload['remat']) ? filter_var($payload['remat'], FILTER_VALIDATE_BOOLEAN) : true;
+    $seq_len = isset($payload['seq_len']) ? intval($payload['seq_len']) : 256;
+    $dtype = isset($payload['dtype']) ? preg_replace('/[^a-zA-Z0-9_\-]/', '', $payload['dtype']) : 'auto';
+    $tok_per_sec = isset($payload['tok_per_sec']) ? floatval($payload['tok_per_sec']) : 0.0;
+    $step_ms = isset($payload['step_ms']) ? floatval($payload['step_ms']) : 0.0;
+    $vram_gb = isset($payload['vram_gb']) ? floatval($payload['vram_gb']) : 0.0;
+    $vram_utilization_pct = isset($payload['vram_utilization_pct']) ? floatval($payload['vram_utilization_pct']) : 0.0;
+    $source = isset($payload['source']) ? preg_replace('/[^a-zA-Z0-9_\-]/', '', $payload['source']) : 'colab';
+
+    $entry = [
+        'model' => $model,
+        'device' => $device,
+        'batch_size' => $batch_size,
+        'remat' => $remat,
+        'seq_len' => $seq_len,
+        'dtype' => $dtype,
+        'tok_per_sec' => $tok_per_sec,
+        'step_ms' => $step_ms,
+        'vram_gb' => $vram_gb,
+        'vram_utilization_pct' => $vram_utilization_pct,
+        'source' => $source,
+        'updated_at' => date('c'),
+    ];
+
+    $configs_file = $storage_dir . '/hardware_configs.json';
+    $configs = (file_exists($configs_file) && filesize($configs_file) > 2) ? json_decode(file_get_contents($configs_file), true) : [];
+    if (!is_array($configs)) {
+        $configs = [];
+    }
+    if (!isset($configs[$model])) {
+        $configs[$model] = [];
+    }
+    $configs[$model][$device] = $entry;
+
+    file_put_contents($configs_file, json_encode($configs, JSON_PRETTY_PRINT));
+
+    echo json_encode([
+        'success' => true,
+        'status' => 'saved',
+        'model' => $model,
+        'device' => $device,
+        'config' => $entry,
+    ]);
+    exit;
+}
+
+// --------------------------------------------------------------------------------------------
 // Action: NOTIFY / TRAINING_START
 // --------------------------------------------------------------------------------------------
 if ($action === 'notify' || $action === 'start' || $action === 'training_start') {

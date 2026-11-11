@@ -425,3 +425,77 @@ def notify_training_start(
     except Exception as e:
         print(f"⚠️ [cloud_sync] Could not send start notification: {e}")
         return False
+
+
+def fetch_remote_hardware_config(
+    model: str,
+    device_signature: str,
+    url: Optional[str] = None,
+    token: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Retrieves cached optimal batch size, remat, and throughput config for hardware from bioflo.in."""
+    sync_url = url or DEFAULT_URL
+    sync_token = token or DEFAULT_TOKEN
+    clean_model = "v5_small" if model in ("tpu_v5e_1", "tpu", "v5_tpu") else model
+
+    req_url = f"{sync_url}?action=get_config&model={clean_model}&device={urllib.parse.quote(device_signature)}"
+    req = urllib.request.Request(
+        req_url,
+        headers={"Authorization": f"Bearer {sync_token}", "User-Agent": "CerebroV5CloudSync/1.0"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data.get("status") == "found" and "config" in data:
+                return data["config"]
+    except Exception as e:
+        print(f"ℹ️ [cloud_sync] Could not retrieve cached hardware config from {sync_url}: {e}")
+    return None
+
+
+def push_remote_hardware_config(
+    model: str,
+    device_signature: str,
+    config: Dict[str, Any],
+    source_node: Optional[str] = None,
+    url: Optional[str] = None,
+    token: Optional[str] = None,
+) -> bool:
+    """Uploads benchmarked optimal hyperparameters to bioflo.in for zero-delay reuse."""
+    sync_url = url or DEFAULT_URL
+    sync_token = token or DEFAULT_TOKEN
+    clean_model = "v5_small" if model in ("tpu_v5e_1", "tpu", "v5_tpu") else model
+    source = source_node or detect_source_environment()
+
+    payload = {
+        "action": "save_config",
+        "model": clean_model,
+        "device": device_signature,
+        "batch_size": int(config.get("batch_size", 16)),
+        "remat": bool(config.get("remat", True)),
+        "seq_len": int(config.get("seq_len", 256)),
+        "dtype": str(config.get("dtype", "auto")),
+        "tok_per_sec": float(config.get("tok_per_sec", 0.0)),
+        "step_ms": float(config.get("step_ms", 0.0)),
+        "vram_gb": float(config.get("vram_gb", 0.0)),
+        "vram_utilization_pct": float(config.get("vram_utilization_pct", 0.0)),
+        "source": source,
+    }
+
+    try:
+        req_data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{sync_url}?action=save_config",
+            data=req_data,
+            headers={
+                "Authorization": f"Bearer {sync_token}",
+                "Content-Type": "application/json",
+                "User-Agent": "CerebroV5CloudSync/1.0",
+            }
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+            return bool(res.get("success", False))
+    except Exception as e:
+        print(f"⚠️ [cloud_sync] Failed to save hardware config to {sync_url}: {e}")
+        return False
