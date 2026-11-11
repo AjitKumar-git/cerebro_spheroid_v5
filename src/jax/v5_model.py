@@ -449,19 +449,25 @@ def training_rollout(
         init_refractory = jnp.zeros((B, vocab_size), dtype=target_dtype)
     init_thought = jnp.zeros((B, surface_dim), dtype=target_dtype)
 
-    # Feedback token embeddings
+    # Feedback token embeddings (automatic causal teacher forcing when targets provided)
+    if feedback_tokens is None and targets is not None:
+        feedback_tokens = targets[:, :target_len]
+
     if feedback_tokens is not None:
         safe_feed = jnp.maximum(feedback_tokens, 0)
         valid_feed = (feedback_tokens >= 0)[:, :, None].astype(target_dtype)
         tf_flux, _ = encode_sensory(params, safe_feed, config=config)
         tf_flux = (tf_flux * valid_feed).astype(target_dtype)
+        # Causal shift: step 0 receives 0, step t receives token t-1
+        zero_pad = jnp.zeros((B, 1, surface_dim), dtype=target_dtype)
+        tf_flux = jnp.concatenate([zero_pad, tf_flux[:, :-1, :]], axis=1)
     else:
         tf_flux = jnp.zeros((B, target_len, surface_dim), dtype=target_dtype)
 
     def _emit(carry, step_idx):
         cur_state, cur_trace, cur_plan, prev_thought = carry
         tf_aud = tf_flux[:, step_idx, :]
-        internal_feed = jnp.where(step_idx == 0, tf_aud, prev_thought)
+        internal_feed = jnp.where(step_idx == 0, 0.0, prev_thought)
         feed = sampling_p * tf_aud + (1.0 - sampling_p) * internal_feed
 
         logits, nxt_s, nxt_t, nxt_p = emit_step(

@@ -79,11 +79,27 @@ class LinguisticDataStreamer:
         self.worker_thread.start()
 
     def _init_tokenizer(self):
-        """Loads tokenizer or falls back to fast byte encoder."""
+        """Loads 32,000-vocabulary LLaMA tokenizer matching pretrained embedding matrix."""
+        # 1. First priority: Local bundled LLaMA 32k tokenizer in data/tokenizer
+        local_tok_dir = os.path.join(self.data_dir, "tokenizer")
+        if os.path.exists(local_tok_dir) and HAS_TRANSFORMERS:
+            try:
+                tok = AutoTokenizer.from_pretrained(local_tok_dir, local_files_only=True)
+                if tok.pad_token_id is None:
+                    tok.pad_token_id = 0
+                print(f"🔤 [DataStreamer] Loaded local LLaMA-32k tokenizer from {local_tok_dir} (vocab: {len(tok)})")
+                return tok
+            except Exception as e:
+                print(f"⚠️ [DataStreamer] Notice loading local tokenizer: {e}")
+
+        # 2. Second priority: Remote LLaMA candidates (strictly 32k vocab, never 50k GPT-2)
         if HAS_TRANSFORMERS:
-            for cand in ["gpt2", "huggyllama/llama-7b"]:
+            for cand in ["huggyllama/llama-7b", "openlm-research/open_llama_7b", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"]:
                 try:
                     tok = AutoTokenizer.from_pretrained(cand, local_files_only=False)
+                    if tok.pad_token_id is None:
+                        tok.pad_token_id = 0
+                    print(f"🔤 [DataStreamer] Loaded remote LLaMA-32k tokenizer: {cand} (vocab: {len(tok)})")
                     return tok
                 except Exception:
                     continue
