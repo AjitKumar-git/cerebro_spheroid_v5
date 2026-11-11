@@ -30,6 +30,8 @@ except ImportError:
 RECURRENT_KEYS: Set[str] = {
     "core.intra_shell", "core.reentrant_field", "core.shortcut_tracts",
     "volumetric_core.w_radial_in", "volumetric_core.w_radial_out", "volumetric_core.shortcut_weight",
+    "core.intra_swiglu.w_gate", "core.intra_swiglu.w_val", "core.intra_swiglu.w_down",
+    "core.w_radial_in", "core.w_radial_out", "core.shortcut_weight",
 }
 VOCAB_KEYS: Set[str] = {
     "sensory.embedding.weight", "sensory_dnn.embedding.weight",

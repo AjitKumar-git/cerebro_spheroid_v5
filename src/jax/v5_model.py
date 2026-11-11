@@ -211,13 +211,11 @@ def init_params_v5(key: jax.random.PRNGKey, config: ModelConfigV5) -> Tuple[Dict
         "motor.refractory_strength": jnp.array(1.2, dtype=jnp.float32),
     }
 
-    # Per-shell intra SwiGLU weights
-    for k_idx in range(K):
-        sub_k = jax.random.split(keys[24 + (k_idx % 7)], 4)
-        params[f"core.intra_swiglu.{k_idx}.fc_gate.weight"] = jax.random.normal(sub_k[0], (s_dim * 2, s_dim)) * (1.0 / math.sqrt(s_dim))
-        params[f"core.intra_swiglu.{k_idx}.fc_val.weight"] = jax.random.normal(sub_k[1], (s_dim * 2, s_dim)) * (1.0 / math.sqrt(s_dim))
-        params[f"core.intra_swiglu.{k_idx}.fc_down.weight"] = jax.random.normal(sub_k[2], (s_dim, s_dim * 2)) * (1.0 / math.sqrt(s_dim * 2))
-        params[f"core.intra_norms.{k_idx}.weight"] = jnp.ones(s_dim, dtype=jnp.float32)
+    # 3D Tensorized Batched Intra-Shell SwiGLU across all K shells in parallel
+    params["core.intra_norms.weight"] = jnp.ones((K, s_dim), dtype=jnp.float32)
+    params["core.intra_swiglu.w_gate"] = jax.random.normal(keys[24], (K, s_dim, s_dim * 2)) * (1.0 / math.sqrt(s_dim))
+    params["core.intra_swiglu.w_val"] = jax.random.normal(keys[25], (K, s_dim, s_dim * 2)) * (1.0 / math.sqrt(s_dim))
+    params["core.intra_swiglu.w_down"] = jax.random.normal(keys[26], (K, s_dim * 2, s_dim)) * (1.0 / math.sqrt(s_dim * 2))
 
     src_idx, dst_idx = generate_small_world_indices(K, T)
     buffers = (src_idx, dst_idx)
@@ -256,25 +254,21 @@ def encode_sensory(params: Dict[str, jnp.ndarray], input_tokens_or_emb: jnp.ndar
 
 
 def deliberate_step(params: Dict[str, jnp.ndarray], state: jnp.ndarray, buffers: Tuple[jnp.ndarray, jnp.ndarray]) -> jnp.ndarray:
-    """Executes a single subconscious deliberation step across all 32 concentric laminae."""
+    """Executes a single subconscious deliberation step across all concentric laminae with fused 3D tensor contractions."""
     B, K, D = state.shape
     src_idx, dst_idx = buffers
 
-    # 1. Intra-shell SwiGLU updates
-    intra_updates = []
-    for k in range(K):
-        s_k = state[:, k, :]
-        h_k = rms_norm(s_k, params[f"core.intra_norms.{k}.weight"])
-        u_k = swiglu(
-            h_k,
-            params[f"core.intra_swiglu.{k}.fc_gate.weight"],
-            params[f"core.intra_swiglu.{k}.fc_val.weight"],
-            params[f"core.intra_swiglu.{k}.fc_down.weight"],
-        ) * params["core.shell_gains"][k]
-        intra_updates.append(s_k + u_k)
-    state_intra = jnp.stack(intra_updates, axis=1)
+    # 1. Batched Intra-shell RMSNorm across all K shells simultaneously
+    var = jnp.mean(jnp.square(state), axis=-1, keepdims=True)
+    h = state * jax.lax.rsqrt(var + 1e-6) * params["core.intra_norms.weight"][None, :, :]
 
-    # 2. Inter-shell radial wave propagation
+    # 2. Batched 3D SwiGLU: Single systolic tensor contraction across all K shells in parallel
+    gate = jax.nn.silu(jnp.einsum("bkd,kde->bke", h, params["core.intra_swiglu.w_gate"]))
+    val  = jnp.einsum("bkd,kde->bke", h, params["core.intra_swiglu.w_val"])
+    down = jnp.einsum("bke,ked->bkd", gate * val, params["core.intra_swiglu.w_down"])
+    state_intra = state + down * params["core.shell_gains"][None, :, None]
+
+    # 3. Inter-shell radial wave propagation
     rad_in = jnp.matmul(state_intra[:, 1:, :], params["core.radial_in_proj.weight"].T)
     in_flux = jnp.einsum("bkd,kde->bke", rad_in, params["core.w_radial_in"])
     in_up = jnp.matmul(in_flux, params["core.radial_up.weight"].T)
@@ -286,15 +280,12 @@ def deliberate_step(params: Dict[str, jnp.ndarray], state: jnp.ndarray, buffers:
     state_radial = state_intra.at[:, :-1, :].add(0.1 * in_up)
     state_radial = state_radial.at[:, 1:, :].add(0.1 * out_up)
 
-    # 3. Small-world hierarchical axonal shortcut tracts
+    # 4. Small-world hierarchical axonal shortcut tracts in 1 vectorized step
     conductances = jax.nn.sigmoid(params["core.shortcut_gate"])
     src_acts = state_radial[:, src_idx, :]
     shortcut_flux = jnp.einsum("btd,tde->bte", src_acts, params["core.shortcut_weight"]) * conductances[None, :, None]
 
-    state_next = state_radial
-    for t in range(len(dst_idx)):
-        dst = dst_idx[t]
-        state_next = state_next.at[:, dst, :].add(0.05 * shortcut_flux[:, t, :])
+    state_next = state_radial.at[:, dst_idx, :].add(0.05 * shortcut_flux)
 
     return rms_norm(state_next, params["core.radial_norm.weight"])
 
@@ -474,11 +465,10 @@ def training_rollout(
             repetition_penalty=repetition_penalty,
         )
 
-        # Thought re-afference
-        soft_p = lax.stop_gradient(jax.nn.softmax(logits, axis=-1))
-        soft_emb = jnp.matmul(soft_p, params["sensory.embedding.weight"])
-        nxt_thought, _ = encode_sensory(params, soft_emb, config=config)
-        nxt_thought = lax.stop_gradient(nxt_thought)
+        # Fast discrete thought re-afference: O(1) embedding slice replaces 32k matmul
+        tok_idx = lax.stop_gradient(jnp.argmax(logits, axis=-1))
+        tok_emb = params["sensory.embedding.weight"][tok_idx]
+        nxt_thought = lax.stop_gradient(rms_norm(tok_emb, params["sensory.norm_in.weight"]))
 
         if targets is not None:
             cur_target = targets[:, step_idx]
