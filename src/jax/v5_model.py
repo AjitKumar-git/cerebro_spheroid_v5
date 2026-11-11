@@ -425,12 +425,14 @@ def training_rollout(
     vocab_size = config.vocab_size if config is not None else 32000
     thinking_cycles = config.thinking_cycles if config is not None else 4
 
+    target_dtype = params["sensory.embedding.weight"].dtype
+
     # Masked centroid pooling
-    mask = (prompts != pad_id)[:, :, None].astype(jnp.float32)
-    prompt_flux = jnp.sum(sensory_flux * mask, axis=1) / jnp.maximum(jnp.sum(mask, axis=1), 1.0)
+    mask = (prompts != pad_id)[:, :, None].astype(target_dtype)
+    prompt_flux = (jnp.sum(sensory_flux * mask, axis=1) / jnp.maximum(jnp.sum(mask, axis=1), 1.0)).astype(target_dtype)
 
     # Initial concentric state
-    init_state = jnp.zeros((B, num_shells, surface_dim), dtype=jnp.float32)
+    init_state = jnp.zeros((B, num_shells, surface_dim), dtype=target_dtype)
     state = init_state.at[:, -1, :].set(prompt_flux)
 
     # Subconscious deliberation cycles
@@ -438,23 +440,23 @@ def training_rollout(
         state = deliberate_step(params, state, buffers)
 
     # Initial executive plan and refractory trace
-    init_plan = jnp.zeros((B, surface_dim), dtype=jnp.float32)
+    init_plan = jnp.zeros((B, surface_dim), dtype=target_dtype)
     # When training (teacher-forced MLE), disable refractory penalty so loss accurately reflects true likelihood
     if targets is not None:
         init_refractory = None
         repetition_penalty = 1.0
     else:
-        init_refractory = jnp.zeros((B, vocab_size), dtype=jnp.float32)
-    init_thought = jnp.zeros((B, surface_dim), dtype=jnp.float32)
+        init_refractory = jnp.zeros((B, vocab_size), dtype=target_dtype)
+    init_thought = jnp.zeros((B, surface_dim), dtype=target_dtype)
 
     # Feedback token embeddings
     if feedback_tokens is not None:
         safe_feed = jnp.maximum(feedback_tokens, 0)
-        valid_feed = (feedback_tokens >= 0)[:, :, None].astype(jnp.float32)
+        valid_feed = (feedback_tokens >= 0)[:, :, None].astype(target_dtype)
         tf_flux, _ = encode_sensory(params, safe_feed, config=config)
-        tf_flux = tf_flux * valid_feed
+        tf_flux = (tf_flux * valid_feed).astype(target_dtype)
     else:
-        tf_flux = jnp.zeros((B, target_len, surface_dim), dtype=jnp.float32)
+        tf_flux = jnp.zeros((B, target_len, surface_dim), dtype=target_dtype)
 
     def _emit(carry, step_idx):
         cur_state, cur_trace, cur_plan, prev_thought = carry
@@ -478,11 +480,17 @@ def training_rollout(
         # Fast discrete thought re-afference: O(1) embedding slice replaces 32k matmul
         tok_idx = lax.stop_gradient(jnp.argmax(logits, axis=-1))
         tok_emb = params["sensory.embedding.weight"][tok_idx]
-        nxt_thought = lax.stop_gradient(rms_norm(tok_emb, params["sensory.norm_in.weight"]))
+        nxt_thought = lax.stop_gradient(rms_norm(tok_emb, params["sensory.norm_in.weight"])).astype(target_dtype)
+
+        # Enforce exact carry type alignment
+        nxt_s = nxt_s.astype(target_dtype)
+        nxt_p = nxt_p.astype(target_dtype)
+        if nxt_t is not None:
+            nxt_t = nxt_t.astype(target_dtype)
 
         if targets is not None:
             cur_target = targets[:, step_idx]
-            log_probs = jax.nn.log_softmax(logits, axis=-1)
+            log_probs = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
             safe_targets = jnp.maximum(cur_target, 0)
             target_log_probs = jnp.take_along_axis(log_probs, safe_targets[:, None], axis=-1).squeeze(-1)
             mask_t = (cur_target >= 0).astype(jnp.float32)
