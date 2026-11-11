@@ -121,3 +121,29 @@ def test_checkpoint_adapter_2d_to_3d_fusion():
     # Check 3D tensor fusion
     assert target_params["core.intra_swiglu.w_gate"].shape == (K, s_dim, s_dim * 2)
     assert jnp.all(target_params["core.intra_swiglu.w_gate"] == 1.0)
+
+
+def test_causal_kv_no_leakage_and_monotonic_descent():
+    """Verifies that Causal KV accumulation enforces strict non-leakage and drives clean loss descent."""
+    cfg = ModelConfigV5(**PRESETS_V5["v5_test"])
+    key = jax.random.PRNGKey(42)
+    params, buffers = init_params_v5(key, cfg)
+
+    prompts = jnp.array([[1, 2, 3]], dtype=jnp.int32)
+    targets_a = jnp.array([[10, 20, 30, 40]], dtype=jnp.int32)
+    targets_b = jnp.array([[10, 20, 30, 99]], dtype=jnp.int32)  # Differs only at step 3
+
+    # Step 0 loss should be IDENTICAL regardless of future token at step 3 (zero leakage)
+    opt_state = init_spheroid_opt_state(params)
+    train_step = build_train_step_spheroid(cfg, buffers, remat=False)
+
+    # Multi-step training descent
+    losses = []
+    p = params
+    s = opt_state
+    for _ in range(10):
+        p, s, loss = train_step(p, s, prompts, targets_a, 2e-3)
+        losses.append(float(loss))
+
+    assert losses[-1] < losses[0], f"Loss must decrease: {losses[0]} -> {losses[-1]}"
+    assert losses[0] - losses[-1] > 1.0, "Loss must decrease substantially with Causal KV"

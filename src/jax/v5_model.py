@@ -311,6 +311,7 @@ def emit_step(
     config: Optional[ModelConfigV5] = None,
     auditory_feedback: Optional[jnp.ndarray] = None,
     repetition_penalty: float = 1.25,
+    attn_mask: Optional[jnp.ndarray] = None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, Optional[jnp.ndarray], jnp.ndarray]:
     """Single motor emission step with affine-tied dictionary projection."""
     B, K, D = state.shape
@@ -329,11 +330,13 @@ def emit_step(
     if auditory_feedback is not None:
         motor_surface = motor_surface + auditory_feedback
 
-    # 2. Multi-Head Arcuate Fasciculus Cross-Resonance
+    # 2. Multi-Head Arcuate Fasciculus Cross-Resonance with Causal Prefix
     keys, values = sensory_kv
     q = jnp.matmul(motor_surface, params["motor.q_proj.weight"].T).reshape(B, 1, num_heads, head_dim)
     q = jnp.swapaxes(q, 1, 2)  # [B, H, 1, head_dim]
     scores = jnp.matmul(q, jnp.swapaxes(keys, -1, -2)) / math.sqrt(head_dim)
+    if attn_mask is not None:
+        scores = jnp.where(attn_mask, scores, -1e4)
     attn_weights = jax.nn.softmax(scores, axis=-1)
     res_heads = jnp.matmul(attn_weights, values)  # [B, H, 1, head_dim]
     res_heads = jnp.swapaxes(res_heads, 1, 2).reshape(B, D)
@@ -459,16 +462,31 @@ def training_rollout(
     if feedback_tokens is None and targets is not None:
         feedback_tokens = targets[:, :target_len]
 
+    prompt_k, prompt_v = sensory_kv
+    num_heads = prompt_k.shape[1]
+    head_dim = prompt_k.shape[3]
+
     if feedback_tokens is not None:
         safe_feed = jnp.maximum(feedback_tokens, 0)
         valid_feed = (feedback_tokens >= 0)[:, :, None].astype(target_dtype)
-        tf_flux, _ = encode_sensory(params, safe_feed, config=config)
+        tf_flux, (tf_k, tf_v) = encode_sensory(params, safe_feed, config=config)
         tf_flux = (tf_flux * valid_feed).astype(target_dtype)
         # Causal shift: step 0 receives 0, step t receives token t-1
         zero_pad = jnp.zeros((B, 1, surface_dim), dtype=target_dtype)
         tf_flux = jnp.concatenate([zero_pad, tf_flux[:, :-1, :]], axis=1)
+
+        # Causal Key/Value Accumulation:
+        # Prompt keys [B, H, L, head_dim] + Target keys [B, H, target_len, head_dim]
+        causal_keys = jnp.concatenate([prompt_k, tf_k], axis=2)
+        causal_values = jnp.concatenate([prompt_v, tf_v], axis=2)
+
+        prompt_valid = (prompts != pad_id)[:, None, None, :]  # [B, 1, 1, L]
+        target_valid = (feedback_tokens >= 0)[:, None, None, :]  # [B, 1, 1, target_len]
+        all_valid = jnp.concatenate([prompt_valid, target_valid], axis=-1)  # [B, 1, 1, L + target_len]
     else:
+        causal_keys, causal_values = prompt_k, prompt_v
         tf_flux = jnp.zeros((B, target_len, surface_dim), dtype=target_dtype)
+        all_valid = (prompts != pad_id)[:, None, None, :]
 
     def _emit(carry, step_idx):
         cur_state, cur_trace, cur_plan, prev_thought = carry
@@ -476,10 +494,16 @@ def training_rollout(
         internal_feed = jnp.where(step_idx == 0, 0.0, prev_thought)
         feed = sampling_p * tf_aud + (1.0 - sampling_p) * internal_feed
 
+        # Causal Attention Mask: tokens strictly before current target position (L + step_idx) are visible
+        total_len = causal_keys.shape[2]
+        pos = jnp.arange(total_len)
+        causal_mask = (pos < (L + step_idx))[None, None, None, :]
+        step_mask = all_valid & causal_mask
+
         logits, nxt_s, nxt_t, nxt_p = emit_step(
             params,
             cur_state,
-            sensory_kv,
+            (causal_keys, causal_values),
             cur_plan,
             cur_trace,
             step_idx,
@@ -487,6 +511,7 @@ def training_rollout(
             config=config,
             auditory_feedback=feed,
             repetition_penalty=repetition_penalty,
+            attn_mask=step_mask,
         )
 
         # Fast discrete thought re-afference: O(1) embedding slice replaces 32k matmul
@@ -511,16 +536,58 @@ def training_rollout(
 
         return (nxt_s, nxt_t, nxt_p, nxt_thought), logits
 
+    # Autoregressive Generation Engine with Dynamic Causal KV Cache (when targets is None)
+    if targets is None:
+        init_k_buf = jnp.zeros((B, num_heads, target_len, head_dim), dtype=target_dtype)
+        init_v_buf = jnp.zeros((B, num_heads, target_len, head_dim), dtype=target_dtype)
+
+        def _emit_gen(carry, step_idx):
+            cur_state, cur_trace, cur_plan, prev_thought, k_buf, v_buf = carry
+            internal_feed = jnp.where(step_idx == 0, 0.0, prev_thought)
+
+            cur_all_k = jnp.concatenate([prompt_k, k_buf], axis=2)
+            cur_all_v = jnp.concatenate([prompt_v, v_buf], axis=2)
+            pos = jnp.arange(L + target_len)
+            step_mask = (pos < (L + step_idx))[None, None, None, :]
+
+            logits, nxt_s, nxt_t, nxt_p = emit_step(
+                params,
+                cur_state,
+                (cur_all_k, cur_all_v),
+                cur_plan,
+                cur_trace,
+                step_idx,
+                buffers,
+                config=config,
+                auditory_feedback=internal_feed,
+                repetition_penalty=repetition_penalty,
+                attn_mask=step_mask,
+            )
+
+            tok_idx = lax.stop_gradient(jnp.argmax(logits, axis=-1))
+            tok_emb = params["sensory.embedding.weight"][tok_idx]
+            nxt_thought = lax.stop_gradient(rms_norm(tok_emb, params["sensory.norm_in.weight"])).astype(target_dtype)
+
+            # Project generated token to key/value and append to dynamic KV cache
+            new_k = jnp.matmul(nxt_thought[:, None, :], params["sensory.k_proj.weight"].T).reshape(B, 1, num_heads, head_dim)
+            new_k = jnp.swapaxes(new_k, 1, 2)
+            new_v = jnp.matmul(nxt_thought[:, None, :], params["sensory.v_proj.weight"].T).reshape(B, 1, num_heads, head_dim)
+            new_v = jnp.swapaxes(new_v, 1, 2)
+
+            nxt_k_buf = lax.dynamic_update_slice(k_buf, new_k, (0, 0, step_idx, 0))
+            nxt_v_buf = lax.dynamic_update_slice(v_buf, new_v, (0, 0, step_idx, 0))
+
+            return (nxt_s.astype(target_dtype), nxt_t, nxt_p.astype(target_dtype), nxt_thought, nxt_k_buf, nxt_v_buf), logits
+
+        _, all_logits = lax.scan(_emit_gen, (state, init_refractory, init_plan, init_thought, init_k_buf, init_v_buf), jnp.arange(target_len))
+        return jnp.swapaxes(all_logits, 0, 1)
+
     # Use activation checkpointing (remat) for training to reduce HBM activation memory by >90%
     use_remat = remat and (targets is not None)
     scan_fn = jax.checkpoint(_emit) if use_remat else _emit
 
-    if targets is not None:
-        _, (all_loss, all_mask) = lax.scan(scan_fn, (state, init_refractory, init_plan, init_thought), jnp.arange(target_len))
-        return jnp.sum(all_loss) / jnp.maximum(jnp.sum(all_mask), 1.0)
-
-    _, all_logits = lax.scan(_emit, (state, init_refractory, init_plan, init_thought), jnp.arange(target_len))
-    return jnp.swapaxes(all_logits, 0, 1)
+    _, (all_loss, all_mask) = lax.scan(scan_fn, (state, init_refractory, init_plan, init_thought), jnp.arange(target_len))
+    return jnp.sum(all_loss) / jnp.maximum(jnp.sum(all_mask), 1.0)
 
 
 def compute_manifold_diagnostics_jax(state: jnp.ndarray) -> Dict[str, Any]:

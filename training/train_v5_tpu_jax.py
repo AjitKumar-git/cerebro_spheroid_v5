@@ -136,9 +136,9 @@ def parse_args(args_list=None):
     parser.add_argument("--force-tune", "--force_tune", dest="force_tune", action="store_true", default=False, help="Force re-running auto-tuner benchmarks even if cached config exists on bioflo.in")
 
     # Scheduled Sampling Curriculum
-    parser.add_argument("--deliberation_mode", type=str, default="scheduled", choices=["scheduled", "teacher_forcing", "internal"], help="Deliberation feedback mode")
-    parser.add_argument("--schedule_steps", type=int, default=5000, help="Steps to anneal from teacher-forcing down to min_sampling_p")
-    parser.add_argument("--min_sampling_p", type=float, default=0.75, help="Minimum teacher sampling floor for scheduled sampling (default: 0.75)")
+    parser.add_argument("--deliberation_mode", type=str, default="teacher_forcing", choices=["teacher_forcing", "scheduled", "internal"], help="Deliberation feedback mode (default: teacher_forcing for clean pretraining)")
+    parser.add_argument("--schedule_steps", type=int, default=5000, help="Steps to anneal from teacher-forcing down to min_sampling_p (if using scheduled mode)")
+    parser.add_argument("--min_sampling_p", type=float, default=1.0, help="Minimum teacher sampling floor (default: 1.0 for clean pretraining)")
 
     # Data Source & Tokenizer
     parser.add_argument("--dataset_source", "--dataset-source", dest="dataset_source", type=str, default="dense_edu",
