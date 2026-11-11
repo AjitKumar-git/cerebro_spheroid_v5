@@ -70,7 +70,6 @@ PRESETS_V5: Dict[str, Dict[str, Any]] = {
         "top_k_tracts": 16,
         "thinking_cycles": 4,
         "phase_scale": 2.0,
-        "use_tied_embeddings": False,
     },
     "v5_compact": {
         "surface_dim": 768,
@@ -596,10 +595,10 @@ class PremotorMotorDecoderV5(nn.Module):
         self.persona_scale = nn.Parameter(torch.tensor(0.5))
 
     def init_plan(self, batch_size: int, device: torch.device, persona_id: Optional[int] = None) -> torch.Tensor:
-        plan = torch.zeros(batch_size, self.surface_dim, device=device)
+        plan = torch.zeros(batch_size, self.surface_dim, device=device, dtype=self.persona_embeddings.dtype)
         if persona_id is not None:
             p_idx = min(max(0, int(persona_id)), self.persona_embeddings.shape[0] - 1)
-            plan = plan + self.persona_scale * self.persona_embeddings[p_idx]
+            plan = plan + (self.persona_scale * self.persona_embeddings[p_idx]).to(plan.dtype)
         return plan
 
     def forward(
@@ -667,15 +666,15 @@ class PremotorMotorDecoderV5(nn.Module):
                 prompt_len_k = L - causal_len
                 prompt_valid = torch.ones(B, prompt_len_k, dtype=torch.bool, device=scores.device)
                 k_valid = torch.cat([prompt_valid, causal_kv_mask[:, :causal_len]], dim=1).view(B, 1, 1, L)
-                scores = torch.where(k_valid, scores, torch.full_like(scores, -1e9))
+                scores = torch.where(k_valid, scores, torch.full_like(scores, -1e4))
 
             # Top-K Sparse Associative Gating (Needle-in-a-Haystack Tethering)
             if self.top_k_resonance > 0 and L > self.top_k_resonance:
                 topk_v, _ = torch.topk(scores, self.top_k_resonance, dim=-1)
                 min_topk = topk_v[..., -1, None]
-                scores = torch.where(scores < min_topk, torch.full_like(scores, -1e9), scores)
+                scores = torch.where(scores < min_topk, torch.full_like(scores, -1e4), scores)
 
-            attn_weights = F.softmax(scores, dim=-1)
+            attn_weights = F.softmax(scores.float(), dim=-1).to(scores.dtype)
             res = torch.matmul(attn_weights, values)  # [B, H, 1, head_dim]
             res = res.transpose(1, 2).contiguous().view(B, D)
             resonance = self.resonance_norm(self.out_proj(res).to(motor_surface.dtype))
@@ -717,7 +716,7 @@ class PremotorMotorDecoderV5(nn.Module):
             p_update = self.plan_update(plan_input)
             next_plan = torch.clamp(p_decay * plan + self.plan_write * p_gate * p_update, -50.0, 50.0)
         else:
-            next_plan = plan if plan is not None else torch.zeros(B, D, device=state.device)
+            next_plan = plan if plan is not None else torch.zeros(B, D, device=state.device, dtype=state.dtype)
 
         # 6. Motor Verbalization Emission Head
         temp = torch.clamp(self.temperature_scale, 0.1, 5.0)
@@ -1018,7 +1017,13 @@ class CerebroSpheroidV5(nn.Module):
 
     def init_spheroid_state(self, batch_size: int, device: torch.device) -> torch.Tensor:
         """Initializes empty concentric spherical state: [B, num_shells, surface_dim]."""
-        return torch.zeros(batch_size, self.config.num_shells, self.config.surface_dim, device=device)
+        return torch.zeros(
+            batch_size,
+            self.config.num_shells,
+            self.config.surface_dim,
+            device=device,
+            dtype=self.sensory_dnn.embedding.weight.dtype,
+        )
 
     @staticmethod
     def _recency_weighted_pool(
@@ -1101,7 +1106,7 @@ class CerebroSpheroidV5(nn.Module):
                 prompt_centroid = self._recency_weighted_pool(sensory_flux)
 
         # 2. State Initialization: Cortical Surface receives sensory prompt flux out-of-place
-        subcortical = torch.zeros(B, self.config.num_shells - 1, self.config.surface_dim, device=dev)
+        subcortical = torch.zeros(B, self.config.num_shells - 1, self.config.surface_dim, device=dev, dtype=prompt_centroid.dtype)
         state = torch.cat([subcortical, prompt_centroid.unsqueeze(1)], dim=1)
 
         # 3. Subconscious Deliberation Cycles with Memory Probing & Adaptive Halting
@@ -1120,8 +1125,8 @@ class CerebroSpheroidV5(nn.Module):
                 scores = torch.matmul(q_rot.to(keys.dtype), k_rot.transpose(-1, -2)) / math.sqrt(self.sensory_dnn.head_dim)
                 if self.config.top_k_resonance > 0 and L_kv > self.config.top_k_resonance:
                     topk_v, _ = torch.topk(scores, self.config.top_k_resonance, dim=-1)
-                    scores = torch.where(scores < topk_v[..., -1, None], torch.full_like(scores, -1e9), scores)
-                attn_p = F.softmax(scores, dim=-1)
+                    scores = torch.where(scores < topk_v[..., -1, None], torch.full_like(scores, -1e4), scores)
+                attn_p = F.softmax(scores.float(), dim=-1).to(scores.dtype)
                 retrieved = torch.matmul(attn_p, values).transpose(1, 2).contiguous().view(B, self.config.surface_dim)
                 state_mantle = state[:, -1:, :] + 0.1 * self.deliberation_probe_norm(retrieved).unsqueeze(1)
                 state = torch.cat([state[:, :-1, :], state_mantle], dim=1)
@@ -1209,8 +1214,8 @@ class CerebroSpheroidV5(nn.Module):
             logits_stacked = torch.cat(all_chunk_logits, dim=1)
         else:
             # Sequential rollout for free sampling or test unrolling
-            refractory = torch.zeros(B, self.config.vocab_size, device=dev)
-            prev_thought = torch.zeros(B, self.config.surface_dim, device=dev)
+            refractory = torch.zeros(B, self.config.vocab_size, device=dev, dtype=state.dtype)
+            prev_thought = torch.zeros(B, self.config.surface_dim, device=dev, dtype=state.dtype)
             all_logits = []
 
             for t in range(t_len):
@@ -1296,7 +1301,7 @@ class CerebroSpheroidV5(nn.Module):
         prompt_centroid = self._recency_weighted_pool(sensory_flux, safe_mask)
 
         # 2. State Initialization: Cortical Surface receives sensory prompt flux out-of-place
-        subcortical = torch.zeros(B, self.config.num_shells - 1, self.config.surface_dim, device=dev)
+        subcortical = torch.zeros(B, self.config.num_shells - 1, self.config.surface_dim, device=dev, dtype=prompt_centroid.dtype)
         state = torch.cat([subcortical, prompt_centroid.unsqueeze(1)], dim=1)
 
         for cycle in range(cycles):
@@ -1309,8 +1314,8 @@ class CerebroSpheroidV5(nn.Module):
                 scores = torch.matmul(q_rot.to(keys.dtype), k_rot.transpose(-1, -2)) / math.sqrt(self.sensory_dnn.head_dim)
                 if self.config.top_k_resonance > 0 and L_kv > self.config.top_k_resonance:
                     topk_v, _ = torch.topk(scores, self.config.top_k_resonance, dim=-1)
-                    scores = torch.where(scores < topk_v[..., -1, None], torch.full_like(scores, -1e9), scores)
-                attn_p = F.softmax(scores, dim=-1)
+                    scores = torch.where(scores < topk_v[..., -1, None], torch.full_like(scores, -1e4), scores)
+                attn_p = F.softmax(scores.float(), dim=-1).to(scores.dtype)
                 retrieved = torch.matmul(attn_p, values).transpose(1, 2).contiguous().view(B, self.config.surface_dim)
                 state_mantle = state[:, -1:, :] + 0.1 * self.deliberation_probe_norm(retrieved).unsqueeze(1)
                 state = torch.cat([state[:, :-1, :], state_mantle], dim=1)
@@ -1324,8 +1329,8 @@ class CerebroSpheroidV5(nn.Module):
 
         # 3. Motor generation loop
         plan = self.motor_decoder.init_plan(B, dev) if self.config.use_plan else None
-        refractory = torch.zeros(B, self.config.vocab_size, device=dev)
-        prev_thought = torch.zeros(B, self.config.surface_dim, device=dev)
+        refractory = torch.zeros(B, self.config.vocab_size, device=dev, dtype=state.dtype)
+        prev_thought = torch.zeros(B, self.config.surface_dim, device=dev, dtype=state.dtype)
 
         generated_tokens = []
         causal_keys_list = []
@@ -1483,3 +1488,156 @@ def compute_manifold_diagnostics(
         "mean_adjacent_cosine": float(sum(adjacent_cosines) / len(adjacent_cosines)) if adjacent_cosines else 1.0,
         "adjacent_cosines": adjacent_cosines,
     }
+
+
+def _extract_raw_v5_state(ckpt_or_state: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Unwraps nested checkpoint payloads into (raw_state_dict, metadata_dict)."""
+    if not isinstance(ckpt_or_state, dict):
+        return {}, {}
+    for key in ("model_state", "model_state_dict", "state_dict"):
+        if key in ckpt_or_state and isinstance(ckpt_or_state[key], dict):
+            return ckpt_or_state[key], ckpt_or_state
+    return ckpt_or_state, {}
+
+
+def infer_v5_config_from_state_dict(
+    ckpt_or_state: Dict[str, Any],
+    default_preset: str = "v5_small",
+    vocab_size_override: Optional[int] = None,
+    **overrides: Any,
+) -> ModelConfigV5:
+    """Infers a compatible ModelConfigV5 from either a PyTorch or JAX V5 checkpoint state dict."""
+    raw_state, meta = _extract_raw_v5_state(ckpt_or_state)
+    preset_name = meta.get("model_preset") or meta.get("preset") or default_preset
+    if preset_name in ("tpu_v5e_1", "tpu", "v5_tpu"):
+        preset_name = "v5_small"
+    cfg_kwargs = PRESETS_V5.get(preset_name, PRESETS_V5.get(default_preset, PRESETS_V5["v5_small"])).copy()
+
+    emb = raw_state.get("sensory_dnn.embedding.weight", raw_state.get("sensory.embedding.weight"))
+    if emb is not None and hasattr(emb, "shape") and len(emb.shape) == 2:
+        cfg_kwargs["vocab_size"] = int(emb.shape[0])
+        s_dim = int(emb.shape[1])
+        cfg_kwargs["surface_dim"] = s_dim
+        for _, p_vals in PRESETS_V5.items():
+            if p_vals.get("surface_dim") == s_dim and "num_heads" in p_vals:
+                cfg_kwargs["num_heads"] = p_vals["num_heads"]
+                break
+
+    rad_in = raw_state.get("volumetric_core.radial_in_proj.weight", raw_state.get("core.radial_in_proj.weight"))
+    if rad_in is not None and hasattr(rad_in, "shape") and len(rad_in.shape) == 2:
+        cfg_kwargs["radial_dim"] = int(rad_in.shape[0])
+
+    shell_gains = raw_state.get("volumetric_core.shell_gains", raw_state.get("core.shell_gains"))
+    if shell_gains is not None and hasattr(shell_gains, "shape"):
+        cfg_kwargs["num_shells"] = int(shell_gains.shape[0])
+
+    sc_w = raw_state.get("volumetric_core.shortcut_weight", raw_state.get("core.shortcut_weight"))
+    if sc_w is not None and hasattr(sc_w, "shape"):
+        num_tracts = int(sc_w.shape[0])
+        cfg_kwargs["num_shortcut_tracts"] = num_tracts
+        cfg_kwargs["top_k_tracts"] = min(cfg_kwargs.get("top_k_tracts", 24), num_tracts)
+
+    has_head = "motor_decoder.head.weight" in raw_state
+    has_affine = ("motor_decoder.affine_scale" in raw_state) or ("motor.affine_scale" in raw_state)
+    if has_affine:
+        cfg_kwargs["use_tied_embeddings"] = True
+    elif has_head:
+        cfg_kwargs["use_tied_embeddings"] = False
+
+    if vocab_size_override is not None:
+        cfg_kwargs["vocab_size"] = int(vocab_size_override)
+    cfg_kwargs.update(overrides)
+    return ModelConfigV5(**cfg_kwargs)
+
+
+def _adapt_jax_state_to_torch(raw_state: Dict[str, Any], target_sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Maps JAX-format V5 state dicts (sensory.*/core.*/motor.*, 3D intra_swiglu) to PyTorch keys/layouts."""
+    mapped: Dict[str, torch.Tensor] = {}
+
+    def _to_tensor(val: Any) -> Optional[torch.Tensor]:
+        if isinstance(val, torch.Tensor):
+            return val
+        try:
+            return torch.as_tensor(val)
+        except Exception:
+            return None
+
+    for k, v in raw_state.items():
+        t = _to_tensor(v)
+        if t is None:
+            continue
+
+        if k == "core.intra_norms.weight" and t.ndim == 2:
+            for idx in range(t.shape[0]):
+                mapped[f"volumetric_core.intra_norms.{idx}.weight"] = t[idx]
+            continue
+
+        if k.startswith("core.intra_swiglu.") and t.ndim == 3:
+            suffix = k.split(".")[-1]
+            proj_name = {"w_gate": "fc_gate", "w_val": "fc_val", "w_down": "fc_down"}.get(suffix)
+            if proj_name is not None:
+                for idx in range(t.shape[0]):
+                    mapped[f"volumetric_core.intra_shell_swiglu.{idx}.{proj_name}.weight"] = t[idx].transpose(-2, -1).contiguous()
+                continue
+
+        if k.startswith("sensory."):
+            dst_k = "sensory_dnn." + k[len("sensory.") :]
+        elif k.startswith("core."):
+            dst_k = "volumetric_core." + k[len("core.") :]
+        elif k.startswith("motor."):
+            sub = k[len("motor.") :]
+            if sub.startswith("swiglu.") and f"motor_decoder.motor_{sub}" in target_sd:
+                dst_k = f"motor_decoder.motor_{sub}"
+            else:
+                dst_k = f"motor_decoder.{sub}"
+        else:
+            dst_k = k
+        mapped[dst_k] = t
+
+    if "volumetric_core.radial_up_out.weight" not in mapped and "volumetric_core.radial_up.weight" in mapped:
+        mapped["volumetric_core.radial_up_out.weight"] = mapped["volumetric_core.radial_up.weight"].clone()
+
+    return mapped
+
+
+def load_v5_checkpoint_into_torch(
+    model: CerebroSpheroidV5,
+    ckpt_or_state: Dict[str, Any],
+    verbose: bool = True,
+) -> Tuple[int, int]:
+    """Loads either PyTorch or JAX V5 checkpoints into CerebroSpheroidV5, returning (loaded, total) tensor counts."""
+    raw_state, _ = _extract_raw_v5_state(ckpt_or_state)
+    target_sd = model.state_dict()
+    is_jax_format = any(k.startswith(("sensory.", "core.", "motor.")) for k in raw_state.keys())
+    adapted = _adapt_jax_state_to_torch(raw_state, target_sd) if is_jax_format else dict(raw_state)
+
+    if "volumetric_core.radial_up_out.weight" not in adapted and "volumetric_core.radial_up.weight" in adapted:
+        adapted["volumetric_core.radial_up_out.weight"] = adapted["volumetric_core.radial_up.weight"].clone()
+
+    filtered: Dict[str, torch.Tensor] = {}
+    skipped: List[str] = []
+    for k, dst_tensor in target_sd.items():
+        if k not in adapted:
+            continue
+        src_val = adapted[k]
+        src_tensor = src_val if isinstance(src_val, torch.Tensor) else torch.as_tensor(src_val)
+        if src_tensor.shape == dst_tensor.shape:
+            filtered[k] = src_tensor.to(device=dst_tensor.device, dtype=dst_tensor.dtype)
+        elif k in ("sensory_dnn.pos_embed.weight", "motor_decoder.phase_embed.weight") and src_tensor.ndim == 2 and src_tensor.shape[1] == dst_tensor.shape[1]:
+            buf = dst_tensor.clone()
+            rows = min(src_tensor.shape[0], dst_tensor.shape[0])
+            buf[:rows] = src_tensor[:rows].to(device=dst_tensor.device, dtype=dst_tensor.dtype)
+            filtered[k] = buf
+        else:
+            skipped.append(f"{k} ({tuple(src_tensor.shape)} vs {tuple(dst_tensor.shape)})")
+
+    if filtered:
+        model.load_state_dict(filtered, strict=False)
+
+    if verbose:
+        fmt_tag = "JAX->PyTorch adapted" if is_jax_format else "PyTorch"
+        print(f"✓ Loaded {len(filtered)}/{len(target_sd)} tensors into CerebroSpheroidV5 ({fmt_tag})")
+        if skipped:
+            print(f"ℹ️ Skipped shape mismatches: {skipped[:5]}")
+
+    return len(filtered), len(target_sd)

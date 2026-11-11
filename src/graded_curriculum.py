@@ -428,9 +428,14 @@ class GradedCurriculumStreamer:
             safe_tokens = [t % vocab_size for t in raw_tokens]
 
             if len(safe_tokens) < T + 1:
-                # Pad with repetition or zeros
                 pad_needed = (T + 1) - len(safe_tokens)
-                safe_tokens = safe_tokens + [0] * pad_needed
+                valid_len = len(safe_tokens)
+                padded_inp = safe_tokens + [0] * pad_needed
+                padded_tgt = safe_tokens + [-100] * pad_needed
+                inp = padded_inp[:T]
+                tgt = padded_tgt[1 : T + 1]
+                if valid_len == 0:
+                    tgt = [-100] * T
             else:
                 # V4 window slice with 25% tail probability for EOS representation
                 max_start = len(safe_tokens) - (T + 1)
@@ -438,10 +443,9 @@ class GradedCurriculumStreamer:
                     start_idx = max_start
                 else:
                     start_idx = self.rng.randint(0, max(0, max_start))
-                safe_tokens = safe_tokens[start_idx : start_idx + T + 1]
-
-            inp = safe_tokens[:T]
-            tgt = safe_tokens[1 : T + 1]
+                window_tokens = safe_tokens[start_idx : start_idx + T + 1]
+                inp = window_tokens[:T]
+                tgt = window_tokens[1 : T + 1]
 
             batch_input_ids.append(inp)
             batch_targets.append(tgt)

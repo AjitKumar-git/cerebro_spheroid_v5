@@ -97,7 +97,7 @@ from src.elastic_window import (
     get_default_elastic_buckets,
 )
 from src.jax.data_streamer import LinguisticDataStreamer
-from src.jax.auto_tuner import run_auto_tuner
+from src.jax.auto_tuner import run_auto_tuner, resolve_jax_compute_dtype
 
 
 def parse_args(args_list=None):
@@ -335,16 +335,7 @@ def main(args=None):
     dev_kind = devices[0].device_kind.lower() if devices else ""
     num_devices = len(devices)
 
-    if args.dtype == "auto":
-        target_dtype = jnp.bfloat16 if ("tpu" in dev_kind or "tpu" in backend.lower()) else jnp.float32
-    elif args.dtype == "bf16":
-        target_dtype = jnp.bfloat16
-    elif args.dtype == "fp16":
-        target_dtype = jnp.float16
-    else:
-        target_dtype = jnp.float32
-
-    dtype_str = "bfloat16 (Native TPU v5e-1 MXU)" if target_dtype == jnp.bfloat16 else str(target_dtype)
+    target_dtype, dtype_str = resolve_jax_compute_dtype(args.dtype)
 
     print("=" * 80)
     print("⚡ CEREBROSPHEROID V5: PURE JAX HIGH-THROUGHPUT ENGINE")

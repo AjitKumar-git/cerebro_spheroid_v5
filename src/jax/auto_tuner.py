@@ -197,6 +197,33 @@ def save_local_hardware_config(preset: str, device_signature: str, config: Dict[
         print(f"⚠️ [AutoTuner] Could not write local config cache: {e}")
 
 
+_BF16_GPU_MARKERS = (
+    "a100", "h100", "h200", "b100", "b200", "l4", "l40",
+    "a10", "a30", "a40", "a6000", "rtx 30", "rtx 40", "rtx 50",
+)
+
+
+def resolve_jax_compute_dtype(dtype: str = "auto") -> Tuple[jnp.dtype, str]:
+    """Resolves optimal compute precision matching TPU MXU vs Ampere+ vs T4/CPU hardware."""
+    hw = get_hardware_info()
+    is_tpu = hw["is_tpu"]
+    is_gpu = hw["is_gpu"]
+    dev_kind = hw.get("device_kind", "Accelerator")
+    dev_lower = dev_kind.lower()
+
+    if dtype == "auto":
+        if is_tpu:
+            return jnp.bfloat16, f"bfloat16 (Native {dev_kind} MXU)"
+        if is_gpu and any(tok in dev_lower for tok in _BF16_GPU_MARKERS):
+            return jnp.bfloat16, f"bfloat16 (Native {dev_kind} Tensor Core)"
+        return jnp.float32, f"float32 ({dev_kind if is_gpu else 'CPU'})"
+    if dtype in ("bf16", "bfloat16"):
+        return jnp.bfloat16, f"bfloat16 ({dev_kind})"
+    if dtype in ("fp16", "float16"):
+        return jnp.float16, f"float16 ({dev_kind})"
+    return jnp.float32, f"float32 ({dev_kind})"
+
+
 def benchmark_config(
     preset: str = "v5_small",
     batch_size: int = 32,
@@ -214,15 +241,7 @@ def benchmark_config(
     is_gpu = hw["is_gpu"]
     total_mem_bytes = hw["total_memory_bytes"]
 
-    # Select precision: BF16 on TPU and GPU with tensor cores
-    if dtype == "auto":
-        target_dtype = jnp.bfloat16 if (is_tpu or is_gpu) else jnp.float32
-    elif dtype in ("bf16", "bfloat16"):
-        target_dtype = jnp.bfloat16
-    elif dtype in ("fp16", "float16"):
-        target_dtype = jnp.float16
-    else:
-        target_dtype = jnp.float32
+    target_dtype, _ = resolve_jax_compute_dtype(dtype)
 
     cfg_dict = PRESETS_V5.get(preset, PRESETS_V5["v5_small"])
     config = ModelConfigV5(**cfg_dict)
@@ -488,12 +507,13 @@ def auto_tune_environment(
         print("=" * 80)
 
     if best_config is None:
+        fb_dtype, _ = resolve_jax_compute_dtype(dtype)
         best_config = {
             "preset": preset,
             "batch_size": 16 if (is_tpu or is_gpu) else 2,
             "remat": True,
             "seq_len": seq_len,
-            "dtype": "bf16" if (is_tpu or is_gpu) else "fp32",
+            "dtype": "bf16" if fb_dtype == jnp.bfloat16 else ("fp16" if fb_dtype == jnp.float16 else "fp32"),
             "tok_per_sec": 0.0,
             "vram_gb": 0.0,
             "vram_utilization_pct": 0.0,

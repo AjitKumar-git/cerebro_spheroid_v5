@@ -109,23 +109,27 @@ def evaluate_benchmark(
 
     print(f"Loaded {len(prompts_data)} benchmark evaluation prompts.")
 
-    # Load Model
-    preset = PRESETS_V5["v5_compact"].copy()
-    config = ModelConfigV5(**preset)
-    config.vocab_size = vocab_size
-    model = CerebroSpheroidV5(config).to(device)
+    # Load Model (auto-detect preset & architecture from checkpoint if available)
+    from src.spheroid_v5 import infer_v5_config_from_state_dict, load_v5_checkpoint_into_torch
 
-    # Checkpoint loading
-    harness = AgenticSpheroidHarness(model).to(device)
+    ckpt = None
     if os.path.exists(checkpoint_path):
         print(f"Loading checkpoint weights from {checkpoint_path}...")
-        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        if "model_state_dict" in ckpt:
-            model.load_state_dict(ckpt["model_state_dict"], strict=False)
-            if "action_head_state_dict" in ckpt:
-                harness.action_head.load_state_dict(ckpt["action_head_state_dict"], strict=False)
-        else:
-            model.load_state_dict(ckpt, strict=False)
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        config = infer_v5_config_from_state_dict(ckpt, default_preset="v5_small", vocab_size_override=vocab_size)
+    else:
+        preset = PRESETS_V5["v5_small"].copy()
+        config = ModelConfigV5(**preset)
+        config.vocab_size = vocab_size
+
+    model = CerebroSpheroidV5(config).to(device)
+    harness = AgenticSpheroidHarness(model).to(device)
+
+    if ckpt is not None:
+        load_v5_checkpoint_into_torch(model, ckpt, verbose=True)
+        act_state = ckpt.get("action_head_state_dict", ckpt.get("action_head_state"))
+        if isinstance(act_state, dict):
+            harness.action_head.load_state_dict(act_state, strict=False)
         print("✓ Model weights loaded successfully.")
     else:
         print(f"⚠️ Checkpoint not found at {checkpoint_path}. Evaluating base initialized weights.")
