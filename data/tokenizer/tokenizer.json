@@ -29,6 +29,42 @@
       "rstrip": false,
       "normalized": true,
       "special": true
+    },
+    {
+      "id": 31,
+      "content": "<stim>",
+      "single_word": false,
+      "lstrip": true,
+      "rstrip": true,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 32,
+      "content": "</stim>",
+      "single_word": false,
+      "lstrip": true,
+      "rstrip": true,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 33,
+      "content": "<act>",
+      "single_word": false,
+      "lstrip": true,
+      "rstrip": true,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 34,
+      "content": "</act>",
+      "single_word": false,
+      "lstrip": true,
+      "rstrip": true,
+      "normalized": false,
+      "special": true
     }
   ],
   "normalizer": {
@@ -160,10 +196,10 @@
       "<0x19>": 28,
       "<0x1A>": 29,
       "<0x1B>": 30,
-      "<0x1C>": 31,
-      "<0x1D>": 32,
-      "<0x1E>": 33,
-      "<0x1F>": 34,
+      "<stim>": 31,
+      "</stim>": 32,
+      "<act>": 33,
+      "</act>": 34,
       "<0x20>": 35,
       "<0x21>": 36,
       "<0x22>": 37,

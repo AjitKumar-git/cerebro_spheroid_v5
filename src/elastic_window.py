@@ -23,6 +23,8 @@ import threading
 import time
 import numpy as np
 
+from src.corpus import encode_no_special
+
 
 def extract_prompt_response_pair(row: Any) -> Tuple[str, str]:
     """Extract `(prompt, response)` strings from HF/Parquet/tuple dataset records."""
@@ -502,8 +504,12 @@ class ElasticBucketBatcher:
             tokenized_pairs = None
             if use_fast_batch and len(raw_pairs) > 1:
                 try:
-                    q_ids_batch = self.tokenizer(q_texts, max_length=max_enc, truncation=True)["input_ids"]
-                    r_ids_batch = self.tokenizer(r_texts, max_length=max_enc, truncation=True)["input_ids"]
+                    q_ids_batch = self.tokenizer(
+                        q_texts, max_length=max_enc, truncation=True, add_special_tokens=False
+                    )["input_ids"]
+                    r_ids_batch = self.tokenizer(
+                        r_texts, max_length=max_enc, truncation=True, add_special_tokens=False
+                    )["input_ids"]
                     tokenized_pairs = list(zip(q_ids_batch, r_ids_batch))
                 except Exception:
                     tokenized_pairs = None
@@ -512,12 +518,8 @@ class ElasticBucketBatcher:
                 tokenized_pairs = []
                 for q_txt, r_txt in raw_pairs:
                     if hasattr(self.tokenizer, "encode"):
-                        try:
-                            q_ids = self.tokenizer.encode(q_txt, max_length=max_enc, truncation=True)
-                            r_ids = self.tokenizer.encode(r_txt, max_length=max_enc, truncation=True)
-                        except TypeError:
-                            q_ids = self.tokenizer.encode(q_txt)
-                            r_ids = self.tokenizer.encode(r_txt)
+                        q_ids = encode_no_special(self.tokenizer, q_txt, max_length=max_enc)
+                        r_ids = encode_no_special(self.tokenizer, r_txt, max_length=max_enc)
                     else:
                         q_ids = [1] * len(q_txt.split())
                         r_ids = [1] * len(r_txt.split())

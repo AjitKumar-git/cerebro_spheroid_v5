@@ -589,14 +589,65 @@ def clean_motor_response(text: str) -> str:
     return t
 
 
+def encode_no_special(tokenizer, text: str, max_length: Optional[int] = None) -> List[int]:
+    """Encode text without prepending/appending BOS/EOS tokens."""
+    if hasattr(tokenizer, "encode"):
+        kwargs: Dict[str, Any] = {"add_special_tokens": False}
+        if max_length is not None:
+            kwargs["max_length"] = max_length
+            kwargs["truncation"] = True
+        try:
+            return list(tokenizer.encode(text, **kwargs))
+        except TypeError:
+            try:
+                ids = list(tokenizer.encode(text, add_special_tokens=False))
+            except TypeError:
+                ids = list(tokenizer.encode(text))
+            return ids[:max_length] if max_length is not None else ids
+    if callable(tokenizer):
+        try:
+            kwargs = {"add_special_tokens": False}
+            if max_length is not None:
+                kwargs["max_length"] = max_length
+                kwargs["truncation"] = True
+            out = tokenizer(text, **kwargs)
+        except TypeError:
+            out = tokenizer(text)
+        ids = list(out["input_ids"] if isinstance(out, dict) else out)
+        return ids[:max_length] if max_length is not None else ids
+    raise TypeError(f"Unsupported tokenizer type: {type(tokenizer)}")
+
+
+def get_bio_token_ids(tokenizer) -> Dict[str, Optional[int]]:
+    """Resolve single-token IDs for <stim>, </stim>, <act>, </act> if defined."""
+    tags = {
+        "stim": "<stim>",
+        "stim_end": "</stim>",
+        "act": "<act>",
+        "act_end": "</act>",
+    }
+    result: Dict[str, Optional[int]] = {k: None for k in tags}
+    if tokenizer is None or not hasattr(tokenizer, "encode"):
+        return result
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    for key, marker in tags.items():
+        try:
+            ids = encode_no_special(tokenizer, marker)
+        except Exception:
+            continue
+        if len(ids) == 1 and int(ids[0]) != unk_id:
+            result[key] = int(ids[0])
+    return result
+
+
 def tokenize_pair(tokenizer, prompt: str, answer: str, max_prompt_len: int,
                   max_answer_tokens: int) -> Tuple[List[int], List[int]]:
     """Tokenises one record using enclosed biological delimiters ('<stim> ... </stim>' / '<act> ... </act>'), appending EOS."""
     formatted_prompt = format_stimulus_prompt(prompt)
-    prompt_ids = tokenizer.encode(formatted_prompt, max_length=max_prompt_len, truncation=True)
-    
+    prompt_ids = encode_no_special(tokenizer, formatted_prompt, max_length=max_prompt_len)
+
     formatted_answer = format_motor_response(answer)
-    answer_ids = tokenizer.encode(formatted_answer, max_length=max_answer_tokens, truncation=True)
+    answer_ids = encode_no_special(tokenizer, formatted_answer, max_length=max_answer_tokens)
     if len(answer_ids) < max_answer_tokens:
         answer_ids = answer_ids + [tokenizer.eos_token_id]
     return prompt_ids, answer_ids

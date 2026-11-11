@@ -464,8 +464,9 @@ def training_rollout(
     persona_id: Optional[int] = None,
     feedback_is_shifted: bool = True,
     pure_teacher_forcing: Optional[bool] = None,
+    seed_token_id: Optional[int] = None,
 ) -> Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]]:
-    """Differentiable training rollout engine in pure JAX."""
+    """Differentiable training and autoregressive generation rollout in pure JAX."""
     B, L = prompts.shape
     sensory_flux, sensory_kv = encode_sensory(params, prompts, config=config, pos_offset=0)
     num_shells = config.num_shells if config is not None else 32
@@ -626,6 +627,12 @@ def training_rollout(
             )
 
             tok_idx = lax.stop_gradient(jnp.argmax(logits, axis=-1))
+            if seed_token_id is not None:
+                tok_idx = jnp.where(
+                    step_idx == 0,
+                    jnp.asarray(seed_token_id, dtype=tok_idx.dtype),
+                    tok_idx,
+                )
             tok_flux, (new_k, new_v) = encode_sensory(
                 params, tok_idx[:, None], config=config, pos_offset=L + step_idx + 1
             )

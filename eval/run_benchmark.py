@@ -35,6 +35,7 @@ if WORKSPACE_ROOT not in sys.path:
 
 from src.spheroid_v5 import CerebroSpheroidV5, ModelConfigV5, PRESETS_V5
 from src.agentic_harness import AgenticSpheroidHarness, ActionType, ACTION_NAMES
+from src.corpus import format_stimulus_prompt, format_motor_response, encode_no_special
 
 try:
     from transformers import AutoTokenizer
@@ -159,9 +160,11 @@ def evaluate_benchmark(
         stats = category_stats[cat]
         stats["total"] += 1
 
-        # 1. Target Cross-Entropy Loss computation
-        ans_tokens = tokenizer.encode(f" {ref_ans}", add_special_tokens=False) if hasattr(tokenizer, "encode") else [1]
-        p_tokens = tokenizer.encode(prompt_text, add_special_tokens=False) if hasattr(tokenizer, "encode") else [1]
+        # 1. Target Cross-Entropy Loss computation (Strategy A delimited format matching training)
+        formatted_p = format_stimulus_prompt(prompt_text)
+        formatted_a = format_motor_response(ref_ans)
+        ans_tokens = encode_no_special(tokenizer, formatted_a) if hasattr(tokenizer, "encode") else [1]
+        p_tokens = encode_no_special(tokenizer, formatted_p) if hasattr(tokenizer, "encode") else [1]
         
         loss_val = None
         if ans_tokens and p_tokens:

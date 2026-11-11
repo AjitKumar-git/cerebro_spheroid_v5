@@ -30,7 +30,13 @@ import jax.numpy as jnp
 from src.spheroid_v5 import PRESETS_V5
 from src.jax.v5_model import ModelConfigV5, training_rollout, PRESETS_V5 as JAX_PRESETS
 from src.jax.checkpoint import load_torch_pt_to_jax
-from src.corpus import build_tokenizer
+from src.corpus import (
+    build_tokenizer,
+    clean_motor_response,
+    encode_no_special,
+    format_stimulus_prompt,
+    get_bio_token_ids,
+)
 
 
 def test_checkpoint(ckpt_path: str, target_preset: str = "tpu_v5e_1"):
@@ -78,17 +84,23 @@ def test_checkpoint(ckpt_path: str, target_preset: str = "tpu_v5e_1"):
 
     # 3. Tokenizer & Test Prompts
     tokenizer = build_tokenizer("llama")
+    bio_ids = get_bio_token_ids(tokenizer)
+    seed_id = bio_ids.get("act")
+    eos_id = getattr(tokenizer, "eos_token_id", 2)
+    stop_ids = {t for t in (eos_id, bio_ids.get("act_end")) if t is not None}
+
     test_prompts = [
-        "<stim>Question: What is photosynthesis? Answer: </stim><act>",
-        "<stim>Question: What are the base pairs in DNA? Answer: </stim><act>",
-        "<stim>Question: Explain how gravity works. Answer: </stim><act>",
-        "<stim>Question: Solve 12 + 15. Answer: </stim><act>",
+        "Question: What is photosynthesis?",
+        "Question: What are the base pairs in DNA?",
+        "Question: Explain how gravity works.",
+        "Question: Solve 12 + 15.",
     ]
-    
+
     print("🧠 AUTOREGRESSIVE GENERATION TESTS (Strategy A Biological Prompts):")
-    for idx, prompt_str in enumerate(test_prompts, 1):
-        prompt_tokens = jnp.array([tokenizer.encode(prompt_str, add_special_tokens=True)])
-        
+    for idx, raw_prompt in enumerate(test_prompts, 1):
+        prompt_str = format_stimulus_prompt(raw_prompt)
+        prompt_tokens = jnp.array([encode_no_special(tokenizer, prompt_str)])
+
         t_gen0 = time.time()
         logits = training_rollout(
             params,
@@ -98,15 +110,23 @@ def test_checkpoint(ckpt_path: str, target_preset: str = "tpu_v5e_1"):
             config=config,
             sampling_p=0.0,
             repetition_penalty=1.2,
+            seed_token_id=seed_id,
         )
         gen_time = time.time() - t_gen0
-        
+
         gen_ids = [int(x) for x in jnp.argmax(logits[0], axis=-1)]
-        gen_text = tokenizer.decode(gen_ids, skip_special_tokens=False)
-        clean_text = tokenizer.decode([t for t in gen_ids if t not in (0, 1, 2)], skip_special_tokens=True)
-        
+        if seed_id is not None and gen_ids:
+            gen_ids[0] = int(seed_id)
+        trimmed_ids = []
+        for tid in gen_ids:
+            if tid in stop_ids and tid != seed_id:
+                break
+            trimmed_ids.append(tid)
+        raw_text = tokenizer.decode(trimmed_ids, skip_special_tokens=True)
+        clean_text = clean_motor_response(raw_text)
+
         print(f"\n  [Sample {idx}] Prompt: {prompt_str}")
-        print(f"  Output Tokens ({gen_time*1000:.1f}ms): {clean_text.strip()}")
+        print(f"  Output Tokens ({gen_time*1000:.1f}ms): {clean_text}")
         print(f"  Token IDs: {gen_ids[:8]}...")
 
     print("\n" + "=" * 80)

@@ -396,3 +396,85 @@ def test_ddp_2rank_gloo_smoke(tmp_path):
     assert r0.keys() == r1.keys()
     for k in r0:
         assert torch.allclose(r0[k], r1[k], atol=1e-5), f"DDP rank divergence in {k}"
+
+
+def test_elastic_batcher_no_bos_and_single_bio_delimiters():
+    from src.corpus import build_tokenizer, format_motor_response, format_stimulus_prompt, get_bio_token_ids
+    from src.elastic_window import ElasticBucketBatcher
+
+    tok = build_tokenizer("llama")
+    bio = get_bio_token_ids(tok)
+    assert bio == {"stim": 31, "stim_end": 32, "act": 33, "act_end": 34}
+
+    def _stream():
+        for i in range(64):
+            yield (
+                format_stimulus_prompt(f"Question {i}: What is 2 + {i}?"),
+                format_motor_response(f"The sum is {2 + i}."),
+            )
+
+    batcher = ElasticBucketBatcher(
+        tokenizer=tok,
+        data_iterator=_stream(),
+        batch_size=2,
+        total_window=256,
+        framework="numpy",
+        tail_probability=0.0,
+    )
+    _b_idx, _b_name, p_arr, t_arr = batcher.next_batch()
+    assert p_arr.shape[0] == 2 and t_arr.shape[0] == 2
+    assert int(p_arr[0, 0]) == 31, f"Expected <stim>=31 at prompt[0], got {p_arr[0, :4]}"
+    assert int(t_arr[0, 0]) == 33, f"Expected <act>=33 at target[0] (no BOS=1), got {t_arr[0, :4]}"
+    t_list = t_arr[0].tolist()
+    assert 34 in t_list and 2 in t_list
+
+
+def test_pytorch_generate_seed_token_and_bio_stop():
+    from src.corpus import build_tokenizer
+
+    cfg = ModelConfigV5(**PRESETS_V5["v5_test"])
+    model = CerebroSpheroidV5(cfg).eval()
+    prompt_ids = torch.tensor([[31, 10, 11, 32]], dtype=torch.long)
+
+    # 1. Verify seed_token_id forces token 0 to <act> (33)
+    out = model.generate(
+        prompt_ids,
+        max_new_tokens=4,
+        temperature=1e-4,
+        top_k=1,
+        top_p=1.0,
+        seed_token_id=33,
+        stop_token_ids=(2, 34),
+    )
+    assert int(out[0, 0]) == 33
+
+    # 2. Verify clean early stop on </act> (34) at step 1
+    orig_forward = model.motor_decoder.forward
+
+    def _bias_act_end(*args, **kwargs):
+        logits, eff, ref, plan = orig_forward(*args, **kwargs)
+        logits = logits.clone()
+        logits[:, 34] = 1e4
+        return logits, eff, ref, plan
+
+    model.motor_decoder.forward = _bias_act_end
+    try:
+        out_stop = model.generate(
+            prompt_ids,
+            max_new_tokens=8,
+            temperature=1e-4,
+            top_k=1,
+            top_p=1.0,
+            seed_token_id=33,
+            stop_token_ids=(2, 34),
+        )
+    finally:
+        model.motor_decoder.forward = orig_forward
+    assert out_stop.tolist() == [[33, 34]]
+
+    # 3. Smoke test generate_text with bundled tokenizer on matching vocab config
+    tok = build_tokenizer("llama")
+    cfg_full = ModelConfigV5(**{**PRESETS_V5["v5_test"], "vocab_size": 32000})
+    m_full = CerebroSpheroidV5(cfg_full).eval()
+    text = m_full.generate_text("Hello", tok, max_new_tokens=5, temperature=0.5)
+    assert isinstance(text, str)

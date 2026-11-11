@@ -30,5 +30,11 @@
     "normalized": true,
     "rstrip": false,
     "single_word": false
-  }
+  },
+  "additional_special_tokens": [
+    "<stim>",
+    "</stim>",
+    "<act>",
+    "</act>"
+  ]
 }

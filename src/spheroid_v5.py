@@ -1287,6 +1287,8 @@ class CerebroSpheroidV5(nn.Module):
         repetition_penalty: float = 1.25,
         thinking_cycles: Optional[int] = None,
         eos_token_id: int = 2,
+        seed_token_id: Optional[int] = None,
+        stop_token_ids: Optional[Union[Tuple[int, ...], List[int]]] = None,
     ) -> torch.Tensor:
         """Closed-loop autoregressive generation with discrete token auditory feedback."""
         self.eval()
@@ -1338,6 +1340,11 @@ class CerebroSpheroidV5(nn.Module):
         finished = torch.zeros(B, dtype=torch.bool, device=dev)
         tied_w = self.sensory_dnn.embedding.weight
 
+        stop_ids = tuple(
+            int(s)
+            for s in (stop_token_ids if stop_token_ids is not None else (eos_token_id,))
+            if s is not None
+        )
         for t in range(max_new_tokens):
             auditory_in = prev_thought if t > 0 else None
 
@@ -1358,32 +1365,37 @@ class CerebroSpheroidV5(nn.Module):
                 causal_kv=causal_kv,
             )
 
-            # Temperature and sampling
-            logits = logits / max(temperature, 1e-4)
+            if t == 0 and seed_token_id is not None:
+                next_tok = torch.full((B, 1), int(seed_token_id), dtype=torch.long, device=dev)
+            else:
+                # Temperature and sampling
+                logits = logits / max(temperature, 1e-4)
 
-            if top_k > 0:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float("Inf")
+                if top_k > 0:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float("Inf")
 
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = cum_probs > top_p
-                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
-                sorted_indices_to_remove[:, 0] = False
-                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                logits[indices_to_remove] = -float("Inf")
+                if top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                    cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    sorted_indices_to_remove = cum_probs > top_p
+                    sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+                    sorted_indices_to_remove[:, 0] = False
+                    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                    logits[indices_to_remove] = -float("Inf")
 
-            probs = F.softmax(logits, dim=-1)
-            next_tok = torch.multinomial(probs, num_samples=1)  # [B, 1]
+                probs = F.softmax(logits, dim=-1)
+                next_tok = torch.multinomial(probs, num_samples=1)  # [B, 1]
 
             generated_tokens.append(next_tok)
-            finished = finished | (next_tok.squeeze(-1) == eos_token_id)
+            flat_tok = next_tok.squeeze(-1)
+            for sid in stop_ids:
+                finished = finished | (flat_tok == sid)
             if finished.all():
                 break
 
             # Thought re-afference & update causal KV buffer
-            prev_thought, (tok_k, tok_v) = self.sensory_dnn(next_tok.squeeze(-1), pos_offset=L + t)
+            prev_thought, (tok_k, tok_v) = self.sensory_dnn(flat_tok, pos_offset=L + t)
             causal_keys_list.append(tok_k)
             causal_values_list.append(tok_v)
 
@@ -1405,13 +1417,24 @@ class CerebroSpheroidV5(nn.Module):
         device: Optional[torch.device] = None,
     ) -> str:
         """Convenience method for generating text from a prompt string."""
-        from src.corpus import format_stimulus_prompt, clean_motor_response
+        from src.corpus import (
+            format_stimulus_prompt,
+            clean_motor_response,
+            encode_no_special,
+            get_bio_token_ids,
+        )
 
         dev = device if device is not None else next(self.parameters()).device
         formatted_prompt = format_stimulus_prompt(prompt)
-        raw_ids = tokenizer.encode(formatted_prompt, add_special_tokens=False)
+        raw_ids = encode_no_special(tokenizer, formatted_prompt)
         input_ids = [t % self.config.vocab_size for t in raw_ids] or [getattr(tokenizer, "bos_token_id", 1) or 1]
         tok_tensor = torch.tensor([input_ids], dtype=torch.long, device=dev)
+
+        bio_ids = get_bio_token_ids(tokenizer)
+        raw_eos = getattr(tokenizer, "eos_token_id", 2)
+        eos_id = int(raw_eos) if raw_eos is not None else 2
+        stop_ids = tuple(t for t in (eos_id, bio_ids.get("act_end")) if t is not None)
+        seed_id = bio_ids.get("act")
 
         out_ids = self.generate(
             tok_tensor,
@@ -1421,9 +1444,16 @@ class CerebroSpheroidV5(nn.Module):
             top_p=top_p,
             repetition_penalty=repetition_penalty,
             thinking_cycles=thinking_cycles,
-            eos_token_id=getattr(tokenizer, "eos_token_id", 2),
+            eos_token_id=eos_id,
+            seed_token_id=seed_id,
+            stop_token_ids=stop_ids,
         )
-        decoded = tokenizer.decode(out_ids[0].tolist(), skip_special_tokens=True)
+        seq = out_ids[0].tolist()
+        for idx_tok, tid in enumerate(seq):
+            if tid in stop_ids and tid != seed_id:
+                seq = seq[:idx_tok]
+                break
+        decoded = tokenizer.decode(seq, skip_special_tokens=True)
         return clean_motor_response(decoded)
 
 
