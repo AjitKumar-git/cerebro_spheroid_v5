@@ -15,6 +15,7 @@ Architecture Parity with PyTorch / GPU SpheroidOptimizer:
    Optimized with AdamW (zero weight decay) to handle heterogeneous parameter scales stably.
 """
 
+from functools import partial
 from typing import Dict, Tuple, Set, Optional, Callable, Any
 import math
 
@@ -72,14 +73,12 @@ def zeropower_via_newtonschulz5_jax(G: jnp.ndarray, steps: int = 3, eps: float =
     norm = jnp.sqrt(jnp.sum(jnp.square(G_mat), axis=(-2, -1), keepdims=True) + eps)
     X = G_mat / norm
 
-    # Quintic Newton-Schulz polynomial coefficients
+    # Quintic Newton-Schulz polynomial coefficients (static unroll improves XLA pipelining)
     a, b, c = 3.4445, -4.7750, 2.0315
-    def _ns_body(i, cur_x):
-        A = jnp.matmul(cur_x, jnp.swapaxes(cur_x, -2, -1))
+    for _ in range(int(steps)):
+        A = jnp.matmul(X, jnp.swapaxes(X, -2, -1))
         B = b * A + c * jnp.matmul(A, A)
-        return a * cur_x + jnp.matmul(B, cur_x)
-
-    X = lax.fori_loop(0, steps, _ns_body, X)
+        X = a * X + jnp.matmul(B, X)
 
     if transposed:
         X = jnp.swapaxes(X, -2, -1)
@@ -101,15 +100,15 @@ def clamp_spectral_norm_jax(
     else:
         W_mat = W_f32
 
-    def _power_body(i, cur_v):
-        u = jnp.matmul(W_mat, cur_v)
+    v_final = v_f32
+    for _ in range(int(power_steps)):
+        u = jnp.matmul(W_mat, v_final)
         u_norm = jnp.sqrt(jnp.sum(jnp.square(u), axis=1, keepdims=True) + eps)
         u = u / u_norm
         v_next = jnp.matmul(jnp.swapaxes(W_mat, -2, -1), u)
         v_norm = jnp.sqrt(jnp.sum(jnp.square(v_next), axis=1, keepdims=True) + eps)
-        return v_next / v_norm
+        v_final = v_next / v_norm
 
-    v_final = lax.fori_loop(0, power_steps, _power_body, v_f32)
     u_final = jnp.matmul(W_mat, v_final)
     sigma = jnp.sqrt(jnp.sum(jnp.square(u_final), axis=1, keepdims=True) + eps)
     scale = jnp.minimum(1.0, max_spec_norm / (sigma * 1.08 + eps))
@@ -153,6 +152,153 @@ def init_spheroid_opt_state(params: Dict[str, jnp.ndarray], key: Optional[jax.Ar
     }
 
 
+def _compute_loss_and_grads(
+    p: Dict[str, jnp.ndarray],
+    q_batch: jnp.ndarray,
+    r_batch: jnp.ndarray,
+    buffers: Tuple[jnp.ndarray, jnp.ndarray],
+    config: ModelConfigV5,
+    pad_id: int,
+    repetition_penalty: float,
+    remat: bool,
+    feedback_tokens: Optional[jnp.ndarray],
+    sampling_p: Any,
+    pure_tf: bool,
+):
+    """Computes loss and gradients for SpheroidOptimizer with static teacher-forcing dispatch."""
+    target_len = r_batch.shape[1]
+
+    def _loss_fn(param_dict):
+        return training_rollout(
+            param_dict,
+            q_batch,
+            target_len,
+            buffers,
+            config=config,
+            feedback_tokens=feedback_tokens,
+            sampling_p=sampling_p,
+            pad_id=pad_id,
+            repetition_penalty=repetition_penalty,
+            targets=r_batch,
+            remat=remat,
+            pure_teacher_forcing=pure_tf,
+        )
+
+    return jax.value_and_grad(_loss_fn, allow_int=True)(p)
+
+
+def _apply_spheroid_grads(
+    p: Dict[str, jnp.ndarray],
+    opt_s: Dict[str, Any],
+    grads: Dict[str, jnp.ndarray],
+    base_lr: Any,
+    weight_decay: float,
+) -> Tuple[Dict[str, jnp.ndarray], Dict[str, Any]]:
+    """Applies Polar Newton-Schulz, recurrent spectral clamp, and float32 master-weight AdamW."""
+    grad_norm = jnp.sqrt(
+        sum(jnp.sum(jnp.square(g.astype(jnp.float32))) for g in grads.values() if jnp.issubdtype(g.dtype, jnp.inexact))
+    )
+    is_finite = jnp.isfinite(grad_norm)
+    clip_scale = jnp.where(is_finite, jnp.minimum(1.0, 1.0 / (grad_norm + 1e-6)), 0.0)
+    clipped_grads = jax.tree_util.tree_map(lambda g: g * clip_scale if jnp.issubdtype(g.dtype, jnp.inexact) else g, grads)
+
+    def _apply_step():
+        cur_step = opt_s["step"] + 1
+        has_master = "master_p" in opt_s
+        new_params = {}
+        new_m = {}
+        new_v = {}
+        new_master_p = {}
+        new_power_v = dict(opt_s["power_v"])
+
+        lr_1d = 0.2 * base_lr
+        lr_vocab = jnp.minimum(base_lr, 6.0e-4)
+
+        for k, param in p.items():
+            if not jnp.issubdtype(param.dtype, jnp.inexact):
+                new_params[k] = param
+                continue
+
+            g = clipped_grads[k].astype(jnp.float32)
+            m_prev = opt_s["m"][k].astype(jnp.float32)
+            p_f32 = opt_s["master_p"][k] if has_master else param.astype(jnp.float32)
+
+            if is_manifold_operator(k, param):
+                m_new = 0.95 * m_prev + 0.05 * g
+                new_m[k] = m_new.astype(opt_s["m"][k].dtype)
+
+                p_decayed = p_f32 * (1.0 - base_lr * weight_decay)
+                O = zeropower_via_newtonschulz5_jax(m_new, steps=3).astype(jnp.float32)
+
+                rows = param.shape[-2]
+                cols = param.shape[-1]
+                aspect_scale = math.sqrt(max(1.0, float(rows) / float(cols)))
+                p_updated = p_decayed - (base_lr * aspect_scale) * O
+
+                if k in RECURRENT_KEYS:
+                    p_updated, v_next = clamp_spectral_norm_jax(p_updated, opt_s["power_v"][k], max_spec_norm=1.0)
+                    new_power_v[k] = v_next
+
+                new_master_p[k] = p_updated.astype(jnp.float32)
+                new_params[k] = p_updated.astype(param.dtype)
+
+            elif k in VOCAB_KEYS:
+                v_prev = opt_s["v"][k].astype(jnp.float32)
+                m_new = 0.9 * m_prev + 0.1 * g
+                v_new = 0.95 * v_prev + 0.05 * jnp.square(g)
+                new_m[k] = m_new.astype(opt_s["m"][k].dtype)
+                new_v[k] = v_new.astype(opt_s["v"][k].dtype)
+
+                m_hat = m_new / (1.0 - jnp.power(0.9, cur_step))
+                v_hat = v_new / (1.0 - jnp.power(0.95, cur_step))
+                step_dir = m_hat / (jnp.sqrt(v_hat) + 1e-6)
+                p_decayed = p_f32 * (1.0 - lr_vocab * weight_decay)
+                p_updated = p_decayed - lr_vocab * step_dir
+                new_master_p[k] = p_updated.astype(jnp.float32)
+                new_params[k] = p_updated.astype(param.dtype)
+
+            else:
+                v_prev = opt_s["v"][k].astype(jnp.float32)
+                m_new = 0.9 * m_prev + 0.1 * g
+                v_new = 0.95 * v_prev + 0.05 * jnp.square(g)
+                new_m[k] = m_new.astype(opt_s["m"][k].dtype)
+                new_v[k] = v_new.astype(opt_s["v"][k].dtype)
+
+                m_hat = m_new / (1.0 - jnp.power(0.9, cur_step))
+                v_hat = v_new / (1.0 - jnp.power(0.95, cur_step))
+                step_dir = m_hat / (jnp.sqrt(v_hat) + 1e-6)
+                p_updated = p_f32 - lr_1d * step_dir
+                new_master_p[k] = p_updated.astype(jnp.float32)
+                new_params[k] = p_updated.astype(param.dtype)
+
+        params_finite = jnp.all(jnp.array([jnp.all(jnp.isfinite(np_)) for np_ in new_params.values()]))
+        safe_params = jax.tree_util.tree_map(lambda np_, op: jnp.where(params_finite, np_, op), new_params, p)
+        safe_m = jax.tree_util.tree_map(lambda nm, om: jnp.where(params_finite, nm, om), new_m, opt_s["m"])
+        safe_v = jax.tree_util.tree_map(lambda nv, ov: jnp.where(params_finite, nv, ov), new_v, opt_s["v"])
+        safe_step = jnp.where(params_finite, cur_step, opt_s["step"])
+
+        new_opt_state = {
+            "step": safe_step,
+            "m": safe_m,
+            "v": safe_v,
+            "power_v": new_power_v,
+        }
+        if has_master:
+            new_opt_state["master_p"] = jax.tree_util.tree_map(
+                lambda nmp, omp: jnp.where(params_finite, nmp, omp), new_master_p, opt_s["master_p"]
+            )
+        return safe_params, new_opt_state
+
+    def _skip_step():
+        return p, opt_s
+
+    return lax.cond(is_finite, _apply_step, _skip_step)
+
+
+def _is_pure_teacher_forcing(sampling_p: Any) -> bool:
+    return (not isinstance(sampling_p, jax.Array)) and (float(sampling_p) >= 1.0)
+
+
 def build_spheroid_train_engine(
     config: ModelConfigV5,
     buffers: Tuple[jnp.ndarray, jnp.ndarray],
@@ -163,147 +309,21 @@ def build_spheroid_train_engine(
 ) -> Tuple[Callable, Callable]:
     """
     Builds decoupled JIT-compiled gradient computation and optimizer application functions.
-    Enables native, zero-stall gradient accumulation across diverse cognitive window buckets.
+    Enables gradient accumulation across batches with zero intermediate Python overhead.
     """
 
-    @jax.jit
+    @partial(jax.jit, static_argnames=("pure_tf",))
+    def _compute_grad_jit(p, q_batch, r_batch, feedback_tokens, sampling_p, pure_tf: bool):
+        return _compute_loss_and_grads(
+            p, q_batch, r_batch, buffers, config, pad_id, repetition_penalty, remat, feedback_tokens, sampling_p, pure_tf
+        )
+
     def compute_grad_step(p, q_batch, r_batch, feedback_tokens=None, sampling_p=1.0):
-        target_len = r_batch.shape[1]
-
-        def _loss_fn(param_dict):
-            return training_rollout(
-                param_dict,
-                q_batch,
-                target_len,
-                buffers,
-                config=config,
-                feedback_tokens=feedback_tokens,
-                sampling_p=sampling_p,
-                pad_id=pad_id,
-                repetition_penalty=repetition_penalty,
-                targets=r_batch,
-                remat=remat,
-            )
-
-        loss_val, grads = jax.value_and_grad(_loss_fn, allow_int=True)(p)
-        return loss_val, grads
+        return _compute_grad_jit(p, q_batch, r_batch, feedback_tokens, sampling_p, _is_pure_teacher_forcing(sampling_p))
 
     @jax.jit
     def apply_opt_step(p, opt_s, grads, base_lr):
-        # Gradient clipping & finite validation in float32 to prevent half-precision overflow
-        grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(g.astype(jnp.float32))) for g in grads.values() if jnp.issubdtype(g.dtype, jnp.inexact)))
-        is_finite = jnp.isfinite(grad_norm)
-        clip_scale = jnp.where(is_finite, jnp.minimum(1.0, 1.0 / (grad_norm + 1e-6)), 0.0)
-        clipped_grads = jax.tree_util.tree_map(lambda g: g * clip_scale if jnp.issubdtype(g.dtype, jnp.inexact) else g, grads)
-
-        def _apply_step():
-            cur_step = opt_s["step"] + 1
-            has_master = "master_p" in opt_s
-            new_params = {}
-            new_m = {}
-            new_v = {}
-            new_master_p = {}
-            new_power_v = dict(opt_s["power_v"])
-
-            lr_1d = 0.2 * base_lr
-            lr_vocab = jnp.minimum(base_lr, 6.0e-4)
-
-            for k, param in p.items():
-                if not jnp.issubdtype(param.dtype, jnp.inexact):
-                    new_params[k] = param
-                    continue
-
-                g = clipped_grads[k].astype(jnp.float32)
-                m_prev = opt_s["m"][k].astype(jnp.float32)
-                p_f32 = opt_s["master_p"][k] if has_master else param.astype(jnp.float32)
-
-                # -----------------------------------------------------------------
-                # 1. Manifold Matrix Operators (Quintic Newton-Schulz Polar Update)
-                # -----------------------------------------------------------------
-                if is_manifold_operator(k, param):
-                    m_new = 0.95 * m_prev + 0.05 * g
-                    new_m[k] = m_new.astype(opt_s["m"][k].dtype)
-
-                    # Decoupled Riemannian Weight Decay in float32
-                    p_decayed = p_f32 * (1.0 - base_lr * weight_decay)
-
-                    # Polar orthogonalization (runs in float32 internally)
-                    O = zeropower_via_newtonschulz5_jax(m_new, steps=3).astype(jnp.float32)
-
-                    # Natural aspect-ratio scaling
-                    rows = param.shape[-2]
-                    cols = param.shape[-1]
-                    aspect_scale = math.sqrt(max(1.0, float(rows) / float(cols)))
-
-                    # Update along orthogonal manifold
-                    p_updated = p_decayed - (base_lr * aspect_scale) * O
-
-                    # Recurrent Manifold Contractive Spectral Guard (rho <= 1.0)
-                    if k in RECURRENT_KEYS:
-                        p_updated, v_next = clamp_spectral_norm_jax(p_updated, opt_s["power_v"][k], max_spec_norm=1.0)
-                        new_power_v[k] = v_next
-
-                    new_master_p[k] = p_updated.astype(jnp.float32)
-                    new_params[k] = p_updated.astype(param.dtype)
-
-                # -----------------------------------------------------------------
-                # 2. Vocabulary & Phase Embeddings / Heads (AdamW in float32)
-                # -----------------------------------------------------------------
-                elif k in VOCAB_KEYS:
-                    v_prev = opt_s["v"][k].astype(jnp.float32)
-                    m_new = 0.9 * m_prev + 0.1 * g
-                    v_new = 0.95 * v_prev + 0.05 * jnp.square(g)
-                    new_m[k] = m_new.astype(opt_s["m"][k].dtype)
-                    new_v[k] = v_new.astype(opt_s["v"][k].dtype)
-
-                    m_hat = m_new / (1.0 - jnp.power(0.9, cur_step))
-                    v_hat = v_new / (1.0 - jnp.power(0.95, cur_step))
-                    step_dir = m_hat / (jnp.sqrt(v_hat) + 1e-6)
-                    p_decayed = p_f32 * (1.0 - lr_vocab * weight_decay)
-                    p_updated = p_decayed - lr_vocab * step_dir
-                    new_master_p[k] = p_updated.astype(jnp.float32)
-                    new_params[k] = p_updated.astype(param.dtype)
-
-                # -----------------------------------------------------------------
-                # 3. 1D Parameters, Scalars, Pacemakers & Norms (AdamW, 0 Decay)
-                # -----------------------------------------------------------------
-                else:
-                    v_prev = opt_s["v"][k].astype(jnp.float32)
-                    m_new = 0.9 * m_prev + 0.1 * g
-                    v_new = 0.95 * v_prev + 0.05 * jnp.square(g)
-                    new_m[k] = m_new.astype(opt_s["m"][k].dtype)
-                    new_v[k] = v_new.astype(opt_s["v"][k].dtype)
-
-                    m_hat = m_new / (1.0 - jnp.power(0.9, cur_step))
-                    v_hat = v_new / (1.0 - jnp.power(0.95, cur_step))
-                    step_dir = m_hat / (jnp.sqrt(v_hat) + 1e-6)
-                    p_updated = p_f32 - lr_1d * step_dir
-                    new_master_p[k] = p_updated.astype(jnp.float32)
-                    new_params[k] = p_updated.astype(param.dtype)
-
-            # Robust NaN / Inf Guard: Discard update and keep old weights if any non-finite value appears
-            params_finite = jnp.all(jnp.array([jnp.all(jnp.isfinite(np_)) for np_ in new_params.values()]))
-            safe_params = jax.tree_util.tree_map(lambda np_, op: jnp.where(params_finite, np_, op), new_params, p)
-            safe_m = jax.tree_util.tree_map(lambda nm, om: jnp.where(params_finite, nm, om), new_m, opt_s["m"])
-            safe_v = jax.tree_util.tree_map(lambda nv, ov: jnp.where(params_finite, nv, ov), new_v, opt_s["v"])
-            safe_step = jnp.where(params_finite, cur_step, opt_s["step"])
-
-            new_opt_state = {
-                "step": safe_step,
-                "m": safe_m,
-                "v": safe_v,
-                "power_v": new_power_v,
-            }
-            if has_master:
-                new_opt_state["master_p"] = jax.tree_util.tree_map(
-                    lambda nmp, omp: jnp.where(params_finite, nmp, omp), new_master_p, opt_s["master_p"]
-                )
-            return safe_params, new_opt_state
-
-        def _skip_step():
-            return p, opt_s
-
-        return lax.cond(is_finite, _apply_step, _skip_step)
+        return _apply_spheroid_grads(p, opt_s, grads, base_lr, weight_decay)
 
     return compute_grad_step, apply_opt_step
 
@@ -316,14 +336,19 @@ def build_train_step_spheroid(
     repetition_penalty: float = 1.25,
     remat: bool = True,
 ) -> Callable:
-    """Builds a combined JIT-compiled train_step function utilizing SpheroidOptimizer."""
-    compute_grad, apply_opt = build_spheroid_train_engine(
-        config, buffers, pad_id=pad_id, weight_decay=weight_decay, repetition_penalty=repetition_penalty, remat=remat
-    )
+    """Builds a single fused JIT-compiled train_step combining forward, backward, and SpheroidOptimizer."""
+
+    @partial(jax.jit, static_argnames=("pure_tf",))
+    def _fused_train_step_jit(p, opt_s, q_batch, r_batch, base_lr, feedback_tokens, sampling_p, pure_tf: bool):
+        loss_val, grads = _compute_loss_and_grads(
+            p, q_batch, r_batch, buffers, config, pad_id, repetition_penalty, remat, feedback_tokens, sampling_p, pure_tf
+        )
+        new_params, new_opt_s = _apply_spheroid_grads(p, opt_s, grads, base_lr, weight_decay)
+        return new_params, new_opt_s, loss_val
 
     def train_step(p, opt_s, q_batch, r_batch, base_lr, feedback_tokens=None, sampling_p=1.0):
-        loss_val, grads = compute_grad(p, q_batch, r_batch, feedback_tokens=feedback_tokens, sampling_p=sampling_p)
-        new_params, new_opt_s = apply_opt(p, opt_s, grads, base_lr)
-        return new_params, new_opt_s, loss_val
+        return _fused_train_step_jit(
+            p, opt_s, q_batch, r_batch, base_lr, feedback_tokens, sampling_p, _is_pure_teacher_forcing(sampling_p)
+        )
 
     return train_step

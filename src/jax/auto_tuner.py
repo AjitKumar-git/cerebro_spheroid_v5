@@ -23,6 +23,7 @@ Key Features:
 
 from __future__ import annotations
 
+import gc
 import json
 import math
 import os
@@ -148,15 +149,30 @@ def generate_vram_maximizing_candidates(
         base_ladder = [2, 4, 8]
 
     candidates = []
-    for idx, b in enumerate(base_ladder):
-        # Always test remat=True (memory-efficient baseline)
+    for b in base_ladder:
+        # Evaluate remat=False first so large batches without OOM skip redundant remat recomputation
+        candidates.append({"batch_size": b, "remat": False})
         candidates.append({"batch_size": b, "remat": True})
-        # Test remat=False on lower batch sizes where memory allows
-        # (remat=False avoids recomputation and often achieves 20-30% faster tok/s)
-        if idx <= min(1, len(base_ladder) - 1):
-            candidates.append({"batch_size": b, "remat": False})
 
     return candidates
+
+
+def _score_benchmark_result(res: Dict[str, Any], tune_objective: str = "balanced") -> float:
+    """Scores a passing benchmark result by throughput, step rate, or balanced Pareto efficiency."""
+    tok_s = max(0.0, float(res.get("tok_per_sec", 0.0)))
+    steps_s = max(0.0, float(res.get("steps_per_sec", 0.0)))
+    if steps_s <= 0.0 and res.get("step_ms"):
+        steps_s = 1000.0 / max(float(res["step_ms"]), 1e-6)
+    if tok_s <= 0.0 or steps_s <= 0.0:
+        return 0.0
+
+    obj = (tune_objective or "balanced").lower()
+    if obj == "tok_per_sec":
+        return tok_s
+    if obj == "steps_per_sec":
+        return (tok_s ** 0.25) * steps_s
+    # "balanced": Pareto efficiency between token throughput and optimizer updates/sec
+    return tok_s * math.sqrt(steps_s)
 
 
 def load_local_hardware_config(preset: str, device_signature: str) -> Optional[Dict[str, Any]]:
@@ -231,10 +247,11 @@ def benchmark_config(
     seq_len: int = 256,
     num_steps: int = 3,
     dtype: str = "auto",
+    prompt_len: int = 32,
 ) -> Dict[str, Any]:
     """
-    Benchmarks a single training configuration and returns throughput & memory metrics.
-    Gracefully catches OOM and compilation errors.
+    Benchmarks a single training configuration and returns step latency, steps/s,
+    token throughput, and memory metrics. Gracefully catches OOM and compile errors.
     """
     hw = get_hardware_info()
     is_tpu = hw["is_tpu"]
@@ -249,6 +266,7 @@ def benchmark_config(
     key = jax.random.PRNGKey(42)
     key, init_key = jax.random.split(key)
 
+    params = opt_state = train_step_fn = dummy_prompts = dummy_targets = pre_batches = None
     try:
         # 1. Initialize parameters
         params, buffers = init_params_v5(init_key, config)
@@ -265,7 +283,7 @@ def benchmark_config(
         )
 
         # 2. Ahead-Of-Time XLA Compilation
-        dummy_prompts = jnp.zeros((batch_size, 32), dtype=jnp.int32)
+        dummy_prompts = jnp.zeros((batch_size, prompt_len), dtype=jnp.int32)
         dummy_targets = jnp.zeros((batch_size, seq_len), dtype=jnp.int32)
 
         t0_compile = time.time()
@@ -273,24 +291,29 @@ def benchmark_config(
         jax.block_until_ready(init_loss)
         compile_time = time.time() - t0_compile
 
-        # 3. Micro-benchmark execution loop
-        tokens_per_step = batch_size * seq_len
+        # 3. Pre-generate synthetic batches so RNG overhead stays out of timed steps
+        pre_batches = []
+        for _ in range(max(1, num_steps)):
+            key, step_key = jax.random.split(key)
+            prompt_b = jax.random.randint(step_key, (batch_size, prompt_len), 0, config.vocab_size)
+            target_b = jax.random.randint(step_key, (batch_size, seq_len), 0, config.vocab_size)
+            pre_batches.append((prompt_b, target_b))
+        jax.block_until_ready(pre_batches[-1][1])
+
+        tokens_per_step = batch_size * (prompt_len + seq_len)
         step_times = []
 
-        for step in range(num_steps):
-            key, step_key = jax.random.split(key)
-            prompt_b = jax.random.randint(step_key, (batch_size, 32), 0, config.vocab_size)
-            target_b = jax.random.randint(step_key, (batch_size, seq_len), 0, config.vocab_size)
-
+        for prompt_b, target_b in pre_batches:
             t0_step = time.time()
             params, opt_state, loss = train_step_fn(params, opt_state, prompt_b, target_b, 5e-4)
             jax.block_until_ready(loss)
             step_times.append(time.time() - t0_step)
 
         avg_step_sec = sum(step_times) / max(len(step_times), 1)
-        tok_per_sec = tokens_per_step / max(avg_step_sec, 1e-6)
+        steps_per_sec = 1.0 / max(avg_step_sec, 1e-6)
+        tok_per_sec = tokens_per_step * steps_per_sec
 
-        # 4. Memory Profiling
+        # 4. Memory Profiling (prefer live bytes_in_use over cumulative peak high-water mark)
         dev = jax.devices()[0] if jax.devices() else None
         vram_gb = 0.0
         vram_utilization_pct = 0.0
@@ -298,23 +321,21 @@ def benchmark_config(
         if dev and hasattr(dev, "memory_stats"):
             try:
                 stats = dev.memory_stats()
-                if stats and "peak_bytes_in_use" in stats:
-                    peak_bytes = stats["peak_bytes_in_use"]
-                    vram_gb = peak_bytes / (1024**3)
-                    limit = stats.get("bytes_limit", total_mem_bytes)
-                    if limit and limit > 0:
-                        vram_utilization_pct = (peak_bytes / limit) * 100.0
+                if stats:
+                    mem_bytes = stats.get("bytes_in_use") or stats.get("peak_bytes_in_use") or 0
+                    if mem_bytes > 0:
+                        vram_gb = mem_bytes / (1024**3)
+                        limit = stats.get("bytes_limit", total_mem_bytes)
+                        if limit and limit > 0:
+                            vram_utilization_pct = (mem_bytes / limit) * 100.0
             except Exception:
                 pass
 
         if vram_gb == 0.0:
-            # Analytical memory estimation
             param_bytes = sum(p.size * p.itemsize for p in params.values())
-            # State + momentum
             opt_bytes = param_bytes * 2
-            # Activation buffer
-            act_mult = 4 if remat else (config.num_shells * 3)
-            act_bytes = batch_size * seq_len * config.surface_dim * (2 if target_dtype == jnp.bfloat16 else 4) * act_mult
+            act_mult = 4 if remat else (config.num_shells * 2)
+            act_bytes = batch_size * (prompt_len + seq_len) * config.surface_dim * (2 if target_dtype == jnp.bfloat16 else 4) * act_mult
             est_total = param_bytes + opt_bytes + act_bytes
             vram_gb = est_total / (1024**3)
             if total_mem_bytes and total_mem_bytes > 0:
@@ -326,9 +347,11 @@ def benchmark_config(
             "batch_size": batch_size,
             "remat": remat,
             "seq_len": seq_len,
+            "prompt_len": prompt_len,
             "dtype": str(target_dtype).replace("jax.numpy.", ""),
             "compile_time": compile_time,
             "step_ms": avg_step_sec * 1000.0,
+            "steps_per_sec": steps_per_sec,
             "tok_per_sec": tok_per_sec,
             "memory_gb": vram_gb,
             "memory_utilization_pct": vram_utilization_pct,
@@ -343,6 +366,10 @@ def benchmark_config(
         err_msg = str(e)
         if "RESOURCE_EXHAUSTED" in err_msg or "HbmOom" in err_msg or "out of memory" in err_msg.lower():
             status_desc = "OOM (Memory Exceeded)"
+            try:
+                jax.clear_caches()
+            except Exception:
+                pass
         else:
             status_desc = f"FAIL ({type(e).__name__}: {err_msg[:40]})"
 
@@ -352,9 +379,11 @@ def benchmark_config(
             "batch_size": batch_size,
             "remat": remat,
             "seq_len": seq_len,
+            "prompt_len": prompt_len,
             "dtype": str(dtype),
             "compile_time": None,
             "step_ms": None,
+            "steps_per_sec": 0.0,
             "tok_per_sec": 0.0,
             "memory_gb": 0.0,
             "memory_utilization_pct": 0.0,
@@ -364,6 +393,9 @@ def benchmark_config(
             "initial_loss": None,
             "status": status_desc,
         }
+    finally:
+        del params, opt_state, train_step_fn, dummy_prompts, dummy_targets, pre_batches
+        gc.collect()
 
 
 def auto_tune_environment(
@@ -377,12 +409,17 @@ def auto_tune_environment(
     cloud_url: Optional[str] = None,
     cloud_token: Optional[str] = None,
     verbose: bool = True,
+    tune_objective: str = "balanced",
+    prompt_len: int = 32,
 ) -> Dict[str, Any]:
     """
     Explores candidate execution configurations and identifies the setting that
-    maximizes token throughput on the active accelerator while utilizing free VRAM.
+    optimizes optimizer steps/sec and token throughput without OOM.
 
-    Synchronizes with bioflo.in so optimal settings are permanently remembered.
+    tune_objective:
+      - "balanced" (default): Pareto efficiency `tok/s * sqrt(steps/s)`
+      - "steps_per_sec": Prioritizes fastest optimizer updates/sec
+      - "tok_per_sec": Maximizes raw token throughput regardless of step latency
     """
     hw = get_hardware_info()
     devices = jax.devices()
@@ -398,12 +435,15 @@ def auto_tune_environment(
     if use_cached_config and not force_tune and candidates is None:
         # Check local cache
         cached_local = load_local_hardware_config(preset, sig)
-        if cached_local and cached_local.get("tok_per_sec", 0) > 0:
+        local_obj = cached_local.get("tune_objective") if cached_local else None
+        if cached_local and cached_local.get("tok_per_sec", 0) > 0 and (local_obj is None or local_obj == tune_objective):
             if verbose:
+                steps_s = cached_local.get("steps_per_sec") or (1000.0 / cached_local["step_ms"] if cached_local.get("step_ms") else 0.0)
                 print("=" * 80)
                 print(f"⚡ [AutoTuner] Loaded verified local config for [{preset}] on [{sig}]:")
                 print(f"   • Batch Size  : {cached_local['batch_size']}")
                 print(f"   • Remat Scan  : {cached_local['remat']}")
+                print(f"   • Step Rate   : {steps_s:.2f} steps/s ({cached_local.get('step_ms', 0):.1f} ms)")
                 print(f"   • Peak Speed  : {cached_local.get('tok_per_sec', 0):,.0f} tok/s")
                 m_gb = cached_local.get("memory_gb", cached_local.get("vram_gb", 0))
                 m_pct = cached_local.get("memory_utilization_pct", cached_local.get("vram_utilization_pct", 0))
@@ -415,7 +455,8 @@ def auto_tune_environment(
         try:
             from ..cloud_sync import fetch_remote_hardware_config
             cached_remote = fetch_remote_hardware_config(model=preset, device_signature=sig, url=cloud_url, token=cloud_token)
-            if cached_remote and cached_remote.get("tok_per_sec", 0) > 0:
+            remote_obj = cached_remote.get("tune_objective") if cached_remote else None
+            if cached_remote and cached_remote.get("tok_per_sec", 0) > 0 and (remote_obj is None or remote_obj == tune_objective):
                 if verbose:
                     print("=" * 80)
                     print(f"🌐 [AutoTuner] Retrieved verified optimal config from bioflo.in for [{preset}] on [{sig}]:")
@@ -436,12 +477,12 @@ def auto_tune_environment(
     # 2. Benchmarking execution
     if verbose:
         print("=" * 80)
-        print(f"🚀 CEREBROSPHEROID V5: AUTOMATIC THROUGHPUT BENCHMARK & {mem_type} AUTO-TUNER")
+        print(f"🚀 CEREBROSPHEROID V5: AUTOMATIC THROUGHPUT, STEPS/S & {mem_type} AUTO-TUNER")
         print("=" * 80)
         print(f"Hardware Platform  : {len(devices)} x {dev_kind} ({sig})")
         print(f"Detected Memory    : {total_gb:.1f} GB Available {mem_type}")
-        print(f"Target Preset      : {preset} (SeqLen: {seq_len})")
-        print(f"Search Strategy    : Maximize {mem_type} utilization without OOM; test remat True vs False")
+        print(f"Target Preset      : {preset} (PromptLen: {prompt_len}, SeqLen: {seq_len})")
+        print(f"Tune Objective     : {tune_objective} (test remat=False across viable batches until OOM)")
         print("-" * 80)
 
     if candidates is None:
@@ -449,15 +490,18 @@ def auto_tune_environment(
 
     results = []
     best_config = None
-    max_tok_s = -1.0
+    best_score = -1.0
+    oom_remat_false_seen = False
     oom_remat_true_seen = False
+    passed_remat_false_batches = set()
 
     for idx, c in enumerate(candidates, 1):
         b = c["batch_size"]
         r = c.get("remat", True)
 
-        # Prune larger batch sizes if smaller remat=True already OOMed
-        if r and oom_remat_true_seen:
+        if not r and oom_remat_false_seen:
+            continue
+        if r and (oom_remat_true_seen or b in passed_remat_false_batches):
             continue
 
         if verbose:
@@ -468,43 +512,55 @@ def auto_tune_environment(
             batch_size=b,
             remat=r,
             seq_len=seq_len,
-            num_steps=3 if (is_tpu or is_gpu) else 2,
+            num_steps=4 if (is_tpu or is_gpu) else 2,
             dtype=dtype,
+            prompt_len=prompt_len,
         )
         results.append(res)
 
         if res["status"] == "PASS":
             tok_s = res["tok_per_sec"]
+            steps_s = res.get("steps_per_sec", 0.0)
             m_gb = res.get("memory_gb", res.get("vram_gb", 0))
             m_pct = res.get("memory_utilization_pct", res.get("vram_utilization_pct", 0))
+            if not r:
+                passed_remat_false_batches.add(b)
             if verbose:
-                print(f"✓ {tok_s:8,.0f} tok/s | {mem_type}: {m_gb:4.1f} GB ({m_pct:4.1f}%) | Latency: {res['step_ms']:6.1f}ms | Compile: {res['compile_time']:4.1f}s")
-            if tok_s > max_tok_s:
-                max_tok_s = tok_s
+                print(
+                    f"✓ {steps_s:5.2f} steps/s | {tok_s:8,.0f} tok/s | "
+                    f"{mem_type}: {m_gb:4.1f} GB ({m_pct:4.1f}%) | Latency: {res['step_ms']:6.1f}ms | Compile: {res['compile_time']:4.1f}s"
+                )
+            score = _score_benchmark_result(res, tune_objective)
+            if score > best_score:
+                best_score = score
                 best_config = res
         else:
-            if "OOM" in res["status"] and r:
-                oom_remat_true_seen = True
+            if "OOM" in res["status"]:
+                if r:
+                    oom_remat_true_seen = True
+                else:
+                    oom_remat_false_seen = True
             if verbose:
                 print(f"❌ {res['status']}")
 
     if verbose:
-        print("\n" + "=" * 80)
-        print(f"📊 AUTO-TUNING {mem_type} & THROUGHPUT BENCHMARK RESULTS")
-        print("=" * 80)
+        print("\n" + "=" * 92)
+        print(f"📊 AUTO-TUNING {mem_type}, STEPS/S & THROUGHPUT BENCHMARK RESULTS")
+        print("=" * 92)
         mem_hdr = f"{mem_type} Util"
-        print(f"{'Preset':<10} | {'Batch':<6} | {'Remat':<7} | {'Compile (s)':<12} | {'Step (ms)':<10} | {mem_hdr:<15} | {'Throughput':<15} | {'Status':<10}")
-        print("-" * 80)
+        print(f"{'Preset':<10} | {'Batch':<5} | {'Remat':<5} | {'Compile':<8} | {'Step':<8} | {'Steps/s':<7} | {mem_hdr:<13} | {'Throughput':<14} | {'Status'}")
+        print("-" * 92)
         for r in results:
             c_str = f"{r['compile_time']:.1f}s" if r['compile_time'] is not None else "-"
             s_str = f"{r['step_ms']:.1f}ms" if r['step_ms'] is not None else "-"
+            st_s = f"{r.get('steps_per_sec', 0.0):.2f}/s" if r.get('steps_per_sec', 0.0) > 0 else "-"
             m_g = r.get('memory_gb', r.get('vram_gb', 0))
             m_p = r.get('memory_utilization_pct', r.get('vram_utilization_pct', 0))
             v_str = f"{m_g:.1f}GB ({m_p:.0f}%)" if m_g > 0 else "-"
             t_str = f"{r['tok_per_sec']:,.0f} tok/s" if r['tok_per_sec'] > 0 else "-"
             winner_mark = " 🏆 (WINNER)" if (best_config and r == best_config) else ""
-            print(f"{r['preset']:<10} | {r['batch_size']:<6} | {str(r['remat']):<7} | {c_str:<12} | {s_str:<10} | {v_str:<15} | {t_str:<15} | {r['status'] + winner_mark:<10}")
-        print("=" * 80)
+            print(f"{r['preset']:<10} | {r['batch_size']:<5} | {str(r['remat']):<5} | {c_str:<8} | {s_str:<8} | {st_s:<7} | {v_str:<13} | {t_str:<14} | {r['status'] + winner_mark}")
+        print("=" * 92)
 
     if best_config is None:
         fb_dtype, _ = resolve_jax_compute_dtype(dtype)
@@ -513,22 +569,29 @@ def auto_tune_environment(
             "batch_size": 16 if (is_tpu or is_gpu) else 2,
             "remat": True,
             "seq_len": seq_len,
+            "prompt_len": prompt_len,
             "dtype": "bf16" if fb_dtype == jnp.bfloat16 else ("fp16" if fb_dtype == jnp.float16 else "fp32"),
+            "steps_per_sec": 0.0,
             "tok_per_sec": 0.0,
             "vram_gb": 0.0,
             "vram_utilization_pct": 0.0,
+            "tune_objective": tune_objective,
+            "tuner_version": 2,
             "status": "DEFAULT_FALLBACK",
         }
         if verbose:
             print("⚠️ All benchmark candidates failed. Falling back to conservative defaults.")
     else:
+        best_config["tune_objective"] = tune_objective
+        best_config["tuner_version"] = 2
         if verbose:
-            print(f"🏆 OPTIMAL CONFIGURATION SELECTED FOR MAXIMUM THROUGHPUT & VRAM UTILIZATION:")
+            print(f"🏆 OPTIMAL CONFIGURATION SELECTED ({tune_objective.upper()}):")
             print(f"   • Batch Size  : {best_config['batch_size']}")
             print(f"   • Remat Scan  : {best_config['remat']}")
-            print(f"   • VRAM Footprint: {best_config['vram_gb']:.1f} GB ({best_config['vram_utilization_pct']:.1f}% of total {total_gb:.1f} GB)")
+            print(f"   • Step Rate   : {best_config.get('steps_per_sec', 0.0):.2f} steps/second ({best_config['step_ms']:.1f} ms)")
             print(f"   • Peak Speed  : {best_config['tok_per_sec']:,.0f} tokens/second")
-            print("=" * 80)
+            print(f"   • {mem_type} Util   : {best_config['vram_gb']:.1f} GB ({best_config['vram_utilization_pct']:.1f}% of {total_gb:.1f} GB)")
+            print("=" * 92)
 
         # 3. Cache locally
         save_local_hardware_config(preset, sig, best_config)

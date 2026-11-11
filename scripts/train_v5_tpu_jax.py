@@ -18,6 +18,7 @@ Ported and enhanced from the battle-tested CerebroSpheroid V4 production trainer
 """
 
 import argparse
+from functools import partial
 import glob
 import json
 import math
@@ -132,8 +133,17 @@ def parse_args(args_list=None):
     parser.add_argument("--preset", type=str, default="tpu_v5e_1", choices=["v5_small", "v5_compact", "v5_base", "v5_test", "tpu_v5e_1"], help="Model preset (default: tpu_v5e_1 / v5_small)")
     parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bf16", "fp16", "fp32"], help="Matrix execution precision ('auto' selects bf16 on TPU)")
     parser.add_argument("--remat", type=str, default="true", choices=["true", "false", "auto"], help="Activation remat scan to minimize HBM footprint (default: true)")
-    parser.add_argument("--auto-tune", action="store_true", default=False, help="Micro-benchmark candidate batch sizes at startup to maximize tok/s and VRAM utilization")
+    parser.add_argument("--auto-tune", action="store_true", default=False, help="Micro-benchmark candidate batch sizes at startup to maximize steps/s, tok/s, and HBM/VRAM utilization")
     parser.add_argument("--force-tune", "--force_tune", dest="force_tune", action="store_true", default=False, help="Force re-running auto-tuner benchmarks even if cached config exists on bioflo.in")
+    parser.add_argument(
+        "--tune-objective",
+        "--tune_objective",
+        dest="tune_objective",
+        type=str,
+        default="balanced",
+        choices=["balanced", "steps_per_sec", "tok_per_sec"],
+        help="Auto-tuner selection objective: 'balanced' (tok/s * sqrt(steps/s)), 'steps_per_sec', or 'tok_per_sec'",
+    )
 
     # Scheduled Sampling Curriculum
     parser.add_argument("--deliberation_mode", type=str, default="teacher_forcing", choices=["teacher_forcing", "scheduled", "internal"], help="Deliberation feedback mode (default: teacher_forcing for clean pretraining)")
@@ -290,12 +300,12 @@ def build_data_stream(
             for idx, (b_name, bp, bt) in enumerate(buckets):
                 print(f"   Bucket {idx}: {b_name:<18} (Prompt: {bp:4d} tok -> Target: {bt:4d} tok)")
             batcher = ElasticBucketBatcher(
-                tokenizer, data_iter, batch_size=batch_size, total_window=total_window, buckets=buckets, framework="jax", return_feedback=True
+                tokenizer, data_iter, batch_size=batch_size, total_window=total_window, buckets=buckets, framework="numpy", return_feedback=True
             )
         else:
             buckets = [("static", prompt_len, target_len)]
             batcher = ElasticBucketBatcher(
-                tokenizer, data_iter, batch_size=batch_size, total_window=prompt_len + target_len, buckets=buckets, framework="jax", return_feedback=True
+                tokenizer, data_iter, batch_size=batch_size, total_window=prompt_len + target_len, buckets=buckets, framework="numpy", return_feedback=True
             )
 
         prefetched = PrefetchedBatcher(batcher, queue_size=16)
@@ -361,6 +371,8 @@ def main(args=None):
             cloud_url=args.cloud_url,
             cloud_token=args.cloud_token,
             verbose=True,
+            tune_objective=getattr(args, "tune_objective", "balanced"),
+            prompt_len=args.prompt_len,
         )
         args.batch_size = best_cfg["batch_size"]
         remat_choice = best_cfg["remat"]
@@ -369,7 +381,9 @@ def main(args=None):
             m_type = best_cfg.get("memory_type", "HBM" if ("tpu" in dev_kind or "tpu" in backend.lower()) else "VRAM")
             v_gb = best_cfg.get("memory_gb", best_cfg.get("vram_gb", 0))
             v_pct = best_cfg.get("memory_utilization_pct", best_cfg.get("vram_utilization_pct", 0))
-            print(f"⚡ Target Benchmark Speed: {best_cfg['tok_per_sec']:,.0f} tok/s ({m_type}: {v_gb:.1f} GB, {v_pct:.1f}% utilization)")
+            sps = best_cfg.get("steps_per_sec", 0.0)
+            sps_str = f"{sps:.2f} steps/s | " if sps and sps > 0 else ""
+            print(f"⚡ Target Benchmark Speed: {sps_str}{best_cfg['tok_per_sec']:,.0f} tok/s ({m_type}: {v_gb:.1f} GB, {v_pct:.1f}% utilization)")
 
     # 3. Model Configuration & Parameters
     config_preset = "v5_small" if args.preset == "tpu_v5e_1" else args.preset
@@ -402,6 +416,7 @@ def main(args=None):
         cloud_sync=args.cloud_sync,
         cloud_url=args.cloud_url,
         cloud_token=args.cloud_token,
+        min_cloud_upload_interval_sec=120.0,
     )
 
     start_step = 0
@@ -478,21 +493,33 @@ def main(args=None):
         print("🔄 [Benchmark Recalibration] Reset best_eval_loss tracker baseline.")
 
     # 6. Spheroid Optimizer & JIT Train Step Engine
+    grad_accum = max(1, int(getattr(args, "grad_accum", 1)))
     if args.optimizer == "spheroid":
         opt_state = init_spheroid_opt_state(params)
-        compute_grad_step, apply_opt_step = build_spheroid_train_engine(
-            config,
-            buffers,
-            pad_id=pad_id,
-            weight_decay=args.weight_decay,
-            repetition_penalty=args.repetition_penalty,
-            remat=remat_choice,
-        )
+        if grad_accum <= 1:
+            train_step_fn = build_train_step_spheroid(
+                config,
+                buffers,
+                pad_id=pad_id,
+                weight_decay=args.weight_decay,
+                repetition_penalty=args.repetition_penalty,
+                remat=remat_choice,
+            )
+            compute_grad_step, apply_opt_step = None, None
+        else:
+            compute_grad_step, apply_opt_step = build_spheroid_train_engine(
+                config,
+                buffers,
+                pad_id=pad_id,
+                weight_decay=args.weight_decay,
+                repetition_penalty=args.repetition_penalty,
+                remat=remat_choice,
+            )
 
-        def train_step_fn(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens=None, sampling_p=1.0):
-            loss_val, grads = compute_grad_step(p, q_batch, r_batch, feedback_tokens=feedback_tokens, sampling_p=sampling_p)
-            new_p, new_opt_s = apply_opt_step(p, opt_s, grads, cur_lr)
-            return new_p, new_opt_s, loss_val
+            def train_step_fn(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens=None, sampling_p=1.0):
+                loss_val, grads = compute_grad_step(p, q_batch, r_batch, feedback_tokens=feedback_tokens, sampling_p=sampling_p)
+                new_p, new_opt_s = apply_opt_step(p, opt_s, grads, cur_lr)
+                return new_p, new_opt_s, loss_val
 
     else:
         if not HAS_OPTAX:
@@ -502,9 +529,10 @@ def main(args=None):
             optax.adamw(learning_rate=args.lr, b1=0.9, b2=0.95, weight_decay=args.weight_decay),
         )
         opt_state = optimizer.init(params)
+        compute_grad_step, apply_opt_step = None, None
 
-        @jax.jit
-        def train_step_adamw(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens=None, sampling_p=1.0):
+        @partial(jax.jit, static_argnames=("pure_tf",))
+        def _train_step_adamw_jit(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens, sampling_p, pure_tf: bool):
             def loss_fn(param_dict):
                 return training_rollout(
                     params=param_dict,
@@ -513,16 +541,24 @@ def main(args=None):
                     buffers=buffers,
                     config=config,
                     feedback_tokens=feedback_tokens,
+                    feedback_is_shifted=True,
+                    pad_id=pad_id,
                     sampling_p=sampling_p,
+                    repetition_penalty=args.repetition_penalty,
                     targets=r_batch,
                     remat=remat_choice,
+                    pure_teacher_forcing=pure_tf,
                 )
             loss_val, grads = jax.value_and_grad(loss_fn)(p)
             updates, next_opt_s = optimizer.update(grads, opt_s, p)
             next_p = optax.apply_updates(p, updates)
             return next_p, next_opt_s, loss_val
 
-        train_step_fn = train_step_adamw
+        def train_step_fn(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens=None, sampling_p=1.0):
+            pure_tf = (not isinstance(sampling_p, jax.Array)) and (float(sampling_p) >= 1.0)
+            return _train_step_adamw_jit(
+                p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens, sampling_p, pure_tf
+            )
 
     # 7. Multi-Stream Ingestion & Prefetching
     local_streamer, elastic_batcher = build_data_stream(
@@ -583,6 +619,7 @@ def main(args=None):
                 batch_size=args.batch_size,
                 prompt_len=args.prompt_len,
                 target_len=args.seq_len,
+                vocab_size=config.vocab_size,
                 queue_size=4,
                 target_pad_id=-100,
             )
@@ -610,6 +647,7 @@ def main(args=None):
             pad_id=pad_id,
             targets=r_b,
             remat=False,
+            pure_teacher_forcing=True,
         )
 
     # 10. Learning Rate & Scheduled Sampling Schedules
@@ -646,56 +684,80 @@ def main(args=None):
     print(f"   • Async Checkpoint : 0ms TPU Pause (Latest: every {args.save_interval} steps)")
     print("=" * 80 + "\n")
 
+    def _next_batch():
+        if elastic_batcher is not None:
+            batch_tuple = (
+                elastic_batcher.get_batch()
+                if hasattr(elastic_batcher, "get_batch")
+                else elastic_batcher.next_batch()
+            )
+            return _unpack_batch(batch_tuple)
+        prompt_b, target_b = local_streamer.get_batch()
+        return prompt_b, target_b, None
+
     step = start_step
     t_start = time.time()
     t_last_log = time.time()
     last_cloud_save_time = time.time()
     step_window_tokens = 0
+    step_window_count = 0
 
     try:
         while step < args.total_steps and not shutdown_requested:
             step += 1
 
-            # Fetch next batch
-            if elastic_batcher is not None:
-                batch_tuple = (
-                    elastic_batcher.get_batch()
-                    if hasattr(elastic_batcher, "get_batch")
-                    else elastic_batcher.next_batch()
-                )
-                prompt_b, target_b, feedback_b = _unpack_batch(batch_tuple)
-            else:
-                prompt_b, target_b = local_streamer.get_batch()
-                feedback_b = None
-
             cur_lr = get_learning_rate(step, args.total_steps, args.lr, args.min_lr, args.warmup_steps)
             cur_sampling_p = get_sampling_p(step, args.schedule_steps, args.min_sampling_p)
 
             # Training Step
-            params, opt_state, loss = train_step_fn(
-                params,
-                opt_state,
-                prompt_b,
-                target_b,
-                cur_lr,
-                feedback_tokens=feedback_b,
-                sampling_p=cur_sampling_p,
-            )
+            if compute_grad_step is not None and grad_accum > 1:
+                acc_grads = None
+                loss_acc = 0.0
+                step_tokens = 0
+                inv_accum = 1.0 / float(grad_accum)
+                for _ in range(grad_accum):
+                    prompt_b, target_b, feedback_b = _next_batch()
+                    g_loss, micro_grads = compute_grad_step(
+                        params, prompt_b, target_b, feedback_tokens=feedback_b, sampling_p=cur_sampling_p
+                    )
+                    acc_grads = (
+                        micro_grads
+                        if acc_grads is None
+                        else jax.tree_util.tree_map(lambda a, b: a + b, acc_grads, micro_grads)
+                    )
+                    loss_acc = loss_acc + g_loss
+                    step_tokens += prompt_b.shape[0] * (prompt_b.shape[1] + target_b.shape[1])
+                acc_grads = jax.tree_util.tree_map(lambda a: a * inv_accum, acc_grads)
+                loss = loss_acc * inv_accum
+                params, opt_state = apply_opt_step(params, opt_state, acc_grads, cur_lr)
+            else:
+                prompt_b, target_b, feedback_b = _next_batch()
+                params, opt_state, loss = train_step_fn(
+                    params,
+                    opt_state,
+                    prompt_b,
+                    target_b,
+                    cur_lr,
+                    feedback_tokens=feedback_b,
+                    sampling_p=cur_sampling_p,
+                )
+                step_tokens = prompt_b.shape[0] * (prompt_b.shape[1] + target_b.shape[1])
 
-            # Token throughput accounting
-            step_tokens = prompt_b.shape[0] * (prompt_b.shape[1] + target_b.shape[1])
+            # Step & token throughput accounting
             step_window_tokens += step_tokens
+            step_window_count += 1
 
             # Console Progress Logging
             if step % args.log_every == 0 or step == start_step + 1:
-                jax.block_until_ready(loss)
-                elapsed_log = time.time() - t_last_log
-                tok_per_sec = step_window_tokens / max(elapsed_log, 1e-6)
                 loss_val = float(loss)
+                elapsed_log = time.time() - t_last_log
+                steps_per_sec = step_window_count / max(elapsed_log, 1e-6)
+                tok_per_sec = step_window_tokens / max(elapsed_log, 1e-6)
 
                 print(
                     f"[Step {step:6d}/{args.total_steps}] "
                     f"Loss: {loss_val:6.4f} | "
+                    f"Steps/s: {steps_per_sec:5.2f} | "
                     f"Tok/s: {tok_per_sec:7,.0f} | "
                     f"LR: {cur_lr:.2e} | "
                     f"Samp_p: {cur_sampling_p:.2f} | "
@@ -703,14 +765,12 @@ def main(args=None):
                 )
                 t_last_log = time.time()
                 step_window_tokens = 0
+                step_window_count = 0
 
             # Held-Out Validation Evaluation
             if eval_batches and (step % args.eval_interval == 0):
-                val_losses = []
-                for vp, vt, vfb in eval_batches:
-                    v_loss = eval_step_loss(params, vp, vt, vfb)
-                    val_losses.append(float(v_loss))
-                eval_loss = float(np.mean(val_losses))
+                val_losses = [eval_step_loss(params, vp, vt, vfb) for vp, vt, vfb in eval_batches]
+                eval_loss = float(jnp.mean(jnp.stack(val_losses)))
                 last_eval_loss = eval_loss
                 eval_ppl = math.exp(min(eval_loss, 20.0))
                 is_champion = eval_loss < best_eval_loss

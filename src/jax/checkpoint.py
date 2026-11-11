@@ -284,12 +284,15 @@ class AsyncCheckpointManager:
         cloud_sync: bool = False,
         cloud_url: str = "https://bioflo.in/api/cerebro/sync.php",
         cloud_token: str = "CerebroSpheroid_Sync_Secure_2026",
+        min_cloud_upload_interval_sec: float = 0.0,
     ):
         self.local_dir = local_dir
         self.target_dir = target_dir
         self.cloud_sync = cloud_sync
         self.cloud_url = cloud_url
         self.cloud_token = cloud_token
+        self.min_cloud_upload_interval_sec = max(0.0, float(min_cloud_upload_interval_sec))
+        self._last_cloud_upload_at: Dict[str, float] = {}
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="ckpt_async")
         self._last_future: Optional[concurrent.futures.Future] = None
         os.makedirs(self.local_dir, exist_ok=True)
@@ -301,6 +304,7 @@ class AsyncCheckpointManager:
         buffers_cpu: Tuple[np.ndarray, np.ndarray],
         filename: str,
         meta_dict: Optional[dict],
+        force_cloud: bool = False,
     ):
         try:
             local_path = os.path.join(self.local_dir, filename)
@@ -321,28 +325,32 @@ class AsyncCheckpointManager:
             # Prune scratch disk
             self._prune_scratch()
 
-            # Upload to cloud if active
+            # Upload to cloud if active (rate-limit non-final uploads so high-step/s runs do not saturate network)
             if self.cloud_sync and ("latest" in filename or "best" in filename):
-                try:
-                    from src.cloud_sync import push_checkpoint_async
-                    step_val = int(meta_dict.get("step", 0)) if meta_dict else 0
-                    target_type = "best" if "best" in filename else "latest"
-                    if target_type == "best":
-                        raw_loss = meta_dict.get("eval_loss", meta_dict.get("loss", 0.0)) if meta_dict else 0.0
-                    else:
-                        raw_loss = meta_dict.get("loss", meta_dict.get("eval_loss", 0.0)) if meta_dict else 0.0
-                    loss_f = float(raw_loss) if raw_loss is not None else 0.0
-                    loss_val = loss_f if (loss_f == loss_f and abs(loss_f) < 1e30) else 0.0
-                    push_checkpoint_async(
-                        local_path,
-                        step=step_val,
-                        loss=loss_val,
-                        target_type=target_type,
-                        url=self.cloud_url,
-                        token=self.cloud_token,
-                    )
-                except Exception as sync_err:
-                    print(f"⚠️ [cloud_sync] Async upload notice: {sync_err}")
+                target_type = "best" if "best" in filename else "latest"
+                now = time.time()
+                last_up = self._last_cloud_upload_at.get(target_type, 0.0)
+                if force_cloud or (self.min_cloud_upload_interval_sec <= 0.0) or ((now - last_up) >= self.min_cloud_upload_interval_sec):
+                    try:
+                        from src.cloud_sync import push_checkpoint_async
+                        step_val = int(meta_dict.get("step", 0)) if meta_dict else 0
+                        if target_type == "best":
+                            raw_loss = meta_dict.get("eval_loss", meta_dict.get("loss", 0.0)) if meta_dict else 0.0
+                        else:
+                            raw_loss = meta_dict.get("loss", meta_dict.get("eval_loss", 0.0)) if meta_dict else 0.0
+                        loss_f = float(raw_loss) if raw_loss is not None else 0.0
+                        loss_val = loss_f if (loss_f == loss_f and abs(loss_f) < 1e30) else 0.0
+                        push_checkpoint_async(
+                            local_path,
+                            step=step_val,
+                            loss=loss_val,
+                            target_type=target_type,
+                            url=self.cloud_url,
+                            token=self.cloud_token,
+                        )
+                        self._last_cloud_upload_at[target_type] = now
+                    except Exception as sync_err:
+                        print(f"⚠️ [cloud_sync] Async upload notice: {sync_err}")
         except Exception as err:
             print(f"⚠️ [AsyncCheckpoint Error]: {err}")
 
@@ -375,9 +383,9 @@ class AsyncCheckpointManager:
         if not is_critical and (self._last_future is not None and not self._last_future.done()):
             return False
 
-        params_cpu = {k: np.array(v) for k, v in params.items()}
-        buffers_cpu = (np.array(buffers[0]), np.array(buffers[1]))
-        self._last_future = self.executor.submit(self._worker, params_cpu, buffers_cpu, filename, meta_dict)
+        params_cpu = jax.device_get(params)
+        buffers_cpu = jax.device_get(buffers)
+        self._last_future = self.executor.submit(self._worker, params_cpu, buffers_cpu, filename, meta_dict, False)
         return True
 
     def flush(
@@ -388,9 +396,9 @@ class AsyncCheckpointManager:
         meta_dict: Optional[dict] = None,
     ):
         """Synchronously flushes state (used on shutdown / emergency exit)."""
-        params_cpu = {k: np.array(v) for k, v in params.items()}
-        buffers_cpu = (np.array(buffers[0]), np.array(buffers[1]))
-        self._worker(params_cpu, buffers_cpu, filename, meta_dict)
+        params_cpu = jax.device_get(params)
+        buffers_cpu = jax.device_get(buffers)
+        self._worker(params_cpu, buffers_cpu, filename, meta_dict, True)
         if self.cloud_sync:
             try:
                 from src.cloud_sync import wait_for_in_flight_uploads

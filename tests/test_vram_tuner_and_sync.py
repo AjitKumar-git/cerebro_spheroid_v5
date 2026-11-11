@@ -26,6 +26,7 @@ from src.jax.auto_tuner import (
     auto_tune_environment,
     load_local_hardware_config,
     save_local_hardware_config,
+    _score_benchmark_result,
 )
 from src.cloud_sync import (
     fetch_remote_hardware_config,
@@ -176,6 +177,103 @@ class TestVRAMTunerAndSync(unittest.TestCase):
         )
         self.assertEqual(winner["tok_per_sec"], 99999.0)
         self.assertEqual(winner["batch_size"], 64)
+
+    def test_tune_objective_selection_and_remat_ladder(self):
+        """Verifies remat=False comes before remat=True per batch and tune_objective distinguishes speed profiles."""
+        c_16 = generate_vram_maximizing_candidates("v5_small", total_gb=16.0, seq_len=256)
+        self.assertGreaterEqual(len(c_16), 2)
+        for i in range(0, len(c_16), 2):
+            self.assertEqual(c_16[i]["batch_size"], c_16[i + 1]["batch_size"])
+            self.assertFalse(c_16[i]["remat"])
+            self.assertTrue(c_16[i + 1]["remat"])
+
+        fast_step_cfg = {"batch_size": 64, "remat": False, "tok_per_sec": 65566.0, "steps_per_sec": 4.00}
+        balanced_cfg = {"batch_size": 128, "remat": False, "tok_per_sec": 95000.0, "steps_per_sec": 2.30}
+        heavy_batch_cfg = {"batch_size": 384, "remat": True, "tok_per_sec": 82696.0, "steps_per_sec": 0.84}
+
+        # tok_per_sec prefers highest token rate regardless of slow steps/s
+        self.assertGreater(
+            _score_benchmark_result(balanced_cfg, "tok_per_sec"),
+            _score_benchmark_result(heavy_batch_cfg, "tok_per_sec"),
+        )
+        # steps_per_sec prioritizes highest update rate
+        self.assertGreater(
+            _score_benchmark_result(fast_step_cfg, "steps_per_sec"),
+            _score_benchmark_result(balanced_cfg, "steps_per_sec"),
+        )
+        self.assertGreater(
+            _score_benchmark_result(fast_step_cfg, "steps_per_sec"),
+            _score_benchmark_result(heavy_batch_cfg, "steps_per_sec"),
+        )
+        # balanced penalizes high-latency large batches in favor of Pareto efficiency
+        self.assertGreater(
+            _score_benchmark_result(balanced_cfg, "balanced"),
+            _score_benchmark_result(heavy_batch_cfg, "balanced"),
+        )
+        self.assertGreater(
+            _score_benchmark_result(fast_step_cfg, "balanced"),
+            _score_benchmark_result(heavy_batch_cfg, "balanced"),
+        )
+
+    @patch("src.jax.auto_tuner.save_local_hardware_config")
+    @patch("src.jax.auto_tuner.benchmark_config")
+    def test_auto_tune_remat_oom_fallback(self, mock_bench, _mock_save):
+        """Verifies remat=False passes skip redundant remat=True and OOM stops larger remat=False batches."""
+        seen_calls = []
+
+        def _fake_bench(preset="v5_small", batch_size=32, remat=True, **kwargs):
+            seen_calls.append((batch_size, remat))
+            if not remat and batch_size >= 256:
+                return {
+                    "preset": preset,
+                    "batch_size": batch_size,
+                    "remat": remat,
+                    "tok_per_sec": 0.0,
+                    "steps_per_sec": 0.0,
+                    "step_ms": None,
+                    "compile_time": None,
+                    "status": "OOM",
+                }
+            steps_s = 256.0 / float(batch_size)
+            tok_s = 50000.0 + batch_size * 100.0 + (2000.0 if not remat else 0.0)
+            return {
+                "preset": preset,
+                "batch_size": batch_size,
+                "remat": remat,
+                "tok_per_sec": tok_s,
+                "steps_per_sec": steps_s,
+                "step_ms": 1000.0 / steps_s,
+                "compile_time": 1.0,
+                "memory_gb": 8.0,
+                "memory_utilization_pct": 50.0,
+                "memory_type": "HBM",
+                "vram_gb": 8.0,
+                "vram_utilization_pct": 50.0,
+                "status": "PASS",
+            }
+
+        mock_bench.side_effect = _fake_bench
+        candidates = [
+            {"batch_size": 64, "remat": False},
+            {"batch_size": 64, "remat": True},
+            {"batch_size": 256, "remat": False},
+            {"batch_size": 256, "remat": True},
+            {"batch_size": 384, "remat": False},
+            {"batch_size": 384, "remat": True},
+        ]
+        winner = auto_tune_environment(
+            preset="v5_test",
+            candidates=candidates,
+            seq_len=64,
+            use_cached_config=False,
+            upload_winner=False,
+            verbose=False,
+            tune_objective="steps_per_sec",
+        )
+        # (64, True) skipped since (64, False) passed; (384, False) skipped after (256, False) OOMed
+        self.assertEqual(seen_calls, [(64, False), (256, False), (256, True), (384, True)])
+        self.assertEqual(winner["batch_size"], 64)
+        self.assertFalse(winner["remat"])
 
 
 if __name__ == "__main__":

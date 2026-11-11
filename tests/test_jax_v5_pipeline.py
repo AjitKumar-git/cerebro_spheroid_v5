@@ -430,3 +430,72 @@ def test_preshifted_feedback_no_double_shift_and_pytorch_causality(monkeypatch):
     finally:
         if hasattr(streamer, "stop"):
             streamer.stop()
+
+
+def test_pure_teacher_forcing_equivalence_and_fused_step():
+    """Verifies pure_teacher_forcing=True matches fallback rollout gradients and fused Spheroid step descends."""
+    cfg = ModelConfigV5(
+        vocab_size=64,
+        num_shells=4,
+        surface_dim=32,
+        radial_dim=16,
+        num_heads=4,
+        max_phase_steps=32,
+        thinking_cycles=1,
+    )
+    params, buffers = init_params_v5(jax.random.PRNGKey(123), cfg)
+    prompts = jnp.array([[2, 3, 4, 5, 6, 7], [8, 9, 10, 11, 12, 13]], dtype=jnp.int32)
+    targets = jnp.array(
+        [[14, 15, 16, 17, 18, 19, -100, -100], [20, 21, 22, 23, 24, -100, -100, -100]],
+        dtype=jnp.int32,
+    )
+    shifted_fb = jnp.array(
+        [[1, 14, 15, 16, 17, 18, 19, -100], [1, 20, 21, 22, 23, -100, -100, -100]],
+        dtype=jnp.int32,
+    )
+
+    for fb in (None, shifted_fb):
+        for remat_flag in (False, True):
+            def _loss(p, pure_tf):
+                return training_rollout(
+                    params=p,
+                    prompts=prompts,
+                    target_len=targets.shape[1],
+                    buffers=buffers,
+                    config=cfg,
+                    feedback_tokens=fb,
+                    feedback_is_shifted=True,
+                    pad_id=0,
+                    sampling_p=1.0,
+                    repetition_penalty=1.25,
+                    targets=targets,
+                    remat=remat_flag,
+                    pure_teacher_forcing=pure_tf,
+                )
+
+            l_ref, g_ref = jax.value_and_grad(lambda p: _loss(p, False))(params)
+            l_fast, g_fast = jax.value_and_grad(lambda p: _loss(p, True))(params)
+            assert abs(float(l_ref - l_fast)) < 1e-5
+            max_grad_diff = max(float(jnp.max(jnp.abs(g_ref[k] - g_fast[k]))) for k in params)
+            assert max_grad_diff < 1e-4
+
+    # Verify fused single-JIT SpheroidOptimizer step decreases loss monotonically over several steps
+    opt_state = init_spheroid_opt_state(params)
+    train_step = build_train_step_spheroid(
+        config=cfg,
+        buffers=buffers,
+        pad_id=0,
+        weight_decay=1e-4,
+        repetition_penalty=1.25,
+        remat=False,
+    )
+    params, opt_state, loss_0 = train_step(
+        params, opt_state, prompts, targets, 1e-3, feedback_tokens=shifted_fb, sampling_p=1.0
+    )
+    cur_loss = float(loss_0)
+    for _ in range(5):
+        params, opt_state, next_loss = train_step(
+            params, opt_state, prompts, targets, 1e-3, feedback_tokens=shifted_fb, sampling_p=1.0
+        )
+        cur_loss = float(next_loss)
+    assert cur_loss < float(loss_0)

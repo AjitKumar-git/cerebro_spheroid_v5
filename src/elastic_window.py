@@ -396,35 +396,35 @@ class ElasticBucketBatcher:
         return extract_prompt_response_pair(row)
 
     def _format_batch(self, b_idx: int, name: str, p_list: list, t_list: list, c_list: Optional[list] = None):
+        prompts_np = np.asarray(p_list, dtype=np.int32)
+        targets_np = np.asarray(t_list, dtype=np.int32)
+        feedback_np = None
+        if self.return_feedback:
+            feedback_np = np.full(targets_np.shape, self.target_pad_id, dtype=np.int32)
+            if targets_np.shape[1] > 1:
+                feedback_np[:, 1:] = targets_np[:, :-1]
+            if c_list is not None:
+                for i, c in enumerate(c_list):
+                    if c is not None:
+                        feedback_np[i, 0] = c
+
         if self.framework == "torch":
             import torch
-            prompts = torch.tensor(p_list, dtype=torch.long)
-            targets = torch.tensor(t_list, dtype=torch.long)
-            if self.return_feedback:
-                feedback = torch.full_like(targets, self.target_pad_id)
-                if targets.shape[1] > 1:
-                    feedback[:, 1:] = targets[:, :-1]
-                if c_list is not None:
-                    for i, c in enumerate(c_list):
-                        if c is not None:
-                            feedback[i, 0] = c
-                return b_idx, name, prompts, targets, feedback
+            prompts = torch.from_numpy(prompts_np).long()
+            targets = torch.from_numpy(targets_np).long()
+            if feedback_np is not None:
+                return b_idx, name, prompts, targets, torch.from_numpy(feedback_np).long()
             return b_idx, name, prompts, targets
-        elif self.framework == "jax":
+        if self.framework == "jax":
             import jax.numpy as jnp
-            prompts = jnp.array(p_list, dtype=jnp.int32)
-            targets = jnp.array(t_list, dtype=jnp.int32)
-            if self.return_feedback:
-                feedback = jnp.full_like(targets, self.target_pad_id)
-                feedback = feedback.at[:, 1:].set(targets[:, :-1])
-                if c_list is not None:
-                    for i, c in enumerate(c_list):
-                        if c is not None:
-                            feedback = feedback.at[i, 0].set(c)
-                return b_idx, name, prompts, targets, feedback
+            prompts = jnp.asarray(prompts_np)
+            targets = jnp.asarray(targets_np)
+            if feedback_np is not None:
+                return b_idx, name, prompts, targets, jnp.asarray(feedback_np)
             return b_idx, name, prompts, targets
-        else:
-            return b_idx, name, np.array(p_list, dtype=np.int32), np.array(t_list, dtype=np.int32)
+        if feedback_np is not None:
+            return b_idx, name, prompts_np, targets_np, feedback_np
+        return b_idx, name, prompts_np, targets_np
 
     def _pull_record(self) -> Any:
         if hasattr(self.data_iter, "__next__"):
@@ -453,15 +453,40 @@ class ElasticBucketBatcher:
                     p_list, t_list, c_list = zip(*batch_items)
                     return self._format_batch(b_idx, name, p_list, t_list, c_list)
 
-            # Ingest more records from stream
-            try:
-                row = self._pull_record()
-            except (StopIteration, RuntimeError):
+            # Pull raw records (batch-tokenize when a fast Rust tokenizer is available)
+            use_fast_batch = bool(getattr(self.tokenizer, "is_fast", False) and callable(self.tokenizer))
+            raw_pull_target = min(32, max(8, self.batch_size // 2)) if use_fast_batch else 1
+            raw_pairs = []
+            stream_ended = False
+
+            while len(raw_pairs) < raw_pull_target:
+                try:
+                    row = self._pull_record()
+                except (StopIteration, RuntimeError):
+                    stream_ended = True
+                    break
+
+                q_txt, r_txt = self._extract_text_pair(row)
+                if not q_txt or not r_txt:
+                    continue
+
+                # Format with enclosed biological delimiters: <stim> ... </stim> and <act> ... </act>
+                try:
+                    from src.corpus import format_stimulus_prompt, format_motor_response
+                    q_txt = format_stimulus_prompt(q_txt)
+                    r_txt = format_motor_response(r_txt)
+                except Exception:
+                    if not q_txt.startswith("<stim>"):
+                        q_txt = f"<stim> {q_txt} </stim>"
+                    if not r_txt.startswith("<act>"):
+                        r_txt = f"<act> {r_txt} </act>"
+                raw_pairs.append((q_txt, r_txt))
+
+            if not raw_pairs and stream_ended:
                 # If stream exhausted, flush whatever bucket has the most items
                 best_b = max(self.queues.keys(), key=lambda k: len(self.queues[k]))
                 if len(self.queues[best_b]) == 0:
                     raise StopIteration("Data stream exhausted.")
-                # Pad to batch_size with repeated items
                 items = list(self.queues[best_b])
                 self.queues[best_b].clear()
                 while len(items) < self.batch_size:
@@ -470,59 +495,59 @@ class ElasticBucketBatcher:
                 p_list, t_list, c_list = zip(*items)
                 return self._format_batch(best_b, name, p_list, t_list, c_list)
 
-            q_txt, r_txt = self._extract_text_pair(row)
-            if not q_txt or not r_txt:
-                continue
-
-            # Format with enclosed biological delimiters: <stim> ... </stim> and <act> ... </act>
-            try:
-                from src.corpus import format_stimulus_prompt, format_motor_response
-                q_txt = format_stimulus_prompt(q_txt)
-                r_txt = format_motor_response(r_txt)
-            except Exception:
-                if not q_txt.startswith("<stim>"):
-                    q_txt = f"<stim> {q_txt} </stim>"
-                if not r_txt.startswith("<act>"):
-                    r_txt = f"<act> {r_txt} </act>"
-
             # Tokenize bounded to prevent processing gigantic out-of-distribution text
             max_enc = self.total_window + 256
-            if hasattr(self.tokenizer, "encode"):
+            q_texts = [pair[0] for pair in raw_pairs]
+            r_texts = [pair[1] for pair in raw_pairs]
+            tokenized_pairs = None
+            if use_fast_batch and len(raw_pairs) > 1:
                 try:
-                    q_ids = self.tokenizer.encode(q_txt, max_length=max_enc, truncation=True)
-                    r_ids = self.tokenizer.encode(r_txt, max_length=max_enc, truncation=True)
-                except TypeError:
-                    q_ids = self.tokenizer.encode(q_txt)
-                    r_ids = self.tokenizer.encode(r_txt)
-            else:
-                q_ids = [1] * len(q_txt.split())
-                r_ids = [1] * len(r_txt.split())
+                    q_ids_batch = self.tokenizer(q_texts, max_length=max_enc, truncation=True)["input_ids"]
+                    r_ids_batch = self.tokenizer(r_texts, max_length=max_enc, truncation=True)["input_ids"]
+                    tokenized_pairs = list(zip(q_ids_batch, r_ids_batch))
+                except Exception:
+                    tokenized_pairs = None
 
-            # Append EOS token to response if not present
+            if tokenized_pairs is None:
+                tokenized_pairs = []
+                for q_txt, r_txt in raw_pairs:
+                    if hasattr(self.tokenizer, "encode"):
+                        try:
+                            q_ids = self.tokenizer.encode(q_txt, max_length=max_enc, truncation=True)
+                            r_ids = self.tokenizer.encode(r_txt, max_length=max_enc, truncation=True)
+                        except TypeError:
+                            q_ids = self.tokenizer.encode(q_txt)
+                            r_ids = self.tokenizer.encode(r_txt)
+                    else:
+                        q_ids = [1] * len(q_txt.split())
+                        r_ids = [1] * len(r_txt.split())
+                    tokenized_pairs.append((q_ids, r_ids))
+
             eos_id = self.tokenizer.eos_token_id if (hasattr(self.tokenizer, "eos_token_id") and self.tokenizer.eos_token_id is not None) else 2
-            if len(r_ids) == 0 or r_ids[-1] != eos_id:
-                r_ids = r_ids + [eos_id]
+            for q_ids, r_ids in tokenized_pairs:
+                if len(r_ids) == 0 or r_ids[-1] != eos_id:
+                    r_ids = r_ids + [eos_id]
 
-            q_len, r_len = len(q_ids), len(r_ids)
+                q_len, r_len = len(q_ids), len(r_ids)
 
-            # Route to best complementary bucket
-            b_idx = select_best_bucket(q_len, r_len, self.buckets)
-            name, bp, bt = self.buckets[b_idx]
+                # Route to best complementary bucket
+                b_idx = select_best_bucket(q_len, r_len, self.buckets)
+                name, bp, bt = self.buckets[b_idx]
 
-            # Pad / truncate to the exact bucket dimensions
-            if len(q_ids) > bp:
-                q_padded = q_ids[:bp]
-            else:
-                q_padded = q_ids + [self.pad_id] * (bp - len(q_ids))
+                # Pad / truncate to the exact bucket dimensions
+                if len(q_ids) > bp:
+                    q_padded = q_ids[:bp]
+                else:
+                    q_padded = q_ids + [self.pad_id] * (bp - len(q_ids))
 
-            if len(r_ids) > bt:
-                context_token, scored = sample_window(r_ids, bt, self.rng, self.tail_probability)
-                r_padded = scored
-            else:
-                context_token = None
-                r_padded = r_ids + [self.target_pad_id] * (bt - len(r_ids))
+                if len(r_ids) > bt:
+                    context_token, scored = sample_window(r_ids, bt, self.rng, self.tail_probability)
+                    r_padded = scored
+                else:
+                    context_token = None
+                    r_padded = r_ids + [self.target_pad_id] * (bt - len(r_ids))
 
-            self.queues[b_idx].append((q_padded, r_padded, context_token))
+                self.queues[b_idx].append((q_padded, r_padded, context_token))
 
 
 class PrefetchedBatcher:

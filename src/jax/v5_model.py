@@ -463,6 +463,7 @@ def training_rollout(
     remat: bool = True,
     persona_id: Optional[int] = None,
     feedback_is_shifted: bool = True,
+    pure_teacher_forcing: Optional[bool] = None,
 ) -> Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]]:
     """Differentiable training rollout engine in pure JAX."""
     B, L = prompts.shape
@@ -640,8 +641,153 @@ def training_rollout(
         _, all_logits = lax.scan(_emit_gen, (state, init_refractory, init_plan, init_thought, init_k_buf, init_v_buf), jnp.arange(target_len))
         return jnp.swapaxes(all_logits, 0, 1)
 
-    # Use activation checkpointing (remat) for training to reduce HBM activation memory by >90%
+    # Use activation checkpointing (remat) for training to reduce HBM activation memory
     use_remat = remat and (targets is not None)
+    is_pure_tf = (
+        (targets is not None)
+        and (num_shells >= 2)
+        and (
+            pure_teacher_forcing is True
+            or (
+                pure_teacher_forcing is None
+                and (not isinstance(sampling_p, jax.Array))
+                and (float(sampling_p) >= 1.0)
+            )
+        )
+    )
+
+    if is_pure_tf:
+        T = int(target_len)
+        surface = state[:, -1, :]
+        init_core = state[:, 0, :]
+
+        # 1. Precompute all T normalized phase clocks and motor surface vectors outside scan
+        max_phase = params["motor.phase_embed.weight"].shape[0]
+        p_indices = jnp.clip(jnp.arange(T), 0, max_phase - 1)
+        phases = params["motor.phase_embed.weight"][p_indices].astype(jnp.float32)
+        p_norms = jnp.maximum(jnp.linalg.norm(phases, axis=-1, keepdims=True), 1e-6)
+        p_scale_val = jnp.clip(
+            params.get("motor.phase_scale", jnp.array(2.0, dtype=jnp.float32)), 0.05, 5.0
+        ).astype(jnp.float32)
+        p_scaled_all = (phases * (p_scale_val / p_norms)).astype(target_dtype)  # [T, D]
+        motor_surface_all = surface[:, None, :] + p_scaled_all[None, :, :] + tf_flux.astype(target_dtype)
+
+        # 2. Vectorized Multi-Head Arcuate Cross-Resonance across all T tokens in one systolic block
+        total_len = causal_keys.shape[2]
+        keys_t = jnp.swapaxes(causal_keys, -1, -2)
+
+        def _parallel_cross_resonance(ms_all):
+            q_all = jnp.matmul(ms_all, params["motor.q_proj.weight"].T).reshape(B, T, num_heads, head_dim)
+            q_all = jnp.swapaxes(q_all, 1, 2)  # [B, H, T, head_dim]
+            scores_all = jnp.matmul(q_all, keys_t) / math.sqrt(head_dim)
+            pos = jnp.arange(total_len)[None, :]
+            step_pos = (L + jnp.arange(T))[:, None]
+            step_mask_all = all_valid & ((pos <= step_pos)[None, None, :, :])
+            scores_all = jnp.where(step_mask_all, scores_all, -1e4)
+            attn_w = jax.nn.softmax(scores_all.astype(jnp.float32), axis=-1).astype(target_dtype)
+            res_heads = jnp.matmul(attn_w, causal_values)
+            res_heads = jnp.swapaxes(res_heads, 1, 2).reshape(B, T, surface_dim)
+            return rms_norm(
+                jnp.matmul(res_heads, params["motor.out_proj.weight"].T),
+                params["motor.resonance_norm.weight"],
+            )
+
+        res_fn = jax.checkpoint(_parallel_cross_resonance) if use_remat else _parallel_cross_resonance
+        resonance_all = res_fn(motor_surface_all)  # [B, T, D]
+
+        # 3. Precompute static shell pooling for shells 1..K-1 (only shell 0 evolves inside emission)
+        shell_weights = jax.nn.softmax(params["motor.shell_score"].astype(jnp.float32), axis=0).astype(target_dtype)
+        shell_scale = params["motor.shell_scale"].astype(target_dtype)
+        w_shell_t = params["motor.shell_proj.weight"].T
+        static_shell_proj = jnp.matmul(state[:, 1:, :], w_shell_t)
+        static_shell_pool = jnp.sum(shell_weights[None, 1:, None] * static_shell_proj, axis=1) * shell_scale
+        w0_shell_scale = shell_weights[0] * shell_scale
+
+        ig = jnp.clip(params.get("motor.input_gate", jnp.ones(5, dtype=jnp.float32)), -5.0, 5.0).astype(target_dtype)
+        gated_ms_seq = jnp.swapaxes(ig[0] * motor_surface_all, 0, 1)  # [T, B, D]
+        gated_res_seq = jnp.swapaxes(ig[2] * resonance_all, 0, 1)     # [T, B, D]
+
+        fused_norm_w = params["motor.fused_norm.weight"]
+        fc_gate_w = params["motor.swiglu.fc_gate.weight"]
+        fc_val_w = params["motor.swiglu.fc_val.weight"]
+        fc_down_w = params["motor.swiglu.fc_down.weight"]
+        norm_mid_w = params["motor.norm_mid.weight"]
+        plan_gate_w_t = params["motor.plan_gate.weight"].T
+        plan_gate_b = params["motor.plan_gate.bias"].astype(target_dtype)
+        plan_decay = jnp.clip(params["motor.plan_decay"].astype(jnp.float32), 0.0, 0.92).astype(target_dtype)
+        plan_write = params["motor.plan_write"].astype(target_dtype)
+        plan_update_w_t = params["motor.plan_update.weight"].T
+        eff_proj_t = params["motor.efference_proj.weight"].T
+        eff_gate_t = params["core.efference_gate.weight"].T
+        radial_norm_w = params["core.radial_norm.weight"]
+
+        def _tf_motor_step(carry, xs):
+            cur_core, cur_plan = carry
+            ms_t, res_t, p_scaled_t = xs
+
+            shell_pool = static_shell_pool + w0_shell_scale * jnp.matmul(cur_core, w_shell_t)
+            fused_in = jnp.concatenate([
+                ms_t,
+                ig[1] * cur_core,
+                res_t,
+                ig[3] * shell_pool,
+                ig[4] * cur_plan,
+            ], axis=-1)
+            fused = rms_norm(fused_in, fused_norm_w)
+            h = rms_norm(swiglu(fused, fc_gate_w, fc_val_w, fc_down_w), norm_mid_w)
+
+            phase_batch = jnp.broadcast_to(p_scaled_t[None, :], (B, surface_dim))
+            plan_input = jnp.concatenate([h, phase_batch], axis=-1)
+            p_gate = jax.nn.sigmoid(jnp.matmul(plan_input, plan_gate_w_t) + plan_gate_b)
+            plan_update = jnp.matmul(plan_input, plan_update_w_t)
+            nxt_plan = jnp.clip(plan_decay * cur_plan + plan_write * p_gate * plan_update, -50.0, 50.0).astype(target_dtype)
+
+            efference = jnp.matmul(h, eff_proj_t)
+            eff_projected = jnp.matmul(efference, eff_gate_t)
+            eff_normed = rms_norm(eff_projected, radial_norm_w).astype(target_dtype)
+            nxt_core = (0.85 * cur_core + 0.15 * eff_normed).astype(target_dtype)
+
+            return (nxt_core, nxt_plan), h
+
+        motor_scan_fn = jax.checkpoint(_tf_motor_step) if use_remat else _tf_motor_step
+        _, h_seq = lax.scan(motor_scan_fn, (init_core, init_plan), (gated_ms_seq, gated_res_seq, p_scaled_all))
+
+        # 4. Chunked Systolic Vocabulary Projection & Cross-Entropy Outside Sequential Scan
+        temp = jnp.clip(params["motor.temperature_scale"].astype(jnp.float32), 0.1, 5.0).astype(target_dtype)
+        affine = params["motor.affine_scale"][None, None, :].astype(target_dtype)
+        h_scaled = ((jnp.swapaxes(h_seq, 0, 1) * affine) / temp).reshape(B * T, surface_dim)
+        targets_flat = targets[:, :T].reshape(B * T)
+        w_emb_t = params["sensory.embedding.weight"].T
+
+        total_tokens = B * T
+        chunk_tokens = total_tokens if total_tokens <= 4096 else next(
+            (c for c in (4096, 3072, 2048, 1536, 1024, 768, 512, 384, 256, 192, 128, 64, 32, 16, 8, 4, 2, 1) if total_tokens % c == 0),
+            total_tokens,
+        )
+        num_chunks = total_tokens // chunk_tokens
+
+        def _ce_loss_chunk(h_c, t_c):
+            logits_c = jnp.matmul(h_c, w_emb_t).astype(jnp.float32)
+            safe_t = jnp.maximum(t_c, 0)
+            tgt_logits = jnp.take_along_axis(logits_c, safe_t[:, None], axis=-1).squeeze(-1)
+            lse = jax.nn.logsumexp(logits_c, axis=-1)
+            mask_c = (t_c >= 0).astype(jnp.float32)
+            loss_c = (lse - tgt_logits) * mask_c
+            return jnp.sum(loss_c), jnp.sum(mask_c)
+
+        if num_chunks == 1:
+            loss_sum, mask_sum = _ce_loss_chunk(h_scaled, targets_flat)
+        else:
+            ce_fn = lambda _, inp: (None, _ce_loss_chunk(inp[0], inp[1]))
+            ce_scan = jax.checkpoint(ce_fn) if (use_remat or num_chunks > 2) else ce_fn
+            h_chunks = h_scaled.reshape(num_chunks, chunk_tokens, surface_dim)
+            t_chunks = targets_flat.reshape(num_chunks, chunk_tokens)
+            _, (chunk_losses, chunk_masks) = lax.scan(ce_scan, None, (h_chunks, t_chunks))
+            loss_sum = jnp.sum(chunk_losses)
+            mask_sum = jnp.sum(chunk_masks)
+
+        return loss_sum / jnp.maximum(mask_sum, 1.0)
+
     scan_fn = jax.checkpoint(_emit) if use_remat else _emit
 
     if targets is not None:
