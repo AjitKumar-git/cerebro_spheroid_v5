@@ -76,8 +76,12 @@ def check_remote_manifest(
     token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Queries bioflo.in to retrieve checkpoint status, step numbers, and loss metrics for model tier."""
+    if model in ("tpu_v5e_1", "tpu", "v5_tpu"):
+        model = "v5_small"
     sync_url = url or DEFAULT_URL
     sync_token = token or DEFAULT_TOKEN
+    if model in ("tpu_v5e_1", "tpu", "v5_tpu"):
+        model = "v5_small"
 
     req_url = f"{sync_url}?action=status"
     if model:
@@ -135,6 +139,8 @@ def pull_checkpoint(
     """
     sync_url = url or DEFAULT_URL
     sync_token = token or DEFAULT_TOKEN
+    if model in ("tpu_v5e_1", "tpu", "v5_tpu"):
+        model = "v5_small"
 
     os.makedirs(os.path.dirname(os.path.abspath(local_dest)), exist_ok=True)
     download_url = f"{sync_url}?action=download&type={target_type}"
@@ -267,6 +273,8 @@ def push_checkpoint(
 
     sync_url = url or DEFAULT_URL
     sync_token = token or DEFAULT_TOKEN
+    if model in ("tpu_v5e_1", "tpu", "v5_tpu"):
+        model = "v5_small"
     node_name = source_node or detect_source_environment()
 
     file_size = os.path.getsize(file_path)
@@ -392,6 +400,8 @@ def notify_training_start(
     """Notifies the central hub on bioflo.in that training has started."""
     sync_url = url or DEFAULT_URL
     sync_token = token or DEFAULT_TOKEN
+    if model in ("tpu_v5e_1", "tpu", "v5_tpu"):
+        model = "v5_small"
     node_name = source_node or detect_source_environment()
     model_name = model or "v5_small"
     msg = message or f"🚀 CerebroSpheroid {model_name} training active on {node_name}"

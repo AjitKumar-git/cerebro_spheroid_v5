@@ -151,12 +151,10 @@ def auto_tune_environment(
     if candidates is None:
         if is_tpu:
             # TPU v5e-1 has 16GB HBM with fast 128x128 systolic matrix units
-            if preset == "v5_small":
+            if preset in ("v5_small", "tpu_v5e_1"):
                 candidates = [
-                    {"batch_size": 32, "remat": True},
                     {"batch_size": 64, "remat": True},
                     {"batch_size": 128, "remat": True},
-                    {"batch_size": 64, "remat": False},
                 ]
             elif preset == "v5_compact":
                 candidates = [

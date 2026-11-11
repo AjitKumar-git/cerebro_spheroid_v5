@@ -146,7 +146,7 @@ def parse_args(args_list=None):
     parser.add_argument("--cloud-sync", action="store_true", default=True, help="Enable live sync with bioflo.in")
     parser.add_argument("--cloud-sync-interval", type=int, default=100, help="Steps between cloud sync uploads")
     parser.add_argument("--checkpoint-dir", "--ckpt-dir", dest="checkpoint_dir", type=str, default="/content/checkpoints" if os.path.exists("/content") else "checkpoints/tpu_jax", help="Checkpoint directory")
-    parser.add_argument("--preset", type=str, default="v5_small", choices=["v5_small", "v5_compact", "v5_base", "v5_test"], help="Model preset (default: v5_small)")
+    parser.add_argument("--preset", type=str, default="v5_small", choices=["v5_small", "v5_compact", "v5_base", "v5_test", "tpu_v5e_1"], help="Model preset (default: v5_small / tpu_v5e_1)")
     parser.add_argument("--optimizer", type=str, default="spheroid", choices=["spheroid", "adamw"], help="Optimizer choice (default: spheroid)")
     parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bf16", "fp32"], help="Matrix execution precision (default: auto, bf16 on TPU)")
     parser.add_argument("--scratch", "--from-scratch", dest="from_scratch", action="store_true", default=False, help="Start training strictly from scratch (step 0, clean initialization)")
@@ -293,12 +293,16 @@ def main(args=None):
     # 3. Cloud Sync & Local Checkpoint Resumption
     start_step = 0
     best_loss = float("inf")
+    sync_model_name = "v5_small" if args.preset == "tpu_v5e_1" else args.preset
     local_latest = os.path.join(args.checkpoint_dir, f"{args.preset}_latest.pt")
     local_best = os.path.join(args.checkpoint_dir, f"{args.preset}_best.pt")
+    fallback_latest = os.path.join(args.checkpoint_dir, f"{sync_model_name}_latest.pt")
+    if not os.path.exists(local_latest) and os.path.exists(fallback_latest):
+        local_latest = fallback_latest
 
     if args.from_scratch:
         print(f"\n🌱 Starting [{args.preset}] pretraining strictly from scratch (Step 0)!")
-        for stale in (local_latest, local_best):
+        for stale in (local_latest, local_best, fallback_latest):
             if os.path.exists(stale):
                 try:
                     os.remove(stale)
@@ -309,19 +313,18 @@ def main(args=None):
         if args.cloud_sync:
             print(f"\n[cloud_sync] Checking remote manifest on bioflo.in for {args.preset}...")
             try:
-                m_resp = check_remote_manifest(model=args.preset)
+                m_resp = check_remote_manifest(model=sync_model_name)
                 models_info = m_resp.get("models", {})
-                model_tier_info = models_info.get(args.preset, {})
+                model_tier_info = models_info.get(sync_model_name, {})
                 has_tier_latest = (
                     m_resp.get("has_latest", False)
                     or bool(m_resp.get("manifest", {}).get("latest"))
                     or model_tier_info.get("has_latest", False)
-                    or bool(tier_manifest)
                 )
                 if has_tier_latest:
-                    pulled = pull_checkpoint(local_latest, target_type="latest", model=args.preset)
+                    pulled = pull_checkpoint(local_latest, target_type="latest", model=sync_model_name)
                     if pulled:
-                        print(f"✓ Restored latest {args.preset} checkpoint from cloud hub!")
+                        print(f"✓ Restored latest {sync_model_name} checkpoint from cloud hub!")
                 else:
                     print(f"ℹ️ No existing cloud checkpoint found for [{args.preset}]. Starting fresh {args.preset} training frontier!")
             except Exception as e:
@@ -337,7 +340,7 @@ def main(args=None):
                     with open(local_latest, "rb") as f:
                         ckpt = pickle.load(f)
                 ckpt_preset = ckpt.get("model_preset")
-                if ckpt_preset is not None and ckpt_preset != args.preset:
+                if ckpt_preset is not None and ckpt_preset not in (args.preset, sync_model_name):
                     print(f"⚠️ Checkpoint preset mismatch: found '{ckpt_preset}', but running '{args.preset}'. Starting clean!")
                     os.remove(local_latest)
                 elif "step" in ckpt or "model_state" in ckpt or "params" in ckpt:
@@ -357,18 +360,23 @@ def main(args=None):
         return
 
     def get_lr(s: int, total_s: int, peak_lr: float, warmup_steps: int = 500) -> float:
-        if s <= warmup_steps:
+        steps_from_start = s - start_step
+        if start_step > 0:
+            # Smooth resumption over first 100 steps to prevent gradient shock
+            if steps_from_start <= 100:
+                return float(peak_lr * (0.2 + 0.8 * (float(steps_from_start) / 100.0)))
+        elif s <= warmup_steps:
             return float(peak_lr * (float(s) / max(1.0, float(warmup_steps))))
-        ratio = min(1.0, float(s - warmup_steps) / max(1.0, float(total_s - warmup_steps)))
+        ratio = min(1.0, float(s) / max(1.0, float(total_s)))
         coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
         return float(peak_lr * (0.05 + 0.95 * coeff))
 
-    # 4. Warmup JIT Trace & Compile
+    # 4. Warmup JIT Trace & Compile (zero lr so dummy batch does not mutate restored weights)
     print("\n⚡ Compiling XLA computation graph on TPU...")
     dummy_prompts = jnp.zeros((args.batch_size, 32), dtype=jnp.int32)
     dummy_targets = jnp.zeros((args.batch_size, args.seq_len), dtype=jnp.int32)
     t0_compile = time.time()
-    params, opt_state, initial_loss = train_step_fn(params, opt_state, dummy_prompts, dummy_targets, args.lr)
+    _, _, initial_loss = train_step_fn(params, opt_state, dummy_prompts, dummy_targets, 0.0)
     jax.block_until_ready(initial_loss)
     print(f"✓ XLA Compilation complete in {time.time() - t0_compile:.2f}s! Initial Loss: {float(initial_loss):.4f}")
 
@@ -427,10 +435,10 @@ def main(args=None):
                         best_loss = loss_val
                         torch.save(save_payload, local_best)
                         if args.cloud_sync:
-                            push_checkpoint_async(local_best, step=step, loss=loss_val, target_type="best", model=args.preset)
+                            push_checkpoint_async(local_best, step=step, loss=loss_val, target_type="best", model=sync_model_name)
 
                     if args.cloud_sync:
-                        push_checkpoint_async(local_latest, step=step, loss=loss_val, target_type="latest", model=args.preset)
+                        push_checkpoint_async(local_latest, step=step, loss=loss_val, target_type="latest", model=sync_model_name)
                 else:
                     import pickle
                     with open(local_latest, "wb") as f:
@@ -440,10 +448,10 @@ def main(args=None):
                         with open(local_best, "wb") as f:
                             pickle.dump(save_payload, f)
                         if args.cloud_sync:
-                            push_checkpoint_async(local_best, step=step, loss=loss_val, target_type="best", model=args.preset)
+                            push_checkpoint_async(local_best, step=step, loss=loss_val, target_type="best", model=sync_model_name)
 
                     if args.cloud_sync:
-                        push_checkpoint_async(local_latest, step=step, loss=loss_val, target_type="latest", model=args.preset)
+                        push_checkpoint_async(local_latest, step=step, loss=loss_val, target_type="latest", model=sync_model_name)
             except Exception as e:
                 print(f"⚠️ Checkpoint save notice: {e}")
 
