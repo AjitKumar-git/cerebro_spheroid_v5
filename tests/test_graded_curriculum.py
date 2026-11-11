@@ -103,7 +103,7 @@ def test_streaming_batch_generation():
     streamer = GradedCurriculumStreamer(
         tokenizer=MockTokenizer(),
         config=cfg,
-        search_dirs=["data", "../reasoning_agent/data"],
+        search_dirs=["data"],
     )
 
     device = torch.device("cpu")
@@ -135,7 +135,7 @@ def test_elastic_window_batching():
     streamer = GradedCurriculumStreamer(
         tokenizer=MockTokenizer(),
         config=cfg,
-        search_dirs=["data", "../reasoning_agent/data"],
+        search_dirs=["data"],
     )
 
     device = torch.device("cpu")

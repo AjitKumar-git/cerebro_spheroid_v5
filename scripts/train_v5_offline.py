@@ -37,11 +37,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 from transformers import AutoTokenizer
 
-V4_ROOT = "/home/ajit/Documents/Startup/Active_Development/reasoning_agent"
-V5_ROOT = "/home/ajit/Documents/Startup/Active_Development/cerebro_spheroid_v5"
-
-if V4_ROOT not in sys.path:
-    sys.path.append(V4_ROOT)
+V5_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if V5_ROOT not in sys.path:
     sys.path.insert(0, V5_ROOT)
 
@@ -51,11 +47,11 @@ from transformers.optimization import Adafactor
 
 
 def load_local_offline_data(tokenizer, count_per_source=40, batch_size=2, max_len=40):
-    """Loads 100% offline batches from local parquets on disk."""
+    """Loads 100% offline batches from local parquets or data directory on disk."""
     pairs = []
 
     # 1. Local OpenHermes-2.5
-    oh_path = os.path.join(V4_ROOT, "data/openhermes/openhermes_2_5.parquet")
+    oh_path = os.path.join(V5_ROOT, "data/openhermes/openhermes_2_5.parquet")
     if os.path.exists(oh_path):
         df_oh = pd.read_parquet(oh_path)
         for _, row in df_oh.head(count_per_source * 2).iterrows():
@@ -73,8 +69,8 @@ def load_local_offline_data(tokenizer, count_per_source=40, batch_size=2, max_le
             if len(pairs) >= count_per_source:
                 break
 
-    # 2. Local Cerebro Cognitive 10k
-    cog_path = os.path.join(V4_ROOT, "data/cerebro_cognitive_8k/cerebro_cognitive_10k.parquet")
+    # 2. Local Cerebro Cognitive
+    cog_path = os.path.join(V5_ROOT, "data/cerebro_cognitive_8k/cerebro_cognitive_10k.parquet")
     if os.path.exists(cog_path):
         df_cog = pd.read_parquet(cog_path)
         collected_cog = 0

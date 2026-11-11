@@ -28,11 +28,7 @@ import torch.nn.functional as F
 os.environ["HF_HOME"] = "/home/ajit/.cache/hf_home"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-V4_ROOT = "/home/ajit/Documents/Startup/Active_Development/reasoning_agent"
-V5_ROOT = "/home/ajit/Documents/Startup/Active_Development/cerebro_spheroid_v5"
-
-if V4_ROOT not in sys.path:
-    sys.path.append(V4_ROOT)
+V5_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if V5_ROOT not in sys.path:
     sys.path.insert(0, V5_ROOT)
 
@@ -42,8 +38,10 @@ from transformers.optimization import Adafactor
 
 
 def load_clean_training_batches(tokenizer, count=60, batch_size=2, max_len=40):
-    """Loads clean reasoning pairs from OpenHermes-2.5."""
-    oh_path = os.path.join(V4_ROOT, "data/openhermes/openhermes_2_5.parquet")
+    """Loads clean reasoning pairs from local corpus or OpenHermes-2.5."""
+    oh_path = os.path.join(V5_ROOT, "data/openhermes/openhermes_2_5.parquet")
+    if not os.path.exists(oh_path):
+        oh_path = os.path.join(V5_ROOT, "data/tokenizer/corpus.jsonl")
     df = pd.read_parquet(oh_path)
     pairs = []
 

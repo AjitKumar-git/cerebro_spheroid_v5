@@ -156,9 +156,7 @@ class GradedCurriculumStreamer:
         self.rng = random.Random(seed)
         self.search_dirs = search_dirs or [
             "data",
-            "../reasoning_agent/data",
-            "/home/ajit/Documents/Startup/Active_Development/cerebro_spheroid_v5/data",
-            "/home/ajit/Documents/Startup/Active_Development/reasoning_agent/data",
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data"),
         ]
         self._dataset_files = self._locate_local_datasets()
 

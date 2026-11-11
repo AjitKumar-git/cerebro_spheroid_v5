@@ -188,12 +188,7 @@ def main():
         tokenizer=tokenizer,
         config=schedule_config,
         mix=args.mix,
-        search_dirs=[
-            "data",
-            "../reasoning_agent/data",
-            "/home/ajit/Documents/Startup/Active_Development/cerebro_spheroid_v5/data",
-            "/home/ajit/Documents/Startup/Active_Development/reasoning_agent/data",
-        ],
+        search_dirs=["data"],
     )
 
     # 3. Setup Optimizer (Default: Custom SpheroidOptimizer with Polar Newton-Schulz)

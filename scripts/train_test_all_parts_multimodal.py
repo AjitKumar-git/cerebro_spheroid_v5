@@ -120,7 +120,7 @@ def run_comprehensive_test():
     streamer = GradedCurriculumStreamer(
         tokenizer=tok,
         config=schedule_cfg,
-        search_dirs=["data", "../reasoning_agent/data"],
+        search_dirs=["data"],
     )
 
     # 4. Adafactor Optimizer
