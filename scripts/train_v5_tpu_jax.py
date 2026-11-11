@@ -375,9 +375,10 @@ def main(args=None):
         remat_choice = best_cfg["remat"]
         print(f"\n⚡ Applying Tuned Hyperparameters: batch_size={args.batch_size}, remat={remat_choice}")
         if "tok_per_sec" in best_cfg and best_cfg["tok_per_sec"] > 0:
-            v_gb = best_cfg.get("vram_gb", 0)
-            v_pct = best_cfg.get("vram_utilization_pct", 0)
-            print(f"⚡ Target Benchmark Speed: {best_cfg['tok_per_sec']:,.0f} tok/s (Memory: {v_gb:.1f} GB, {v_pct:.1f}% utilization)")
+            m_type = best_cfg.get("memory_type", "HBM" if ("tpu" in dev_kind or "tpu" in backend.lower()) else "VRAM")
+            v_gb = best_cfg.get("memory_gb", best_cfg.get("vram_gb", 0))
+            v_pct = best_cfg.get("memory_utilization_pct", best_cfg.get("vram_utilization_pct", 0))
+            print(f"⚡ Target Benchmark Speed: {best_cfg['tok_per_sec']:,.0f} tok/s ({m_type}: {v_gb:.1f} GB, {v_pct:.1f}% utilization)")
 
     # 3. Model Configuration & Parameters
     config_preset = "v5_small" if args.preset == "tpu_v5e_1" else args.preset

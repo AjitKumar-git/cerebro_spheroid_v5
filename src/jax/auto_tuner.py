@@ -93,12 +93,14 @@ def get_hardware_info() -> Dict[str, Any]:
     total_gb = total_memory_bytes / (1024**3)
     clean_kind = dev_kind.replace(" ", "_").replace("/", "_").replace("-", "_")
     sig = f"{clean_kind}_{int(round(total_gb))}GB"
+    mem_type = "HBM" if is_tpu else ("VRAM" if is_gpu else "RAM")
 
     return {
         "device_kind": dev_kind,
         "platform": platform,
         "is_tpu": is_tpu,
         "is_gpu": is_gpu,
+        "memory_type": mem_type,
         "total_memory_bytes": total_memory_bytes,
         "total_gb": total_gb,
         "hardware_signature": sig,
@@ -113,7 +115,7 @@ def generate_vram_maximizing_candidates(
 ) -> List[Dict[str, Any]]:
     """
     Generates a progressive search ladder designed to push hardware memory
-    to its optimal capacity (~85-92% VRAM/HBM) without leaving free memory on the table.
+    to its optimal capacity (~85-92% HBM on TPU / VRAM on GPU) without leaving free memory on the table.
     """
     if total_gb >= 32.0:
         # High-capacity accelerator: TPU v4 (32GB), A100/H100 (40GB/80GB)
@@ -299,6 +301,7 @@ def benchmark_config(
             if total_mem_bytes and total_mem_bytes > 0:
                 vram_utilization_pct = min(99.0, (est_total / total_mem_bytes) * 100.0)
 
+        mem_label = "HBM" if is_tpu else ("VRAM" if is_gpu else "RAM")
         return {
             "preset": preset,
             "batch_size": batch_size,
@@ -308,6 +311,9 @@ def benchmark_config(
             "compile_time": compile_time,
             "step_ms": avg_step_sec * 1000.0,
             "tok_per_sec": tok_per_sec,
+            "memory_gb": vram_gb,
+            "memory_utilization_pct": vram_utilization_pct,
+            "memory_type": mem_label,
             "vram_gb": vram_gb,
             "vram_utilization_pct": vram_utilization_pct,
             "initial_loss": float(init_loss),
@@ -321,6 +327,7 @@ def benchmark_config(
         else:
             status_desc = f"FAIL ({type(e).__name__}: {err_msg[:40]})"
 
+        mem_label = "HBM" if is_tpu else ("VRAM" if is_gpu else "RAM")
         return {
             "preset": preset,
             "batch_size": batch_size,
@@ -330,6 +337,9 @@ def benchmark_config(
             "compile_time": None,
             "step_ms": None,
             "tok_per_sec": 0.0,
+            "memory_gb": 0.0,
+            "memory_utilization_pct": 0.0,
+            "memory_type": mem_label,
             "vram_gb": 0.0,
             "vram_utilization_pct": 0.0,
             "initial_loss": None,
@@ -363,6 +373,8 @@ def auto_tune_environment(
     total_gb = hw["total_gb"]
     sig = hw["hardware_signature"]
 
+    mem_type = hw.get("memory_type", "HBM" if is_tpu else ("VRAM" if is_gpu else "RAM"))
+
     # 1. First Priority: Check remote website bioflo.in or local cache to avoid wasting time
     if use_cached_config and not force_tune and candidates is None:
         # Check local cache
@@ -374,7 +386,9 @@ def auto_tune_environment(
                 print(f"   • Batch Size  : {cached_local['batch_size']}")
                 print(f"   • Remat Scan  : {cached_local['remat']}")
                 print(f"   • Peak Speed  : {cached_local.get('tok_per_sec', 0):,.0f} tok/s")
-                print(f"   • Memory Util : {cached_local.get('vram_gb', 0):.1f} GB ({cached_local.get('vram_utilization_pct', 0):.1f}%)")
+                m_gb = cached_local.get("memory_gb", cached_local.get("vram_gb", 0))
+                m_pct = cached_local.get("memory_utilization_pct", cached_local.get("vram_utilization_pct", 0))
+                print(f"   • {mem_type} Util   : {m_gb:.1f} GB ({m_pct:.1f}%)")
                 print(f"⏩ Skipping micro-benchmarks and adopting verified parameters!\n" + "=" * 80)
             return cached_local
 
@@ -389,7 +403,9 @@ def auto_tune_environment(
                     print(f"   • Batch Size  : {cached_remote['batch_size']}")
                     print(f"   • Remat Scan  : {cached_remote['remat']}")
                     print(f"   • Peak Speed  : {cached_remote.get('tok_per_sec', 0):,.0f} tok/s")
-                    print(f"   • Memory Util : {cached_remote.get('vram_gb', 0):.1f} GB ({cached_remote.get('vram_utilization_pct', 0):.1f}%)")
+                    m_gb = cached_remote.get("memory_gb", cached_remote.get("vram_gb", 0))
+                    m_pct = cached_remote.get("memory_utilization_pct", cached_remote.get("vram_utilization_pct", 0))
+                    print(f"   • {mem_type} Util   : {m_gb:.1f} GB ({m_pct:.1f}%)")
                     print(f"   • Verified At : {cached_remote.get('updated_at', 'recently')}")
                     print(f"⏩ Skipping micro-benchmarks and adopting verified parameters from website!\n" + "=" * 80)
                 save_local_hardware_config(preset, sig, cached_remote)
@@ -401,12 +417,12 @@ def auto_tune_environment(
     # 2. Benchmarking execution
     if verbose:
         print("=" * 80)
-        print("🚀 CEREBROSPHEROID V5: AUTOMATIC THROUGHPUT BENCHMARK & VRAM TUNER")
+        print(f"🚀 CEREBROSPHEROID V5: AUTOMATIC THROUGHPUT BENCHMARK & {mem_type} AUTO-TUNER")
         print("=" * 80)
         print(f"Hardware Platform  : {len(devices)} x {dev_kind} ({sig})")
-        print(f"Detected Memory    : {total_gb:.1f} GB Available VRAM / HBM")
+        print(f"Detected Memory    : {total_gb:.1f} GB Available {mem_type}")
         print(f"Target Preset      : {preset} (SeqLen: {seq_len})")
-        print(f"VRAM Strategy      : Maximize VRAM utilization without OOM; test remat True vs False")
+        print(f"Search Strategy    : Maximize {mem_type} utilization without OOM; test remat True vs False")
         print("-" * 80)
 
     if candidates is None:
@@ -440,10 +456,10 @@ def auto_tune_environment(
 
         if res["status"] == "PASS":
             tok_s = res["tok_per_sec"]
-            v_gb = res["vram_gb"]
-            v_pct = res["vram_utilization_pct"]
+            m_gb = res.get("memory_gb", res.get("vram_gb", 0))
+            m_pct = res.get("memory_utilization_pct", res.get("vram_utilization_pct", 0))
             if verbose:
-                print(f"✓ {tok_s:8,.0f} tok/s | VRAM: {v_gb:4.1f} GB ({v_pct:4.1f}%) | Latency: {res['step_ms']:6.1f}ms | Compile: {res['compile_time']:4.1f}s")
+                print(f"✓ {tok_s:8,.0f} tok/s | {mem_type}: {m_gb:4.1f} GB ({m_pct:4.1f}%) | Latency: {res['step_ms']:6.1f}ms | Compile: {res['compile_time']:4.1f}s")
             if tok_s > max_tok_s:
                 max_tok_s = tok_s
                 best_config = res
@@ -455,14 +471,17 @@ def auto_tune_environment(
 
     if verbose:
         print("\n" + "=" * 80)
-        print("📊 AUTO-TUNING VRAM & THROUGHPUT BENCHMARK RESULTS")
+        print(f"📊 AUTO-TUNING {mem_type} & THROUGHPUT BENCHMARK RESULTS")
         print("=" * 80)
-        print(f"{'Preset':<10} | {'Batch':<6} | {'Remat':<7} | {'Compile (s)':<12} | {'Step (ms)':<10} | {'VRAM Util':<15} | {'Throughput':<15} | {'Status':<10}")
+        mem_hdr = f"{mem_type} Util"
+        print(f"{'Preset':<10} | {'Batch':<6} | {'Remat':<7} | {'Compile (s)':<12} | {'Step (ms)':<10} | {mem_hdr:<15} | {'Throughput':<15} | {'Status':<10}")
         print("-" * 80)
         for r in results:
             c_str = f"{r['compile_time']:.1f}s" if r['compile_time'] is not None else "-"
             s_str = f"{r['step_ms']:.1f}ms" if r['step_ms'] is not None else "-"
-            v_str = f"{r['vram_gb']:.1f}GB ({r['vram_utilization_pct']:.0f}%)" if r['vram_gb'] > 0 else "-"
+            m_g = r.get('memory_gb', r.get('vram_gb', 0))
+            m_p = r.get('memory_utilization_pct', r.get('vram_utilization_pct', 0))
+            v_str = f"{m_g:.1f}GB ({m_p:.0f}%)" if m_g > 0 else "-"
             t_str = f"{r['tok_per_sec']:,.0f} tok/s" if r['tok_per_sec'] > 0 else "-"
             winner_mark = " 🏆 (WINNER)" if (best_config and r == best_config) else ""
             print(f"{r['preset']:<10} | {r['batch_size']:<6} | {str(r['remat']):<7} | {c_str:<12} | {s_str:<10} | {v_str:<15} | {t_str:<15} | {r['status'] + winner_mark:<10}")
