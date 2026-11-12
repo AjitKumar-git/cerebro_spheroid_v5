@@ -90,6 +90,13 @@ if ($action === 'status') {
         $b_file = $storage_dir . '/' . $m . '_best.pt';
         $has_l = file_exists($l_file);
         $has_b = file_exists($b_file);
+        $hist_file = $storage_dir . '/loss_history_' . $m . '.json';
+        $has_hist = file_exists($hist_file) && filesize($hist_file) > 2;
+        $hist_count = 0;
+        if ($has_hist) {
+            $h_data = json_decode(file_get_contents($hist_file), true);
+            if (is_array($h_data)) $hist_count = count($h_data);
+        }
         $model_status[$m] = [
             'has_latest' => $has_l,
             'has_best' => $has_b,
@@ -97,6 +104,8 @@ if ($action === 'status') {
             'best_size' => $has_b ? filesize($b_file) : 0,
             'latest_manifest' => isset($manifest[$m . '_latest']) ? $manifest[$m . '_latest'] : null,
             'best_manifest' => isset($manifest[$m . '_best']) ? $manifest[$m . '_best'] : null,
+            'has_loss_history' => $has_hist,
+            'loss_history_count' => $hist_count,
         ];
     }
 
@@ -230,6 +239,140 @@ if ($action === 'save_config') {
         'model' => $model,
         'device' => $device,
         'config' => $entry,
+    ]);
+    exit;
+}
+
+// --------------------------------------------------------------------------------------------
+// Action: GET_LOSS_HISTORY (Retrieve recorded training loss trajectory)
+// --------------------------------------------------------------------------------------------
+if ($action === 'get_loss_history' || $action === 'loss_history') {
+    header('Content-Type: application/json');
+    $model = isset($_REQUEST['model']) ? normalize_model_name($_REQUEST['model']) : 'v5_small';
+    $norm_m = !empty($model) ? $model : 'v5_small';
+    $history_file = $storage_dir . '/loss_history_' . $norm_m . '.json';
+
+    // Fallback to legacy un-prefixed history if model-specific file doesn't exist
+    if (!file_exists($history_file) && file_exists($storage_dir . '/loss_history.json')) {
+        $history_file = $storage_dir . '/loss_history.json';
+    }
+
+    if (file_exists($history_file) && filesize($history_file) > 2) {
+        $data = json_decode(file_get_contents($history_file), true);
+        if (is_array($data)) {
+            echo json_encode([
+                'status' => 'found',
+                'model' => $norm_m,
+                'count' => count($data),
+                'records' => $data,
+                'server_time' => date('c'),
+            ]);
+            exit;
+        }
+    }
+
+    echo json_encode([
+        'status' => 'not_found',
+        'model' => $norm_m,
+        'count' => 0,
+        'records' => [],
+        'server_time' => date('c'),
+    ]);
+    exit;
+}
+
+// --------------------------------------------------------------------------------------------
+// Action: SAVE_LOSS_HISTORY (Save / append loss trajectory data points to website data)
+// --------------------------------------------------------------------------------------------
+if ($action === 'save_loss_history' || $action === 'save_loss' || $action === 'record_loss') {
+    header('Content-Type: application/json');
+
+    $input_json = file_get_contents('php://input');
+    $payload = (!empty($input_json)) ? json_decode($input_json, true) : null;
+    if (!is_array($payload)) {
+        $payload = $_POST;
+    }
+
+    $model = isset($payload['model']) ? normalize_model_name($payload['model']) : (isset($_REQUEST['model']) ? normalize_model_name($_REQUEST['model']) : 'v5_small');
+    $norm_m = !empty($model) ? $model : 'v5_small';
+    $history_file = $storage_dir . '/loss_history_' . $norm_m . '.json';
+
+    $existing = [];
+    if (file_exists($history_file) && filesize($history_file) > 2) {
+        $decoded = json_decode(file_get_contents($history_file), true);
+        if (is_array($decoded)) {
+            $existing = $decoded;
+        }
+    }
+
+    // Map existing records by step for deduplication
+    $by_step = [];
+    foreach ($existing as $r) {
+        if (isset($r['step'])) {
+            $by_step[intval($r['step'])] = $r;
+        }
+    }
+
+    // Records can be passed as a list under 'records' or as a single record payload
+    $incoming_records = [];
+    if (isset($payload['records']) && is_array($payload['records'])) {
+        $incoming_records = $payload['records'];
+    } elseif (isset($payload['step']) && isset($payload['loss'])) {
+        $incoming_records = [$payload];
+    }
+
+    $added_or_updated = 0;
+    foreach ($incoming_records as $rec) {
+        if (!isset($rec['step']) || !isset($rec['loss'])) {
+            continue;
+        }
+        $s = intval($rec['step']);
+        $clean_rec = [
+            'step' => $s,
+            'loss' => floatval($rec['loss']),
+            'eval_loss' => (isset($rec['eval_loss']) && $rec['eval_loss'] !== null) ? floatval($rec['eval_loss']) : null,
+            'ema_loss' => (isset($rec['ema_loss']) && $rec['ema_loss'] !== null) ? floatval($rec['ema_loss']) : null,
+            'delta' => (isset($rec['delta']) && $rec['delta'] !== null) ? floatval($rec['delta']) : null,
+            'status' => isset($rec['status']) ? preg_replace('/[^a-zA-Z0-9_\-]/', '', strval($rec['status'])) : 'SMOOTH_DESCENT',
+            'timestamp' => isset($rec['timestamp']) && !empty($rec['timestamp']) ? strval($rec['timestamp']) : date('c'),
+            'source' => isset($rec['source']) ? preg_replace('/[^a-zA-Z0-9_\-]/', '', strval($rec['source'])) : 'cloud',
+        ];
+        if (isset($rec['md5'])) {
+            $clean_rec['md5'] = strval($rec['md5']);
+        }
+        if (isset($rec['size_bytes'])) {
+            $clean_rec['size_bytes'] = intval($rec['size_bytes']);
+        }
+
+        // Merge if existing record had eval_loss and new doesn't, preserve eval_loss
+        if (isset($by_step[$s])) {
+            if ($clean_rec['eval_loss'] === null && isset($by_step[$s]['eval_loss']) && $by_step[$s]['eval_loss'] !== null) {
+                $clean_rec['eval_loss'] = $by_step[$s]['eval_loss'];
+            }
+        }
+
+        $by_step[$s] = $clean_rec;
+        $added_or_updated++;
+    }
+
+    // Sort by step ascending
+    ksort($by_step);
+    $merged = array_values($by_step);
+
+    // Limit to latest 10,000 points to keep storage strictly bounded
+    if (count($merged) > 10000) {
+        $merged = array_slice($merged, -10000);
+    }
+
+    file_put_contents($history_file, json_encode($merged, JSON_PRETTY_PRINT));
+
+    echo json_encode([
+        'success' => true,
+        'status' => 'saved',
+        'model' => $norm_m,
+        'added_or_updated' => $added_or_updated,
+        'total_records' => count($merged),
+        'server_time' => date('c'),
     ]);
     exit;
 }
@@ -450,6 +593,30 @@ if ($action === 'upload_chunk') {
             'md5' => md5_file($final_file)
         ];
         file_put_contents($manifest_file, json_encode($manifest, JSON_PRETTY_PRINT));
+
+        // Auto-record completed checkpoint into model loss history
+        if (!empty($norm_m) && $step > 0 && $loss > 0) {
+            $h_file = $storage_dir . '/loss_history_' . $norm_m . '.json';
+            $h_list = (file_exists($h_file) && filesize($h_file) > 2) ? (json_decode(file_get_contents($h_file), true) ?: []) : [];
+            $h_by_step = [];
+            foreach ($h_list as $item) {
+                if (isset($item['step'])) $h_by_step[intval($item['step'])] = $item;
+            }
+            $h_by_step[intval($step)] = [
+                'step' => intval($step),
+                'loss' => floatval($loss),
+                'eval_loss' => isset($h_by_step[intval($step)]['eval_loss']) ? $h_by_step[intval($step)]['eval_loss'] : null,
+                'status' => 'SMOOTH_DESCENT',
+                'timestamp' => date('c'),
+                'source' => $source,
+                'md5' => md5_file($final_file),
+                'size_bytes' => filesize($final_file),
+            ];
+            ksort($h_by_step);
+            $h_clean = array_values($h_by_step);
+            if (count($h_clean) > 10000) $h_clean = array_slice($h_clean, -10000);
+            file_put_contents($h_file, json_encode($h_clean, JSON_PRETTY_PRINT));
+        }
 
         echo json_encode([
             'success' => true,

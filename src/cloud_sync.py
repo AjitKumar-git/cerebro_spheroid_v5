@@ -533,3 +533,72 @@ def push_remote_hardware_config(
     except Exception as e:
         print(f"⚠️ [cloud_sync] Failed to save hardware config to {sync_url}: {e}")
         return False
+
+
+def push_remote_loss_history(
+    model: str,
+    records: List[Any],
+    url: Optional[str] = None,
+    token: Optional[str] = None,
+) -> bool:
+    """Uploads/syncs loss records over time to bioflo.in website data repository."""
+    sync_url = url or DEFAULT_URL
+    sync_token = token or DEFAULT_TOKEN
+    clean_model = "v5_small" if model in TPU_PRESET_ALIASES else model
+
+    serialized = []
+    for r in records:
+        if hasattr(r, "to_dict"):
+            serialized.append(r.to_dict())
+        elif isinstance(r, dict):
+            serialized.append(r)
+
+    payload = {
+        "action": "save_loss_history",
+        "model": clean_model,
+        "records": serialized,
+    }
+
+    try:
+        req_data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{sync_url}?action=save_loss_history",
+            data=req_data,
+            headers={
+                "Authorization": f"Bearer {sync_token}",
+                "Content-Type": "application/json",
+                "User-Agent": "CerebroV5CloudSync/1.0",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return bool(data.get("success", False))
+    except Exception as e:
+        print(f"ℹ️ [cloud_sync] Could not sync loss history to {sync_url}: {e}")
+        return False
+
+
+def fetch_remote_loss_history(
+    model: str,
+    url: Optional[str] = None,
+    token: Optional[str] = None,
+) -> Optional[List[Dict[str, Any]]]:
+    """Retrieves recorded training loss progression over time from bioflo.in website data repository."""
+    sync_url = url or DEFAULT_URL
+    sync_token = token or DEFAULT_TOKEN
+    clean_model = "v5_small" if model in TPU_PRESET_ALIASES else model
+
+    req_url = f"{sync_url}?action=get_loss_history&model={clean_model}"
+    req = urllib.request.Request(
+        req_url,
+        headers={"Authorization": f"Bearer {sync_token}", "User-Agent": "CerebroV5CloudSync/1.0"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data.get("status") == "found" and "records" in data:
+                return data["records"]
+    except Exception as e:
+        print(f"ℹ️ [cloud_sync] Could not retrieve remote loss history from {sync_url}: {e}")
+    return None

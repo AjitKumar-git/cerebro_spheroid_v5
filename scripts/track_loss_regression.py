@@ -23,6 +23,11 @@ import math
 import os
 import sys
 import time
+
+# Ensure repo root is on sys.path regardless of execution CWD
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -390,27 +395,65 @@ def run_loss_tracker(
     save_plot: Optional[str] = None,
     checkpoint_dir: Optional[str] = None,
     cloud_url: Optional[str] = None,
+    cloud_token: Optional[str] = None,
+    save_to_cloud: bool = True,
 ):
     """
     Main entry point for live loss tracking and regression audit.
     Can be imported and called directly inside Google Colab cells or run from CLI.
+    Persists and synchronizes loss trajectory over time to local disk and bioflo.in website data.
     """
-    from src.cloud_sync import check_remote_manifest, pull_checkpoint
+    from src.cloud_sync import (
+        check_remote_manifest,
+        pull_checkpoint,
+        push_remote_loss_history,
+        fetch_remote_loss_history,
+    )
     from src.corpus import build_tokenizer
     from src.spheroid_v5 import CerebroSpheroidV5, ModelConfigV5, PRESETS_V5, load_v5_checkpoint_into_torch
 
     hist_path = history_file or f"loss_history_{model}.json"
     records: List[LossRecord] = []
 
-    # Load existing history if available
+    # 1. Load existing history if available locally
     if os.path.exists(hist_path):
         try:
             with open(hist_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 records = [LossRecord.from_dict(d) for d in data]
-                print(f"📂 Loaded {len(records)} historical tracking entries from {hist_path}")
+                print(f"📂 Loaded {len(records)} historical tracking entries from local {hist_path}")
         except Exception as e:
-            print(f"⚠️ Could not read history file {hist_path}: {e}")
+            print(f"⚠️ Could not read local history file {hist_path}: {e}")
+
+    # 2. Fetch remote loss history from bioflo.in website data and merge
+    if save_to_cloud:
+        try:
+            remote_records = fetch_remote_loss_history(model=model, url=cloud_url, token=cloud_token)
+            if remote_records:
+                by_step: Dict[int, LossRecord] = {}
+                for d in remote_records:
+                    r = LossRecord.from_dict(d)
+                    by_step[r.step] = r
+                for r in records:
+                    if r.step in by_step:
+                        if r.eval_loss is not None and by_step[r.step].eval_loss is None:
+                            by_step[r.step].eval_loss = r.eval_loss
+                        if r.ema_loss is not None:
+                            by_step[r.step].ema_loss = r.ema_loss
+                    else:
+                        by_step[r.step] = r
+                records = sorted(by_step.values(), key=lambda x: x.step)
+                print(f"🌐 [cloud_sync] Synchronized {len(records)} loss records from bioflo.in website data!")
+                try:
+                    with open(hist_path, "w", encoding="utf-8") as f:
+                        json.dump([r.to_dict() for r in records], f, indent=2)
+                except Exception:
+                    pass
+            elif records:
+                # Seed website data with existing local records
+                push_remote_loss_history(model=model, records=records, url=cloud_url, token=cloud_token)
+        except Exception as sync_init_err:
+            print(f"ℹ️ [cloud_sync] Notice on initial website history fetch: {sync_init_err}")
 
     analyzer = LossTrajectoryAnalyzer(regression_threshold=regression_threshold)
     tokenizer = None
@@ -433,6 +476,7 @@ def run_loss_tracker(
     print(f"Mode                : {'Continuous Watch (Polling every ' + str(interval_sec) + 's)' if watch else 'Single Audit Pass'}")
     print(f"Regression Trigger  : Spike > +{regression_threshold:.2f} or 3 consecutive climbs")
     print(f"Held-Out Evaluation : {'Active (Deterministic Probe)' if eval_model else 'Disabled (Manifest only)'}")
+    print(f"Website Data Sync   : {'Active (https://bioflo.in/api/cerebro/data/)' if save_to_cloud else 'Disabled'}")
     print(f"History File        : {hist_path}")
     print("-" * 80)
 
@@ -492,12 +536,21 @@ def run_loss_tracker(
                     )
                     records.append(rec)
 
-                    # Save updated history
+                    # Update analysis so status, ema_loss, delta are computed before persisting
+                    analysis = analyzer.analyze(records)
+
+                    # Save updated history locally
                     try:
                         with open(hist_path, "w", encoding="utf-8") as f:
                             json.dump([r.to_dict() for r in records], f, indent=2)
                     except Exception as wr_err:
                         print(f"⚠️ Could not write history: {wr_err}")
+
+                    # Mirror loss trajectory over time to bioflo.in website data
+                    if save_to_cloud:
+                        ok = push_remote_loss_history(model=model, records=records, url=cloud_url, token=cloud_token)
+                        if ok:
+                            print(f"🌐 [cloud_sync] Mirrored loss trajectory to bioflo.in website data (Step {rec.step:,}, Loss {rec.loss:.4f})")
 
             # 2. Run Trajectory Analysis
             analysis = analyzer.analyze(records)
@@ -550,6 +603,9 @@ def parse_args():
     parser.add_argument("--save-plot", type=str, default=None, help="Save matplotlib trajectory plot image to this path")
     parser.add_argument("--checkpoint-dir", type=str, default=None, help="Optional local checkpoint directory to monitor instead of cloud")
     parser.add_argument("--cloud-url", type=str, default=None, help="Custom cloud sync endpoint URL")
+    parser.add_argument("--cloud-token", type=str, default=None, help="Custom authorization token for bioflo.in")
+    parser.add_argument("--cloud-sync", "--cloud_sync", dest="save_to_cloud", action="store_true", default=True, help="Save and sync loss over time to bioflo.in website data (default: True)")
+    parser.add_argument("--no-cloud-sync", "--no_cloud_sync", dest="save_to_cloud", action="store_false", help="Disable saving loss to website data")
     return parser.parse_args()
 
 
@@ -565,6 +621,8 @@ def main():
         save_plot=args.save_plot,
         checkpoint_dir=args.checkpoint_dir,
         cloud_url=args.cloud_url,
+        cloud_token=args.cloud_token,
+        save_to_cloud=args.save_to_cloud,
     )
 
 

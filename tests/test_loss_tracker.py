@@ -138,3 +138,107 @@ def test_colab_loss_tracker_notebook_valid():
             clean_src = "\n".join("# " + l if l.strip().startswith(("%", "!")) else l for l in src.splitlines())
             compile(clean_src, nb_path, "exec")
 
+
+def test_cloud_sync_loss_history_roundtrip(monkeypatch):
+    """Verifies push_remote_loss_history and fetch_remote_loss_history serialization and roundtrip."""
+    from unittest.mock import MagicMock
+    import json
+    import urllib.request
+    from src.cloud_sync import push_remote_loss_history, fetch_remote_loss_history
+
+    records = [
+        LossRecord(step=1000, loss=3.5, eval_loss=4.2, status=RegressionStatus.SMOOTH_DESCENT),
+        LossRecord(step=2000, loss=3.2, eval_loss=3.9, status=RegressionStatus.SMOOTH_DESCENT),
+    ]
+
+    # Test push
+    push_called = {}
+    def mock_urlopen(req, timeout=15):
+        m = MagicMock()
+        if "action=save_loss_history" in req.full_url:
+            push_called["payload"] = json.loads(req.data.decode("utf-8"))
+            m.read.return_value = json.dumps({"success": True, "status": "saved", "total_records": 2}).encode("utf-8")
+        elif "action=get_loss_history" in req.full_url:
+            m.read.return_value = json.dumps({
+                "status": "found",
+                "model": "v5_small",
+                "count": 2,
+                "records": [r.to_dict() for r in records],
+            }).encode("utf-8")
+        m.__enter__.return_value = m
+        return m
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+
+    ok = push_remote_loss_history(model="v5_small", records=records)
+    assert ok is True
+    assert "payload" in push_called
+    assert push_called["payload"]["model"] == "v5_small"
+    assert len(push_called["payload"]["records"]) == 2
+    assert push_called["payload"]["records"][0]["step"] == 1000
+
+    # Test fetch
+    fetched = fetch_remote_loss_history(model="v5_small")
+    assert fetched is not None
+    assert len(fetched) == 2
+    assert fetched[1]["step"] == 2000
+    assert fetched[1]["loss"] == pytest.approx(3.2)
+
+
+def test_run_loss_tracker_syncs_with_website_data(tmp_path, monkeypatch):
+    """Verifies run_loss_tracker fetches remote history, merges it, and pushes new steps to website data."""
+    from unittest.mock import MagicMock
+    from scripts.track_loss_regression import run_loss_tracker
+    import src.cloud_sync as cs
+
+    remote_store = [
+        {"step": 1000, "loss": 4.0, "status": "SMOOTH_DESCENT", "timestamp": "2026-11-12T01:00:00Z"},
+        {"step": 2000, "loss": 3.7, "status": "SMOOTH_DESCENT", "timestamp": "2026-11-12T02:00:00Z"},
+    ]
+    pushed_records = []
+
+    def mock_fetch(model, url=None, token=None):
+        return list(remote_store)
+
+    def mock_push(model, records, url=None, token=None):
+        pushed_records.clear()
+        pushed_records.extend(records)
+        return True
+
+    def mock_manifest(model=None, url=None, token=None):
+        return {
+            "models": {
+                "v5_small": {
+                    "latest_manifest": {
+                        "model": "v5_small",
+                        "step": 3000,
+                        "loss": 3.4,
+                        "source": "tpu",
+                        "updated_at": "2026-11-12T03:00:00Z",
+                        "md5": "md5step3000",
+                    }
+                }
+            }
+        }
+
+    monkeypatch.setattr(cs, "fetch_remote_loss_history", mock_fetch)
+    monkeypatch.setattr(cs, "push_remote_loss_history", mock_push)
+    monkeypatch.setattr(cs, "check_remote_manifest", mock_manifest)
+
+    hist_file = str(tmp_path / "loss_hist_test.json")
+    records, analysis = run_loss_tracker(
+        model="v5_small",
+        watch=False,
+        history_file=hist_file,
+        save_to_cloud=True,
+    )
+
+    assert len(records) == 3
+    assert records[0].step == 1000
+    assert records[1].step == 2000
+    assert records[2].step == 3000
+    assert records[2].loss == pytest.approx(3.4)
+    assert len(pushed_records) == 3
+    assert pushed_records[-1].step == 3000
+    assert os.path.exists(hist_file)
+
