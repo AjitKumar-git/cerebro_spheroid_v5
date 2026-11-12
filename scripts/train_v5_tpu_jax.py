@@ -166,6 +166,10 @@ def parse_args(args_list=None):
     parser.add_argument("--schedule_steps", type=int, default=5000, help="Steps to anneal from teacher-forcing down to min_sampling_p (default: 5000)")
     parser.add_argument("--min_sampling_p", type=float, default=0.5, help="Minimum teacher sampling floor (default: 0.5 for active self-deliberation and error recovery)")
     parser.add_argument("--pitfall_prob", type=float, default=0.15, help="Probability of exploring counterfactual/pitfall thoughts during deliberation (default: 0.15)")
+    parser.add_argument("--loss_window_governor", action=argparse.BooleanOptionalAction, default=True, help="Automatically clamp deliberation and float sampling_p back to 1.0 if loss climbs above window ceiling")
+    parser.add_argument("--loss_ceiling", type=float, default=3.25, help="Upper loss boundary: if smoothed loss exceeds this, restore full (100%%) teacher forcing to prevent loss climb (default: 3.25)")
+    parser.add_argument("--loss_floor", type=float, default=2.80, help="Lower loss boundary: if smoothed loss is at/below this, permit full deliberation at min_sampling_p (default: 2.80)")
+    parser.add_argument("--loss_lr_damping", action=argparse.BooleanOptionalAction, default=True, help="Damp learning rate when loss is climbing towards ceiling to prevent optimizer overshoot")
 
     # Data Source & Tokenizer
     parser.add_argument("--dataset_source", "--dataset-source", dest="dataset_source", type=str, default="dense_edu",
@@ -677,18 +681,33 @@ def main(args=None):
             coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
             return float(min_lr + (peak_lr - min_lr) * coeff)
 
-    def get_sampling_p(step_idx: int, sched_steps: int, min_p: float) -> float:
+    def get_sampling_p(step_idx: int, sched_steps: int, min_p: float, nominal_pitfall: float = 0.0, current_loss: Optional[float] = None) -> Tuple[float, float, float]:
         if args.deliberation_mode == "teacher_forcing":
-            return 1.0
-        if args.deliberation_mode == "internal":
-            return min_p
+            return 1.0, 0.0, 0.0
         if sched_steps <= 0:
-            return min_p
-        # Relative annealing from start_step allows smooth curriculum transition on resumption without gradient shock
-        elapsed = max(0, step_idx - start_step)
-        ratio = min(1.0, float(elapsed) / float(sched_steps))
-        coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
-        return float(min_p + (1.0 - min_p) * coeff)
+            nominal_p = min_p
+        elif args.deliberation_mode == "internal":
+            nominal_p = min_p
+        else:
+            # Relative annealing from start_step allows smooth curriculum transition on resumption without gradient shock
+            elapsed = max(0, step_idx - start_step)
+            ratio = min(1.0, float(elapsed) / float(sched_steps))
+            coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
+            nominal_p = float(min_p + (1.0 - min_p) * coeff)
+
+        # Loss-Window Governor: automatically keeps loss within [loss_floor, loss_ceiling]
+        alpha_gov = 0.0
+        if getattr(args, "loss_window_governor", True) and current_loss is not None and math.isfinite(current_loss):
+            c_floor = float(getattr(args, "loss_floor", 2.80))
+            c_ceil = float(getattr(args, "loss_ceiling", 3.25))
+            if c_ceil > c_floor:
+                alpha_gov = max(0.0, min(1.0, (float(current_loss) - c_floor) / (c_ceil - c_floor)))
+
+        # When alpha_gov -> 1.0 (loss climbing), sampling_p floats smoothly back to 1.0 (pure teacher forcing)
+        # and pitfall perturbation is suppressed to 0.0 to stabilize the descent
+        effective_p = nominal_p + alpha_gov * (1.0 - nominal_p)
+        effective_pitfall = nominal_pitfall * (1.0 - alpha_gov)
+        return float(effective_p), float(effective_pitfall), float(alpha_gov)
 
     # 11. High-Throughput Training Loop
     print("\n" + "=" * 80)
@@ -743,6 +762,7 @@ def main(args=None):
     last_cloud_save_time = time.time()
     step_window_tokens = 0
     step_window_count = 0
+    ema_loss: Optional[float] = None
 
     try:
         while step < args.total_steps and not shutdown_requested:
@@ -750,7 +770,11 @@ def main(args=None):
             step += step_stride
 
             cur_lr = get_learning_rate(step, args.total_steps, args.lr, args.min_lr, args.warmup_steps)
-            cur_sampling_p = get_sampling_p(step, args.schedule_steps, args.min_sampling_p)
+            cur_sampling_p, cur_pitfall_prob, alpha_gov = get_sampling_p(
+                step, args.schedule_steps, args.min_sampling_p, args.pitfall_prob, current_loss=ema_loss
+            )
+            if getattr(args, "loss_lr_damping", True) and alpha_gov > 0.0:
+                cur_lr = cur_lr * (1.0 - 0.4 * alpha_gov)
 
             # Training Step
             if use_multi_tpu_local_sgd:
@@ -799,6 +823,10 @@ def main(args=None):
                 )
                 step_tokens = prompt_b.shape[0] * (prompt_b.shape[1] + target_b.shape[1])
 
+            loss_val = float(loss)
+            if math.isfinite(loss_val):
+                ema_loss = loss_val if ema_loss is None else (0.90 * ema_loss + 0.10 * loss_val)
+
             # Step & token throughput accounting
             step_window_tokens += step_tokens
             step_window_count += step_stride
@@ -806,18 +834,18 @@ def main(args=None):
             # Console Progress Logging
             crossed_log = (prev_step == start_step) or ((step // max(1, args.log_every)) > (prev_step // max(1, args.log_every)))
             if crossed_log:
-                loss_val = float(loss)
                 elapsed_log = time.time() - t_last_log
                 steps_per_sec = step_window_count / max(elapsed_log, 1e-6)
                 tok_per_sec = step_window_tokens / max(elapsed_log, 1e-6)
 
+                gov_str = f" | Gov: {alpha_gov:.2f}" if getattr(args, "loss_window_governor", True) and alpha_gov > 0.01 else ""
                 print(
                     f"[Step {step:6d}/{args.total_steps}] "
                     f"Loss: {loss_val:6.4f} | "
                     f"Steps/s: {steps_per_sec:5.2f} | "
                     f"Tok/s: {tok_per_sec:7,.0f} | "
                     f"LR: {cur_lr:.2e} | "
-                    f"Samp_p: {cur_sampling_p:.2f} | "
+                    f"Samp_p: {cur_sampling_p:.2f}{gov_str} | "
                     f"Elapsed: {time.time() - t_start:5.1f}s"
                 )
                 t_last_log = time.time()

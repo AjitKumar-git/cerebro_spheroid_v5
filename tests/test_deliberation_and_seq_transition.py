@@ -108,3 +108,45 @@ def test_autotuner_cache_sig_incorporates_sequence_length():
     seq_suffix_512 = f"_seq{512}" if 512 != 256 else ""
     assert seq_suffix_512 == "_seq512"
     assert f"{sig}{seq_suffix_512}" == f"{sig}_seq512"
+
+
+def test_loss_window_governor_curbs_loss_climb_and_restores_teacher_forcing():
+    """Verifies that the loss-window governor dynamically throttles deliberation and restores teacher forcing."""
+    import argparse
+    from training.train_v5_tpu_jax import parse_args
+
+    args = parse_args([])
+    args.deliberation_mode = "scheduled"
+    args.schedule_steps = 1000
+    args.min_sampling_p = 0.5
+    args.pitfall_prob = 0.15
+    args.loss_window_governor = True
+    args.loss_floor = 2.80
+    args.loss_ceiling = 3.25
+
+    # Simulated step beyond schedule: nominal deliberation reached min_sampling_p (0.50)
+    # 1. Healthy loss <= floor (e.g. 2.75): full deliberation permitted
+    alpha = max(0.0, min(1.0, (2.75 - args.loss_floor) / (args.loss_ceiling - args.loss_floor)))
+    eff_p = 0.5 + alpha * (1.0 - 0.5)
+    eff_pitfall = args.pitfall_prob * (1.0 - alpha)
+    assert alpha == 0.0
+    assert eff_p == 0.5
+    assert eff_pitfall == 0.15
+
+    # 2. Moderate loss in mid-window (e.g. 3.025): governor gently floats sampling_p up and damps pitfall
+    alpha_mid = max(0.0, min(1.0, (3.025 - args.loss_floor) / (args.loss_ceiling - args.loss_floor)))
+    eff_p_mid = 0.5 + alpha_mid * (1.0 - 0.5)
+    eff_pitfall_mid = args.pitfall_prob * (1.0 - alpha_mid)
+    assert abs(alpha_mid - 0.5) < 1e-4
+    assert abs(eff_p_mid - 0.75) < 1e-4
+    assert abs(eff_pitfall_mid - 0.075) < 1e-4
+
+    # 3. Critical loss climbing to 3.7 - 3.9: governor triggers immediate 100% teacher forcing and zeroes pitfalls
+    for high_loss in [3.25, 3.50, 3.70, 3.90]:
+        alpha_high = max(0.0, min(1.0, (high_loss - args.loss_floor) / (args.loss_ceiling - args.loss_floor)))
+        eff_p_high = 0.5 + alpha_high * (1.0 - 0.5)
+        eff_pitfall_high = args.pitfall_prob * (1.0 - alpha_high)
+        assert alpha_high == 1.0, f"Expected full brake at loss {high_loss}"
+        assert eff_p_high == 1.0, f"Expected 100% teacher forcing at loss {high_loss}"
+        assert eff_pitfall_high == 0.0, f"Expected zero pitfall perturbation at loss {high_loss}"
+

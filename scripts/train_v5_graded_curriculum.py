@@ -165,6 +165,10 @@ def parse_args():
     parser.add_argument("--schedule-steps", "--schedule_steps", dest="schedule_steps", type=int, default=5000, help="Steps to anneal from teacher-forcing down to min_sampling_p (default: 5000)")
     parser.add_argument("--min-sampling-p", "--min_sampling_p", dest="min_sampling_p", type=float, default=0.5, help="Minimum teacher sampling floor (default: 0.5 for active self-deliberation and error recovery)")
     parser.add_argument("--pitfall-prob", "--pitfall_prob", dest="pitfall_prob", type=float, default=0.15, help="Probability of exploring counterfactual/pitfall thoughts during deliberation (default: 0.15)")
+    parser.add_argument("--loss-window-governor", action=argparse.BooleanOptionalAction, default=True, help="Automatically clamp deliberation and float sampling_p back to 1.0 if loss climbs above window ceiling")
+    parser.add_argument("--loss-ceiling", type=float, default=3.25, help="Upper loss boundary: if smoothed loss exceeds this, restore full (100%%) teacher forcing to prevent loss climb (default: 3.25)")
+    parser.add_argument("--loss-floor", type=float, default=2.80, help="Lower loss boundary: if smoothed loss is at/below this, permit full deliberation at min_sampling_p (default: 2.80)")
+    parser.add_argument("--loss-lr-damping", action=argparse.BooleanOptionalAction, default=True, help="Damp learning rate when loss is climbing towards ceiling to prevent optimizer overshoot")
     parser.add_argument("--max-lr", type=float, default=5e-4, help="Peak learning rate (default: 5e-4 matching TPU)")
     parser.add_argument("--warmup-steps", type=int, default=500, help="Linear warmup steps (default: 500 matching TPU)")
     parser.add_argument("--log-interval", type=int, default=10, help="Steps between log lines")
@@ -618,17 +622,40 @@ def _run_training(
     latest_eval_loss = None
     best_eval_loss = best_loss if math.isfinite(best_loss) else float("inf")
 
-    def get_sampling_p(step_idx: int, start_s: int, sched_steps: int, min_p: float, mode: str) -> float:
+    def get_sampling_p(
+        step_idx: int,
+        start_s: int,
+        sched_steps: int,
+        min_p: float,
+        mode: str,
+        nominal_pitfall: float = 0.0,
+        current_loss: Optional[float] = None,
+    ) -> Tuple[float, float, float]:
         if mode == "teacher_forcing":
-            return 1.0
-        if mode == "internal":
-            return min_p
+            return 1.0, 0.0, 0.0
         if sched_steps <= 0:
-            return min_p
-        elapsed = max(0, step_idx - start_s)
-        ratio = min(1.0, float(elapsed) / float(sched_steps))
-        coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
-        return float(min_p + (1.0 - min_p) * coeff)
+            nominal_p = min_p
+        elif mode == "internal":
+            nominal_p = min_p
+        else:
+            elapsed = max(0, step_idx - start_s)
+            ratio = min(1.0, float(elapsed) / float(sched_steps))
+            coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
+            nominal_p = float(min_p + (1.0 - min_p) * coeff)
+
+        # Loss-Window Governor: automatically keeps loss strictly within [loss_floor, loss_ceiling]
+        alpha_gov = 0.0
+        if getattr(args, "loss_window_governor", True) and current_loss is not None and math.isfinite(current_loss):
+            c_floor = float(getattr(args, "loss_floor", 2.80))
+            c_ceil = float(getattr(args, "loss_ceiling", 3.25))
+            if c_ceil > c_floor:
+                alpha_gov = max(0.0, min(1.0, (float(current_loss) - c_floor) / (c_ceil - c_floor)))
+
+        effective_p = nominal_p + alpha_gov * (1.0 - nominal_p)
+        effective_pitfall = nominal_pitfall * (1.0 - alpha_gov)
+        return float(effective_p), float(effective_pitfall), float(alpha_gov)
+
+    ema_loss: Optional[float] = None
 
     try:
         while step < max_steps:
@@ -658,17 +685,25 @@ def _run_training(
                     }, boundary_ckpt)
                     print(f"[Checkpoint Saved] Phase boundary snapshot: {boundary_ckpt}")
 
+            cur_sampling_p, cur_pitfall_prob, alpha_gov = get_sampling_p(
+                step,
+                start_step,
+                args.schedule_steps,
+                args.min_sampling_p,
+                args.deliberation_mode,
+                nominal_pitfall=args.pitfall_prob if args.deliberation_mode in ("pitfall_recovery", "scheduled") else 0.0,
+                current_loss=ema_loss,
+            )
+
             # Update dynamic learning rate while preserving per-group LR ratios (lr_1d, lr_vocab)
             lr = compute_curriculum_lr(step, schedule_config)
+            if getattr(args, "loss_lr_damping", True) and alpha_gov > 0.0:
+                lr = lr * (1.0 - 0.4 * alpha_gov)
             lr_scale = lr / max(schedule_config.max_lr, 1e-12)
             for pg in optimizer.param_groups:
                 pg["lr"] = pg["initial_lr"] * lr_scale
 
             optimizer.zero_grad(set_to_none=True)
-
-            cur_sampling_p = get_sampling_p(
-                step, start_step, args.schedule_steps, args.min_sampling_p, args.deliberation_mode
-            )
 
             # Gradient accumulation loop (every micro-batch preserves Strategy-A prompt/target/feedback parity)
             for micro in range(args.grad_accum):
@@ -697,7 +732,7 @@ def _run_training(
                             targets=targets,
                             feedback_tokens=feedback,
                             sampling_p=cur_sampling_p,
-                            pitfall_prob=args.pitfall_prob if args.deliberation_mode in ("pitfall_recovery", "scheduled") else 0.0,
+                            pitfall_prob=cur_pitfall_prob,
                             pad_id=pad_id,
                             perceptual_inputs=perceptual_inputs,
                             compute_action=compute_action,
@@ -768,7 +803,8 @@ def _run_training(
                     vram_mb = torch.cuda.memory_reserved(device) / (1024**2) if use_cuda else 0.0
                     act_str = f" | ActLoss: {avg_act_loss:.4f}" if current_phase >= CurriculumPhase.PHASE_3_WORKFLOWS else ""
                     eval_str = f" | Eval: {latest_eval_loss:.4f} (Best: {best_eval_loss:.4f})" if latest_eval_loss is not None else ""
-                    samp_str = f" | Samp_p: {cur_sampling_p:.2f}"
+                    gov_str = f" (Gov: {alpha_gov:.2f})" if getattr(args, "loss_window_governor", True) and alpha_gov > 0.01 else ""
+                    samp_str = f" | Samp_p: {cur_sampling_p:.2f}{gov_str}"
                     print(
                         f"[Step {step:6d}/{max_steps}] Phase: {int(current_phase)} ({PHASE_NAMES[current_phase][:16]}...) | "
                         f"Loss: {avg_loss:.4f} (EMA: {ema_loss:.4f}){eval_str}{samp_str}{act_str} | LR: {lr:.2e} | "
