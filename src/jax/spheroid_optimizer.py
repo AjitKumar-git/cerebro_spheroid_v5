@@ -296,7 +296,7 @@ def _apply_spheroid_grads(
 
 
 def _is_pure_teacher_forcing(sampling_p: Any) -> bool:
-    return (not isinstance(sampling_p, jax.Array)) and (float(sampling_p) >= 1.0)
+    return (not isinstance(sampling_p, jax.Array)) and (float(sampling_p) >= 1.0 - 1e-4)
 
 
 def build_spheroid_train_engine(

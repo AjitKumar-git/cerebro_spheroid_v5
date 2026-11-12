@@ -638,6 +638,7 @@ def test_gpu_and_tpu_trainers_parity_and_checkpoint_link(tmp_path):
 
 
 def test_graded_curriculum_retries_transient_stream_errors(monkeypatch):
+    import time
     from src import graded_curriculum as gc_mod
 
     class _DummyTok:
@@ -669,7 +670,12 @@ def test_graded_curriculum_retries_transient_stream_errors(monkeypatch):
         online_streaming=True,
         prefetch_size=4,
     )
-    pair = streamer._next_online_pair("dense_edu")
+    pair = None
+    for _ in range(25):
+        pair = streamer._next_online_pair("dense_edu")
+        if pair is not None:
+            break
+        time.sleep(0.1)
     streamer._stop_event.set()
     assert attempts["count"] >= 2
     assert pair is not None

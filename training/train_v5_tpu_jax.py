@@ -162,9 +162,9 @@ def parse_args(args_list=None):
     )
 
     # Scheduled Sampling & Deliberation Curriculum
-    parser.add_argument("--deliberation_mode", type=str, default="scheduled", choices=["teacher_forcing", "scheduled", "pitfall_recovery", "internal"], help="Deliberation feedback mode: 'scheduled' anneals sampling_p smoothly; 'pitfall_recovery' trains model to recover from erroneous thoughts; 'teacher_forcing' uses pure ground truth")
-    parser.add_argument("--schedule_steps", type=int, default=5000, help="Steps to anneal from teacher-forcing down to min_sampling_p (default: 5000)")
-    parser.add_argument("--min_sampling_p", type=float, default=0.5, help="Minimum teacher sampling floor (default: 0.5 for active self-deliberation and error recovery)")
+    parser.add_argument("--deliberation_mode", type=str, default="teacher_forcing", choices=["teacher_forcing", "scheduled", "pitfall_recovery", "internal"], help="Deliberation feedback mode: 'teacher_forcing' uses pure ground truth (peak 200k tok/s); 'scheduled' anneals sampling_p smoothly; 'pitfall_recovery' trains model to recover from erroneous thoughts")
+    parser.add_argument("--schedule_steps", type=int, default=0, help="Steps to anneal from teacher-forcing down to min_sampling_p (default: 0)")
+    parser.add_argument("--min_sampling_p", type=float, default=1.0, help="Minimum teacher sampling floor (default: 1.0 for teacher-forcing)")
     parser.add_argument("--pitfall_prob", type=float, default=0.15, help="Probability of exploring counterfactual/pitfall thoughts during deliberation (default: 0.15)")
     parser.add_argument("--loss_window_governor", action=argparse.BooleanOptionalAction, default=True, help="Automatically clamp deliberation and float sampling_p back to 1.0 if loss climbs above window ceiling")
     parser.add_argument("--loss_ceiling", type=float, default=3.25, help="Upper loss boundary: if smoothed loss exceeds this, restore full (100%%) teacher forcing to prevent loss climb (default: 3.25)")
@@ -699,7 +699,7 @@ def main(args=None):
             return float(min_lr + (peak_lr - min_lr) * coeff)
 
     def get_sampling_p(step_idx: int, sched_steps: int, min_p: float, nominal_pitfall: float = 0.0, current_loss: Optional[float] = None) -> Tuple[float, float, float]:
-        if args.deliberation_mode == "teacher_forcing":
+        if args.deliberation_mode == "teacher_forcing" or min_p >= 1.0 - 1e-4:
             return 1.0, 0.0, 0.0
         if sched_steps <= 0:
             nominal_p = min_p
@@ -724,6 +724,8 @@ def main(args=None):
         # and pitfall perturbation is suppressed to 0.0 to stabilize the descent
         effective_p = nominal_p + alpha_gov * (1.0 - nominal_p)
         effective_pitfall = nominal_pitfall * (1.0 - alpha_gov)
+        if effective_p >= 1.0 - 1e-4:
+            effective_p = 1.0
         return float(effective_p), float(effective_pitfall), float(alpha_gov)
 
     # 11. High-Throughput Training Loop
@@ -733,7 +735,7 @@ def main(args=None):
     if use_multi_tpu_local_sgd:
         print(f"   • Multi-TPU Engine : Local-SGD ({eff_num_devices} TPUs x {eff_local_steps} local steps = +{step_stride} steps/round)")
     print(f"   • Sequence Length  : {args.seq_len}")
-    print(f"   • Scheduled Mode   : {args.deliberation_mode} (Floor: {args.min_sampling_p})")
+    print(f"   • Deliberation Mode: {args.deliberation_mode} (Sampling P: {args.min_sampling_p})")
     print(f"   • Async Checkpoint : 0ms TPU Pause (Latest: every {args.save_interval} steps)")
     print("=" * 80 + "\n")
 

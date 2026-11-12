@@ -693,7 +693,7 @@ def training_rollout(
             or (
                 pure_teacher_forcing is None
                 and (not isinstance(sampling_p, jax.Array))
-                and (float(sampling_p) >= 1.0)
+                and (float(sampling_p) >= 1.0 - 1e-4)
             )
         )
     )

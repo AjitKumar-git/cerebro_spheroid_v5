@@ -170,9 +170,9 @@ def parse_args():
     parser.add_argument("--seq-len", type=int, default=256, help="Target sequence length in TPU-parity static mode (default: 256)")
     parser.add_argument("--target-seq-len", "--target_seq_len", dest="target_seq_len", type=int, default=None, help="Target sequence length to transition toward (e.g. 512 or 1024)")
     parser.add_argument("--seq-transition-steps", "--seq_transition_steps", dest="seq_transition_steps", type=int, default=0, help="Steps over which to transition sequence length (0 = immediate transition to target_seq_len)")
-    parser.add_argument("--deliberation-mode", "--deliberation_mode", dest="deliberation_mode", type=str, default="scheduled", choices=["teacher_forcing", "scheduled", "pitfall_recovery", "internal"], help="Deliberation feedback mode: 'scheduled' anneals sampling_p; 'pitfall_recovery' trains error recovery; 'teacher_forcing' uses pure ground truth")
-    parser.add_argument("--schedule-steps", "--schedule_steps", dest="schedule_steps", type=int, default=5000, help="Steps to anneal from teacher-forcing down to min_sampling_p (default: 5000)")
-    parser.add_argument("--min-sampling-p", "--min_sampling_p", dest="min_sampling_p", type=float, default=0.5, help="Minimum teacher sampling floor (default: 0.5 for active self-deliberation and error recovery)")
+    parser.add_argument("--deliberation-mode", "--deliberation_mode", dest="deliberation_mode", type=str, default="teacher_forcing", choices=["teacher_forcing", "scheduled", "pitfall_recovery", "internal"], help="Deliberation feedback mode: 'teacher_forcing' uses pure ground truth (peak throughput); 'scheduled' anneals sampling_p; 'pitfall_recovery' trains error recovery")
+    parser.add_argument("--schedule-steps", "--schedule_steps", dest="schedule_steps", type=int, default=0, help="Steps to anneal from teacher-forcing down to min_sampling_p (default: 0)")
+    parser.add_argument("--min-sampling-p", "--min_sampling_p", dest="min_sampling_p", type=float, default=1.0, help="Minimum teacher sampling floor (default: 1.0 for teacher-forcing)")
     parser.add_argument("--pitfall-prob", "--pitfall_prob", dest="pitfall_prob", type=float, default=0.15, help="Probability of exploring counterfactual/pitfall thoughts during deliberation (default: 0.15)")
     parser.add_argument("--loss-window-governor", action=argparse.BooleanOptionalAction, default=True, help="Automatically clamp deliberation and float sampling_p back to 1.0 if loss climbs above window ceiling")
     parser.add_argument("--loss-ceiling", type=float, default=3.25, help="Upper loss boundary: if smoothed loss exceeds this, restore full (100%%) teacher forcing to prevent loss climb (default: 3.25)")
@@ -677,7 +677,7 @@ def _run_training(
         nominal_pitfall: float = 0.0,
         current_loss: Optional[float] = None,
     ) -> Tuple[float, float, float]:
-        if mode == "teacher_forcing":
+        if mode == "teacher_forcing" or min_p >= 1.0 - 1e-4:
             return 1.0, 0.0, 0.0
         if sched_steps <= 0:
             nominal_p = min_p
@@ -699,6 +699,8 @@ def _run_training(
 
         effective_p = nominal_p + alpha_gov * (1.0 - nominal_p)
         effective_pitfall = nominal_pitfall * (1.0 - alpha_gov)
+        if effective_p >= 1.0 - 1e-4:
+            effective_p = 1.0
         return float(effective_p), float(effective_pitfall), float(alpha_gov)
 
     ema_loss: Optional[float] = None
