@@ -289,8 +289,12 @@ def encode_sensory(
     # Additive zero-init positional encoding (preserves legacy weights identically at step 0 of transfer)
     if "sensory.pos_embed.weight" in params:
         pos_tbl = params["sensory.pos_embed.weight"]
-        pos_ids = jnp.clip(jnp.arange(L) + pos_offset, 0, pos_tbl.shape[0] - 1)
-        x = x + pos_tbl[pos_ids][None, :, :].astype(x.dtype)
+        max_p = pos_tbl.shape[0]
+        raw_pos = jnp.arange(L) + pos_offset
+        pos_ids = raw_pos % max_p
+        scale_factor = (raw_pos // max_p).astype(jnp.float32)[:, None]
+        pos_enc = pos_tbl[pos_ids] * (1.0 / (1.0 + 0.05 * scale_factor))
+        x = x + pos_enc[None, :, :].astype(x.dtype)
 
     h = rms_norm(x, params["sensory.norm_in.weight"])
     h_swiglu = swiglu(h, params["sensory.swiglu.fc_gate.weight"], params["sensory.swiglu.fc_val.weight"], params["sensory.swiglu.fc_down.weight"])
