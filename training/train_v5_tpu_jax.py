@@ -171,6 +171,14 @@ def parse_args(args_list=None):
     parser.add_argument("--loss_floor", type=float, default=2.80, help="Lower loss boundary: if smoothed loss is at/below this, permit full deliberation at min_sampling_p (default: 2.80)")
     parser.add_argument("--loss_lr_damping", action=argparse.BooleanOptionalAction, default=True, help="Damp learning rate when loss is climbing towards ceiling to prevent optimizer overshoot")
 
+    # Target Workload & Cognitive Steering Hyperparameters
+    parser.add_argument("--num_mtp_heads", "--num-mtp-heads", dest="num_mtp_heads", type=int, default=1, choices=[1, 2, 3, 4], help="Multi-Token Prediction heads (1: standard single-token emission; 2 or 3: speculative decoding & future-token predictive training)")
+    parser.add_argument("--persona_id", "--persona-id", dest="persona_id", type=int, default=None, choices=[0, 1, 2, 3], help="Cognitive Persona Steering basis (None: unbiased representation; 0: Reasoner, 1: Explorer, 2: Concise, 3: Verifier)")
+    parser.add_argument("--use_adaptive_thinking", "--use-adaptive-thinking", dest="use_adaptive_thinking", action=argparse.BooleanOptionalAction, default=True, help="Toggle dynamic subconscious deliberation halting gate (True: adaptive thinking up to max cycles; False: fast fixed cycles)")
+    parser.add_argument("--no_adaptive_thinking", "--no-adaptive-thinking", dest="use_adaptive_thinking", action="store_false", help="Disable adaptive thinking (use fast fixed cycles)")
+    parser.add_argument("--thinking_cycles", "--thinking-cycles", dest="thinking_cycles", type=int, default=4, help="Subconscious deliberation iterations per token (default: 4)")
+    parser.add_argument("--max_thinking_cycles", "--max-thinking-cycles", dest="max_thinking_cycles", type=int, default=16, help="Maximum thinking cycles when adaptive thinking is active (default: 16)")
+
     # Data Source & Tokenizer
     parser.add_argument("--dataset_source", "--dataset-source", dest="dataset_source", type=str, default="dense_edu",
                         choices=["dense_edu", "local", "conversation_sft", "balanced_mix", "reasoning_anneal", "fineweb_edu", "openhermes"],
@@ -348,7 +356,16 @@ def main(args=None):
     config_preset = "v5_small" if args.preset in ("tpu_v5e_1", "tpu_v6e_1", "tpu_v6e") else args.preset
     if config_preset not in PRESETS_V5:
         config_preset = "v5_small"
-    config = JAXConfigV5(**PRESETS_V5[config_preset])
+    cfg_kwargs = PRESETS_V5[config_preset].copy()
+    if getattr(args, "num_mtp_heads", None) is not None:
+        cfg_kwargs["num_mtp_heads"] = args.num_mtp_heads
+    if getattr(args, "use_adaptive_thinking", None) is not None:
+        cfg_kwargs["use_adaptive_thinking"] = args.use_adaptive_thinking
+    if getattr(args, "thinking_cycles", None) is not None:
+        cfg_kwargs["thinking_cycles"] = args.thinking_cycles
+    if getattr(args, "max_thinking_cycles", None) is not None:
+        cfg_kwargs["max_thinking_cycles"] = args.max_thinking_cycles
+    config = JAXConfigV5(**cfg_kwargs)
     params, buffers = init_params_v5(jax.random.PRNGKey(42), config)
 
     # Convert parameter arrays to target precision

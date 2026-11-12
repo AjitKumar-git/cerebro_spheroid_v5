@@ -150,3 +150,41 @@ def test_loss_window_governor_curbs_loss_climb_and_restores_teacher_forcing():
         assert eff_p_high == 1.0, f"Expected 100% teacher forcing at loss {high_loss}"
         assert eff_pitfall_high == 0.0, f"Expected zero pitfall perturbation at loss {high_loss}"
 
+
+def test_workload_hyperparameters_cli_and_model_parity(monkeypatch):
+    """Verifies MTP, Persona Steering, and Adaptive Thinking CLI flags and model config wiring."""
+    import sys
+    from scripts.train_v5_graded_curriculum import parse_args as parse_gpu_args
+    from training.train_v5_tpu_jax import parse_args as parse_tpu_args
+
+    # 1. Test GPU CLI parsing
+    monkeypatch.setattr(sys, "argv", [
+        "train_v5_graded_curriculum.py",
+        "--num-mtp-heads", "3",
+        "--persona-id", "1",
+        "--no-adaptive-thinking",
+        "--thinking-cycles", "6",
+        "--max-thinking-cycles", "20",
+    ])
+    gpu_args = parse_gpu_args()
+    assert gpu_args.num_mtp_heads == 3
+    assert gpu_args.persona_id == 1
+    assert gpu_args.use_adaptive_thinking is False
+    assert gpu_args.thinking_cycles == 6
+    assert gpu_args.max_thinking_cycles == 20
+
+    # 2. Test TPU CLI parsing
+    tpu_args = parse_tpu_args([
+        "--num_mtp_heads", "2",
+        "--persona_id", "2",
+        "--use_adaptive_thinking",
+        "--thinking_cycles", "8",
+        "--max_thinking_cycles", "12",
+    ])
+    assert tpu_args.num_mtp_heads == 2
+    assert tpu_args.persona_id == 2
+    assert tpu_args.use_adaptive_thinking is True
+    assert tpu_args.thinking_cycles == 8
+    assert tpu_args.max_thinking_cycles == 12
+
+

@@ -133,6 +133,7 @@ class _CerebroDDPModule(nn.Module):
         pad_id: int = 0,
         perceptual_inputs: Optional[torch.Tensor] = None,
         compute_action: bool = False,
+        persona_id: Optional[int] = None,
     ):
         ce_loss, logits = self.model(
             input_ids,
@@ -142,6 +143,7 @@ class _CerebroDDPModule(nn.Module):
             pitfall_prob=pitfall_prob,
             pad_id=pad_id,
             perceptual_inputs=perceptual_inputs,
+            persona_id=persona_id,
         )
         action_logits = None
         if compute_action:
@@ -181,6 +183,12 @@ def parse_args():
     parser.add_argument("--elastic-window", action=argparse.BooleanOptionalAction, default=False, help="Enable multi-bucket elastic sliding window instead of static TPU (32, 256) shape")
     parser.add_argument("--total-window", type=int, default=288, help="Total sequence budget (prompt + response) for elastic window")
     parser.add_argument("--tail-prob", type=float, default=0.25, help="V4 tail probability for EOS representation in window sampling")
+    parser.add_argument("--num-mtp-heads", "--num_mtp_heads", dest="num_mtp_heads", type=int, default=1, choices=[1, 2, 3, 4], help="Multi-Token Prediction heads (1: standard single-token emission; 2 or 3: speculative decoding & future-token predictive training)")
+    parser.add_argument("--persona-id", "--persona_id", dest="persona_id", type=int, default=None, choices=[0, 1, 2, 3], help="Cognitive Persona Steering basis (None: unbiased representation; 0: Reasoner, 1: Explorer, 2: Concise, 3: Verifier)")
+    parser.add_argument("--use-adaptive-thinking", "--use_adaptive_thinking", dest="use_adaptive_thinking", action=argparse.BooleanOptionalAction, default=True, help="Toggle dynamic subconscious deliberation halting gate (True: adaptive thinking up to max cycles; False: fast fixed cycles)")
+    parser.add_argument("--no-adaptive-thinking", "--no_adaptive_thinking", dest="use_adaptive_thinking", action="store_false", help="Disable adaptive thinking (use fast fixed cycles)")
+    parser.add_argument("--thinking-cycles", "--thinking_cycles", dest="thinking_cycles", type=int, default=4, help="Subconscious deliberation iterations per token (default: 4)")
+    parser.add_argument("--max-thinking-cycles", "--max_thinking_cycles", dest="max_thinking_cycles", type=int, default=16, help="Maximum thinking cycles when adaptive thinking is active (default: 16)")
     parser.add_argument("--model-preset", type=str, default="v5_small", choices=["v5_small", "v5_compact", "v5_base"], help="Model preset architecture tier (v5_small: 101M, v5_compact: 244M, v5_base: 617M)")
     parser.add_argument("--mix", type=str, default="auto", choices=["auto", "foundation", "reasoning", "code", "agentic", "consolidation"], help="Curriculum data mixture selection")
     parser.add_argument("--optimizer", type=str, default="spheroid", choices=["spheroid", "adafactor", "adamw"], help="Optimizer to use (default: custom SpheroidOptimizer with Polar Newton-Schulz & spectral clamp)")
@@ -473,6 +481,15 @@ def _run_training(
             preset_kwargs["vocab_size"] = tokenizer.vocab_size
         config = ModelConfigV5(**preset_kwargs)
 
+    if getattr(args, "num_mtp_heads", None) is not None:
+        config.num_mtp_heads = args.num_mtp_heads
+    if getattr(args, "use_adaptive_thinking", None) is not None:
+        config.use_adaptive_thinking = args.use_adaptive_thinking
+    if getattr(args, "thinking_cycles", None) is not None:
+        config.thinking_cycles = args.thinking_cycles
+    if getattr(args, "max_thinking_cycles", None) is not None:
+        config.max_thinking_cycles = args.max_thinking_cycles
+
     torch.manual_seed(args.seed)
     raw_model = CerebroSpheroidV5(config).to(device)
     raw_action_head = ToolActionHead(surface_dim=config.surface_dim, num_actions=len(ActionType)).to(device)
@@ -752,6 +769,7 @@ def _run_training(
                             pad_id=pad_id,
                             perceptual_inputs=perceptual_inputs,
                             compute_action=compute_action,
+                            persona_id=args.persona_id,
                         )
                         if compute_action and action_logits is not None:
                             act_loss = action_loss_fn(action_logits, action_labels)
@@ -780,7 +798,13 @@ def _run_training(
                     with torch.amp.autocast("cuda", enabled=use_cuda, dtype=amp_dtype):
                         v_losses = []
                         for ev_p, ev_t, ev_fb in fixed_eval_batches:
-                            ev_out, _ = raw_model(ev_p, targets=ev_t, feedback_tokens=ev_fb, pad_id=pad_id)
+                            ev_out, _ = raw_model(
+                                ev_p,
+                                targets=ev_t,
+                                feedback_tokens=ev_fb,
+                                pad_id=pad_id,
+                                persona_id=args.persona_id,
+                            )
                             v_losses.append(float(ev_out.item()))
                         cur_eval_loss = sum(v_losses) / len(v_losses)
                 if is_distributed:
