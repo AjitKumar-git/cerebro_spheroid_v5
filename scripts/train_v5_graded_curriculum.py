@@ -214,6 +214,20 @@ def _atomic_save_and_link(payload: dict, primary_path: str, legacy_path: str) ->
     os.replace(tmp_legacy, legacy_path)
 
 
+def _to_bfloat16_state(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Converts floating-point tensors (float32/float64) in a state dict to CPU bfloat16 for compact serialization and upload."""
+    converted = {}
+    for k, v in state_dict.items():
+        if isinstance(v, torch.Tensor):
+            if v.is_floating_point() and v.dtype in (torch.float32, torch.float64):
+                converted[k] = v.detach().to(device="cpu", dtype=torch.bfloat16)
+            else:
+                converted[k] = v.detach().to(device="cpu")
+        else:
+            converted[k] = v
+    return converted
+
+
 def _save_and_push_checkpoints(
     checkpoint_dir: str,
     model_preset: str,
@@ -228,12 +242,14 @@ def _save_and_push_checkpoints(
     eval_loss: Optional[float] = None,
     final_save: bool = False,
 ) -> float:
-    """Persist local latest/best/step checkpoints and enqueue optional bioflo.in upload."""
+    """Persist local latest/best/step checkpoints (in bfloat16) and enqueue optional bioflo.in upload."""
     metric_loss = eval_loss if (eval_loss is not None and math.isfinite(eval_loss) and eval_loss > 0.0) else loss_val
+    model_sd = _to_bfloat16_state(raw_model.state_dict())
+    action_sd = _to_bfloat16_state(raw_action_head.state_dict())
     ckpt_payload = {
         "step": step,
-        "model_state": raw_model.state_dict(),
-        "action_head_state": raw_action_head.state_dict(),
+        "model_state": model_sd,
+        "action_head_state": action_sd,
         "config": config,
         "loss": loss_val,
         "eval_loss": eval_loss if eval_loss is not None else loss_val,
@@ -679,8 +695,8 @@ def _run_training(
                     boundary_ckpt = os.path.join(args.checkpoint_dir, f"v5_phase_{int(new_phase)}_boundary_{step}.pt")
                     torch.save({
                         "step": step,
-                        "model_state": raw_model.state_dict(),
-                        "action_head_state": raw_action_head.state_dict(),
+                        "model_state": _to_bfloat16_state(raw_model.state_dict()),
+                        "action_head_state": _to_bfloat16_state(raw_action_head.state_dict()),
                         "config": config,
                     }, boundary_ckpt)
                     print(f"[Checkpoint Saved] Phase boundary snapshot: {boundary_ckpt}")

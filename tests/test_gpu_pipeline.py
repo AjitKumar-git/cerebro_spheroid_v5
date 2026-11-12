@@ -939,4 +939,86 @@ def test_efference_non_linear_projection_active():
     assert torch.isfinite(s2).all()
 
 
+def test_gpu_checkpoint_save_and_cloud_sync_converts_to_bfloat16(tmp_path):
+    """Verifies GPU checkpoints are converted to bfloat16 before saving and uploading."""
+    from scripts.train_v5_graded_curriculum import _save_and_push_checkpoints, _to_bfloat16_state
+    from src.cloud_sync import _ensure_bfloat16_checkpoint
+    from src.agentic_harness import ToolActionHead, ActionType
+
+    cfg = ModelConfigV5(
+        vocab_size=128,
+        num_shells=3,
+        surface_dim=32,
+        radial_dim=16,
+        num_heads=4,
+        max_phase_steps=32,
+    )
+    # Model in FP32 (master weights on GPU)
+    model = CerebroSpheroidV5(cfg).float()
+    action_head = ToolActionHead(surface_dim=cfg.surface_dim, num_actions=len(ActionType)).float()
+
+    # 1. Test _to_bfloat16_state helper directly
+    sd = model.state_dict()
+    assert any(v.dtype == torch.float32 for v in sd.values() if isinstance(v, torch.Tensor) and v.is_floating_point())
+    bf16_sd = _to_bfloat16_state(sd)
+    for k, v in bf16_sd.items():
+        if isinstance(v, torch.Tensor) and v.is_floating_point():
+            assert v.dtype == torch.bfloat16, f"Tensor {k} should be bfloat16, got {v.dtype}"
+        elif isinstance(v, torch.Tensor):
+            assert v.dtype in (torch.int64, torch.long, torch.int32)
+
+    # 2. Test _save_and_push_checkpoints saves bfloat16 on disk
+    ckpt_dir = str(tmp_path / "ckpts")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    _save_and_push_checkpoints(
+        checkpoint_dir=ckpt_dir,
+        model_preset="v5_test",
+        raw_model=model,
+        raw_action_head=action_head,
+        config=cfg,
+        step=500,
+        loss_val=3.10,
+        best_loss=99.0,
+        need_local_save=True,
+        need_cloud_sync=False,
+    )
+
+    saved_latest = os.path.join(ckpt_dir, "v5_test_latest.pt")
+    saved_step = os.path.join(ckpt_dir, "v5_test_step_500.pt")
+    assert os.path.exists(saved_latest)
+    assert os.path.exists(saved_step)
+
+    data_latest = torch.load(saved_latest, map_location="cpu", weights_only=False)
+    for k, v in data_latest["model_state"].items():
+        if isinstance(v, torch.Tensor) and v.is_floating_point():
+            assert v.dtype == torch.bfloat16, f"Saved tensor {k} should be bfloat16, got {v.dtype}"
+
+    for k, v in data_latest["action_head_state"].items():
+        if isinstance(v, torch.Tensor) and v.is_floating_point():
+            assert v.dtype == torch.bfloat16, f"Saved action tensor {k} should be bfloat16, got {v.dtype}"
+
+    # 3. Test _ensure_bfloat16_checkpoint converts raw float32 file before upload
+    legacy_fp32_file = str(tmp_path / "legacy_fp32.pt")
+    torch.save({
+        "step": 100,
+        "model_state": {k: v.float() if (isinstance(v, torch.Tensor) and v.is_floating_point()) else v for k, v in sd.items()}
+    }, legacy_fp32_file)
+
+    fp32_sz = os.path.getsize(legacy_fp32_file)
+    _ensure_bfloat16_checkpoint(legacy_fp32_file)
+    bf16_sz = os.path.getsize(legacy_fp32_file)
+    assert bf16_sz < fp32_sz, f"bfloat16 size ({bf16_sz}) should be strictly smaller than fp32 ({fp32_sz})"
+
+    converted_data = torch.load(legacy_fp32_file, map_location="cpu", weights_only=False)
+    for k, v in converted_data["model_state"].items():
+        if isinstance(v, torch.Tensor) and v.is_floating_point():
+            assert v.dtype == torch.bfloat16
+
+    # 4. Roundtrip load into fresh model
+    fresh_model = CerebroSpheroidV5(cfg).float()
+    loaded, total = load_v5_checkpoint_into_torch(fresh_model, data_latest, verbose=False)
+    assert loaded == total
+
+
+
 

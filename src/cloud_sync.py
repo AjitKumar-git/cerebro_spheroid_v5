@@ -266,6 +266,68 @@ def pull_checkpoint(
         return False
 
 
+def _ensure_bfloat16_checkpoint(file_path: str) -> None:
+    """Ensures any PyTorch .pt checkpoint has all floating-point tensors converted to bfloat16 before cloud upload."""
+    if not file_path.endswith(".pt") or not os.path.exists(file_path):
+        return
+    try:
+        import torch
+    except ImportError:
+        return
+
+    try:
+        ckpt = torch.load(file_path, map_location="cpu", weights_only=False)
+        if not isinstance(ckpt, dict):
+            return
+
+        def _has_fp32(d: dict) -> bool:
+            for v in d.values():
+                if isinstance(v, torch.Tensor) and v.is_floating_point() and v.dtype in (torch.float32, torch.float64):
+                    return True
+            return False
+
+        def _convert_dict_to_bf16(d: dict) -> int:
+            count = 0
+            for k, v in d.items():
+                if isinstance(v, torch.Tensor) and v.is_floating_point() and v.dtype in (torch.float32, torch.float64):
+                    d[k] = v.to(torch.bfloat16)
+                    count += 1
+            return count
+
+        has_fp = False
+        target_keys = ["model_state", "state_dict", "action_head_state", "action_head_state_dict"]
+        is_nested = any(k in ckpt for k in target_keys)
+
+        if is_nested:
+            for tk in target_keys:
+                sub = ckpt.get(tk)
+                if isinstance(sub, dict) and _has_fp32(sub):
+                    has_fp = True
+                    break
+        else:
+            has_fp = _has_fp32(ckpt)
+
+        if not has_fp:
+            return
+
+        converted_count = 0
+        if is_nested:
+            for tk in target_keys:
+                sub = ckpt.get(tk)
+                if isinstance(sub, dict):
+                    converted_count += _convert_dict_to_bf16(sub)
+        else:
+            converted_count += _convert_dict_to_bf16(ckpt)
+
+        tmp_out = f"{file_path}.bf16.{os.getpid()}"
+        torch.save(ckpt, tmp_out)
+        os.replace(tmp_out, file_path)
+        new_mb = os.path.getsize(file_path) / 1e6
+        print(f"✅ [cloud_sync] Converted {converted_count} float32 tensors to bfloat16 ({new_mb:.1f} MB) in {os.path.basename(file_path)}")
+    except Exception as e:
+        print(f"⚠️ [cloud_sync] Warning during bfloat16 check: {e}")
+
+
 def push_checkpoint(
     file_path: str,
     step: int,
@@ -284,6 +346,9 @@ def push_checkpoint(
     if not os.path.exists(file_path):
         print(f"⚠️ [cloud_sync] Cannot push: {file_path} not found.")
         return False
+
+    # Ensure any float32 tensors are converted to bfloat16 before chunking and uploading
+    _ensure_bfloat16_checkpoint(file_path)
 
     slot_key = f"{model}_{target_type}" if model else target_type
 
