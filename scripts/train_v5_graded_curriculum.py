@@ -99,9 +99,16 @@ def _has_native_bf16(device_index: int = 0) -> bool:
         return bool(torch.cuda.is_bf16_supported())
 
 
-def _select_amp_dtype(use_cuda: bool, device_index: int = 0) -> torch.dtype:
+def _select_amp_dtype(use_cuda: bool, device_index: int = 0, preferred_dtype: str = "auto") -> torch.dtype:
     """Pick bfloat16 on sm_80+, native FP16 on pre-Ampere GPUs (e.g., Tesla T4), else FP32."""
     if not use_cuda:
+        return torch.float32
+    pref = (preferred_dtype or "auto").lower()
+    if pref in ("float16", "fp16", "half"):
+        return torch.float16
+    elif pref in ("bfloat16", "bf16"):
+        return torch.bfloat16
+    elif pref in ("float32", "fp32"):
         return torch.float32
     return torch.bfloat16 if _has_native_bf16(device_index) else torch.float16
 
@@ -191,6 +198,7 @@ def parse_args():
     parser.add_argument("--max-thinking-cycles", "--max_thinking_cycles", dest="max_thinking_cycles", type=int, default=16, help="Maximum thinking cycles when adaptive thinking is active (default: 16)")
     parser.add_argument("--model-preset", type=str, default="v5_small", choices=["v5_small", "v5_compact", "v5_base"], help="Model preset architecture tier (v5_small: 101M, v5_compact: 244M, v5_base: 617M)")
     parser.add_argument("--mix", type=str, default="auto", choices=["auto", "foundation", "reasoning", "code", "agentic", "consolidation"], help="Curriculum data mixture selection")
+    parser.add_argument("--amp-dtype", "--precision", dest="amp_dtype", type=str, default="auto", choices=["auto", "float16", "fp16", "bfloat16", "bf16", "float32", "fp32"], help="Mixed precision dtype: 'auto' (native BF16 on Ampere+, FP16 on Turing/T4), or explicitly 'float16' / 'bfloat16' / 'float32'")
     parser.add_argument("--optimizer", type=str, default="spheroid", choices=["spheroid", "adafactor", "adamw"], help="Optimizer to use (default: custom SpheroidOptimizer with Polar Newton-Schulz & spectral clamp)")
     parser.add_argument("--from-scratch", "--from_scratch", dest="from_scratch", action="store_true", default=False, help="Start clean from Step 0 without restoring local/cloud checkpoints")
     parser.add_argument("--max-hours", type=float, default=None, help="Wall-clock budget in hours for clean checkpoint save before timeout")
@@ -372,7 +380,7 @@ def _run_training(
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
-    amp_dtype = _select_amp_dtype(use_cuda, gpu_idx)
+    amp_dtype = _select_amp_dtype(use_cuda, gpu_idx, preferred_dtype=getattr(args, "amp_dtype", "auto"))
     scaler = torch.amp.GradScaler("cuda", enabled=(use_cuda and amp_dtype == torch.float16))
     if use_cuda and amp_dtype == torch.bfloat16:
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -402,7 +410,12 @@ def _run_training(
         if use_cuda:
             gpu_name = torch.cuda.get_device_name(gpu_idx)
             vram_gb = torch.cuda.get_device_properties(gpu_idx).total_memory / (1024**3)
-            prec_label = "bfloat16 (Native Tensor Core)" if amp_dtype == torch.bfloat16 else "float16 (Native AMP + GradScaler)"
+            if amp_dtype == torch.bfloat16:
+                prec_label = "bfloat16 (Tensor Core BF16)"
+            elif amp_dtype == torch.float16:
+                prec_label = "float16 (Hardware-Native sm_75 Tensor Cores + GradScaler)"
+            else:
+                prec_label = "float32 (Full FP32)"
             print(f"GPU: {gpu_name} ({vram_gb:.2f} GB VRAM/GPU) | Precision: {prec_label}")
         else:
             print(f"Precision: float32 (CPU)")

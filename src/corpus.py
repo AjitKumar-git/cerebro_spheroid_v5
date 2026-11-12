@@ -180,13 +180,26 @@ def small_parquet_pairs(path: str, seed: int = 0, holdout_every: int = 0,
 # streaming fluff-free educational corpora (zero disk download, zero setup wait)
 # --------------------------------------------------------------------------------------------
 
+def _get_hf_token() -> Optional[str]:
+    """Retrieve Hugging Face API token from environment if present."""
+    return (
+        os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    )
+
+
 def cosmopedia_stream(seed: int = 0) -> Iterator[Pair]:
     """Pure online streaming iterator for Cosmopedia v2 (100% synthetic fluff-free textbooks/articles)."""
     import time
     from datasets import load_dataset
+    hf_tok = _get_hf_token()
+    kw = {"split": "train", "streaming": True}
+    if hf_tok:
+        kw["token"] = hf_tok
     while True:
         try:
-            ds = load_dataset("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", split="train", streaming=True)
+            ds = load_dataset("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", **kw)
             for item in ds:
                 prompt = (item.get("prompt") or "").strip()
                 text = (item.get("text") or item.get("content") or "").strip()
@@ -198,20 +211,26 @@ def cosmopedia_stream(seed: int = 0) -> Iterator[Pair]:
                 if prompt and text:
                     yield (prompt, text)
         except Exception as e:
-            print(f"[corpus stream] Cosmopedia transient stream reconnect: {e}")
-            time.sleep(2)
+            err_msg = str(e).lower()
+            wait_s = 10 if ("429" in err_msg or "rate limit" in err_msg or "too many requests" in err_msg) else 2
+            print(f"[corpus stream] Cosmopedia transient stream reconnect: {e} (backing off {wait_s}s)")
+            time.sleep(wait_s)
 
 
 def fineweb_edu_stream(seed: int = 0, min_score: float = 3.0) -> Iterator[Pair]:
     """Pure online streaming iterator for FineWeb-Edu (AI-scored educational web text >= 3.0)."""
     import time
     from datasets import load_dataset
+    hf_tok = _get_hf_token()
+    kw = {"split": "train", "streaming": True}
+    if hf_tok:
+        kw["token"] = hf_tok
     while True:
         try:
             try:
-                ds = load_dataset("HuggingFaceTB/smollm-corpus", "fineweb-edu-dedup", split="train", streaming=True)
+                ds = load_dataset("HuggingFaceTB/smollm-corpus", "fineweb-edu-dedup", **kw)
             except Exception:
-                ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
+                ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", **kw)
             for item in ds:
                 score = float(item.get("score", 3.5) or item.get("educational_score", 3.5) or 3.5)
                 if score < min_score:
@@ -230,17 +249,23 @@ def fineweb_edu_stream(seed: int = 0, min_score: float = 3.0) -> Iterator[Pair]:
                 if prompt and response:
                     yield (prompt, response)
         except Exception as e:
-            print(f"[corpus stream] FineWeb-Edu transient stream reconnect: {e}")
-            time.sleep(2)
+            err_msg = str(e).lower()
+            wait_s = 10 if ("429" in err_msg or "rate limit" in err_msg or "too many requests" in err_msg) else 2
+            print(f"[corpus stream] FineWeb-Edu transient stream reconnect: {e} (backing off {wait_s}s)")
+            time.sleep(wait_s)
 
 
 def finemath_stream(seed: int = 0) -> Iterator[Pair]:
     """Pure online streaming iterator for FineMath (high-density mathematical equations and proofs)."""
     import time
     from datasets import load_dataset
+    hf_tok = _get_hf_token()
+    kw = {"split": "train", "streaming": True}
+    if hf_tok:
+        kw["token"] = hf_tok
     while True:
         try:
-            ds = load_dataset("HuggingFaceTB/finemath", "finemath-4plus", split="train", streaming=True)
+            ds = load_dataset("HuggingFaceTB/finemath", "finemath-4plus", **kw)
             for item in ds:
                 text = (item.get("text") or "").strip()
                 if len(text) < 60:
@@ -255,17 +280,23 @@ def finemath_stream(seed: int = 0) -> Iterator[Pair]:
                 if prompt and response:
                     yield (prompt, response)
         except Exception as e:
-            print(f"[corpus stream] FineMath transient stream reconnect: {e}")
-            time.sleep(2)
+            err_msg = str(e).lower()
+            wait_s = 10 if ("429" in err_msg or "rate limit" in err_msg or "too many requests" in err_msg) else 2
+            print(f"[corpus stream] FineMath transient stream reconnect: {e} (backing off {wait_s}s)")
+            time.sleep(wait_s)
 
 
 def stack_edu_stream(seed: int = 0) -> Iterator[Pair]:
     """Pure online streaming iterator for Stack-Edu (curated production-grade code)."""
     import time
     from datasets import load_dataset
+    hf_tok = _get_hf_token()
+    kw = {"split": "train", "streaming": True}
+    if hf_tok:
+        kw["token"] = hf_tok
     while True:
         try:
-            ds = load_dataset("devngho/the-stack-mini-edu", "scored_over_4", split="train", streaming=True)
+            ds = load_dataset("devngho/the-stack-mini-edu", "scored_over_4", **kw)
             for item in ds:
                 text = (item.get("content") or item.get("text") or "").strip()
                 if len(text) < 60:
@@ -278,8 +309,10 @@ def stack_edu_stream(seed: int = 0) -> Iterator[Pair]:
                 if prompt and response:
                     yield (prompt, response)
         except Exception as e:
-            print(f"[corpus stream] Stack-Edu transient stream reconnect: {e}")
-            time.sleep(2)
+            err_msg = str(e).lower()
+            wait_s = 10 if ("429" in err_msg or "rate limit" in err_msg or "too many requests" in err_msg) else 2
+            print(f"[corpus stream] Stack-Edu transient stream reconnect: {e} (backing off {wait_s}s)")
+            time.sleep(wait_s)
 
 
 def cosmopedia_pairs(path: str, seed: int = 0, holdout_every: int = 0,

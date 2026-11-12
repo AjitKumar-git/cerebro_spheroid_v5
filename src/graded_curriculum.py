@@ -402,6 +402,15 @@ class GradedCurriculumStreamer:
                                         continue
                         return
                     except Exception as exc:
+                        err_msg = str(exc).lower()
+                        is_rate_limit = "429" in err_msg or "rate limit" in err_msg or "too many requests" in err_msg
+                        if is_rate_limit:
+                            print(
+                                f"⚠️ [online-stream:{stream_key}:r{self.rank}] "
+                                f"HuggingFace 429 Rate Limit encountered. Switching immediately to resilient local/synthetic curriculum."
+                            )
+                            self._online_failed[stream_key] = True
+                            return
                         print(
                             f"⚠️ [online-stream:{stream_key}:r{self.rank}] "
                             f"attempt {attempt + 1}/{max_attempts} failed ({type(exc).__name__}: {exc})"
@@ -424,7 +433,8 @@ class GradedCurriculumStreamer:
         q = self._ensure_online_worker(stream_key)
         if q is None:
             return None
-        wait_s = 20.0 if not self._online_connected.get(stream_key, False) else 2.0
+        # Use low-latency timeout so queue depletion never blocks or throttles GPU throughput
+        wait_s = 0.2 if not self._online_connected.get(stream_key, False) else 0.005
         try:
             pair = q.get(timeout=wait_s)
             self._online_connected[stream_key] = True

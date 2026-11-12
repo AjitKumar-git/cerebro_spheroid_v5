@@ -96,6 +96,16 @@ _DEFAULT_DATASET_REVISIONS: Dict[str, str] = {
 }
 
 
+def _get_hf_token() -> Optional[str]:
+    """Retrieve Hugging Face API token from standard environment variables."""
+    import os
+    return (
+        os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    )
+
+
 def _open_hf_stream(
     repo: str,
     config_name: Optional[str] = None,
@@ -104,7 +114,7 @@ def _open_hf_stream(
     world_size: int = 1,
     revision: Optional[str] = None,
 ) -> Iterator[Any]:
-    """Open a HuggingFace streaming dataset with optional multi-rank sharding."""
+    """Open a HuggingFace streaming dataset with optional multi-rank sharding and auth token."""
     import os
 
     if "HF_HOME" not in os.environ:
@@ -119,14 +129,25 @@ def _open_hf_stream(
     if effective_revision is not None:
         kwargs["revision"] = effective_revision
 
+    token = _get_hf_token()
+    if token:
+        kwargs["token"] = token
+
     try:
         ds = load_dataset(repo, config_name, **kwargs) if config_name else load_dataset(repo, **kwargs)
     except TypeError:
+        # Backward compatibility for older datasets library versions lacking token or revision kwargs
         if "revision" in kwargs:
             kwargs.pop("revision", None)
-            ds = load_dataset(repo, config_name, **kwargs) if config_name else load_dataset(repo, **kwargs)
-        else:
-            raise
+        if "token" in kwargs and TypeError:
+            kwargs.pop("token", None)
+        ds = load_dataset(repo, config_name, **kwargs) if config_name else load_dataset(repo, **kwargs)
+    except Exception as e:
+        err_str = str(e).lower()
+        if "429" in err_str or "rate limit" in err_str or "too many requests" in err_str:
+            print(f"⚠️ [DataStreamer] HuggingFace Rate Limit (429) on {repo}. Recommend setting HF_TOKEN.")
+        raise
+
     if world_size > 1:
         try:
             from datasets.distributed import split_dataset_by_node

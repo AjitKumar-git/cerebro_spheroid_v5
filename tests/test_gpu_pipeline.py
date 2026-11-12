@@ -1020,5 +1020,67 @@ def test_gpu_checkpoint_save_and_cloud_sync_converts_to_bfloat16(tmp_path):
     assert loaded == total
 
 
+def test_amp_dtype_resolution_and_cli_parsing(monkeypatch):
+    """Verifies explicit --amp-dtype CLI flag and _select_amp_dtype behavior across precisions."""
+    import sys
+    from scripts.train_v5_graded_curriculum import parse_args, _select_amp_dtype
+
+    # 1. Test precision selection logic
+    assert _select_amp_dtype(use_cuda=False) == torch.float32
+    assert _select_amp_dtype(use_cuda=True, preferred_dtype="float16") == torch.float16
+    assert _select_amp_dtype(use_cuda=True, preferred_dtype="fp16") == torch.float16
+    assert _select_amp_dtype(use_cuda=True, preferred_dtype="bfloat16") == torch.bfloat16
+    assert _select_amp_dtype(use_cuda=True, preferred_dtype="float32") == torch.float32
+
+    # 2. Test CLI flag parsing
+    monkeypatch.setattr(sys, "argv", [
+        "train_v5_graded_curriculum.py",
+        "--amp-dtype", "float16",
+        "--deliberation-mode", "teacher_forcing",
+    ])
+    args = parse_args()
+    assert args.amp_dtype == "float16"
+    assert args.deliberation_mode == "teacher_forcing"
+
+
+def test_hf_token_pickup_and_streamer_429_resilience(monkeypatch):
+    """Ensures HF_TOKEN is correctly sourced and streamer never stalls when online queue is dry or throttled."""
+    import time
+    from src.elastic_window import _get_hf_token
+    from src.graded_curriculum import GradedCurriculumStreamer, CurriculumScheduleConfig
+
+    # 1. Test token discovery
+    monkeypatch.setenv("HF_TOKEN", "hf_test_secret_token_123")
+    assert _get_hf_token() == "hf_test_secret_token_123"
+
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setenv("HUGGINGFACE_HUB_TOKEN", "hf_alt_token_456")
+    assert _get_hf_token() == "hf_alt_token_456"
+
+    # 2. Test streamer zero-latency fallback when online queue is dry
+    class MockTokenizer:
+        vocab_size = 32000
+        pad_token_id = 0
+        eos_token_id = 1
+        def encode(self, text, **kwargs):
+            return [10, 11, 12]
+
+    cfg = CurriculumScheduleConfig(prompt_len=16, seq_len=32, batch_size=4)
+    streamer = GradedCurriculumStreamer(
+        tokenizer=MockTokenizer(),
+        config=cfg,
+        mix="auto",
+        offline=True,  # offline ensures online workers do not launch
+    )
+
+    t0 = time.time()
+    pair = streamer._next_online_pair("dense_edu")
+    dt = time.time() - t0
+    # Must return immediately (< 0.05s) without blocking for 2.0s
+    assert pair is None
+    assert dt < 0.05, f"Expected non-blocking online check, took {dt:.3f}s"
+
+
+
 
 

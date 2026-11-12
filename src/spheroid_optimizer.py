@@ -32,6 +32,20 @@ import torch
 from torch.optim.optimizer import Optimizer
 
 
+def _has_native_bf16(device: Optional[torch.device] = None) -> bool:
+    """Return True only for hardware Tensor Core BF16 (Ampere sm_80+ or newer)."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        idx = device.index if (device is not None and device.index is not None) else torch.cuda.current_device()
+        major, _ = torch.cuda.get_device_capability(idx)
+        if major < 8:
+            return False
+        return bool(torch.cuda.is_bf16_supported(including_emulation=False))
+    except Exception:
+        return False
+
+
 def _zeropower_via_newtonschulz5(
     G: torch.Tensor,
     steps: int = 3,
@@ -273,7 +287,7 @@ class SpheroidOptimizer(Optimizer):
                     need_master = p.dtype in (torch.float16, torch.bfloat16)
                     if len(state) == 0:
                         state["step"] = 0
-                        m_dtype = (torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16) if (use_half and p.is_cuda) else torch.float32
+                        m_dtype = (torch.bfloat16 if _has_native_bf16(p.device) else torch.float16) if (use_half and p.is_cuda) else torch.float32
                         if p.dtype == torch.float32 and not use_half:
                             m_dtype = torch.float32
                         state["momentum"] = torch.zeros_like(p, dtype=m_dtype)
