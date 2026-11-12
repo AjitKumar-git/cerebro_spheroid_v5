@@ -467,7 +467,9 @@ def auto_tune_environment(
     is_gpu = hw.get("is_gpu", str(hw.get("platform", "")).lower() in ("gpu", "cuda", "rocm"))
     total_gb = hw["total_gb"]
     sig = hw["hardware_signature"]
-    cache_sig = f"{sig}_cap{int(max_batch_size)}" if max_batch_size is not None else sig
+    seq_suffix = f"_seq{seq_len}" if seq_len != 256 else ""
+    cap_suffix = f"_cap{int(max_batch_size)}" if max_batch_size is not None else ""
+    cache_sig = f"{sig}{seq_suffix}{cap_suffix}"
 
     mem_type = hw.get("memory_type", "HBM" if is_tpu else ("VRAM" if is_gpu else "RAM"))
 
@@ -475,9 +477,14 @@ def auto_tune_environment(
     if use_cached_config and not force_tune and candidates is None:
         # Check local cache
         cached_local = load_local_hardware_config(preset, cache_sig)
+        if cached_local is None and cache_sig != sig and max_batch_size is None:
+            fallback_local = load_local_hardware_config(preset, sig)
+            if fallback_local and fallback_local.get("seq_len") == seq_len:
+                cached_local = fallback_local
+        local_seq_match = (cached_local.get("seq_len", 256) == seq_len) if cached_local else False
         local_obj = cached_local.get("tune_objective") if cached_local else None
         local_within_cap = (max_batch_size is None) or (int(cached_local.get("batch_size", 0)) <= int(max_batch_size)) if cached_local else False
-        if cached_local and local_within_cap and cached_local.get("tok_per_sec", 0) > 0 and (local_obj is None or local_obj == tune_objective):
+        if cached_local and local_seq_match and local_within_cap and cached_local.get("tok_per_sec", 0) > 0 and (local_obj is None or local_obj == tune_objective):
             if verbose:
                 steps_s = cached_local.get("steps_per_sec") or (1000.0 / cached_local["step_ms"] if cached_local.get("step_ms") else 0.0)
                 print("=" * 80)
@@ -496,9 +503,14 @@ def auto_tune_environment(
         try:
             from ..cloud_sync import fetch_remote_hardware_config
             cached_remote = fetch_remote_hardware_config(model=preset, device_signature=cache_sig, url=cloud_url, token=cloud_token)
+            if cached_remote is None and cache_sig != sig and max_batch_size is None:
+                fallback_remote = fetch_remote_hardware_config(model=preset, device_signature=sig, url=cloud_url, token=cloud_token)
+                if fallback_remote and fallback_remote.get("seq_len") == seq_len:
+                    cached_remote = fallback_remote
+            remote_seq_match = (cached_remote.get("seq_len", 256) == seq_len) if cached_remote else False
             remote_obj = cached_remote.get("tune_objective") if cached_remote else None
             remote_within_cap = (max_batch_size is None) or (int(cached_remote.get("batch_size", 0)) <= int(max_batch_size)) if cached_remote else False
-            if cached_remote and remote_within_cap and cached_remote.get("tok_per_sec", 0) > 0 and (remote_obj is None or remote_obj == tune_objective):
+            if cached_remote and remote_seq_match and remote_within_cap and cached_remote.get("tok_per_sec", 0) > 0 and (remote_obj is None or remote_obj == tune_objective):
                 if verbose:
                     print("=" * 80)
                     print(f"🌐 [AutoTuner] Retrieved verified optimal config from bioflo.in for [{preset}] on [{cache_sig}]:")

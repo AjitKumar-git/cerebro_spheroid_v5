@@ -97,6 +97,8 @@ from src.cloud_sync import (
     select_highest_step_slot,
     pull_checkpoint,
     push_checkpoint_async,
+    push_remote_loss_history,
+    detect_source_environment,
     wait_for_in_flight_uploads,
 )
 from src.corpus import build_tokenizer
@@ -126,7 +128,9 @@ def parse_args(args_list=None):
     parser.add_argument("--grad-accum", "--grad_accum", dest="grad_accum", type=int, default=1, help="Gradient accumulation micro-steps per optimizer update")
     parser.add_argument("--multi-tpu", "--multi_tpu", dest="multi_tpu", type=str, default="auto", choices=["auto", "local_sgd", "single"], help="Multi-TPU execution mode ('auto'/'local_sgd' uses all TPUs with 1 step per TPU)")
     parser.add_argument("--local-steps", "--local_steps", dest="local_steps", type=int, default=4, help="Sequential local optimizer steps per TPU before pmean parameter merge (default: 4)")
-    parser.add_argument("--seq-len", "--target_len", dest="seq_len", type=int, default=256, help="Target response sequence length (default: 256)")
+    parser.add_argument("--seq-len", "--target_len", dest="seq_len", type=int, default=256, help="Target response sequence length (default: 256, transitioning to 512 for reasoning)")
+    parser.add_argument("--target-seq-len", "--target_seq_len", dest="target_seq_len", type=int, default=None, help="Target sequence length to transition toward (e.g. 512 or 1024)")
+    parser.add_argument("--seq-transition-steps", "--seq_transition_steps", dest="seq_transition_steps", type=int, default=0, help="Steps over which to transition sequence length (0 = immediate transition to target_seq_len)")
     parser.add_argument("--prompt_len", type=int, default=32, help="Prompt context length (used when --elastic_window is disabled)")
     parser.add_argument("--total_window", type=int, default=288, help="Total sequence budget for elastic sliding window (default: 288 tokens)")
     parser.add_argument("--elastic_window", action="store_true", default=False, help="Enable elastic sliding context window with complementary buckets")
@@ -157,10 +161,11 @@ def parse_args(args_list=None):
         help="Auto-tuner selection objective: 'balanced' (tok/s * sqrt(steps/s)), 'steps_per_sec', or 'tok_per_sec'",
     )
 
-    # Scheduled Sampling Curriculum
-    parser.add_argument("--deliberation_mode", type=str, default="teacher_forcing", choices=["teacher_forcing", "scheduled", "internal"], help="Deliberation feedback mode (default: teacher_forcing for clean pretraining)")
-    parser.add_argument("--schedule_steps", type=int, default=5000, help="Steps to anneal from teacher-forcing down to min_sampling_p (if using scheduled mode)")
-    parser.add_argument("--min_sampling_p", type=float, default=1.0, help="Minimum teacher sampling floor (default: 1.0 for clean pretraining)")
+    # Scheduled Sampling & Deliberation Curriculum
+    parser.add_argument("--deliberation_mode", type=str, default="scheduled", choices=["teacher_forcing", "scheduled", "pitfall_recovery", "internal"], help="Deliberation feedback mode: 'scheduled' anneals sampling_p smoothly; 'pitfall_recovery' trains model to recover from erroneous thoughts; 'teacher_forcing' uses pure ground truth")
+    parser.add_argument("--schedule_steps", type=int, default=5000, help="Steps to anneal from teacher-forcing down to min_sampling_p (default: 5000)")
+    parser.add_argument("--min_sampling_p", type=float, default=0.5, help="Minimum teacher sampling floor (default: 0.5 for active self-deliberation and error recovery)")
+    parser.add_argument("--pitfall_prob", type=float, default=0.15, help="Probability of exploring counterfactual/pitfall thoughts during deliberation (default: 0.15)")
 
     # Data Source & Tokenizer
     parser.add_argument("--dataset_source", "--dataset-source", dest="dataset_source", type=str, default="dense_edu",
@@ -276,6 +281,14 @@ def main(args=None):
 
     signal.signal(signal.SIGINT, sig_handler)
     signal.signal(signal.SIGTERM, sig_handler)
+
+    # Sequence Length Transition & Context Budget Progression
+    if getattr(args, "target_seq_len", None) is not None and args.target_seq_len > args.seq_len:
+        print(f"\n🔄 [Sequence Transition] Advancing target sequence length from {args.seq_len} -> {args.target_seq_len} tokens for deep reasoning!")
+        args.seq_len = args.target_seq_len
+
+    if args.total_window == 288 and (args.seq_len != 256 or args.prompt_len != 32):
+        args.total_window = args.prompt_len + args.seq_len
 
     # 1. Hardware Platform & Devices
     devices = jax.devices()
@@ -670,8 +683,10 @@ def main(args=None):
         if args.deliberation_mode == "internal":
             return min_p
         if sched_steps <= 0:
-            return 1.0
-        ratio = min(1.0, float(step_idx) / float(sched_steps))
+            return min_p
+        # Relative annealing from start_step allows smooth curriculum transition on resumption without gradient shock
+        elapsed = max(0, step_idx - start_step)
+        ratio = min(1.0, float(elapsed) / float(sched_steps))
         coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
         return float(min_p + (1.0 - min_p) * coeff)
 
@@ -836,6 +851,26 @@ def main(args=None):
                     }
                     ckpt_mgr.dispatch(_get_host_params(), buffers, best_fname, meta_dict=meta_best, block_if_busy=True)
 
+                    if args.cloud_sync:
+                        try:
+                            import datetime
+                            champ_rec = {
+                                "step": step,
+                                "loss": float(loss),
+                                "eval_loss": eval_loss,
+                                "status": "NEW_CHAMPION",
+                                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                "source": detect_source_environment(),
+                            }
+                            push_remote_loss_history(
+                                model=sync_model_name or args.preset,
+                                records=[champ_rec],
+                                url=args.cloud_url,
+                                token=args.cloud_token,
+                            )
+                        except Exception:
+                            pass
+
             # Asynchronous Checkpoint Saving
             save_latest = False
             if args.cloud_save_hours is not None:
@@ -858,6 +893,26 @@ def main(args=None):
                     "timestamp": time.time(),
                 }
                 ckpt_mgr.dispatch(_get_host_params(), buffers, latest_fname, meta_dict=meta_latest)
+
+                if args.cloud_sync:
+                    try:
+                        import datetime
+                        latest_rec = {
+                            "step": step,
+                            "loss": float(loss),
+                            "eval_loss": last_eval_loss if math.isfinite(last_eval_loss) else None,
+                            "status": "SMOOTH_DESCENT",
+                            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                            "source": detect_source_environment(),
+                        }
+                        push_remote_loss_history(
+                            model=sync_model_name or args.preset,
+                            records=[latest_rec],
+                            url=args.cloud_url,
+                            token=args.cloud_token,
+                        )
+                    except Exception:
+                        pass
 
             # Periodic Milestone Archive Saving
             if (step // max(1, args.periodic_every)) > (prev_step // max(1, args.periodic_every)):

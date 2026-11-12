@@ -64,6 +64,7 @@ from src.cloud_sync import (
     notify_training_start,
     pull_checkpoint,
     push_checkpoint_async,
+    push_remote_loss_history,
     select_highest_step_slot,
     wait_for_in_flight_uploads,
 )
@@ -127,6 +128,8 @@ class _CerebroDDPModule(nn.Module):
         input_ids: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
         feedback_tokens: Optional[torch.Tensor] = None,
+        sampling_p: float = 1.0,
+        pitfall_prob: float = 0.0,
         pad_id: int = 0,
         perceptual_inputs: Optional[torch.Tensor] = None,
         compute_action: bool = False,
@@ -135,6 +138,8 @@ class _CerebroDDPModule(nn.Module):
             input_ids,
             targets=targets,
             feedback_tokens=feedback_tokens,
+            sampling_p=sampling_p,
+            pitfall_prob=pitfall_prob,
             pad_id=pad_id,
             perceptual_inputs=perceptual_inputs,
         )
@@ -154,6 +159,12 @@ def parse_args():
     parser.add_argument("--target-batch-size", "--prompts-per-step", dest="target_batch_size", type=int, default=64, help="Global prompts per optimizer step across all GPUs (default: 64, matching TPU)")
     parser.add_argument("--prompt-len", type=int, default=32, help="Prompt context length in TPU-parity static mode (default: 32)")
     parser.add_argument("--seq-len", type=int, default=256, help="Target sequence length in TPU-parity static mode (default: 256)")
+    parser.add_argument("--target-seq-len", "--target_seq_len", dest="target_seq_len", type=int, default=None, help="Target sequence length to transition toward (e.g. 512 or 1024)")
+    parser.add_argument("--seq-transition-steps", "--seq_transition_steps", dest="seq_transition_steps", type=int, default=0, help="Steps over which to transition sequence length (0 = immediate transition to target_seq_len)")
+    parser.add_argument("--deliberation-mode", "--deliberation_mode", dest="deliberation_mode", type=str, default="scheduled", choices=["teacher_forcing", "scheduled", "pitfall_recovery", "internal"], help="Deliberation feedback mode: 'scheduled' anneals sampling_p; 'pitfall_recovery' trains error recovery; 'teacher_forcing' uses pure ground truth")
+    parser.add_argument("--schedule-steps", "--schedule_steps", dest="schedule_steps", type=int, default=5000, help="Steps to anneal from teacher-forcing down to min_sampling_p (default: 5000)")
+    parser.add_argument("--min-sampling-p", "--min_sampling_p", dest="min_sampling_p", type=float, default=0.5, help="Minimum teacher sampling floor (default: 0.5 for active self-deliberation and error recovery)")
+    parser.add_argument("--pitfall-prob", "--pitfall_prob", dest="pitfall_prob", type=float, default=0.15, help="Probability of exploring counterfactual/pitfall thoughts during deliberation (default: 0.15)")
     parser.add_argument("--max-lr", type=float, default=5e-4, help="Peak learning rate (default: 5e-4 matching TPU)")
     parser.add_argument("--warmup-steps", type=int, default=500, help="Linear warmup steps (default: 500 matching TPU)")
     parser.add_argument("--log-interval", type=int, default=10, help="Steps between log lines")
@@ -251,6 +262,19 @@ def _save_and_push_checkpoints(
         push_checkpoint_async(latest_path, step=step, loss=metric_loss, target_type="latest", model=model_preset)
         if is_best:
             push_checkpoint_async(best_path, step=step, loss=best_loss, target_type="best", model=model_preset)
+        try:
+            import datetime
+            rec = {
+                "step": step,
+                "loss": float(loss_val),
+                "eval_loss": float(eval_loss) if (eval_loss is not None and math.isfinite(eval_loss)) else None,
+                "status": "NEW_CHAMPION" if is_best else "SMOOTH_DESCENT",
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "source": detect_source_environment(),
+            }
+            push_remote_loss_history(model=model_preset, records=[rec])
+        except Exception:
+            pass
 
     return best_loss
 
@@ -325,6 +349,15 @@ def _run_training(
     if use_cuda and amp_dtype == torch.bfloat16:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+
+    # Sequence Length Transition & Context Budget Progression
+    if getattr(args, "target_seq_len", None) is not None and args.target_seq_len > args.seq_len:
+        if is_main:
+            print(f"\n🔄 [Sequence Transition] Advancing target sequence length from {args.seq_len} -> {args.target_seq_len} tokens for deep reasoning!")
+        args.seq_len = args.target_seq_len
+
+    if args.total_window == 288 and not args.elastic_window and (args.seq_len != 256 or args.prompt_len != 32):
+        args.total_window = args.prompt_len + args.seq_len
 
     # Resolve effective grad_accum for global prompt/token parity with TPU (64 prompts/step)
     if args.grad_accum is None:
@@ -585,6 +618,18 @@ def _run_training(
     latest_eval_loss = None
     best_eval_loss = best_loss if math.isfinite(best_loss) else float("inf")
 
+    def get_sampling_p(step_idx: int, start_s: int, sched_steps: int, min_p: float, mode: str) -> float:
+        if mode == "teacher_forcing":
+            return 1.0
+        if mode == "internal":
+            return min_p
+        if sched_steps <= 0:
+            return min_p
+        elapsed = max(0, step_idx - start_s)
+        ratio = min(1.0, float(elapsed) / float(sched_steps))
+        coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
+        return float(min_p + (1.0 - min_p) * coeff)
+
     try:
         while step < max_steps:
             local_stop = _STOP_REQUESTED or (
@@ -621,6 +666,10 @@ def _run_training(
 
             optimizer.zero_grad(set_to_none=True)
 
+            cur_sampling_p = get_sampling_p(
+                step, start_step, args.schedule_steps, args.min_sampling_p, args.deliberation_mode
+            )
+
             # Gradient accumulation loop (every micro-batch preserves Strategy-A prompt/target/feedback parity)
             for micro in range(args.grad_accum):
                 sync_ctx = (
@@ -647,6 +696,8 @@ def _run_training(
                             prompts,
                             targets=targets,
                             feedback_tokens=feedback,
+                            sampling_p=cur_sampling_p,
+                            pitfall_prob=args.pitfall_prob if args.deliberation_mode in ("pitfall_recovery", "scheduled") else 0.0,
                             pad_id=pad_id,
                             perceptual_inputs=perceptual_inputs,
                             compute_action=compute_action,
@@ -717,9 +768,10 @@ def _run_training(
                     vram_mb = torch.cuda.memory_reserved(device) / (1024**2) if use_cuda else 0.0
                     act_str = f" | ActLoss: {avg_act_loss:.4f}" if current_phase >= CurriculumPhase.PHASE_3_WORKFLOWS else ""
                     eval_str = f" | Eval: {latest_eval_loss:.4f} (Best: {best_eval_loss:.4f})" if latest_eval_loss is not None else ""
+                    samp_str = f" | Samp_p: {cur_sampling_p:.2f}"
                     print(
                         f"[Step {step:6d}/{max_steps}] Phase: {int(current_phase)} ({PHASE_NAMES[current_phase][:16]}...) | "
-                        f"Loss: {avg_loss:.4f} (EMA: {ema_loss:.4f}){eval_str}{act_str} | LR: {lr:.2e} | "
+                        f"Loss: {avg_loss:.4f} (EMA: {ema_loss:.4f}){eval_str}{samp_str}{act_str} | LR: {lr:.2e} | "
                         f"Tok/s: {tok_per_sec:6.1f} | VRAM: {vram_mb:5.0f}MB"
                     )
                 accum_loss = 0.0

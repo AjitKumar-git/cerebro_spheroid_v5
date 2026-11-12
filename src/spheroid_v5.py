@@ -1407,6 +1407,7 @@ class CerebroSpheroidV5(nn.Module):
         feedback_tokens: Optional[torch.Tensor] = None,
         feedback_is_shifted: bool = True,
         sampling_p: float = 1.0,
+        pitfall_prob: float = 0.0,
         pad_id: int = 0,
         target_len: Optional[int] = None,
         perceptual_inputs: Optional[torch.Tensor] = None,
@@ -1541,7 +1542,7 @@ class CerebroSpheroidV5(nn.Module):
             targets is not None
             and not getattr(self, "force_sequential", False)
             and tf_flux is not None
-            and (feedback_tokens is not None or sampling_p >= 1.0 - 1e-6)
+            and (sampling_p >= 1.0 - 1e-6)
         )
 
         if use_fast_tf:
@@ -1597,7 +1598,13 @@ class CerebroSpheroidV5(nn.Module):
                 )
                 all_logits.append(logits)
 
-                soft_p = F.softmax(logits.float(), dim=-1).to(tied_w.dtype)
+                if self.training and pitfall_prob > 0.0 and torch.rand(1).item() < pitfall_prob:
+                    # Inject exploratory thought perturbation to force the model to reason and recover from pitfalls
+                    logits_in = logits + torch.randn_like(logits) * 1.5
+                else:
+                    logits_in = logits
+
+                soft_p = F.softmax(logits_in.float(), dim=-1).to(tied_w.dtype)
                 soft_emb = soft_p @ tied_w
                 soft_emb_diff = 0.2 * soft_emb + 0.8 * soft_emb.detach()
                 prev_thought, _ = self.sensory_dnn(soft_emb_diff, pos_offset=prompt_pos_offset + t + 1)

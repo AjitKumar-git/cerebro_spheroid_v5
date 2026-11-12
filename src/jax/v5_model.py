@@ -477,6 +477,7 @@ def training_rollout(
     config: Optional[ModelConfigV5] = None,
     feedback_tokens: Optional[jnp.ndarray] = None,
     sampling_p: float = 1.0,
+    pitfall_prob: float = 0.0,
     pad_id: int = 0,
     repetition_penalty: float = 1.25,
     targets: Optional[jnp.ndarray] = None,
@@ -596,7 +597,13 @@ def training_rollout(
         )
 
         # Scheduled sampling re-afference using full sensory encoder (position + SwiGLU aligned)
-        tok_idx = lax.stop_gradient(jnp.argmax(logits, axis=-1))
+        if pitfall_prob > 0.0:
+            top2 = lax.top_k(logits, 2)[1]
+            hash_val = jnp.sin(step_idx * 12.9898 + 78.233) * 43758.5453
+            pitfall_mask = (hash_val - jnp.floor(hash_val)) < pitfall_prob
+            tok_idx = lax.stop_gradient(jnp.where(pitfall_mask, top2[:, 1], top2[:, 0]))
+        else:
+            tok_idx = lax.stop_gradient(jnp.argmax(logits, axis=-1))
         tok_flux, _ = encode_sensory(params, tok_idx[:, None], config=config, pos_offset=L + step_idx + 1)
         nxt_thought = lax.stop_gradient(tok_flux[:, 0, :]).astype(target_dtype)
 
