@@ -179,7 +179,7 @@ def precompute_rope_freqs(dim: int, max_seq_len: int = 32768, theta: float = 500
     return cos, sin
 
 
-def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, offset: int = 0) -> torch.Tensor:
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, offset: int = 0, theta: float = 500000.0) -> torch.Tensor:
     """
     Applies Rotary Position Embedding to x shaped [B, H, L, D] or [B, H, 1, D].
     offset indexes into the precomputed rotary frequencies. Dynamically extends
@@ -189,7 +189,7 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, offset: in
     if offset + L > cos.shape[0]:
         new_max = max(offset + L + 1024, cos.shape[0] * 2)
         dim = x.shape[-1]
-        cos, sin = precompute_rope_freqs(dim, max_seq_len=new_max)
+        cos, sin = precompute_rope_freqs(dim, max_seq_len=new_max, theta=theta)
         cos = cos.to(device=x.device, dtype=x.dtype)
         sin = sin.to(device=x.device, dtype=x.dtype)
     c = cos[offset : offset + L].to(device=x.device, dtype=x.dtype).unsqueeze(0).unsqueeze(0)  # [1, 1, L, D]
@@ -343,10 +343,16 @@ class SensoryInputDNNV5(nn.Module):
             x = x.unsqueeze(1)
 
         B, L, D = x.shape
-        pos_ids = (torch.arange(L, device=x.device, dtype=torch.long) + pos_offset).clamp(
-            0, self.pos_embed.num_embeddings - 1
-        )
-        x = x + self.pos_embed(pos_ids).unsqueeze(0).to(x.dtype)
+        max_p = self.pos_embed.num_embeddings
+        raw_pos = torch.arange(L, device=x.device, dtype=torch.long) + pos_offset
+        if (raw_pos >= max_p).any():
+            pos_ids = raw_pos % max_p
+            scale_factor = (raw_pos // max_p).float().unsqueeze(-1)
+            pos_enc = self.pos_embed(pos_ids) * (1.0 / (1.0 + 0.05 * scale_factor))
+        else:
+            pos_ids = raw_pos.clamp(0, max_p - 1)
+            pos_enc = self.pos_embed(pos_ids)
+        x = x + pos_enc.unsqueeze(0).to(x.dtype)
         h = self.norm_in(x)
         h = x + self.dropout(self.swiglu(h))
         flux = self.norm_out(h)
@@ -544,14 +550,14 @@ class VolumetricSpheroidCoreV5(nn.Module):
 
     def step_efference_fast(self, state: torch.Tensor, efference: torch.Tensor) -> torch.Tensor:
         """O(1) bounded residual efference feedback onto Shell 0 without full deliberate_step."""
-        eff_projected = self.efference_gate(efference)
+        eff_projected = self.efference_gate(F.silu(efference))
         eff_normed = self.radial_norm(eff_projected).to(state.dtype)
         new_shell0 = 0.85 * state[:, 0, :] + 0.15 * eff_normed
         return torch.cat([new_shell0.unsqueeze(1), state[:, 1:, :]], dim=1)
 
     def inject_efference_copy(self, state: torch.Tensor, efference: torch.Tensor) -> torch.Tensor:
         """Injects motor efference copy directly into Shell 0 out-of-place."""
-        eff_projected = self.efference_gate(efference).unsqueeze(1)  # [B, 1, D]
+        eff_projected = self.efference_gate(F.silu(efference)).unsqueeze(1)  # [B, 1, D]
         state_new = torch.cat([state[:, :1, :] + eff_projected, state[:, 1:, :]], dim=1)
         return state_new
 
@@ -601,7 +607,7 @@ def _motor_recur_block(
         p_in = torch.cat([h_t, p_sc_c[t].unsqueeze(0).expand(batch_len, -1)], dim=-1)
         pg, pu = F.linear(p_in, w_plan_gu, b_plan_gu).chunk(2, dim=-1)
         cur_plan = torch.clamp(pd * cur_plan + pw * torch.sigmoid(pg) * pu, -50.0, 50.0)
-        eff = F.linear(F.linear(h_t, eff_w), eg_w)
+        eff = F.linear(F.silu(F.linear(h_t, eff_w)), eg_w)
         eff32 = eff.float()
         eff_normed = (eff32 * torch.rsqrt(eff32.pow(2).mean(dim=-1, keepdim=True) + 1e-6) * rn_w).to(cur_core.dtype)
         cur_core = 0.85 * cur_core + 0.15 * eff_normed
@@ -726,11 +732,19 @@ class PremotorMotorDecoderV5(nn.Module):
         self.persona_embeddings = nn.Parameter(torch.empty(4, surface_dim).normal_(mean=0.0, std=0.05))
         self.persona_scale = nn.Parameter(torch.tensor(0.5))
 
-    def init_plan(self, batch_size: int, device: torch.device, persona_id: Optional[int] = None) -> torch.Tensor:
+    def init_plan(self, batch_size: int, device: torch.device, persona_id: Optional[Union[int, torch.Tensor]] = None) -> torch.Tensor:
         plan = torch.zeros(batch_size, self.surface_dim, device=device, dtype=self.persona_embeddings.dtype)
         if persona_id is not None:
-            p_idx = min(max(0, int(persona_id)), self.persona_embeddings.shape[0] - 1)
-            plan = plan + (self.persona_scale * self.persona_embeddings[p_idx]).to(plan.dtype)
+            if isinstance(persona_id, torch.Tensor):
+                if persona_id.ndim == 0:
+                    p_idx = int(persona_id.item()) % self.persona_embeddings.shape[0]
+                    plan = plan + (self.persona_scale * self.persona_embeddings[p_idx]).to(plan.dtype)
+                else:
+                    p_idx = persona_id.long().clamp(0, self.persona_embeddings.shape[0] - 1)
+                    plan = plan + (self.persona_scale * self.persona_embeddings[p_idx]).to(plan.dtype)
+            else:
+                p_idx = int(persona_id) % self.persona_embeddings.shape[0]
+                plan = plan + (self.persona_scale * self.persona_embeddings[p_idx]).to(plan.dtype)
         return plan
 
     def _prepare_phase_vectors(self, steps: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
@@ -995,7 +1009,8 @@ class PremotorMotorDecoderV5(nn.Module):
         plan: Optional[torch.Tensor] = None,
         target_kv_mask: Optional[torch.Tensor] = None,
         prompt_valid_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        return_hidden: bool = False,
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]], Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]]:
         """
         Vectorized Cross-Resonance + Exact Per-Token Core/Plan Motor Recurrence:
         Matches JAX pure teacher-forcing (`is_pure_tf`) 1:1 while computing cross-resonance once via SDPA.
@@ -1126,7 +1141,7 @@ class PremotorMotorDecoderV5(nn.Module):
                 if self.use_plan and cur_plan is not None:
                     p_in = torch.cat([h_t, p_scaled[t].unsqueeze(0).expand(B, -1)], dim=-1)
                     cur_plan = torch.clamp(pd * cur_plan + pw * torch.sigmoid(self.plan_gate(p_in)) * self.plan_update(p_in), -50.0, 50.0)
-                eff_proj = efference_gate(self.efference_proj(h_t))
+                eff_proj = efference_gate(F.silu(self.efference_proj(h_t)))
                 eff_normed = radial_norm(eff_proj).to(dt)
                 cur_core = 0.85 * cur_core + 0.15 * eff_normed
             H = torch.stack(hs, dim=1)
@@ -1139,6 +1154,8 @@ class PremotorMotorDecoderV5(nn.Module):
             logits = self.head(H) / temp
 
         final_state = torch.cat([cur_core.unsqueeze(1), state[:, 1:, :]], dim=1) if K > 1 else cur_core.unsqueeze(1)
+        if return_hidden:
+            return logits, final_state, cur_plan, H
         return logits, final_state, cur_plan
 
     def forward_chunk(
@@ -1413,6 +1430,7 @@ class CerebroSpheroidV5(nn.Module):
         perceptual_inputs: Optional[torch.Tensor] = None,
         images: Optional[torch.Tensor] = None,
         audio: Optional[torch.Tensor] = None,
+        persona_id: Optional[Union[int, torch.Tensor]] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Differentiable training rollout engine:
@@ -1535,7 +1553,7 @@ class CerebroSpheroidV5(nn.Module):
             fb_valid_mask = None
 
         # 4. Motor Emission Engine (Vectorized Cross-Resonance + Per-Token Recurrence vs Sequential)
-        plan = self.motor_decoder.init_plan(B, dev) if self.config.use_plan else None
+        plan = self.motor_decoder.init_plan(B, dev, persona_id=persona_id) if self.config.use_plan else None
         tied_w = self.sensory_dnn.embedding.weight
 
         use_fast_tf = (
@@ -1544,26 +1562,45 @@ class CerebroSpheroidV5(nn.Module):
             and tf_flux is not None
             and (sampling_p >= 1.0 - 1e-6)
         )
+        has_mtp = len(self.mtp_heads) > 0 and targets is not None
 
         if use_fast_tf:
-            logits_stacked, state, plan = self.motor_decoder.forward_sequence(
-                state=state,
-                sensory_kv=sensory_kv,
-                target_feedback=tf_flux[:, :t_len, :],
-                target_kv=(tf_keys[:, :, :t_len, :], tf_values[:, :, :t_len, :]) if tf_keys is not None else None,
-                tied_embedding_weight=tied_w,
-                efference_gate=self.volumetric_core.efference_gate,
-                radial_norm=self.volumetric_core.radial_norm,
-                plan=plan,
-                target_kv_mask=fb_valid_mask[:, :t_len] if fb_valid_mask is not None else None,
-                prompt_valid_mask=prompt_valid_mask,
-            )
+            if has_mtp:
+                logits_stacked, state, plan, H = self.motor_decoder.forward_sequence(
+                    state=state,
+                    sensory_kv=sensory_kv,
+                    target_feedback=tf_flux[:, :t_len, :],
+                    target_kv=(tf_keys[:, :, :t_len, :], tf_values[:, :, :t_len, :]) if tf_keys is not None else None,
+                    tied_embedding_weight=tied_w,
+                    efference_gate=self.volumetric_core.efference_gate,
+                    radial_norm=self.volumetric_core.radial_norm,
+                    plan=plan,
+                    target_kv_mask=fb_valid_mask[:, :t_len] if fb_valid_mask is not None else None,
+                    prompt_valid_mask=prompt_valid_mask,
+                    return_hidden=True,
+                )
+            else:
+                logits_stacked, state, plan = self.motor_decoder.forward_sequence(
+                    state=state,
+                    sensory_kv=sensory_kv,
+                    target_feedback=tf_flux[:, :t_len, :],
+                    target_kv=(tf_keys[:, :, :t_len, :], tf_values[:, :, :t_len, :]) if tf_keys is not None else None,
+                    tied_embedding_weight=tied_w,
+                    efference_gate=self.volumetric_core.efference_gate,
+                    radial_norm=self.volumetric_core.radial_norm,
+                    plan=plan,
+                    target_kv_mask=fb_valid_mask[:, :t_len] if fb_valid_mask is not None else None,
+                    prompt_valid_mask=prompt_valid_mask,
+                    return_hidden=False,
+                )
+                H = None
         else:
             # Sequential rollout for scheduled sampling, free generation, or test unrolling
             refractory = None if targets is not None else torch.zeros(B, self.config.vocab_size, device=dev, dtype=state.dtype)
             rep_penalty = 1.0 if targets is not None else 1.25
             prev_thought = torch.zeros(B, self.config.surface_dim, device=dev, dtype=state.dtype)
             all_logits = []
+            all_h = [] if has_mtp else None
 
             for t in range(t_len):
                 if tf_flux is not None:
@@ -1583,19 +1620,37 @@ class CerebroSpheroidV5(nn.Module):
                     causal_kv = (tf_keys[:, :, : t + 1, :], tf_values[:, :, : t + 1, :])
                     causal_kv_mask = fb_valid_mask[:, : t + 1] if fb_valid_mask is not None else None
 
-                logits, efference, refractory, plan = self.motor_decoder(
-                    state=state,
-                    sensory_kv=sensory_kv,
-                    tied_embedding_weight=tied_w,
-                    plan=plan,
-                    refractory_trace=refractory,
-                    step_idx=t,
-                    auditory_feedback=auditory_in,
-                    repetition_penalty=rep_penalty,
-                    causal_kv=causal_kv,
-                    causal_kv_mask=causal_kv_mask,
-                    prompt_valid_mask=prompt_valid_mask,
-                )
+                if has_mtp:
+                    logits, efference, refractory, plan, h_t = self.motor_decoder(
+                        state=state,
+                        sensory_kv=sensory_kv,
+                        tied_embedding_weight=tied_w,
+                        plan=plan,
+                        refractory_trace=refractory,
+                        step_idx=t,
+                        auditory_feedback=auditory_in,
+                        repetition_penalty=rep_penalty,
+                        causal_kv=causal_kv,
+                        causal_kv_mask=causal_kv_mask,
+                        prompt_valid_mask=prompt_valid_mask,
+                        return_hidden=True,
+                    )
+                    all_h.append(h_t)
+                else:
+                    logits, efference, refractory, plan = self.motor_decoder(
+                        state=state,
+                        sensory_kv=sensory_kv,
+                        tied_embedding_weight=tied_w,
+                        plan=plan,
+                        refractory_trace=refractory,
+                        step_idx=t,
+                        auditory_feedback=auditory_in,
+                        repetition_penalty=rep_penalty,
+                        causal_kv=causal_kv,
+                        causal_kv_mask=causal_kv_mask,
+                        prompt_valid_mask=prompt_valid_mask,
+                        return_hidden=False,
+                    )
                 all_logits.append(logits)
 
                 if self.training and pitfall_prob > 0.0 and torch.rand(1).item() < pitfall_prob:
@@ -1612,6 +1667,7 @@ class CerebroSpheroidV5(nn.Module):
                 state = self.volumetric_core.step_efference_fast(state, efference)
 
             logits_stacked = torch.stack(all_logits, dim=1)
+            H = torch.stack(all_h, dim=1) if has_mtp else None
 
         self.current_spheroid_state = state
 
@@ -1622,6 +1678,35 @@ class CerebroSpheroidV5(nn.Module):
                 targets[:, :t_len].contiguous().view(-1),
                 ignore_index=-100,
             )
+
+            # Auxiliary Multi-Token Prediction (MTP) loss for future token forecasting
+            if has_mtp and H is not None:
+                mtp_loss_total = torch.tensor(0.0, device=dev)
+                h_curr = H
+                temp = float(torch.clamp(self.motor_decoder.temperature_scale, 0.1, 5.0).item())
+                tgt_full = targets[:, :t_len]
+                num_heads_computed = 0
+                for k, mtp_head in enumerate(self.mtp_heads):
+                    offset = k + 1
+                    if t_len > offset:
+                        prev_tok = tgt_full[:, k : t_len - 1]
+                        prev_emb = self.sensory_dnn.embedding(torch.clamp(prev_tok, min=0))
+                        prev_emb = prev_emb * (prev_tok >= 0).unsqueeze(-1).to(prev_emb.dtype)
+                        h_slice = h_curr[:, : t_len - offset, :]
+                        mtp_logits, h_next = mtp_head(h_slice, prev_emb, tied_w, temp=temp)
+                        tgt_future = tgt_full[:, offset : t_len]
+                        mtp_l = F.cross_entropy(
+                            mtp_logits.reshape(-1, self.config.vocab_size).float(),
+                            tgt_future.contiguous().reshape(-1),
+                            ignore_index=-100,
+                        )
+                        if not torch.isnan(mtp_l):
+                            mtp_loss_total = mtp_loss_total + mtp_l
+                            num_heads_computed += 1
+                        h_curr = h_next
+                if num_heads_computed > 0:
+                    loss = loss + (0.3 / len(self.mtp_heads)) * mtp_loss_total
+
             if self.config.use_energy_regularization:
                 loss = loss + 0.01 * (energy_loss / max(cycles, 1))
             if use_adapt:
@@ -1644,6 +1729,7 @@ class CerebroSpheroidV5(nn.Module):
         eos_token_id: int = 2,
         seed_token_id: Optional[int] = None,
         stop_token_ids: Optional[Union[Tuple[int, ...], List[int]]] = None,
+        persona_id: Optional[Union[int, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Closed-loop autoregressive generation with discrete token auditory feedback."""
         self.eval()
@@ -1691,7 +1777,7 @@ class CerebroSpheroidV5(nn.Module):
                     break
 
         # 3. Motor generation loop
-        plan = self.motor_decoder.init_plan(B, dev) if self.config.use_plan else None
+        plan = self.motor_decoder.init_plan(B, dev, persona_id=persona_id) if self.config.use_plan else None
         refractory = torch.zeros(B, self.config.vocab_size, device=dev, dtype=state.dtype)
         prev_thought = torch.zeros(B, self.config.surface_dim, device=dev, dtype=state.dtype)
 
@@ -1765,6 +1851,48 @@ class CerebroSpheroidV5(nn.Module):
             state = self.volumetric_core.step_efference_fast(state, efference)
 
         return torch.cat(generated_tokens, dim=1)
+
+    @torch.no_grad()
+    def draft_speculative_tokens(
+        self,
+        h_last: torch.Tensor,
+        last_token_id: torch.Tensor,
+        num_tokens: Optional[int] = None,
+    ) -> List[torch.Tensor]:
+        """
+        Drafts speculative future tokens using trained MTP heads in O(1) latency.
+        Args:
+            h_last: Motor hidden representation [B, surface_dim] or [B, 1, surface_dim]
+            last_token_id: Emitted token ID [B] or [B, 1]
+            num_tokens: Maximum number of tokens to draft (defaults to all available MTP heads)
+        Returns:
+            draft_tokens: List of drafted token tensors each [B]
+        """
+        if len(self.mtp_heads) == 0:
+            return []
+
+        max_draft = len(self.mtp_heads) if num_tokens is None else min(num_tokens, len(self.mtp_heads))
+        if max_draft <= 0:
+            return []
+
+        if last_token_id.dim() == 1:
+            tok = last_token_id
+        else:
+            tok = last_token_id.squeeze(-1)
+
+        h_curr = h_last.unsqueeze(1) if h_last.dim() == 2 else h_last  # [B, 1, D]
+        draft_tokens = []
+        tied_w = self.sensory_dnn.embedding.weight
+        temp = float(torch.clamp(self.motor_decoder.temperature_scale, 0.1, 5.0).item())
+
+        for k in range(max_draft):
+            prev_emb = self.sensory_dnn.embedding(torch.clamp(tok, min=0)).unsqueeze(1)  # [B, 1, D]
+            logits_k, h_next = self.mtp_heads[k](h_curr, prev_emb, tied_w, temp=temp)
+            tok = torch.argmax(logits_k.squeeze(1), dim=-1)  # [B]
+            draft_tokens.append(tok)
+            h_curr = h_next
+
+        return draft_tokens
 
     def generate_text(
         self,

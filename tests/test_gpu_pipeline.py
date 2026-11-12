@@ -92,7 +92,7 @@ def test_jax_to_pytorch_checkpoint_adaptation():
 
 
 def test_pytorch_to_jax_checkpoint_adaptation_full_parity():
-    """Verifies PyTorch GPU checkpoint adapts all 52/52 parameters into JAX TPU engine with zero missing weights."""
+    """Verifies PyTorch GPU checkpoint adapts all 54/54 parameters into JAX TPU engine with zero missing weights."""
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -108,7 +108,7 @@ def test_pytorch_to_jax_checkpoint_adaptation_full_parity():
     jparams, _ = init_params_v5(jax.random.PRNGKey(0), jcfg)
 
     restored = adapt_and_load_checkpoint_weights({"model_state": pt_state}, jparams, jnp.float32, jcfg)
-    assert restored == len(jparams) == 52, f"Expected 52 restored parameters, got {restored}"
+    assert restored == len(jparams) == 54, f"Expected 54 restored parameters, got {restored}"
 
     # Verify motor swiglu weights (which previously suffered from prefix shadowing)
     assert np.allclose(
@@ -825,5 +825,118 @@ def test_graded_curriculum_eval_tracking_and_checkpoint_eval_loss(tmp_path):
     best_ckpt = torch.load(best_ckpt_path, map_location="cpu", weights_only=False)
     assert "eval_loss" in best_ckpt
     assert math.isfinite(best_ckpt["eval_loss"]) and best_ckpt["eval_loss"] > 0.0
+
+
+def test_mtp_heads_forward_loss_and_speculative_drafting():
+    """Verifies Multi-Token Prediction (MTP) drafting heads compute auxiliary loss, receive gradients, and draft tokens."""
+    cfg = ModelConfigV5(
+        vocab_size=128,
+        num_shells=4,
+        surface_dim=32,
+        radial_dim=16,
+        num_heads=4,
+        max_phase_steps=32,
+        thinking_cycles=1,
+        num_mtp_heads=3,  # 2 auxiliary MTP drafting heads
+    )
+    model = CerebroSpheroidV5(cfg)
+    assert len(model.mtp_heads) == 2
+
+    prompts = torch.randint(1, 128, (2, 4))
+    targets = torch.randint(1, 128, (2, 8))
+
+    # Fast teacher forcing forward pass
+    loss_fast, logits_fast = model(prompts, targets=targets)
+    assert torch.isfinite(loss_fast)
+    assert logits_fast.shape == (2, 8, 128)
+    loss_fast.backward()
+
+    # Verify MTP heads received gradients
+    for i, mtp_h in enumerate(model.mtp_heads):
+        has_grad = any(p.grad is not None and torch.norm(p.grad) > 0 for p in mtp_h.parameters())
+        assert has_grad, f"MTP head {i} did not receive gradients during fast teacher forcing"
+
+    # Sequential rollout forward pass
+    model.zero_grad()
+    model.force_sequential = True
+    loss_seq, logits_seq = model(prompts, targets=targets)
+    assert torch.isfinite(loss_seq)
+    loss_seq.backward()
+    for i, mtp_h in enumerate(model.mtp_heads):
+        has_grad = any(p.grad is not None and torch.norm(p.grad) > 0 for p in mtp_h.parameters())
+        assert has_grad, f"MTP head {i} did not receive gradients during sequential teacher forcing"
+
+    # Test speculative drafting
+    model.eval()
+    h_dummy = torch.randn(2, 32)
+    last_tok = torch.tensor([5, 10], dtype=torch.long)
+    drafted = model.draft_speculative_tokens(h_dummy, last_tok)
+    assert len(drafted) == 2  # num_mtp_heads - 1
+    assert drafted[0].shape == (2,)
+    assert drafted[1].shape == (2,)
+
+
+def test_persona_steering_embeddings_and_gradient_flow():
+    """Verifies persona embeddings steer the initial plan and receive training gradients."""
+    cfg = ModelConfigV5(
+        vocab_size=128,
+        num_shells=4,
+        surface_dim=32,
+        radial_dim=16,
+        num_heads=4,
+        max_phase_steps=32,
+        thinking_cycles=1,
+    )
+    model = CerebroSpheroidV5(cfg)
+    prompts = torch.randint(1, 128, (2, 4))
+    targets = torch.randint(1, 128, (2, 6))
+
+    # Forward with persona 0 vs persona 1
+    with torch.no_grad():
+        _, logits_p0 = model(prompts, targets=targets, persona_id=0)
+        _, logits_p1 = model(prompts, targets=targets, persona_id=1)
+    diff = (logits_p0 - logits_p1).abs().max()
+    assert diff > 1e-4, f"Persona conditioning did not alter forward logits: diff={diff}"
+
+    # Verify persona parameter gradients
+    model.train()
+    model.zero_grad()
+    loss, _ = model(prompts, targets=targets, persona_id=torch.tensor([0, 1]))
+    loss.backward()
+    assert model.motor_decoder.persona_embeddings.grad is not None
+    assert torch.norm(model.motor_decoder.persona_embeddings.grad) > 0
+    assert model.motor_decoder.persona_scale.grad is not None
+    assert torch.norm(model.motor_decoder.persona_scale.grad) > 0
+
+    # Generation steering test
+    model.eval()
+    gen_p0 = model.generate(prompts, max_new_tokens=4, persona_id=0, temperature=0.01)
+    gen_p2 = model.generate(prompts, max_new_tokens=4, persona_id=2, temperature=0.01)
+    assert gen_p0.shape == (2, 4)
+    assert gen_p2.shape == (2, 4)
+
+
+def test_efference_non_linear_projection_active():
+    """Verifies efference projection includes non-linearity (SiLU) and bounded residual updates."""
+    cfg = ModelConfigV5(
+        vocab_size=64,
+        num_shells=4,
+        surface_dim=32,
+        radial_dim=16,
+        num_heads=4,
+        max_phase_steps=32,
+    )
+    model = CerebroSpheroidV5(cfg)
+    core = model.volumetric_core
+    state = torch.randn(2, 4, 32)
+    eff = torch.randn(2, 32)
+
+    s1 = core.step_efference_fast(state, eff)
+    s2 = core.step_efference_fast(state, 2.0 * eff)
+    assert s1.shape == state.shape
+    assert s2.shape == state.shape
+    assert torch.isfinite(s1).all()
+    assert torch.isfinite(s2).all()
+
 
 

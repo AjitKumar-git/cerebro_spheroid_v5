@@ -248,6 +248,10 @@ def init_params_v5(key: jax.random.PRNGKey, config: ModelConfigV5) -> Tuple[Dict
         "motor.efference_proj.weight": jax.random.normal(keys[23], (s_dim, s_dim)) * (1.0 / math.sqrt(s_dim)),
         "motor.refractory_decay": jnp.array(0.75, dtype=jnp.float32),
         "motor.refractory_strength": jnp.array(1.2, dtype=jnp.float32),
+
+        # Persona Steering Basis & Scale
+        "motor.persona_embeddings": jax.random.normal(keys[27], (4, s_dim)) * 0.05,
+        "motor.persona_scale": jnp.array(0.5, dtype=jnp.float32),
     }
 
     # 3D Tensorized Batched Intra-Shell SwiGLU across all K shells in parallel
@@ -461,7 +465,7 @@ def emit_step(
 
     # 8. Lightweight Bounded Efference Update on Shell 0 (eliminates O(T^2 * K) full deliberate_step inside emission)
     efference = jnp.matmul(h, params["motor.efference_proj.weight"].T)
-    eff_projected = jnp.matmul(efference, params["core.efference_gate.weight"].T)
+    eff_projected = jnp.matmul(jax.nn.silu(efference), params["core.efference_gate.weight"].T)
     eff_normed = rms_norm(eff_projected, params["core.radial_norm.weight"]).astype(st_dtype)
     new_core = (0.85 * core + 0.15 * eff_normed).astype(st_dtype)
     next_state = state.at[:, 0, :].set(new_core)
@@ -777,7 +781,7 @@ def training_rollout(
             nxt_plan = jnp.clip(plan_decay * cur_plan + plan_write * p_gate * plan_update, -50.0, 50.0).astype(target_dtype)
 
             efference = jnp.matmul(h, eff_proj_t)
-            eff_projected = jnp.matmul(efference, eff_gate_t)
+            eff_projected = jnp.matmul(jax.nn.silu(efference), eff_gate_t)
             eff_normed = rms_norm(eff_projected, radial_norm_w).astype(target_dtype)
             nxt_core = (0.85 * cur_core + 0.15 * eff_normed).astype(target_dtype)
 
