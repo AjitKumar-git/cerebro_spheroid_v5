@@ -748,3 +748,35 @@ def test_step_efference_fast_uses_gate_and_fp16_autocast_backward_finite():
             if param.grad is not None:
                 assert torch.isfinite(param.grad).all(), f"Non-finite gradient in {name}"
 
+
+def test_graded_curriculum_eval_tracking_and_checkpoint_eval_loss(tmp_path):
+    """Verifies periodic held-out evaluation tracking, EMA logging, and eval_loss persistence."""
+    import math
+    import subprocess
+    import sys
+
+    ckpt_dir = str(tmp_path / "ckpts")
+    cmd = [
+        sys.executable,
+        "scripts/train_v5_graded_curriculum.py",
+        "--model-preset", "v5_small",
+        "--batch-size", "2",
+        "--target-batch-size", "2",
+        "--test-steps", "3",
+        "--log-interval", "1",
+        "--eval-interval", "1",
+        "--offline",
+        "--from-scratch",
+        "--checkpoint-dir", ckpt_dir,
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    assert "Eval:" in res.stdout
+    assert "EMA:" in res.stdout
+
+    best_ckpt_path = os.path.join(ckpt_dir, "v5_small_best.pt")
+    assert os.path.exists(best_ckpt_path)
+    best_ckpt = torch.load(best_ckpt_path, map_location="cpu", weights_only=False)
+    assert "eval_loss" in best_ckpt
+    assert math.isfinite(best_ckpt["eval_loss"]) and best_ckpt["eval_loss"] > 0.0
+
+

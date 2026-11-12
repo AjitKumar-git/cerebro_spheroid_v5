@@ -157,6 +157,7 @@ def parse_args():
     parser.add_argument("--max-lr", type=float, default=5e-4, help="Peak learning rate (default: 5e-4 matching TPU)")
     parser.add_argument("--warmup-steps", type=int, default=500, help="Linear warmup steps (default: 500 matching TPU)")
     parser.add_argument("--log-interval", type=int, default=10, help="Steps between log lines")
+    parser.add_argument("--eval-interval", type=int, default=250, help="Steps between fixed held-out validation passes (default: 250)")
     parser.add_argument("--save-interval", type=int, default=1000, help="Steps between checkpoints")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints/graded_curriculum", help="Checkpoint directory")
     parser.add_argument("--cloud-sync", action="store_true", help="Enable bi-directional checkpoint sync with bioflo.in")
@@ -209,15 +210,18 @@ def _save_and_push_checkpoints(
     best_loss: float,
     need_local_save: bool,
     need_cloud_sync: bool,
+    eval_loss: Optional[float] = None,
     final_save: bool = False,
 ) -> float:
     """Persist local latest/best/step checkpoints and enqueue optional bioflo.in upload."""
+    metric_loss = eval_loss if (eval_loss is not None and math.isfinite(eval_loss) and eval_loss > 0.0) else loss_val
     ckpt_payload = {
         "step": step,
         "model_state": raw_model.state_dict(),
         "action_head_state": raw_action_head.state_dict(),
         "config": config,
         "loss": loss_val,
+        "eval_loss": eval_loss if eval_loss is not None else loss_val,
         "model_preset": model_preset,
     }
     latest_path = os.path.join(checkpoint_dir, f"{model_preset}_latest.pt")
@@ -236,14 +240,15 @@ def _save_and_push_checkpoints(
     _atomic_save_and_link(ckpt_payload, latest_path, legacy_latest)
 
     is_best = False
-    if math.isfinite(loss_val) and loss_val > 0.0 and loss_val < best_loss:
-        best_loss = loss_val
+    if math.isfinite(metric_loss) and metric_loss > 0.0 and metric_loss < best_loss:
+        best_loss = metric_loss
         _atomic_save_and_link(ckpt_payload, best_path, legacy_best)
         is_best = True
-        print(f"🌟 New best loss: {best_loss:.4f} -> saved {best_path}")
+        loss_label = f"eval loss: {eval_loss:.4f}" if eval_loss is not None else f"loss: {best_loss:.4f}"
+        print(f"🌟 New best {loss_label} -> saved {best_path}")
 
     if need_cloud_sync:
-        push_checkpoint_async(latest_path, step=step, loss=loss_val, target_type="latest", model=model_preset)
+        push_checkpoint_async(latest_path, step=step, loss=metric_loss, target_type="latest", model=model_preset)
         if is_best:
             push_checkpoint_async(best_path, step=step, loss=best_loss, target_type="best", model=model_preset)
 
@@ -432,13 +437,16 @@ def _run_training(
             if isinstance(act_state, dict):
                 raw_action_head.load_state_dict(act_state, strict=False)
             start_step = int(ckpt.get("step", 0) or 0)
+            ckpt_eval_loss = ckpt.get("eval_loss", ckpt.get("best_eval_loss", None))
             ckpt_loss = ckpt.get("loss", None)
-            if ckpt_loss is not None and math.isfinite(float(ckpt_loss)) and float(ckpt_loss) > 0.0:
+            if ckpt_eval_loss is not None and math.isfinite(float(ckpt_eval_loss)) and float(ckpt_eval_loss) > 0.0:
+                best_loss = float(ckpt_eval_loss)
+            elif ckpt_loss is not None and math.isfinite(float(ckpt_loss)) and float(ckpt_loss) > 0.0:
                 best_loss = float(ckpt_loss)
             else:
                 best_loss = float("inf")
             if is_main:
-                print(f"✓ Resumed from {os.path.basename(load_cand)} at step {start_step:,} (loss: {best_loss:.4f})")
+                print(f"✓ Resumed from {os.path.basename(load_cand)} at step {start_step:,} (best loss: {best_loss:.4f})")
         except Exception as e:
             if is_main:
                 print(f"⚠️ Could not load checkpoint from {load_cand}: {e}")
@@ -543,6 +551,40 @@ def _run_training(
     static_buckets = None if args.elastic_window else [("static", args.prompt_len, args.seq_len)]
     window_budget = args.total_window if args.elastic_window else (args.prompt_len + args.seq_len)
 
+    fixed_eval_batches = []
+    if args.eval_interval and args.eval_interval > 0:
+        try:
+            eval_streamer = GradedCurriculumStreamer(
+                tokenizer=tokenizer,
+                config=schedule_config,
+                seed=99999,
+                mix=args.mix,
+                search_dirs=["data"],
+                offline=args.offline,
+                rank=0,
+                world_size=1,
+            )
+            for _ in range(2):
+                ev_p, ev_t, ev_fb, _, _, _, _ = eval_streamer.get_elastic_batch(
+                    step=0,
+                    device=device,
+                    batch_size=min(8, args.batch_size),
+                    total_window=window_budget,
+                    tail_probability=args.tail_prob,
+                    buckets=static_buckets,
+                )
+                fixed_eval_batches.append((ev_p, ev_t, ev_fb))
+            eval_streamer.close()
+            if is_main:
+                print(f"✓ Prepared {len(fixed_eval_batches)} fixed held-out evaluation batches for periodic tracking")
+        except Exception as e:
+            if is_main:
+                print(f"ℹ️ Could not pre-generate held-out eval batches: {e}")
+
+    ema_loss = None
+    latest_eval_loss = None
+    best_eval_loss = best_loss if math.isfinite(best_loss) else float("inf")
+
     try:
         while step < max_steps:
             local_stop = _STOP_REQUESTED or (
@@ -629,6 +671,25 @@ def _run_training(
             step += 1
             steps_since_log += 1
 
+            # Periodic Held-Out Evaluation
+            if args.eval_interval and step % args.eval_interval == 0 and fixed_eval_batches:
+                raw_model.eval()
+                with torch.no_grad():
+                    with torch.amp.autocast("cuda", enabled=use_cuda, dtype=amp_dtype):
+                        v_losses = []
+                        for ev_p, ev_t, ev_fb in fixed_eval_batches:
+                            ev_out, _ = raw_model(ev_p, targets=ev_t, feedback_tokens=ev_fb, pad_id=pad_id)
+                            v_losses.append(float(ev_out.item()))
+                        cur_eval_loss = sum(v_losses) / len(v_losses)
+                if is_distributed:
+                    ev_t = torch.tensor([cur_eval_loss], dtype=torch.float64, device=device)
+                    dist.all_reduce(ev_t, op=dist.ReduceOp.SUM)
+                    cur_eval_loss = float(ev_t.item()) / world_size
+                raw_model.train()
+                latest_eval_loss = cur_eval_loss
+                if cur_eval_loss < best_eval_loss:
+                    best_eval_loss = cur_eval_loss
+
             # Periodic Logging
             if step % args.log_interval == 0:
                 elapsed = time.time() - start_time
@@ -646,13 +707,19 @@ def _run_training(
                     avg_act_loss = avg_act_local
 
                 last_avg_loss = avg_loss
+                if ema_loss is None:
+                    ema_loss = avg_loss
+                else:
+                    ema_loss = 0.9 * ema_loss + 0.1 * avg_loss
+
                 if is_main:
                     tok_per_sec = global_tok / max(1.0, elapsed)
                     vram_mb = torch.cuda.memory_reserved(device) / (1024**2) if use_cuda else 0.0
                     act_str = f" | ActLoss: {avg_act_loss:.4f}" if current_phase >= CurriculumPhase.PHASE_3_WORKFLOWS else ""
+                    eval_str = f" | Eval: {latest_eval_loss:.4f} (Best: {best_eval_loss:.4f})" if latest_eval_loss is not None else ""
                     print(
                         f"[Step {step:6d}/{max_steps}] Phase: {int(current_phase)} ({PHASE_NAMES[current_phase][:16]}...) | "
-                        f"Loss: {avg_loss:.4f}{act_str} | LR: {lr:.2e} | "
+                        f"Loss: {avg_loss:.4f} (EMA: {ema_loss:.4f}){eval_str}{act_str} | LR: {lr:.2e} | "
                         f"Tok/s: {tok_per_sec:6.1f} | VRAM: {vram_mb:5.0f}MB"
                     )
                 accum_loss = 0.0
@@ -663,7 +730,7 @@ def _run_training(
             need_local_save = (step % args.save_interval == 0 and step > start_step)
             need_cloud_sync = (args.cloud_sync and step > start_step and (step % args.cloud_sync_interval == 0))
             if (need_local_save or need_cloud_sync) and is_main:
-                cur_loss = (accum_loss / steps_since_log) if steps_since_log > 0 else last_avg_loss
+                cur_loss = (accum_loss / steps_since_log) if steps_since_log > 0 else (ema_loss or last_avg_loss)
                 best_loss = _save_and_push_checkpoints(
                     checkpoint_dir=args.checkpoint_dir,
                     model_preset=args.model_preset,
@@ -675,11 +742,12 @@ def _run_training(
                     best_loss=best_loss,
                     need_local_save=need_local_save,
                     need_cloud_sync=need_cloud_sync,
+                    eval_loss=latest_eval_loss,
                     final_save=False,
                 )
 
         # Final Checkpoint
-        final_loss_local = (accum_loss / steps_since_log) if steps_since_log > 0 else last_avg_loss
+        final_loss_local = (accum_loss / steps_since_log) if steps_since_log > 0 else (ema_loss or last_avg_loss)
         if is_distributed:
             loss_t = torch.tensor([final_loss_local], dtype=torch.float64, device=device)
             dist.all_reduce(loss_t, op=dist.ReduceOp.SUM)
@@ -699,6 +767,7 @@ def _run_training(
                 best_loss=best_loss,
                 need_local_save=False,
                 need_cloud_sync=args.cloud_sync,
+                eval_loss=latest_eval_loss,
                 final_save=True,
             )
             final_ckpt = os.path.join(args.checkpoint_dir, f"{args.model_preset}_graded_final.pt")
