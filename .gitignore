@@ -9,3 +9,6 @@ checkpoints/*
 /tmp/
 .ipynb_checkpoints/
 *.log
+
+loss_history_*.json
+loss_trajectory_*.png
