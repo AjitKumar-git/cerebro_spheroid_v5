@@ -51,21 +51,33 @@ class TestVRAMTunerAndSync(unittest.TestCase):
 
     def test_candidate_generation_memory_tiers(self):
         """Verifies candidate search ladders push VRAM utilization across tiers."""
-        # 32GB+ tier (e.g. TPU v4, A100-40/80GB)
-        c_32 = generate_vram_maximizing_candidates("v5_small", total_gb=32.0, seq_len=256)
+        # Ultra tier (64GB+, e.g. TPU v5p 95GB, H100 80GB)
+        c_64 = generate_vram_maximizing_candidates("v5_small", total_gb=64.0, seq_len=256)
+        batch_sizes_64 = [c["batch_size"] for c in c_64]
+        self.assertIn(1024, batch_sizes_64)
+        self.assertIn(2048, batch_sizes_64)
+        self.assertIn(4096, batch_sizes_64)
+
+        # 32GB tier (e.g. TPU v6e Trillium 32GB, TPU v4 32GB, A100-40GB)
+        c_32 = generate_vram_maximizing_candidates("tpu_v6e_1", total_gb=32.0, seq_len=256)
         batch_sizes_32 = [c["batch_size"] for c in c_32]
         self.assertIn(256, batch_sizes_32)
         self.assertIn(512, batch_sizes_32)
+        self.assertIn(1024, batch_sizes_32)
+        self.assertIn(2048, batch_sizes_32)
         # Verify remat=False is also evaluated for higher throughput when memory permits
         remat_false_32 = [c for c in c_32 if not c["remat"]]
         self.assertGreaterEqual(len(remat_false_32), 1)
 
-        # 16GB tier (e.g. TPU v5e-1, T4 16GB)
-        c_16 = generate_vram_maximizing_candidates("v5_small", total_gb=16.0, seq_len=256)
+        # 16GB tier (e.g. TPU v5e-1, T4 16GB) - expanded beyond 384
+        c_16 = generate_vram_maximizing_candidates("tpu_v5e_1", total_gb=16.0, seq_len=256)
         batch_sizes_16 = [c["batch_size"] for c in c_16]
         self.assertIn(128, batch_sizes_16)
         self.assertIn(256, batch_sizes_16)
         self.assertIn(384, batch_sizes_16)
+        self.assertIn(512, batch_sizes_16)
+        self.assertIn(768, batch_sizes_16)
+        self.assertIn(1024, batch_sizes_16)
 
         # 8GB tier (e.g. desktop RTX 3070 8GB)
         c_8 = generate_vram_maximizing_candidates("v5_small", total_gb=8.0, seq_len=256)
@@ -380,6 +392,61 @@ class TestVRAMTunerAndSync(unittest.TestCase):
         self.assertTrue(cache_sig_used.endswith("_cap64"), f"Expected _cap64 cache suffix, got {cache_sig_used}")
         save_sig_used = mock_save_cache.call_args[0][1]
         self.assertTrue(save_sig_used.endswith("_cap64"), f"Expected _cap64 save suffix, got {save_sig_used}")
+
+    @patch("jax.devices")
+    def test_tpu_v6e_and_v5p_hardware_profiling(self, mock_devices):
+        """Verifies TPU v6e (Trillium 32GB) and TPU v5p (95GB) profiling and memory mapping."""
+        # TPU v6e (Trillium)
+        dev_v6e = MagicMock()
+        dev_v6e.device_kind = "TPU v6e"
+        dev_v6e.platform = "tpu"
+        del dev_v6e.memory_stats
+        mock_devices.return_value = [dev_v6e]
+
+        hw_v6e = get_hardware_info()
+        self.assertEqual(hw_v6e["total_gb"], 32.0)
+        self.assertTrue(hw_v6e["is_tpu"])
+        self.assertIn("32GB", hw_v6e["hardware_signature"])
+
+        # Trillium alias
+        dev_trillium = MagicMock()
+        dev_trillium.device_kind = "Trillium"
+        dev_trillium.platform = "tpu"
+        del dev_trillium.memory_stats
+        mock_devices.return_value = [dev_trillium]
+
+        hw_trillium = get_hardware_info()
+        self.assertEqual(hw_trillium["total_gb"], 32.0)
+
+        # TPU v5p (95GB)
+        dev_v5p = MagicMock()
+        dev_v5p.device_kind = "TPU v5p"
+        dev_v5p.platform = "tpu"
+        del dev_v5p.memory_stats
+        mock_devices.return_value = [dev_v5p]
+
+        hw_v5p = get_hardware_info()
+        self.assertEqual(hw_v5p["total_gb"], 95.0)
+        self.assertTrue(hw_v5p["is_tpu"])
+        self.assertIn("95GB", hw_v5p["hardware_signature"])
+
+    def test_tpu_v6e_presets_and_aliases(self):
+        """Verifies tpu_v6e_1 and tpu_v6e presets and cloud sync alias normalization."""
+        from src.jax.v5_model import PRESETS_V5 as JAX_PRESETS
+        from src.spheroid_v5 import PRESETS_V5 as PT_PRESETS, infer_v5_config_from_state_dict
+
+        self.assertIn("tpu_v6e_1", JAX_PRESETS)
+        self.assertIn("tpu_v6e", JAX_PRESETS)
+        self.assertIn("tpu_v6e_1", PT_PRESETS)
+        self.assertIn("tpu_v6e", PT_PRESETS)
+        self.assertEqual(JAX_PRESETS["tpu_v6e_1"]["surface_dim"], 640)
+        self.assertEqual(JAX_PRESETS["tpu_v6e_1"]["num_shells"], 16)
+
+        # Inferred config normalization
+        dummy_state = {"preset": "tpu_v6e_1"}
+        inferred = infer_v5_config_from_state_dict(dummy_state)
+        self.assertEqual(inferred.surface_dim, 640)
+        self.assertEqual(inferred.num_shells, 16)
 
 
 if __name__ == "__main__":

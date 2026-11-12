@@ -142,7 +142,7 @@ def parse_args(args_list=None):
     parser.add_argument("--repetition_penalty", type=float, default=1.25, help="Two-tier refractory repetition penalty multiplier")
 
     # Model & Precision
-    parser.add_argument("--preset", type=str, default="tpu_v5e_1", choices=["v5_small", "v5_compact", "v5_base", "v5_test", "tpu_v5e_1"], help="Model preset (default: tpu_v5e_1 / v5_small)")
+    parser.add_argument("--preset", type=str, default="tpu_v5e_1", choices=["v5_small", "v5_compact", "v5_base", "v5_test", "tpu_v5e_1", "tpu_v6e_1", "tpu_v6e"], help="Model preset (default: tpu_v5e_1 / v5_small / tpu_v6e_1)")
     parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bf16", "fp16", "fp32"], help="Matrix execution precision ('auto' selects bf16 on TPU)")
     parser.add_argument("--remat", type=str, default="true", choices=["true", "false", "auto"], help="Activation remat scan to minimize HBM footprint (default: true)")
     parser.add_argument("--auto-tune", action="store_true", default=False, help="Micro-benchmark candidate batch sizes at startup to maximize steps/s, tok/s, and HBM/VRAM utilization")
@@ -328,7 +328,7 @@ def main(args=None):
         args.batch_size = min(int(args.batch_size), int(max_bs))
 
     # 3. Model Configuration & Parameters
-    config_preset = "v5_small" if args.preset == "tpu_v5e_1" else args.preset
+    config_preset = "v5_small" if args.preset in ("tpu_v5e_1", "tpu_v6e_1", "tpu_v6e") else args.preset
     if config_preset not in PRESETS_V5:
         config_preset = "v5_small"
     config = JAXConfigV5(**PRESETS_V5[config_preset])
@@ -364,7 +364,7 @@ def main(args=None):
     start_step = 0
     best_eval_loss = float("inf")
     last_eval_loss = float("inf")
-    sync_model_name = "v5_small" if args.preset == "tpu_v5e_1" else args.preset
+    sync_model_name = "v5_small" if args.preset in ("tpu_v5e_1", "tpu_v6e_1", "tpu_v6e") else args.preset
     local_latest = os.path.join(args.checkpoint_dir, f"{args.preset}_latest.pt")
     fallback_latest = os.path.join(args.checkpoint_dir, f"{sync_model_name}_latest.pt")
 

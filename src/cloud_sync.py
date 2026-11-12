@@ -42,6 +42,7 @@ socket.getaddrinfo = _preferred_getaddrinfo
 
 DEFAULT_URL = os.environ.get("BIOFLO_SYNC_URL", "https://bioflo.in/api/cerebro/sync.php")
 DEFAULT_TOKEN = os.environ.get("BIOFLO_SYNC_TOKEN", "CerebroSpheroid_Sync_Secure_2026")
+TPU_PRESET_ALIASES = ("tpu_v5e_1", "tpu_v6e_1", "tpu_v6e", "tpu", "v5_tpu")
 
 _IN_FLIGHT_UPLOADS: Dict[str, int] = {}
 _IN_FLIGHT_UPLOAD_TIMES: Dict[str, float] = {}
@@ -78,11 +79,11 @@ def check_remote_manifest(
     token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Queries bioflo.in to retrieve checkpoint status, step numbers, and loss metrics for model tier."""
-    if model in ("tpu_v5e_1", "tpu", "v5_tpu"):
+    if model in TPU_PRESET_ALIASES:
         model = "v5_small"
     sync_url = url or DEFAULT_URL
     sync_token = token or DEFAULT_TOKEN
-    if model in ("tpu_v5e_1", "tpu", "v5_tpu"):
+    if model in TPU_PRESET_ALIASES:
         model = "v5_small"
 
     req_url = f"{sync_url}?action=status"
@@ -110,7 +111,7 @@ def select_highest_step_slot(
     Pick whichever bioflo.in slot (named model vs root fallback) holds the highest step.
     Returns (slot_model_arg, step, loss).
     """
-    norm_model = "v5_small" if model in ("tpu_v5e_1", "tpu", "v5_tpu") else model
+    norm_model = "v5_small" if model in TPU_PRESET_ALIASES else model
     manifest = (manifest_resp or {}).get("manifest") or {}
     models_block = (manifest_resp or {}).get("models") or {}
 
@@ -172,7 +173,7 @@ def pull_checkpoint(
     """
     sync_url = url or DEFAULT_URL
     sync_token = token or DEFAULT_TOKEN
-    if model in ("tpu_v5e_1", "tpu", "v5_tpu"):
+    if model in TPU_PRESET_ALIASES:
         model = "v5_small"
 
     os.makedirs(os.path.dirname(os.path.abspath(local_dest)), exist_ok=True)
@@ -306,7 +307,7 @@ def push_checkpoint(
 
     sync_url = url or DEFAULT_URL
     sync_token = token or DEFAULT_TOKEN
-    if model in ("tpu_v5e_1", "tpu", "v5_tpu"):
+    if model in TPU_PRESET_ALIASES:
         model = "v5_small"
     node_name = source_node or detect_source_environment()
 
@@ -433,7 +434,7 @@ def notify_training_start(
     """Notifies the central hub on bioflo.in that training has started."""
     sync_url = url or DEFAULT_URL
     sync_token = token or DEFAULT_TOKEN
-    if model in ("tpu_v5e_1", "tpu", "v5_tpu"):
+    if model in TPU_PRESET_ALIASES:
         model = "v5_small"
     node_name = source_node or detect_source_environment()
     model_name = model or "v5_small"
@@ -469,7 +470,7 @@ def fetch_remote_hardware_config(
     """Retrieves cached optimal batch size, remat, and throughput config for hardware from bioflo.in."""
     sync_url = url or DEFAULT_URL
     sync_token = token or DEFAULT_TOKEN
-    clean_model = "v5_small" if model in ("tpu_v5e_1", "tpu", "v5_tpu") else model
+    clean_model = "v5_small" if model in TPU_PRESET_ALIASES else model
 
     req_url = f"{sync_url}?action=get_config&model={clean_model}&device={urllib.parse.quote(device_signature)}"
     req = urllib.request.Request(
@@ -497,7 +498,7 @@ def push_remote_hardware_config(
     """Uploads benchmarked optimal hyperparameters to bioflo.in for zero-delay reuse."""
     sync_url = url or DEFAULT_URL
     sync_token = token or DEFAULT_TOKEN
-    clean_model = "v5_small" if model in ("tpu_v5e_1", "tpu", "v5_tpu") else model
+    clean_model = "v5_small" if model in TPU_PRESET_ALIASES else model
     source = source_node or detect_source_environment()
 
     payload = {

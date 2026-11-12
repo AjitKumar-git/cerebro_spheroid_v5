@@ -801,9 +801,11 @@ def test_graded_curriculum_eval_tracking_and_checkpoint_eval_loss(tmp_path):
     import sys
 
     ckpt_dir = str(tmp_path / "ckpts")
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script_path = os.path.join(repo_root, "scripts", "train_v5_graded_curriculum.py")
     cmd = [
         sys.executable,
-        "scripts/train_v5_graded_curriculum.py",
+        script_path,
         "--model-preset", "v5_small",
         "--batch-size", "2",
         "--target-batch-size", "2",
@@ -814,7 +816,7 @@ def test_graded_curriculum_eval_tracking_and_checkpoint_eval_loss(tmp_path):
         "--from-scratch",
         "--checkpoint-dir", ckpt_dir,
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    res = subprocess.run(cmd, cwd=repo_root, capture_output=True, text=True, check=True)
     assert "Eval:" in res.stdout
     assert "EMA:" in res.stdout
 

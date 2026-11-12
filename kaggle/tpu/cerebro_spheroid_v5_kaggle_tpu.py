@@ -7,9 +7,39 @@ resuming from the latest cloud checkpoint on bioflo.in.
 """
 
 import importlib.util
+import json
 import os
+import shutil
+import signal
 import subprocess
 import sys
+import time
+import urllib.request
+
+# Real-time out-of-band telemetry (reverse-engineered from kaggle-tpu-lab)
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "cs5-tpu-ajitsheoran")
+
+
+def publish(phase: str, **extra):
+    """Publish live telemetry events to ntfy.sh so developer sees instant progress."""
+    print(f"📡 [telemetry] {phase} {json.dumps(extra) if extra else ''}", flush=True)
+    if not NTFY_TOPIC:
+        return
+    try:
+        payload = {
+            "topic": NTFY_TOPIC,
+            "title": f"Cerebro-TPU {phase}",
+            "message": json.dumps({"phase": phase, "time": time.time(), **extra}),
+            "tags": ["tpu", "cerebro"],
+        }
+        req = urllib.request.Request(
+            "https://ntfy.sh",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass
 
 # PyArrow compatibility shim for Python 3.12+ / pyarrow 19+
 try:
@@ -41,6 +71,7 @@ def verify_tpu_devices():
         print(f"  - [{idx}] {dev}")
     if "tpu" not in backend.lower():
         print(f"⚠️ Warning: Expected TPU backend, got {backend!r}", flush=True)
+    publish("devices_verified", count=len(devices), backend=backend, kind=devices[0].device_kind if devices else "none")
 
 
 def sync_repository():
@@ -61,10 +92,11 @@ def sync_repository():
     if not os.path.isdir(tok_dir):
         raise FileNotFoundError(f"Offline LLaMA tokenizer directory missing at {tok_dir}")
     print(f"🔤 Offline LLaMA-32k tokenizer verified at {tok_dir}", flush=True)
+    publish("repo_synced", commit=commit_hash)
 
 
 def ensure_dependencies():
-    """Install only missing pure-Python/data deps without touching JAX/libtpu."""
+    """Install only missing pure-Python/data deps with high-speed uv package manager."""
     required = ["datasets", "pyarrow", "transformers", "sentencepiece", "optax"]
     missing = [pkg for pkg in required if importlib.util.find_spec(pkg) is None]
 
@@ -81,33 +113,60 @@ def ensure_dependencies():
     else:
         missing = [pkg if pkg != "datasets" else "datasets>=3.0.0" for pkg in missing]
 
-    if missing:
-        print(f"📦 Installing missing dependencies (keeping preinstalled JAX/libtpu): {missing}", flush=True)
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-q", "--upgrade-strategy", "only-if-needed", *missing],
-            check=True,
-        )
-    else:
-        print("✅ All non-JAX data/tokenizer dependencies already present.", flush=True)
+    has_torch = importlib.util.find_spec("torch") is not None
 
-    # train_v5_tpu_jax.py only needs torch.save/load for .pt checkpoint compatibility
-    if importlib.util.find_spec("torch") is None:
-        print("📦 Installing CPU-only PyTorch for .pt checkpoint serialization...", flush=True)
-        subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "-q",
-                "--index-url",
-                "https://download.pytorch.org/whl/cpu",
-                "torch",
-            ],
-            check=True,
-        )
+    if missing or not has_torch:
+        print(f"📦 Bootstrapping dependencies ({missing}, torch={has_torch}) using uv...", flush=True)
+        publish("deps_installing", missing=missing)
+        try:
+            if shutil.which("uv") is None and importlib.util.find_spec("uv") is None:
+                subprocess.run([sys.executable, "-m", "pip", "install", "-q", "uv"], check=False)
+            has_uv = shutil.which("uv") is not None or importlib.util.find_spec("uv") is not None
+        except Exception:
+            has_uv = False
+
+        if missing:
+            if has_uv:
+                subprocess.run([sys.executable, "-m", "uv", "pip", "install", "--system", "-q", *missing], check=False)
+            else:
+                subprocess.run([sys.executable, "-m", "pip", "install", "-q", *missing], check=True)
+
+        if not has_torch:
+            print("📦 Installing CPU-only PyTorch for .pt checkpoint serialization...", flush=True)
+            if has_uv:
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "uv",
+                        "pip",
+                        "install",
+                        "--system",
+                        "-q",
+                        "--index-url",
+                        "https://download.pytorch.org/whl/cpu",
+                        "torch",
+                    ],
+                    check=False,
+                )
+            else:
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "pip",
+                        "install",
+                        "-q",
+                        "--index-url",
+                        "https://download.pytorch.org/whl/cpu",
+                        "torch",
+                    ],
+                    check=True,
+                )
+        publish("deps_ready")
     else:
-        print("✅ PyTorch already present for .pt checkpoint I/O.", flush=True)
+        print("✅ All non-JAX data/tokenizer and torch dependencies already present.", flush=True)
+        publish("deps_ready")
 
 
 def main():
@@ -182,8 +241,10 @@ def main():
     print("\n🚀 Launching Multi-TPU Trainer:")
     print(" ".join(cmd))
     print("=" * 80, flush=True)
+    publish("trainer_started", preset="tpu_v5e_1", multi_tpu="local_sgd")
 
     result = subprocess.run(cmd, env=env)
+    publish("trainer_exited", returncode=result.returncode)
     sys.exit(result.returncode)
 
 

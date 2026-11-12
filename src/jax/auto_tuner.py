@@ -66,10 +66,16 @@ def get_hardware_info() -> Dict[str, Any]:
     # Method 2: TPU known architectural specifications
     if is_tpu and not total_memory_bytes:
         k = dev_kind.lower()
-        if "v4" in k:
+        if "v5p" in k:
+            total_memory_bytes = 95 * (1024**3)
+        elif "v6e" in k or "v6" in k or "trillium" in k:
             total_memory_bytes = 32 * (1024**3)
-        elif "v5e" in k or "v5p" in k or "v5" in k or "v3" in k or "v2" in k:
+        elif "v4" in k:
+            total_memory_bytes = 32 * (1024**3)
+        elif "v5e" in k or "v5 lite" in k or "v5" in k or "v3" in k:
             total_memory_bytes = 16 * (1024**3)
+        elif "v2" in k:
+            total_memory_bytes = 8 * (1024**3)
         else:
             total_memory_bytes = 16 * (1024**3)
 
@@ -87,7 +93,19 @@ def get_hardware_info() -> Dict[str, Any]:
         if is_tpu:
             total_memory_bytes = 16 * (1024**3)
         elif is_gpu:
-            total_memory_bytes = 16 * (1024**3)
+            k = dev_kind.lower()
+            if "h200" in k or "b200" in k or "b100" in k:
+                total_memory_bytes = 141 * (1024**3)
+            elif "h100" in k or "a100" in k:
+                total_memory_bytes = 80 * (1024**3)
+            elif "l40" in k or "a6000" in k or "rtx 6000" in k:
+                total_memory_bytes = 48 * (1024**3)
+            elif "l4" in k or "rtx 4090" in k or "rtx 3090" in k or "a5000" in k:
+                total_memory_bytes = 24 * (1024**3)
+            elif "t4" in k or "v100" in k:
+                total_memory_bytes = 16 * (1024**3)
+            else:
+                total_memory_bytes = 16 * (1024**3)
         else:
             total_memory_bytes = 8 * (1024**3)
 
@@ -119,38 +137,49 @@ def generate_vram_maximizing_candidates(
     Generates a progressive search ladder designed to push hardware memory
     to its optimal capacity (~85-92% HBM on TPU / VRAM on GPU) without leaving free memory on the table.
     """
-    if total_gb >= 32.0:
-        # High-capacity accelerator: TPU v4 (32GB), A100/H100 (40GB/80GB)
-        if preset in ("v5_small", "tpu_v5e_1", "v5_test"):
-            base_ladder = [64, 128, 256, 384, 512]
-        elif preset == "v5_compact":
-            base_ladder = [32, 64, 128, 192, 256]
+    is_small_tier = preset in ("v5_small", "tpu_v5e_1", "tpu_v6e_1", "tpu_v6e", "v5_test")
+    is_compact_tier = preset == "v5_compact"
+
+    if total_gb >= 64.0:
+        # Ultra-capacity accelerator: TPU v5p (95GB), H100/H200 (80GB/141GB), B200 (192GB)
+        if is_small_tier:
+            base_ladder = [128, 256, 512, 768, 1024, 1536, 2048, 3072, 4096]
+        elif is_compact_tier:
+            base_ladder = [64, 128, 256, 384, 512, 768, 1024, 1536]
         else:  # v5_base
-            base_ladder = [16, 32, 64, 96, 128]
+            base_ladder = [32, 64, 128, 192, 256, 384, 512, 768]
+    elif total_gb >= 28.0:
+        # High-capacity accelerator: TPU v6e (32GB Trillium), TPU v4 (32GB), A100 (40GB/80GB)
+        if is_small_tier:
+            base_ladder = [64, 128, 256, 384, 512, 768, 1024, 1536, 2048]
+        elif is_compact_tier:
+            base_ladder = [32, 64, 128, 192, 256, 384, 512, 768]
+        else:  # v5_base
+            base_ladder = [16, 32, 64, 96, 128, 192, 256, 384]
     elif total_gb >= 12.0:
         # Standard datacenter accelerator: TPU v5e-1 (16GB), T4 (16GB), V100 (16GB), L4 (24GB), RTX 3090/4090 (24GB)
-        if preset in ("v5_small", "tpu_v5e_1"):
+        if is_small_tier:
             if max_batch_size is not None and max_batch_size <= 64:
                 base_ladder = [16, 32, 64]
             else:
-                base_ladder = [32, 64, 128, 192, 256, 384]
-        elif preset == "v5_compact":
-            base_ladder = [16, 32, 64, 96, 128]
+                base_ladder = [32, 64, 128, 192, 256, 384, 512, 768, 1024]
+        elif is_compact_tier:
+            base_ladder = [16, 32, 64, 96, 128, 192, 256, 384]
         elif preset == "v5_test":
             base_ladder = [8, 16, 32, 64]
         else:  # v5_base
-            base_ladder = [8, 16, 32, 48, 64]
+            base_ladder = [8, 16, 32, 48, 64, 96, 128]
     elif total_gb >= 6.0:
         # Mid-tier workstation / gaming GPU: 8GB - 12GB
-        if preset in ("v5_small", "tpu_v5e_1"):
-            base_ladder = [16, 32, 64, 96]
-        elif preset == "v5_compact":
-            base_ladder = [8, 16, 32, 48]
+        if is_small_tier:
+            base_ladder = [16, 32, 64, 96, 128, 192, 256]
+        elif is_compact_tier:
+            base_ladder = [8, 16, 32, 48, 64, 96]
         else:
-            base_ladder = [4, 8, 16, 24]
+            base_ladder = [4, 8, 16, 24, 32]
     else:
         # Entry GPU (e.g. 4GB) or CPU
-        base_ladder = [2, 4, 8]
+        base_ladder = [2, 4, 8, 16]
 
     if max_batch_size is not None:
         cap = max(1, int(max_batch_size))
@@ -186,7 +215,7 @@ def _score_benchmark_result(res: Dict[str, Any], tune_objective: str = "balanced
 
 def load_local_hardware_config(preset: str, device_signature: str) -> Optional[Dict[str, Any]]:
     """Loads cached configuration from local filesystem if present."""
-    norm_preset = "v5_small" if preset in ("tpu_v5e_1", "tpu", "v5_tpu") else preset
+    norm_preset = "v5_small" if preset in ("tpu_v5e_1", "tpu_v6e_1", "tpu_v6e", "tpu", "v5_tpu") else preset
     for path in [LOCAL_CONFIG_PATH, os.path.join("configs", "hardware_configs.json"), os.path.join("checkpoints", "hardware_configs.json")]:
         try:
             if os.path.exists(path) and os.path.getsize(path) > 2:
@@ -201,7 +230,7 @@ def load_local_hardware_config(preset: str, device_signature: str) -> Optional[D
 
 def save_local_hardware_config(preset: str, device_signature: str, config: Dict[str, Any]) -> None:
     """Saves verified configuration to local filesystem."""
-    norm_preset = "v5_small" if preset in ("tpu_v5e_1", "tpu", "v5_tpu") else preset
+    norm_preset = "v5_small" if preset in ("tpu_v5e_1", "tpu_v6e_1", "tpu_v6e", "tpu", "v5_tpu") else preset
     os.makedirs(os.path.dirname(os.path.abspath(LOCAL_CONFIG_PATH)), exist_ok=True)
     data = {}
     if os.path.exists(LOCAL_CONFIG_PATH) and os.path.getsize(LOCAL_CONFIG_PATH) > 2:

@@ -74,6 +74,36 @@ PRESETS_V5: Dict[str, Dict[str, Any]] = {
         "thinking_cycles": 4,
         "phase_scale": 2.0,
     },
+    "tpu_v5e_1": {
+        "surface_dim": 640,
+        "radial_dim": 256,
+        "num_shells": 16,
+        "num_shortcut_tracts": 40,
+        "num_heads": 8,
+        "top_k_tracts": 16,
+        "thinking_cycles": 4,
+        "phase_scale": 2.0,
+    },
+    "tpu_v6e_1": {
+        "surface_dim": 640,
+        "radial_dim": 256,
+        "num_shells": 16,
+        "num_shortcut_tracts": 40,
+        "num_heads": 8,
+        "top_k_tracts": 16,
+        "thinking_cycles": 4,
+        "phase_scale": 2.0,
+    },
+    "tpu_v6e": {
+        "surface_dim": 640,
+        "radial_dim": 256,
+        "num_shells": 16,
+        "num_shortcut_tracts": 40,
+        "num_heads": 8,
+        "top_k_tracts": 16,
+        "thinking_cycles": 4,
+        "phase_scale": 2.0,
+    },
     "v5_compact": {
         "surface_dim": 768,
         "radial_dim": 512,
@@ -1864,7 +1894,7 @@ def infer_v5_config_from_state_dict(
     """Infers a compatible ModelConfigV5 from either a PyTorch or JAX V5 checkpoint state dict."""
     raw_state, meta = _extract_raw_v5_state(ckpt_or_state)
     preset_name = meta.get("model_preset") or meta.get("preset") or default_preset
-    if preset_name in ("tpu_v5e_1", "tpu", "v5_tpu"):
+    if preset_name in ("tpu_v5e_1", "tpu_v6e_1", "tpu_v6e", "tpu", "v5_tpu"):
         preset_name = "v5_small"
     cfg_kwargs = PRESETS_V5.get(preset_name, PRESETS_V5.get(default_preset, PRESETS_V5["v5_small"])).copy()
 
