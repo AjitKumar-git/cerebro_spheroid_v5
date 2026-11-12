@@ -91,6 +91,51 @@ def test_jax_to_pytorch_checkpoint_adaptation():
     assert torch.isfinite(logits).all()
 
 
+def test_pytorch_to_jax_checkpoint_adaptation_full_parity():
+    """Verifies PyTorch GPU checkpoint adapts all 52/52 parameters into JAX TPU engine with zero missing weights."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from src.jax.v5_model import ModelConfigV5 as JAXConfig, init_params_v5, PRESETS_V5
+    from src.spheroid_v5 import CerebroSpheroidV5, ModelConfigV5 as PTConfig
+    from src.jax.checkpoint import adapt_and_load_checkpoint_weights
+
+    cfg_d = PRESETS_V5["v5_small"]
+    pt_model = CerebroSpheroidV5(PTConfig(**cfg_d))
+    pt_state = pt_model.state_dict()
+
+    jcfg = JAXConfig(**cfg_d)
+    jparams, _ = init_params_v5(jax.random.PRNGKey(0), jcfg)
+
+    restored = adapt_and_load_checkpoint_weights({"model_state": pt_state}, jparams, jnp.float32, jcfg)
+    assert restored == len(jparams) == 52, f"Expected 52 restored parameters, got {restored}"
+
+    # Verify motor swiglu weights (which previously suffered from prefix shadowing)
+    assert np.allclose(
+        np.array(jparams["motor.swiglu.fc_gate.weight"]),
+        pt_state["motor_decoder.motor_swiglu.fc_gate.weight"].numpy(),
+        atol=1e-6,
+    )
+    assert np.allclose(
+        np.array(jparams["motor.swiglu.fc_val.weight"]),
+        pt_state["motor_decoder.motor_swiglu.fc_val.weight"].numpy(),
+        atol=1e-6,
+    )
+    assert np.allclose(
+        np.array(jparams["motor.swiglu.fc_down.weight"]),
+        pt_state["motor_decoder.motor_swiglu.fc_down.weight"].numpy(),
+        atol=1e-6,
+    )
+
+    # Verify 3D fused intra_swiglu tensor
+    for k in range(jcfg.num_shells):
+        assert np.allclose(
+            np.array(jparams["core.intra_swiglu.w_gate"][k]),
+            pt_state[f"volumetric_core.intra_shell_swiglu.{k}.fc_gate.weight"].numpy().T,
+            atol=1e-6,
+        )
+
+
 def test_real_step_1000_checkpoint_loads_into_pytorch_if_present():
     ckpt_path = os.path.join(os.path.dirname(__file__), "..", "checkpoints", "v5_tpu_step_1000.pt")
     if not os.path.exists(ckpt_path):

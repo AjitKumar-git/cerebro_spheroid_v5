@@ -431,7 +431,10 @@ def main(args=None):
                 last_eval_loss = best_eval_loss
                 restored = adapt_and_load_checkpoint_weights(ckpt, params, target_dtype, config)
                 print(f"✓ Resumed from {os.path.basename(discovered_ckpt)} at Step {start_step:,} (Loss: {best_eval_loss:.4f})")
-                print(f"✓ Restored & adapted {restored}/{len(params)} parameter arrays into JAX engine!")
+                if restored == len(params):
+                    print(f"✅ Restored & adapted {restored}/{len(params)} parameter arrays into JAX engine (100% parity)!")
+                else:
+                    print(f"⚠️ Restored & adapted {restored}/{len(params)} parameter arrays into JAX engine ({len(params) - restored} missing).")
             except Exception as e:
                 print(f"⚠️ Checkpoint load notice: {e}. Starting fresh.")
 

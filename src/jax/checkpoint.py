@@ -116,7 +116,7 @@ def adapt_and_load_checkpoint_weights(
     if not isinstance(raw_state, dict):
         return 0
 
-    restored_cnt = 0
+    restored_keys = set()
     K = config.num_shells
     s_dim = config.surface_dim
 
@@ -144,40 +144,59 @@ def adapt_and_load_checkpoint_weights(
             target_params["core.intra_swiglu.w_gate"] = jnp.asarray(np.stack(gates, axis=0), dtype=target_dtype)
             target_params["core.intra_swiglu.w_val"] = jnp.asarray(np.stack(vals, axis=0), dtype=target_dtype)
             target_params["core.intra_swiglu.w_down"] = jnp.asarray(np.stack(downs, axis=0), dtype=target_dtype)
-            restored_cnt += 3
+            restored_keys.update(["core.intra_swiglu.w_gate", "core.intra_swiglu.w_val", "core.intra_swiglu.w_down"])
         if len(norms) == K:
             target_params["core.intra_norms.weight"] = jnp.asarray(np.stack(norms, axis=0), dtype=target_dtype)
-            restored_cnt += 1
+            restored_keys.add("core.intra_norms.weight")
 
-    # 2. General prefix and name translations
-    key_translations = {
-        "sensory_dnn.": "sensory.",
-        "volumetric_core.": "core.",
-        "motor_decoder.": "motor.",
-        "motor_decoder.head.weight": "sensory.embedding.weight",
-        "motor.head.weight": "sensory.embedding.weight",
-        "motor_decoder.fc_gate.weight": "motor.swiglu.fc_gate.weight",
-        "motor_decoder.fc_val.weight": "motor.swiglu.fc_val.weight",
-        "motor_decoder.fc_down.weight": "motor.swiglu.fc_down.weight",
-    }
+    # 2. General prefix and name translations (ordered from most specific to general)
+    key_translations = [
+        # Specific motor SwiGLU projections (PyTorch motor_decoder.motor_swiglu.* or motor.motor_swiglu.*)
+        ("motor_decoder.motor_swiglu.", "motor.swiglu."),
+        ("motor_decoder.swiglu.", "motor.swiglu."),
+        ("motor.motor_swiglu.", "motor.swiglu."),
+        ("motor_decoder.fc_gate.weight", "motor.swiglu.fc_gate.weight"),
+        ("motor_decoder.fc_val.weight", "motor.swiglu.fc_val.weight"),
+        ("motor_decoder.fc_down.weight", "motor.swiglu.fc_down.weight"),
+        ("motor.fc_gate.weight", "motor.swiglu.fc_gate.weight"),
+        ("motor.fc_val.weight", "motor.swiglu.fc_val.weight"),
+        ("motor.fc_down.weight", "motor.swiglu.fc_down.weight"),
+        # Tied embedding projections
+        ("motor_decoder.head.weight", "sensory.embedding.weight"),
+        ("motor.head.weight", "sensory.embedding.weight"),
+        # General module prefixes (evaluated after specific prefixes above)
+        ("sensory_dnn.", "sensory."),
+        ("volumetric_core.", "core."),
+        ("motor_decoder.", "motor."),
+    ]
 
     for raw_k, raw_v in raw_state.items():
         v = _to_numpy(raw_v)
         target_k = raw_k
         if target_k not in target_params:
-            for old_p, new_p in key_translations.items():
+            for old_p, new_p in key_translations:
                 if target_k.startswith(old_p):
                     target_k = target_k.replace(old_p, new_p, 1)
                     break
 
-        if target_k in target_params:
+        if target_k in target_params and target_k not in restored_keys:
             t_shape = target_params[target_k].shape
             if t_shape == v.shape:
                 target_params[target_k] = jnp.asarray(v, dtype=target_dtype)
-                restored_cnt += 1
+                restored_keys.add(target_k)
             elif t_shape == v.T.shape:
                 target_params[target_k] = jnp.asarray(v.T, dtype=target_dtype)
-                restored_cnt += 1
+                restored_keys.add(target_k)
+            elif (
+                target_k in ("sensory.pos_embed.weight", "motor.phase_embed.weight")
+                and v.ndim == 2
+                and t_shape[1] == v.shape[1]
+            ):
+                rows = min(t_shape[0], v.shape[0])
+                buf = np.array(target_params[target_k])
+                buf[:rows] = v[:rows]
+                target_params[target_k] = jnp.asarray(buf, dtype=target_dtype)
+                restored_keys.add(target_k)
 
     # Weight transferability: legacy checkpoints share one radial_up across inward/outward waves
     has_radial_up_out = isinstance(raw_state, dict) and any(
@@ -190,7 +209,11 @@ def adapt_and_load_checkpoint_weights(
     ):
         target_params["core.radial_up_out.weight"] = target_params["core.radial_up.weight"]
 
-    return restored_cnt
+    missing = [k for k in target_params.keys() if k not in restored_keys and k != "core.radial_up_out.weight"]
+    if missing:
+        print(f"ℹ️ [adapt_weights] Unmapped JAX parameter arrays ({len(missing)}/{len(target_params)}): {missing}")
+
+    return len(restored_keys)
 
 
 def load_torch_pt_to_jax(
