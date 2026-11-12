@@ -551,6 +551,7 @@ def build_tokenizer(name: str = "llama"):
             tok = AutoTokenizer.from_pretrained(local_tok, local_files_only=True)
             if tok.pad_token_id is None:
                 tok.pad_token_id = 0
+            tok.model_max_length = 100_000
             return tok
         except Exception:
             pass
@@ -561,6 +562,7 @@ def build_tokenizer(name: str = "llama"):
             tok = AutoTokenizer.from_pretrained(cand)
             if tok.pad_token_id is None:
                 tok.pad_token_id = 0
+            tok.model_max_length = 100_000
             return tok
         except Exception:
             continue

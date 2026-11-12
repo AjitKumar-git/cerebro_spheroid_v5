@@ -117,6 +117,10 @@ def _open_hf_stream(
     """Open a HuggingFace streaming dataset with optional multi-rank sharding and auth token."""
     import os
 
+    # Redirect legacy script-based gsm8k repo to official Parquet dataset to prevent 429 rate limit stalls
+    if repo == "gsm8k":
+        repo = "openai/gsm8k"
+
     if "HF_HOME" not in os.environ:
         default_cache = os.path.join(os.path.expanduser("~"), ".cache")
         if not os.access(default_cache, os.W_OK):
@@ -273,7 +277,7 @@ def build_online_dataset_iterator(
                 try:
                     if turn % 2 == 0:
                         row, gsm_it = _next_or_reopen(
-                            gsm_it, lambda: _open_hf_stream("gsm8k", "main", rank=rank, world_size=world_size)
+                            gsm_it, lambda: _open_hf_stream("openai/gsm8k", "main", rank=rank, world_size=world_size)
                         )
                         yield {"conversations": [{"from": "human", "value": row.get("question", "")}, {"from": "gpt", "value": row.get("answer", "")}]}
                     else:
@@ -282,6 +286,17 @@ def build_online_dataset_iterator(
                         )
                         yield row
                 except Exception:
+                    try:
+                        import json
+                        base_data = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "cerebro_cognitive_8k", "cerebro_cognitive_10k.jsonl")
+                        if os.path.exists(base_data):
+                            with open(base_data, "r", encoding="utf-8") as f:
+                                for line in f:
+                                    if line.strip():
+                                        d = json.loads(line)
+                                        yield {"conversations": [{"from": "human", "value": d.get("question", "")}, {"from": "gpt", "value": d.get("answer", "")}]}
+                    except Exception:
+                        pass
                     time.sleep(0.5)
                 turn += 1
 

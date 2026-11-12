@@ -597,9 +597,9 @@ def test_open_hf_stream_uses_parquet_revision_for_openhermes(monkeypatch):
     assert calls[0][2]["revision"] == "refs/convert/parquet"
     assert calls[0][2]["streaming"] is True
 
-    # Non-OpenHermes repos should not inject an unexpected revision kwarg.
+    # Non-OpenHermes repos should not inject an unexpected revision kwarg; gsm8k rewrites to official parquet.
     list(_open_hf_stream("gsm8k", "main", rank=0, world_size=1))
-    assert calls[1][0] == "gsm8k"
+    assert calls[1][0] == "openai/gsm8k"
     assert "revision" not in calls[1][2]
 
     # Legacy mocks that do not accept `revision` fall back cleanly via TypeError handling.
