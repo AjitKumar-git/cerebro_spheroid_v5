@@ -216,6 +216,70 @@ def adapt_and_load_checkpoint_weights(
     return len(restored_keys)
 
 
+def adapt_jax_to_torch_state_dict(
+    jax_state: Dict[str, Any],
+    config: ModelConfigV5,
+) -> Dict[str, Any]:
+    """
+    Losslessly converts JAX parameter dictionary (fused 3D SwiGLU & norms)
+    into standard PyTorch CerebroSpheroidV5 state_dict (ModuleList keys).
+    """
+    if not HAS_TORCH:
+        raise RuntimeError(f"PyTorch is required for checkpoint conversion: {_TORCH_ERR}")
+
+    raw_state = jax_state.get("model_state", jax_state) if isinstance(jax_state, dict) else jax_state
+    new_state: Dict[str, Any] = {}
+    K = config.num_shells
+    s_dim = config.surface_dim
+
+    # 1. Unpack 3D intra-shell swiglu & norms into ModuleList keys
+    if "core.intra_swiglu.w_gate" in raw_state:
+        g = _safe_torch_tensor(raw_state["core.intra_swiglu.w_gate"])
+        v = _safe_torch_tensor(raw_state["core.intra_swiglu.w_val"])
+        d = _safe_torch_tensor(raw_state["core.intra_swiglu.w_down"])
+        for k in range(K):
+            g_k = g[k].t() if g[k].shape == (s_dim, s_dim * 2) else g[k]
+            v_k = v[k].t() if v[k].shape == (s_dim, s_dim * 2) else v[k]
+            d_k = d[k].t() if d[k].shape == (s_dim * 2, s_dim) else d[k]
+            new_state[f"volumetric_core.intra_shell_swiglu.{k}.fc_gate.weight"] = g_k
+            new_state[f"volumetric_core.intra_shell_swiglu.{k}.fc_val.weight"] = v_k
+            new_state[f"volumetric_core.intra_shell_swiglu.{k}.fc_down.weight"] = d_k
+
+    if "core.intra_norms.weight" in raw_state:
+        norms = _safe_torch_tensor(raw_state["core.intra_norms.weight"])
+        for k in range(K):
+            new_state[f"volumetric_core.intra_norms.{k}.weight"] = norms[k]
+
+    # 2. Module prefix & name translations
+    pfx_map = [
+        ("motor.swiglu.fc_gate.weight", "motor_decoder.motor_swiglu.fc_gate.weight"),
+        ("motor.swiglu.fc_val.weight", "motor_decoder.motor_swiglu.fc_val.weight"),
+        ("motor.swiglu.fc_down.weight", "motor_decoder.motor_swiglu.fc_down.weight"),
+        ("sensory.", "sensory_dnn."),
+        ("core.", "volumetric_core."),
+        ("motor.", "motor_decoder."),
+    ]
+
+    for k, val in raw_state.items():
+        if k in (
+            "core.intra_swiglu.w_gate",
+            "core.intra_swiglu.w_val",
+            "core.intra_swiglu.w_down",
+            "core.intra_norms.weight",
+            "core.src_indices",
+            "core.dst_indices",
+        ):
+            continue
+        mapped_k = k
+        for old_p, new_p in pfx_map:
+            if mapped_k.startswith(old_p):
+                mapped_k = mapped_k.replace(old_p, new_p, 1)
+                break
+        new_state[mapped_k] = _safe_torch_tensor(val)
+
+    return new_state
+
+
 def load_torch_pt_to_jax(
     ckpt_path: str,
     config: ModelConfigV5,

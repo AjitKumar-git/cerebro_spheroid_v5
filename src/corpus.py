@@ -607,8 +607,13 @@ def format_motor_response(answer: str) -> str:
     return a
 
 
-def clean_motor_response(text: str) -> str:
-    """Strips <act> and </act> delimiters if present, with fallback for legacy prefixes."""
+def clean_motor_response(text: str, strict: bool = True) -> str:
+    """
+    Strips biological <act> and </act> delimiters and returns strictly the interior payload.
+    If <act> and </act> tags are present, extracts strictly the text between them,
+    discarding all tokens before <act> and all tokens after </act>.
+    If only <act> is present without </act>, extracts from <act> onwards.
+    """
     t = text.strip()
     m = re.search(r"<act>\s*(.*?)(?:\s*</act>|$)", t, re.DOTALL)
     if m:
@@ -621,7 +626,59 @@ def clean_motor_response(text: str) -> str:
         t = t[4:].strip()
     if t.startswith("act:"):
         t = t[4:].strip()
+    if strict and "</act>" in t:
+        t = t.split("</act>")[0].strip()
     return t
+
+
+def extract_strict_act_tokens(
+    tokens: Sequence[int],
+    tokenizer: Any = None,
+    bio_ids: Optional[Dict[str, Optional[int]]] = None,
+) -> List[int]:
+    """
+    Extracts strictly the token IDs inside the biological delimiters <act> (33) and </act> (34).
+    Discards any tokens prior to <act>, skips the <act> token itself, and truncates
+    immediately upon encountering </act> or EOS.
+    """
+    if bio_ids is None and tokenizer is not None:
+        bio_ids = get_bio_token_ids(tokenizer)
+    act_id = bio_ids.get("act", 33) if bio_ids else 33
+    act_end_id = bio_ids.get("act_end", 34) if bio_ids else 34
+    eos_id = getattr(tokenizer, "eos_token_id", 2) if tokenizer is not None else 2
+
+    stop_ids = {t for t in (eos_id, act_end_id) if t is not None}
+
+    token_list = list(tokens)
+    if not token_list:
+        return []
+
+    # Find start: if act_id is present, start right after it; otherwise start at 0
+    if act_id in token_list:
+        start_idx = token_list.index(act_id) + 1
+    else:
+        start_idx = 0
+
+    # Find end: stop at the first occurrence of any stop_id after start_idx
+    end_idx = len(token_list)
+    for i in range(start_idx, len(token_list)):
+        if token_list[i] in stop_ids:
+            end_idx = i
+            break
+
+    return token_list[start_idx:end_idx]
+
+
+def extract_strict_act_payload(
+    tokens: Sequence[int],
+    tokenizer: Any,
+) -> str:
+    """
+    Extracts strictly the text payload inside <act> and </act> from a sequence of token IDs.
+    """
+    payload_tokens = extract_strict_act_tokens(tokens, tokenizer=tokenizer)
+    decoded = tokenizer.decode(payload_tokens, skip_special_tokens=True).strip()
+    return clean_motor_response(decoded, strict=True)
 
 
 def encode_no_special(tokenizer, text: str, max_length: Optional[int] = None) -> List[int]:

@@ -921,3 +921,51 @@ def compute_manifold_diagnostics_jax(state: jnp.ndarray) -> Dict[str, Any]:
         "mean_adjacent_cosine": float(sum(adjacent_cosines) / len(adjacent_cosines)) if adjacent_cosines else 1.0,
         "adjacent_cosines": adjacent_cosines,
     }
+
+
+def generate_text_jax(
+    params: Dict[str, jnp.ndarray],
+    buffers: Tuple[jnp.ndarray, jnp.ndarray],
+    config: ModelConfigV5,
+    prompt: str,
+    tokenizer: Any,
+    max_new_tokens: int = 64,
+    temperature: float = 0.7,
+    repetition_penalty: float = 1.2,
+    seed_token_id: Optional[int] = None,
+    strict_act: bool = True,
+) -> str:
+    """
+    Convenience method for generating autoregressive text in JAX.
+    Strictly extracts and returns only the interior motor payload between <act> and </act>.
+    """
+    from src.corpus import (
+        format_stimulus_prompt,
+        clean_motor_response,
+        encode_no_special,
+        get_bio_token_ids,
+        extract_strict_act_payload,
+    )
+
+    bio_ids = get_bio_token_ids(tokenizer)
+    act_id = bio_ids.get("act", 33)
+    seed = seed_token_id if seed_token_id is not None else act_id
+
+    formatted_prompt = format_stimulus_prompt(prompt)
+    prompt_ids = encode_no_special(tokenizer, formatted_prompt)
+    prompts_arr = jnp.array([prompt_ids], dtype=jnp.int32)
+
+    logits = training_rollout(
+        params=params,
+        prompts=prompts_arr,
+        target_len=max_new_tokens,
+        buffers=buffers,
+        config=config,
+        repetition_penalty=repetition_penalty,
+        seed_token_id=seed,
+    )
+    token_ids = [int(x) for x in jnp.argmax(logits[0], axis=-1)]
+    if strict_act:
+        return extract_strict_act_payload(token_ids, tokenizer)
+    raw = tokenizer.decode(token_ids, skip_special_tokens=False)
+    return clean_motor_response(raw)

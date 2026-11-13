@@ -1987,13 +1987,15 @@ class CerebroSpheroidV5(nn.Module):
         repetition_penalty: float = 1.25,
         thinking_cycles: Optional[int] = None,
         device: Optional[torch.device] = None,
+        strict_act: bool = True,
     ) -> str:
-        """Convenience method for generating text from a prompt string."""
+        """Convenience method for generating text from a prompt string with strict <act> ... </act> payload extraction."""
         from src.corpus import (
             format_stimulus_prompt,
             clean_motor_response,
             encode_no_special,
             get_bio_token_ids,
+            extract_strict_act_payload,
         )
 
         dev = device if device is not None else next(self.parameters()).device
@@ -2021,6 +2023,8 @@ class CerebroSpheroidV5(nn.Module):
             stop_token_ids=stop_ids,
         )
         seq = out_ids[0].tolist()
+        if strict_act:
+            return extract_strict_act_payload(seq, tokenizer)
         for idx_tok, tid in enumerate(seq):
             if tid in stop_ids and tid != seed_id:
                 seq = seq[:idx_tok]

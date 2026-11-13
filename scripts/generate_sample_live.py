@@ -14,6 +14,7 @@ if WORKSPACE_ROOT not in sys.path:
     sys.path.insert(0, WORKSPACE_ROOT)
 
 from src.spheroid_v5 import CerebroSpheroidV5, ModelConfigV5, PRESETS_V5
+from src.jax.checkpoint import adapt_jax_to_torch_state_dict
 from transformers import AutoTokenizer
 
 def run_sample_generation(checkpoint_path: str, preset: str = "tpu_v5e_1"):
@@ -21,7 +22,7 @@ def run_sample_generation(checkpoint_path: str, preset: str = "tpu_v5e_1"):
     tok_dir = os.path.join(WORKSPACE_ROOT, "data", "tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(tok_dir)
 
-    raw_cfg = PRESETS_V5[preset]
+    raw_cfg = PRESETS_V5.get(preset, PRESETS_V5.get("v5_small"))
     cfg = ModelConfigV5(**raw_cfg) if isinstance(raw_cfg, dict) else raw_cfg
     model = CerebroSpheroidV5(cfg)
 
@@ -31,7 +32,10 @@ def run_sample_generation(checkpoint_path: str, preset: str = "tpu_v5e_1"):
     loss = ckpt.get("loss", "unknown")
     print(f"✓ Checkpoint loaded: Step {step:,} (Loss: {loss})")
 
-    # Adapt keys if necessary
+    # Adapt JAX keys if needed
+    if any(k.startswith("core.intra_swiglu") for k in state.keys()):
+        state = adapt_jax_to_torch_state_dict(state, cfg)
+
     model.load_state_dict(state, strict=False)
     model.eval()
 
@@ -39,18 +43,19 @@ def run_sample_generation(checkpoint_path: str, preset: str = "tpu_v5e_1"):
     model.to(device)
 
     prompts = [
+        "What is an atom?",
         "What is gravity and how does it work?",
-        "Explain photosynthesis in plants:",
-        "The fundamental law of energy states that",
-        "def fibonacci(n):",
+        "Question: If 2 + 2 = 4, then 4 + 4 equals what? Answer:",
+        "Explain the importance of water for living organisms:",
     ]
 
     print("\n" + "="*80)
     print(f"🧠 CEREBRO-SPHEROID V5 SAMPLE OUTPUTS (Step {step:,} | Loss {loss})")
+    print("   [Mode: Strict output inside <act> ... </act>]")
     print("="*80)
 
     for p in prompts:
-        print(f"\n[Prompt]: {p}")
+        print(f"\n[Stimulus Prompt]: {p}")
         with torch.no_grad():
             out = model.generate_text(
                 prompt=p,
@@ -60,8 +65,9 @@ def run_sample_generation(checkpoint_path: str, preset: str = "tpu_v5e_1"):
                 top_p=0.9,
                 repetition_penalty=1.2,
                 device=device,
+                strict_act=True,
             )
-        print(f"[Model Output]:\n{out.strip()}\n" + "-"*60)
+        print(f"[Strict Motor Action Output]:\n{out.strip()}\n" + "-"*60)
 
 if __name__ == "__main__":
     ckpt = sys.argv[1] if len(sys.argv) > 1 else "/home/ajit/Documents/Startup/Active_Development/cerebro_spheroid_v5/checkpoints/v5_small_cloud_best_live.pt"

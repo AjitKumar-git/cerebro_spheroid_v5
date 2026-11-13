@@ -271,4 +271,79 @@ def test_deliberation_mode_cli_parsing():
         assert tpu_args.deliberation_mode == mode
 
 
+def test_strict_act_token_and_payload_extraction():
+    """Verifies that extract_strict_act_tokens and extract_strict_act_payload strictly isolate content between <act> and </act>."""
+    from src.corpus import (
+        build_tokenizer,
+        extract_strict_act_tokens,
+        extract_strict_act_payload,
+        clean_motor_response,
+        get_bio_token_ids,
+    )
+
+    tok = build_tokenizer("llama")
+    bio_ids = get_bio_token_ids(tok)
+    act_id = bio_ids["act"]
+    act_end_id = bio_ids["act_end"]
+    eos_id = tok.eos_token_id
+
+    # Simulated token stream: [prefix_noise, <act>, word1, word2, </act>, post_noise_1, post_noise_2]
+    # "Hello world" inside delimiters
+    word_ids = tok.encode("Hello world", add_special_tokens=False)
+    raw_stream = [999, 888, act_id] + word_ids + [act_end_id, 777, 666]
+
+    strict_tokens = extract_strict_act_tokens(raw_stream, tokenizer=tok)
+    assert strict_tokens == word_ids
+    assert act_id not in strict_tokens
+    assert act_end_id not in strict_tokens
+    assert 999 not in strict_tokens
+    assert 777 not in strict_tokens
+
+    payload_text = extract_strict_act_payload(raw_stream, tok)
+    assert payload_text == "Hello world"
+
+    # Test clean_motor_response string behavior
+    text_with_noise = "<act> The atom is the basic unit of chemical elements. </act> and furthermore there is extra noise"
+    cleaned = clean_motor_response(text_with_noise, strict=True)
+    assert cleaned == "The atom is the basic unit of chemical elements."
+    assert "extra noise" not in cleaned
+    assert "<act>" not in cleaned
+    assert "</act>" not in cleaned
+
+
+def test_jax_to_torch_state_dict_bidirectional_adaptation():
+    """Verifies that adapt_jax_to_torch_state_dict faithfully converts JAX weights to PyTorch CerebroSpheroidV5."""
+    from src.jax.checkpoint import adapt_jax_to_torch_state_dict
+    cfg = dict(PRESETS_V5["v5_small"])
+    cfg["vocab_size"] = 500
+    cfg["num_shells"] = 4
+    config = ModelConfigV5(**cfg)
+
+    # Mock JAX parameters with 3D intra_swiglu tensors
+    s_dim = config.surface_dim
+    K = config.num_shells
+    jax_params = {
+        "core.intra_swiglu.w_gate": np.random.randn(K, s_dim * 2, s_dim).astype(np.float32),
+        "core.intra_swiglu.w_val": np.random.randn(K, s_dim * 2, s_dim).astype(np.float32),
+        "core.intra_swiglu.w_down": np.random.randn(K, s_dim, s_dim * 2).astype(np.float32),
+        "core.intra_norms.weight": np.random.randn(K, s_dim).astype(np.float32),
+        "sensory.embedding.weight": np.random.randn(config.vocab_size, s_dim).astype(np.float32),
+        "motor.swiglu.fc_gate.weight": np.random.randn(s_dim * 2, s_dim).astype(np.float32),
+        "motor.swiglu.fc_val.weight": np.random.randn(s_dim * 2, s_dim).astype(np.float32),
+        "motor.swiglu.fc_down.weight": np.random.randn(s_dim, s_dim * 2).astype(np.float32),
+    }
+
+    pt_state = adapt_jax_to_torch_state_dict(jax_params, config)
+
+    # Check that intra-shell swiglu unpacked into K modules
+    for k in range(K):
+        assert f"volumetric_core.intra_shell_swiglu.{k}.fc_gate.weight" in pt_state
+        assert f"volumetric_core.intra_shell_swiglu.{k}.fc_val.weight" in pt_state
+        assert f"volumetric_core.intra_shell_swiglu.{k}.fc_down.weight" in pt_state
+        assert f"volumetric_core.intra_norms.{k}.weight" in pt_state
+
+    assert "sensory_dnn.embedding.weight" in pt_state
+    assert "motor_decoder.motor_swiglu.fc_gate.weight" in pt_state
+
+
 

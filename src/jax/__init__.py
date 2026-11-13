@@ -12,6 +12,7 @@ from .v5_model import (
     emit_step,
     training_rollout,
     compute_manifold_diagnostics_jax,
+    generate_text_jax,
 )
 
 from .spheroid_optimizer import (
@@ -26,6 +27,7 @@ from .checkpoint import (
     save_jax_to_torch_pt,
     load_torch_pt_to_jax,
     adapt_and_load_checkpoint_weights,
+    adapt_jax_to_torch_state_dict,
     discover_latest_checkpoint,
     AsyncCheckpointManager,
 )
@@ -43,6 +45,7 @@ __all__ = [
     "emit_step",
     "training_rollout",
     "compute_manifold_diagnostics_jax",
+    "generate_text_jax",
     "zeropower_via_newtonschulz5_jax",
     "clamp_spectral_norm_jax",
     "init_spheroid_opt_state",
@@ -51,6 +54,7 @@ __all__ = [
     "save_jax_to_torch_pt",
     "load_torch_pt_to_jax",
     "adapt_and_load_checkpoint_weights",
+    "adapt_jax_to_torch_state_dict",
     "discover_latest_checkpoint",
     "AsyncCheckpointManager",
     "LinguisticDataStreamer",
