@@ -26,7 +26,7 @@ import shutil
 import signal
 import sys
 import time
-from typing import Optional, Dict, Any, List, Union, Tuple
+from typing import Optional, Dict, Any, List, Union, Tuple, Sequence
 
 # Kaggle / Python 3.12+ PyArrow compatibility shim for HuggingFace `datasets`
 try:
