@@ -139,6 +139,7 @@ def parse_args(args_list=None):
     parser.add_argument("--lr", type=float, default=2e-3, help="Peak Spheroid learning rate (default: 2e-3)")
     parser.add_argument("--min_lr", type=float, default=1e-4, help="Final annealed learning rate floor (default: 1e-4)")
     parser.add_argument("--warmup_steps", type=int, default=500, help="Linear warmup steps (default: 500)")
+    parser.add_argument("--resume_warmup_steps", "--resume-warmup-steps", dest="resume_warmup_steps", type=int, default=100, help="Smooth warmup steps upon checkpoint resumption (default: 100)")
     parser.add_argument("--lr_schedule", type=str, default="cosine", choices=["cosine", "warm_restart", "session", "anneal"], help="Learning rate schedule")
     parser.add_argument("--restart_steps", type=int, default=25000, help="Cycle period for warm_restart schedule")
     parser.add_argument("--optimizer", type=str, default="spheroid", choices=["spheroid", "adamw"], help="Optimizer choice (default: spheroid)")
@@ -398,6 +399,7 @@ def main(args=None):
     start_step = 0
     best_eval_loss = float("inf")
     last_eval_loss = float("inf")
+    initial_ema_loss: Optional[float] = None
     sync_model_name = "v5_small" if args.preset in ("tpu_v5e_1", "tpu_v6e_1", "tpu_v6e") else args.preset
     local_latest = os.path.join(args.checkpoint_dir, f"{args.preset}_latest.pt")
     fallback_latest = os.path.join(args.checkpoint_dir, f"{sync_model_name}_latest.pt")
@@ -463,8 +465,12 @@ def main(args=None):
                 start_step = int(ckpt.get("step", 0))
                 best_eval_loss = float(ckpt.get("eval_loss", ckpt.get("loss", float("inf"))))
                 last_eval_loss = best_eval_loss
+                restored_ema = ckpt.get("ema_loss", ckpt.get("loss", ckpt.get("eval_loss", None)))
+                if restored_ema is not None and math.isfinite(float(restored_ema)) and float(restored_ema) > 0.0:
+                    initial_ema_loss = float(restored_ema)
                 restored = adapt_and_load_checkpoint_weights(ckpt, params, target_dtype, config)
-                print(f"✓ Resumed from {os.path.basename(discovered_ckpt)} at Step {start_step:,} (Loss: {best_eval_loss:.4f})")
+                ema_info = f" (EMA: {initial_ema_loss:.4f})" if initial_ema_loss is not None else ""
+                print(f"✓ Resumed from {os.path.basename(discovered_ckpt)} at Step {start_step:,} (Loss: {best_eval_loss:.4f}{ema_info})")
                 if restored == len(params):
                     print(f"✅ Restored & adapted {restored}/{len(params)} parameter arrays into JAX engine (100% parity)!")
                 else:
@@ -635,7 +641,10 @@ def main(args=None):
         jax.block_until_ready(initial_loss)
         init_loss_val = float(initial_loss)
         del _warm_p, _warm_opt
-    print(f"✓ XLA Compilation complete in {time.time() - t0_compile:.2f}s! Initial Loss: {init_loss_val:.4f}")
+    if start_step > 0 and math.isfinite(best_eval_loss):
+        print(f"✓ XLA Compilation complete in {time.time() - t0_compile:.2f}s! Baseline Restored Loss: {best_eval_loss:.4f} (Tracer init: {init_loss_val:.2f})")
+    else:
+        print(f"✓ XLA Compilation complete in {time.time() - t0_compile:.2f}s! Initial Loss: {init_loss_val:.4f}")
 
     # 9. Clean Held-Out Validation Split (sampled from active data distribution with -100 target padding)
     eval_batches = []
@@ -781,7 +790,7 @@ def main(args=None):
     last_cloud_save_time = time.time()
     step_window_tokens = 0
     step_window_count = 0
-    ema_loss: Optional[float] = None
+    ema_loss: Optional[float] = initial_ema_loss
 
     try:
         while step < args.total_steps and not shutdown_requested:
@@ -789,9 +798,23 @@ def main(args=None):
             step += step_stride
 
             cur_lr = get_learning_rate(step, args.total_steps, args.lr, args.min_lr, args.warmup_steps)
+
+            # Smooth resumption warmup: prevents cold-optimizer momentum shock on resume
+            resume_warm_steps = int(getattr(args, "resume_warmup_steps", 100))
+            if start_step > 0 and resume_warm_steps > 0:
+                elapsed_resume = step - start_step
+                if elapsed_resume < resume_warm_steps:
+                    warmup_factor = 0.10 + 0.90 * (float(elapsed_resume) / float(max(1, resume_warm_steps)))
+                    cur_lr = cur_lr * warmup_factor
+
             cur_sampling_p, cur_pitfall_prob, alpha_gov = get_sampling_p(
                 step, args.schedule_steps, args.min_sampling_p, args.pitfall_prob, current_loss=ema_loss
             )
+            # Resumption protection: smoothly ramp governor during cold resumption to prevent early jerks
+            if start_step > 0 and resume_warm_steps > 0 and (step - start_step) < resume_warm_steps:
+                warm_frac = float(step - start_step) / float(max(1, resume_warm_steps))
+                alpha_gov = alpha_gov * warm_frac
+
             if getattr(args, "loss_lr_damping", True) and alpha_gov > 0.0:
                 cur_lr = cur_lr * (1.0 - 0.4 * alpha_gov)
 
@@ -844,7 +867,8 @@ def main(args=None):
 
             loss_val = float(loss)
             if math.isfinite(loss_val):
-                ema_loss = loss_val if ema_loss is None else (0.90 * ema_loss + 0.10 * loss_val)
+                # Smooth 0.96 / 0.04 EMA update to prevent single-batch spikes from oscillating the governor
+                ema_loss = loss_val if ema_loss is None else (0.96 * ema_loss + 0.04 * loss_val)
 
             # Step & token throughput accounting
             step_window_tokens += step_tokens
@@ -891,6 +915,7 @@ def main(args=None):
                         "step": step,
                         "eval_loss": eval_loss,
                         "loss": float(loss),
+                        "ema_loss": ema_loss if ema_loss is not None else float(loss),
                         "ppl": eval_ppl,
                         "preset": args.preset,
                         "sync_model": sync_model_name,
@@ -933,6 +958,7 @@ def main(args=None):
                 meta_latest = {
                     "step": step,
                     "loss": float(loss),
+                    "ema_loss": ema_loss if ema_loss is not None else float(loss),
                     "eval_loss": last_eval_loss if math.isfinite(last_eval_loss) else float(loss),
                     "best_eval_loss": best_eval_loss,
                     "preset": args.preset,
@@ -971,6 +997,7 @@ def main(args=None):
                     meta_dict={
                         "step": step,
                         "loss": float(loss),
+                        "ema_loss": ema_loss if ema_loss is not None else float(loss),
                         "eval_loss": last_eval_loss if math.isfinite(last_eval_loss) else float(loss),
                         "sync_model": sync_model_name,
                     },
@@ -999,6 +1026,7 @@ def main(args=None):
         final_meta = {
             "step": step,
             "loss": float(loss) if "loss" in locals() else 0.0,
+            "ema_loss": ema_loss if ema_loss is not None else (float(loss) if "loss" in locals() else 0.0),
             "eval_loss": best_eval_loss,
             "preset": args.preset,
             "sync_model": sync_model_name,

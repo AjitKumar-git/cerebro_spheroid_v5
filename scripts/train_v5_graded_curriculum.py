@@ -159,7 +159,7 @@ class _CerebroDDPModule(nn.Module):
         return ce_loss, logits, action_logits
 
 
-def parse_args():
+def parse_args(args_list: Optional[Sequence[str]] = None):
     parser = argparse.ArgumentParser(description="CerebroSpheroid V5 Graded Curriculum Training")
     parser.add_argument("--total-steps", type=int, default=1_000_000, help="Total training steps")
     parser.add_argument("--test-steps", type=int, default=None, help="If set, stops after test-steps (for local dry run)")
@@ -180,6 +180,7 @@ def parse_args():
     parser.add_argument("--loss-lr-damping", action=argparse.BooleanOptionalAction, default=True, help="Damp learning rate when loss is climbing towards ceiling to prevent optimizer overshoot")
     parser.add_argument("--max-lr", type=float, default=5e-4, help="Peak learning rate (default: 5e-4 matching TPU)")
     parser.add_argument("--warmup-steps", type=int, default=500, help="Linear warmup steps (default: 500 matching TPU)")
+    parser.add_argument("--resume-warmup-steps", "--resume_warmup_steps", dest="resume_warmup_steps", type=int, default=100, help="Smooth warmup steps upon checkpoint resumption (default: 100)")
     parser.add_argument("--log-interval", type=int, default=10, help="Steps between log lines")
     parser.add_argument("--eval-interval", type=int, default=250, help="Steps between fixed held-out validation passes (default: 250)")
     parser.add_argument("--save-interval", type=int, default=1000, help="Steps between checkpoints")
@@ -204,7 +205,7 @@ def parse_args():
     parser.add_argument("--max-hours", type=float, default=None, help="Wall-clock budget in hours for clean checkpoint save before timeout")
     parser.add_argument("--seed", type=int, default=42, help="Base PRNG seed (offset per DDP rank for data streaming)")
     parser.add_argument("--local-rank", "--local_rank", dest="local_rank", type=int, default=0, help="Local device rank when launched via distributed runner")
-    return parser.parse_args()
+    return parser.parse_args(args_list)
 
 
 def load_local_tokenizer(offline: bool = True):
@@ -256,6 +257,7 @@ def _save_and_push_checkpoints(
     need_local_save: bool,
     need_cloud_sync: bool,
     eval_loss: Optional[float] = None,
+    ema_loss: Optional[float] = None,
     final_save: bool = False,
 ) -> float:
     """Persist local latest/best/step checkpoints (in bfloat16) and enqueue optional bioflo.in upload."""
@@ -269,6 +271,7 @@ def _save_and_push_checkpoints(
         "config": config,
         "loss": loss_val,
         "eval_loss": eval_loss if eval_loss is not None else loss_val,
+        "ema_loss": ema_loss if ema_loss is not None else loss_val,
         "model_preset": model_preset,
     }
     latest_path = os.path.join(checkpoint_dir, f"{model_preset}_latest.pt")
@@ -513,6 +516,7 @@ def _run_training(
         print(f"Model Preset: {args.model_preset} ({config.num_shells} shells, {config.surface_dim} surface dim, tied={config.use_tied_embeddings})")
         print(f"Total Parameters (Model + ActionHead): {total_params:,} (~{total_params/1e6:.1f}M)")
 
+    initial_ema_loss: Optional[float] = None
     if ckpt is not None and load_cand is not None:
         try:
             load_v5_checkpoint_into_torch(raw_model, ckpt, verbose=is_main)
@@ -528,8 +532,12 @@ def _run_training(
                 best_loss = float(ckpt_loss)
             else:
                 best_loss = float("inf")
+            ckpt_ema = ckpt.get("ema_loss", ckpt.get("loss", ckpt.get("eval_loss", None)))
+            if ckpt_ema is not None and math.isfinite(float(ckpt_ema)) and float(ckpt_ema) > 0.0:
+                initial_ema_loss = float(ckpt_ema)
+            ema_str = f", EMA: {initial_ema_loss:.4f}" if initial_ema_loss is not None else ""
             if is_main:
-                print(f"✓ Resumed from {os.path.basename(load_cand)} at step {start_step:,} (best loss: {best_loss:.4f})")
+                print(f"✓ Resumed from {os.path.basename(load_cand)} at step {start_step:,} (best loss: {best_loss:.4f}{ema_str})")
         except Exception as e:
             if is_main:
                 print(f"⚠️ Could not load checkpoint from {load_cand}: {e}")
@@ -664,7 +672,7 @@ def _run_training(
             if is_main:
                 print(f"ℹ️ Could not pre-generate held-out eval batches: {e}")
 
-    ema_loss = None
+    ema_loss: Optional[float] = initial_ema_loss
     latest_eval_loss = None
     best_eval_loss = best_loss if math.isfinite(best_loss) else float("inf")
 
@@ -697,13 +705,17 @@ def _run_training(
             if c_ceil > c_floor:
                 alpha_gov = max(0.0, min(1.0, (float(current_loss) - c_floor) / (c_ceil - c_floor)))
 
+        # Resumption protection: smoothly ramp governor during cold resumption to prevent early jerks
+        resume_warm_steps = int(getattr(args, "resume_warmup_steps", 100))
+        if start_s > 0 and resume_warm_steps > 0 and (step_idx - start_s) < resume_warm_steps:
+            warm_frac = float(step_idx - start_s) / float(max(1, resume_warm_steps))
+            alpha_gov = alpha_gov * warm_frac
+
         effective_p = nominal_p + alpha_gov * (1.0 - nominal_p)
         effective_pitfall = nominal_pitfall * (1.0 - alpha_gov)
         if effective_p >= 1.0 - 1e-4:
             effective_p = 1.0
         return float(effective_p), float(effective_pitfall), float(alpha_gov)
-
-    ema_loss: Optional[float] = None
 
     try:
         while step < max_steps:
@@ -745,6 +757,15 @@ def _run_training(
 
             # Update dynamic learning rate while preserving per-group LR ratios (lr_1d, lr_vocab)
             lr = compute_curriculum_lr(step, schedule_config)
+
+            # Smooth resumption warmup: prevents cold-optimizer momentum shock on resume
+            resume_warm_steps = int(getattr(args, "resume_warmup_steps", 100))
+            if start_step > 0 and resume_warm_steps > 0:
+                elapsed_resume = step - start_step
+                if elapsed_resume < resume_warm_steps:
+                    warmup_factor = 0.10 + 0.90 * (float(elapsed_resume) / float(max(1, resume_warm_steps)))
+                    lr = lr * warmup_factor
+
             if getattr(args, "loss_lr_damping", True) and alpha_gov > 0.0:
                 lr = lr * (1.0 - 0.4 * alpha_gov)
             lr_scale = lr / max(schedule_config.max_lr, 1e-12)
@@ -851,7 +872,7 @@ def _run_training(
                 if ema_loss is None:
                     ema_loss = avg_loss
                 else:
-                    ema_loss = 0.9 * ema_loss + 0.1 * avg_loss
+                    ema_loss = 0.96 * ema_loss + 0.04 * avg_loss
 
                 if is_main:
                     tok_per_sec = global_tok / max(1.0, elapsed)
@@ -886,6 +907,7 @@ def _run_training(
                     need_local_save=need_local_save,
                     need_cloud_sync=need_cloud_sync,
                     eval_loss=latest_eval_loss,
+                    ema_loss=ema_loss,
                     final_save=False,
                 )
 
@@ -911,6 +933,7 @@ def _run_training(
                 need_local_save=False,
                 need_cloud_sync=args.cloud_sync,
                 eval_loss=latest_eval_loss,
+                ema_loss=ema_loss,
                 final_save=True,
             )
             final_ckpt = os.path.join(args.checkpoint_dir, f"{args.model_preset}_graded_final.pt")
