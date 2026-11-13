@@ -51,7 +51,9 @@ class ModelConfigV5:
     use_energy_regularization: bool = True
     enable_multimodal: bool = True
     visual_dim: int = 512
+    audio_dim: int = 512
     num_visual_patches: int = 16
+    image_patch_size: int = 16
 
 
 # Register ModelConfigV5 as static PyTree node
@@ -64,7 +66,7 @@ jax.tree_util.register_pytree_node(
         c.rope_theta, c.max_seq_len, c.top_k_resonance, c.use_deliberation_probe,
         c.use_adaptive_thinking, c.max_thinking_cycles, c.thinking_halt_threshold,
         c.num_mtp_heads, c.use_sparse_mot, c.top_k_tracts, c.use_energy_regularization,
-        c.enable_multimodal, c.visual_dim, c.num_visual_patches,
+        c.enable_multimodal, c.visual_dim, c.audio_dim, c.num_visual_patches, c.image_patch_size,
     )),
     lambda aux, _: ModelConfigV5(*aux),
 )
@@ -181,7 +183,7 @@ def generate_small_world_indices(num_shells: int, num_tracts: int) -> Tuple[jnp.
 
 def init_params_v5(key: jax.random.PRNGKey, config: ModelConfigV5) -> Tuple[Dict[str, jnp.ndarray], Tuple[jnp.ndarray, jnp.ndarray]]:
     """Initializes CerebroSpheroid V5 parameters and small-world tract buffers."""
-    keys = jax.random.split(key, 32)
+    keys = jax.random.split(key, 40)
     s_dim = config.surface_dim
     r_dim = config.radial_dim
     K = config.num_shells
@@ -260,9 +262,92 @@ def init_params_v5(key: jax.random.PRNGKey, config: ModelConfigV5) -> Tuple[Dict
     params["core.intra_swiglu.w_val"] = jax.random.normal(keys[25], (K, s_dim, s_dim * 2)) * (1.0 / math.sqrt(s_dim))
     params["core.intra_swiglu.w_down"] = jax.random.normal(keys[26], (K, s_dim * 2, s_dim)) * (1.0 / math.sqrt(s_dim * 2))
 
+    # 4. Multimodal Perceptual Projections (Images, Audio, Continuous Sensors)
+    if getattr(config, "enable_multimodal", False):
+        v_dim = getattr(config, "visual_dim", s_dim)
+        p_size = getattr(config, "image_patch_size", 16)
+        params["image_stem.conv.weight"] = jax.random.normal(keys[28], (v_dim, 3, p_size, p_size)) * (1.0 / math.sqrt(3 * p_size * p_size))
+        params["image_stem.norm.weight"] = jnp.ones(v_dim, dtype=jnp.float32)
+
+        params["audio_stem.conv.weight"] = jax.random.normal(keys[29], (v_dim, 1, 400)) * (1.0 / math.sqrt(400))
+        params["audio_stem.norm.weight"] = jnp.ones(v_dim, dtype=jnp.float32)
+
+        params["perceptual.norm_in.weight"] = jnp.ones(v_dim, dtype=jnp.float32)
+        params["perceptual.linear.weight"] = jax.random.normal(keys[30], (s_dim, v_dim)) * (1.0 / math.sqrt(v_dim))
+        params["perceptual.swiglu.fc_gate.weight"] = jax.random.normal(keys[31], (s_dim * 2, s_dim)) * (1.0 / math.sqrt(s_dim))
+        params["perceptual.swiglu.fc_val.weight"] = jax.random.normal(keys[32], (s_dim * 2, s_dim)) * (1.0 / math.sqrt(s_dim))
+        params["perceptual.swiglu.fc_down.weight"] = jax.random.normal(keys[33], (s_dim, s_dim * 2)) * (1.0 / math.sqrt(s_dim * 2))
+        params["perceptual.norm_out.weight"] = jnp.ones(s_dim, dtype=jnp.float32)
+
     src_idx, dst_idx = generate_small_world_indices(K, T)
     buffers = (src_idx, dst_idx)
     return params, buffers
+
+
+def encode_image_stem(
+    params: Dict[str, jnp.ndarray],
+    images: jnp.ndarray,
+    patch_size: int = 16,
+) -> jnp.ndarray:
+    """
+    2D Convolutional Patchify Stem:
+    images: [B, 3, H, W] -> [B, P, visual_dim]
+    """
+    w_conv = params["image_stem.conv.weight"]  # [v_dim, 3, p_size, p_size] (OIHW)
+    out = lax.conv_general_dilated(
+        lhs=images,
+        rhs=w_conv,
+        window_strides=(patch_size, patch_size),
+        padding="VALID",
+        dimension_numbers=("NCHW", "OIHW", "NCHW"),
+    )
+    B, C, H, W = out.shape
+    h = out.reshape(B, C, H * W).swapaxes(1, 2)  # [B, P, v_dim]
+    return rms_norm(h, params["image_stem.norm.weight"])
+
+
+def encode_audio_stem(
+    params: Dict[str, jnp.ndarray],
+    audio: jnp.ndarray,
+    kernel_size: int = 400,
+    stride: int = 160,
+) -> jnp.ndarray:
+    """
+    1D Convolutional Acoustic Stem:
+    audio: [B, T_samples] or [B, 1, T_samples] -> [B, T_frames, audio_dim]
+    """
+    if audio.ndim == 2:
+        audio = audio[:, None, :]  # [B, 1, T]
+    w_conv = params["audio_stem.conv.weight"]  # [audio_dim, 1, kernel_size] (OIW)
+    pad = kernel_size // 2
+    out = lax.conv_general_dilated(
+        lhs=audio,
+        rhs=w_conv,
+        window_strides=(stride,),
+        padding=[(pad, pad)],
+        dimension_numbers=("NCW", "OIW", "NCW"),
+    )
+    h = out.swapaxes(1, 2)  # [B, T_frames, audio_dim]
+    return rms_norm(h, params["audio_stem.norm.weight"])
+
+
+def project_perceptual(
+    params: Dict[str, jnp.ndarray],
+    perceptual_flux: jnp.ndarray,
+) -> jnp.ndarray:
+    """
+    Projects raw perceptual tokens [B, P_total, v_dim] into surface_dim space:
+    RMSNorm(v_dim) -> Linear(v_dim, s_dim) -> SwiGLU(s_dim) -> RMSNorm(s_dim)
+    """
+    h = rms_norm(perceptual_flux, params["perceptual.norm_in.weight"])
+    h_lin = jnp.matmul(h, params["perceptual.linear.weight"].T)
+    h_swiglu = swiglu(
+        h_lin,
+        params["perceptual.swiglu.fc_gate.weight"],
+        params["perceptual.swiglu.fc_val.weight"],
+        params["perceptual.swiglu.fc_down.weight"],
+    )
+    return rms_norm(h_swiglu, params["perceptual.norm_out.weight"])
 
 
 def encode_sensory(
@@ -497,6 +582,9 @@ def training_rollout(
     deliberation_mode: str = "scheduled",
     interleave_stride: int = 2,
     predictive_gain: float = 0.5,
+    images: Optional[jnp.ndarray] = None,
+    audio: Optional[jnp.ndarray] = None,
+    perceptual_inputs: Optional[jnp.ndarray] = None,
 ) -> Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]]:
     """Differentiable training and autoregressive generation rollout in pure JAX."""
     # Dual-Pass Twin Resonance: runs teacher-forcing pass and deliberative rollout pass on identical tokens
@@ -518,6 +606,9 @@ def training_rollout(
             feedback_is_shifted=feedback_is_shifted,
             pure_teacher_forcing=True,
             deliberation_mode="teacher_forcing",
+            images=images,
+            audio=audio,
+            perceptual_inputs=perceptual_inputs,
         )
         loss_delib = training_rollout(
             params=params,
@@ -536,27 +627,76 @@ def training_rollout(
             feedback_is_shifted=feedback_is_shifted,
             pure_teacher_forcing=False,
             deliberation_mode="scheduled",
+            images=images,
+            audio=audio,
+            perceptual_inputs=perceptual_inputs,
         )
         return 0.5 * loss_tf + 0.5 * loss_delib
 
-    B, L = prompts.shape
-    sensory_flux, sensory_kv = encode_sensory(params, prompts, config=config, pos_offset=0)
+    target_dtype = params["sensory.embedding.weight"].dtype
+
+    # 1. Sensory Ingestion (Multimodal Images, Audio, Perceptual Flux or Text)
+    sensory_tokens_list = []
+    if images is not None and "image_stem.conv.weight" in params:
+        p_size = getattr(config, "image_patch_size", 16) if config is not None else 16
+        sensory_tokens_list.append(encode_image_stem(params, images, patch_size=p_size))
+    if audio is not None and "audio_stem.conv.weight" in params:
+        sensory_tokens_list.append(encode_audio_stem(params, audio))
+    if perceptual_inputs is not None:
+        sensory_tokens_list.append(perceptual_inputs)
+
+    has_perceptual = len(sensory_tokens_list) > 0 and "perceptual.linear.weight" in params
+    if has_perceptual:
+        raw_p_flux = jnp.concatenate(sensory_tokens_list, axis=1)  # [B, P_total, v_dim]
+        B_vis, P_vis, _ = raw_p_flux.shape
+        vis_flux = project_perceptual(params, raw_p_flux)  # [B, P_total, surface_dim]
+        w_emb = params["sensory.embedding.weight"]
+        if prompts.ndim == 2 and prompts.dtype in (jnp.int32, jnp.int64):
+            txt_emb = w_emb[prompts]
+            combined_emb = jnp.concatenate([vis_flux, txt_emb], axis=1)
+            sensory_flux, sensory_kv = encode_sensory(params, combined_emb, config=config, pos_offset=0)
+            vis_mask = jnp.ones((B_vis, P_vis), dtype=jnp.float32)
+            txt_mask = (prompts != pad_id).astype(jnp.float32)
+            combined_mask = jnp.concatenate([vis_mask, txt_mask], axis=1)
+            total_prompt_L = P_vis + prompts.shape[1]
+            pos_idx = jnp.arange(total_prompt_L, dtype=jnp.float32)[None, :]
+            last_valid_pos = jnp.max(jnp.where(combined_mask > 0.0, pos_idx, 0.0), axis=1, keepdims=True)
+            recency_weights = jnp.exp(0.05 * (pos_idx - last_valid_pos)) * combined_mask
+            weight_sum = jnp.maximum(jnp.sum(recency_weights, axis=1, keepdims=True), 1.0)
+            prompt_flux = (
+                jnp.sum(sensory_flux.astype(jnp.float32) * recency_weights[:, :, None], axis=1) / weight_sum
+            ).astype(target_dtype)
+            prompt_valid = (combined_mask > 0.0)[:, None, None, :]
+        else:
+            combined_emb = jnp.concatenate([vis_flux, prompts], axis=1)
+            sensory_flux, sensory_kv = encode_sensory(params, combined_emb, config=config, pos_offset=0)
+            total_prompt_L = combined_emb.shape[1]
+            pos_idx = jnp.arange(total_prompt_L, dtype=jnp.float32)[None, :]
+            recency_weights = jnp.exp(0.05 * (pos_idx - float(max(total_prompt_L - 1, 0))))
+            weight_sum = jnp.maximum(jnp.sum(recency_weights, axis=1, keepdims=True), 1.0)
+            prompt_flux = (
+                jnp.sum(sensory_flux.astype(jnp.float32) * recency_weights[:, :, None], axis=1) / weight_sum
+            ).astype(target_dtype)
+            prompt_valid = jnp.ones((B_vis, 1, 1, total_prompt_L), dtype=bool)
+        B = B_vis
+    else:
+        B, L = prompts.shape
+        total_prompt_L = L
+        sensory_flux, sensory_kv = encode_sensory(params, prompts, config=config, pos_offset=0)
+        mask_2d = (prompts != pad_id).astype(jnp.float32)  # [B, L]
+        pos_idx = jnp.arange(L, dtype=jnp.float32)[None, :]  # [1, L]
+        last_valid_pos = jnp.max(jnp.where(mask_2d > 0.0, pos_idx, 0.0), axis=1, keepdims=True)
+        recency_weights = jnp.exp(0.05 * (pos_idx - last_valid_pos)) * mask_2d
+        weight_sum = jnp.maximum(jnp.sum(recency_weights, axis=1, keepdims=True), 1.0)
+        prompt_flux = (
+            jnp.sum(sensory_flux.astype(jnp.float32) * recency_weights[:, :, None], axis=1) / weight_sum
+        ).astype(target_dtype)
+        prompt_valid = (prompts != pad_id)[:, None, None, :]
+
     num_shells = config.num_shells if config is not None else 32
     surface_dim = config.surface_dim if config is not None else 768
     vocab_size = config.vocab_size if config is not None else 32000
     thinking_cycles = config.thinking_cycles if config is not None else 4
-
-    target_dtype = params["sensory.embedding.weight"].dtype
-
-    # Recency-weighted positional pooling (preserves word order rather than bag-of-words mean)
-    mask_2d = (prompts != pad_id).astype(jnp.float32)  # [B, L]
-    pos_idx = jnp.arange(L, dtype=jnp.float32)[None, :]  # [1, L]
-    last_valid_pos = jnp.max(jnp.where(mask_2d > 0.0, pos_idx, 0.0), axis=1, keepdims=True)
-    recency_weights = jnp.exp(0.05 * (pos_idx - last_valid_pos)) * mask_2d
-    weight_sum = jnp.maximum(jnp.sum(recency_weights, axis=1, keepdims=True), 1.0)
-    prompt_flux = (
-        jnp.sum(sensory_flux.astype(jnp.float32) * recency_weights[:, :, None], axis=1) / weight_sum
-    ).astype(target_dtype)
 
     # Initial concentric state
     init_state = jnp.zeros((B, num_shells, surface_dim), dtype=target_dtype)
@@ -601,21 +741,20 @@ def training_rollout(
     prompt_k, prompt_v = sensory_kv
     num_heads = prompt_k.shape[1]
     head_dim = prompt_k.shape[3]
-    prompt_valid = (prompts != pad_id)[:, None, None, :]  # [B, 1, 1, L]
 
     if prev_tokens is not None:
         safe_feed = jnp.maximum(prev_tokens, 0)
         valid_feed = (prev_tokens >= 0)[:, :, None].astype(target_dtype)
-        tf_flux, (tf_k, tf_v) = encode_sensory(params, safe_feed, config=config, pos_offset=L)
+        tf_flux, (tf_k, tf_v) = encode_sensory(params, safe_feed, config=config, pos_offset=total_prompt_L)
         tf_flux = (tf_flux * valid_feed).astype(target_dtype)
 
         # Causal Key/Value Accumulation:
-        # Prompt keys [B, H, L, head_dim] + prev_tokens keys [B, H, target_len, head_dim]
+        # Prompt keys [B, H, total_prompt_L, head_dim] + prev_tokens keys [B, H, target_len, head_dim]
         causal_keys = jnp.concatenate([prompt_k, tf_k], axis=2)
         causal_values = jnp.concatenate([prompt_v, tf_v], axis=2)
 
         target_valid = (prev_tokens >= 0)[:, None, None, :]  # [B, 1, 1, target_len]
-        all_valid = jnp.concatenate([prompt_valid, target_valid], axis=-1)  # [B, 1, 1, L + target_len]
+        all_valid = jnp.concatenate([prompt_valid, target_valid], axis=-1)  # [B, 1, 1, total_prompt_L + target_len]
     else:
         causal_keys, causal_values = prompt_k, prompt_v
         tf_flux = jnp.zeros((B, target_len, surface_dim), dtype=target_dtype)
@@ -635,10 +774,10 @@ def training_rollout(
         else:
             feed = sampling_p * tf_aud + (1.0 - sampling_p) * internal_feed
 
-        # Causal Attention Mask: prev_tokens[0..step_idx] (up to L + step_idx) strictly precede targets[step_idx]
+        # Causal Attention Mask: prev_tokens[0..step_idx] (up to total_prompt_L + step_idx) strictly precede targets[step_idx]
         total_len = causal_keys.shape[2]
         pos = jnp.arange(total_len)
-        causal_mask = (pos <= (L + step_idx))[None, None, None, :]
+        causal_mask = (pos <= (total_prompt_L + step_idx))[None, None, None, :]
         step_mask = all_valid & causal_mask
 
         logits, nxt_s, nxt_t, nxt_p = emit_step(
@@ -663,7 +802,7 @@ def training_rollout(
             tok_idx = lax.stop_gradient(jnp.where(pitfall_mask, top2[:, 1], top2[:, 0]))
         else:
             tok_idx = lax.stop_gradient(jnp.argmax(logits, axis=-1))
-        tok_flux, _ = encode_sensory(params, tok_idx[:, None], config=config, pos_offset=L + step_idx + 1)
+        tok_flux, _ = encode_sensory(params, tok_idx[:, None], config=config, pos_offset=total_prompt_L + step_idx + 1)
         nxt_thought = lax.stop_gradient(tok_flux[:, 0, :]).astype(target_dtype)
 
         # Enforce exact carry type alignment
@@ -698,8 +837,8 @@ def training_rollout(
 
             cur_all_k = jnp.concatenate([prompt_k, k_buf], axis=2)
             cur_all_v = jnp.concatenate([prompt_v, v_buf], axis=2)
-            pos = jnp.arange(L + target_len)
-            step_mask = gen_valid & (pos < (L + step_idx))[None, None, None, :]
+            pos = jnp.arange(total_prompt_L + target_len)
+            step_mask = gen_valid & (pos < (total_prompt_L + step_idx))[None, None, None, :]
 
             logits, nxt_s, nxt_t, nxt_p = emit_step(
                 params,
@@ -723,7 +862,7 @@ def training_rollout(
                     tok_idx,
                 )
             tok_flux, (new_k, new_v) = encode_sensory(
-                params, tok_idx[:, None], config=config, pos_offset=L + step_idx + 1
+                params, tok_idx[:, None], config=config, pos_offset=total_prompt_L + step_idx + 1
             )
             nxt_thought = lax.stop_gradient(tok_flux[:, 0, :]).astype(target_dtype)
             new_k = lax.stop_gradient(new_k).astype(target_dtype)
@@ -778,7 +917,7 @@ def training_rollout(
             q_all = jnp.swapaxes(q_all, 1, 2)  # [B, H, T, head_dim]
             scores_all = jnp.matmul(q_all, keys_t) / math.sqrt(head_dim)
             pos = jnp.arange(total_len)[None, :]
-            step_pos = (L + jnp.arange(T))[:, None]
+            step_pos = (total_prompt_L + jnp.arange(T))[:, None]
             step_mask_all = all_valid & ((pos <= step_pos)[None, None, :, :])
             scores_all = jnp.where(step_mask_all, scores_all, -1e4)
             attn_w = jax.nn.softmax(scores_all.astype(jnp.float32), axis=-1).astype(target_dtype)
@@ -934,6 +1073,9 @@ def generate_text_jax(
     repetition_penalty: float = 1.2,
     seed_token_id: Optional[int] = None,
     strict_act: bool = True,
+    images: Optional[jnp.ndarray] = None,
+    audio: Optional[jnp.ndarray] = None,
+    perceptual_inputs: Optional[jnp.ndarray] = None,
 ) -> str:
     """
     Convenience method for generating autoregressive text in JAX.
@@ -963,6 +1105,9 @@ def generate_text_jax(
         config=config,
         repetition_penalty=repetition_penalty,
         seed_token_id=seed,
+        images=images,
+        audio=audio,
+        perceptual_inputs=perceptual_inputs,
     )
     token_ids = [int(x) for x in jnp.argmax(logits[0], axis=-1)]
     if strict_act:

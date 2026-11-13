@@ -151,6 +151,13 @@ def adapt_and_load_checkpoint_weights(
 
     # 2. General prefix and name translations (ordered from most specific to general)
     key_translations = [
+        # Multimodal perceptual projector mappings (PyTorch -> JAX)
+        ("perceptual_projector.0.weight", "perceptual.norm_in.weight"),
+        ("perceptual_projector.1.weight", "perceptual.linear.weight"),
+        ("perceptual_projector.2.fc_gate.weight", "perceptual.swiglu.fc_gate.weight"),
+        ("perceptual_projector.2.fc_val.weight", "perceptual.swiglu.fc_val.weight"),
+        ("perceptual_projector.2.fc_down.weight", "perceptual.swiglu.fc_down.weight"),
+        ("perceptual_projector.3.weight", "perceptual.norm_out.weight"),
         # Specific motor SwiGLU projections (PyTorch motor_decoder.motor_swiglu.* or motor.motor_swiglu.*)
         ("motor_decoder.motor_swiglu.", "motor.swiglu."),
         ("motor_decoder.swiglu.", "motor.swiglu."),
@@ -255,6 +262,12 @@ def adapt_jax_to_torch_state_dict(
         ("motor.swiglu.fc_gate.weight", "motor_decoder.motor_swiglu.fc_gate.weight"),
         ("motor.swiglu.fc_val.weight", "motor_decoder.motor_swiglu.fc_val.weight"),
         ("motor.swiglu.fc_down.weight", "motor_decoder.motor_swiglu.fc_down.weight"),
+        ("perceptual.norm_in.weight", "perceptual_projector.0.weight"),
+        ("perceptual.linear.weight", "perceptual_projector.1.weight"),
+        ("perceptual.swiglu.fc_gate.weight", "perceptual_projector.2.fc_gate.weight"),
+        ("perceptual.swiglu.fc_val.weight", "perceptual_projector.2.fc_val.weight"),
+        ("perceptual.swiglu.fc_down.weight", "perceptual_projector.2.fc_down.weight"),
+        ("perceptual.norm_out.weight", "perceptual_projector.3.weight"),
         ("sensory.", "sensory_dnn."),
         ("core.", "volumetric_core."),
         ("motor.", "motor_decoder."),

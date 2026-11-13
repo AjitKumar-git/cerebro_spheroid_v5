@@ -1812,6 +1812,9 @@ class CerebroSpheroidV5(nn.Module):
         seed_token_id: Optional[int] = None,
         stop_token_ids: Optional[Union[Tuple[int, ...], List[int]]] = None,
         persona_id: Optional[Union[int, torch.Tensor]] = None,
+        images: Optional[torch.Tensor] = None,
+        audio: Optional[torch.Tensor] = None,
+        perceptual_inputs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Closed-loop autoregressive generation with discrete token auditory feedback."""
         self.eval()
@@ -1820,13 +1823,42 @@ class CerebroSpheroidV5(nn.Module):
         use_adapt = self.config.use_adaptive_thinking and self.halting_gate is not None
         cycles = thinking_cycles if thinking_cycles is not None else (self.config.max_thinking_cycles if use_adapt else self.config.thinking_cycles)
 
-        # 1. Encode prompt with order-preserving recency weighting
-        sensory_flux, sensory_kv = self.sensory_dnn(prompt_ids)
-        prompt_mask_b = prompt_ids != 0
-        prompt_mask = prompt_mask_b.float()
-        safe_mask = torch.where(prompt_mask.sum(dim=1, keepdim=True) > 0, prompt_mask, torch.ones_like(prompt_mask))
-        prompt_valid_mask = safe_mask.bool()
-        prompt_centroid = self._recency_weighted_pool(sensory_flux, safe_mask)
+        # 1. Sensory Ingestion (Multimodal Images, Audio, Perceptual Flux or Text)
+        sensory_tokens_list = []
+        if images is not None and self.image_stem is not None:
+            sensory_tokens_list.append(self.image_stem(images))
+        if audio is not None and self.audio_stem is not None:
+            sensory_tokens_list.append(self.audio_stem(audio))
+        if perceptual_inputs is not None:
+            sensory_tokens_list.append(perceptual_inputs)
+
+        has_perceptual = len(sensory_tokens_list) > 0 and self.perceptual_projector is not None
+        if has_perceptual:
+            raw_p_flux = torch.cat(sensory_tokens_list, dim=1)  # [B, P_total, visual_dim]
+            B_vis, P_vis, _ = raw_p_flux.shape
+            vis_flux = self.perceptual_projector(raw_p_flux)   # [B, P_total, surface_dim]
+            if prompt_ids.dim() == 2 and prompt_ids.dtype in (torch.int32, torch.int64):
+                txt_emb = self.sensory_dnn.embedding(prompt_ids)  # [B, L, D]
+                combined_emb = torch.cat([vis_flux, txt_emb], dim=1)  # [B, P+L, D]
+                sensory_flux, sensory_kv = self.sensory_dnn(combined_emb)
+                vis_mask = torch.ones(B_vis, P_vis, device=dev)
+                txt_mask = (prompt_ids != 0).float()
+                combined_mask = torch.cat([vis_mask, txt_mask], dim=1)
+                prompt_valid_mask = combined_mask.bool()
+                prompt_centroid = self._recency_weighted_pool(sensory_flux, combined_mask)
+            else:
+                combined_emb = torch.cat([vis_flux, prompt_ids], dim=1)
+                sensory_flux, sensory_kv = self.sensory_dnn(combined_emb)
+                prompt_valid_mask = None
+                prompt_centroid = self._recency_weighted_pool(sensory_flux)
+            B = B_vis
+        else:
+            sensory_flux, sensory_kv = self.sensory_dnn(prompt_ids)
+            prompt_mask_b = prompt_ids != 0
+            prompt_mask = prompt_mask_b.float()
+            safe_mask = torch.where(prompt_mask.sum(dim=1, keepdim=True) > 0, prompt_mask, torch.ones_like(prompt_mask))
+            prompt_valid_mask = safe_mask.bool()
+            prompt_centroid = self._recency_weighted_pool(sensory_flux, safe_mask)
 
         # 2. State Initialization: Cortical Surface receives sensory prompt flux out-of-place
         subcortical = torch.zeros(B, self.config.num_shells - 1, self.config.surface_dim, device=dev, dtype=prompt_centroid.dtype)
@@ -1988,6 +2020,9 @@ class CerebroSpheroidV5(nn.Module):
         thinking_cycles: Optional[int] = None,
         device: Optional[torch.device] = None,
         strict_act: bool = True,
+        images: Optional[torch.Tensor] = None,
+        audio: Optional[torch.Tensor] = None,
+        perceptual_inputs: Optional[torch.Tensor] = None,
     ) -> str:
         """Convenience method for generating text from a prompt string with strict <act> ... </act> payload extraction."""
         from src.corpus import (
@@ -2021,6 +2056,9 @@ class CerebroSpheroidV5(nn.Module):
             eos_token_id=eos_id,
             seed_token_id=seed_id,
             stop_token_ids=stop_ids,
+            images=images,
+            audio=audio,
+            perceptual_inputs=perceptual_inputs,
         )
         seq = out_ids[0].tolist()
         if strict_act:
