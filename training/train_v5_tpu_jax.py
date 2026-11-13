@@ -163,7 +163,7 @@ def parse_args(args_list=None):
     )
 
     # Scheduled Sampling & Deliberation Curriculum
-    parser.add_argument("--deliberation_mode", type=str, default="teacher_forcing", choices=["teacher_forcing", "scheduled", "pitfall_recovery", "internal"], help="Deliberation feedback mode: 'teacher_forcing' uses pure ground truth (peak 200k tok/s); 'scheduled' anneals sampling_p smoothly; 'pitfall_recovery' trains model to recover from erroneous thoughts")
+    parser.add_argument("--deliberation_mode", type=str, default="teacher_forcing", choices=["teacher_forcing", "scheduled", "pitfall_recovery", "internal", "interleaved", "dual_pass", "predictive_coding"], help="Deliberation feedback mode: 'teacher_forcing' uses pure ground truth (peak 200k tok/s); 'scheduled' anneals sampling_p smoothly; 'interleaved' alternates deliberation and teacher forcing; 'dual_pass' runs twin resonance passes; 'predictive_coding' trains predictive state innovation; 'pitfall_recovery' trains model to recover from erroneous thoughts")
     parser.add_argument("--schedule_steps", type=int, default=0, help="Steps to anneal from teacher-forcing down to min_sampling_p (default: 0)")
     parser.add_argument("--min_sampling_p", type=float, default=1.0, help="Minimum teacher sampling floor (default: 1.0 for teacher-forcing)")
     parser.add_argument("--pitfall_prob", type=float, default=0.15, help="Probability of exploring counterfactual/pitfall thoughts during deliberation (default: 0.15)")
@@ -522,6 +522,7 @@ def main(args=None):
                 weight_decay=args.weight_decay,
                 repetition_penalty=args.repetition_penalty,
                 remat=remat_choice,
+                deliberation_mode=args.deliberation_mode,
             )
             compute_grad_step, apply_opt_step = None, None
         else:
@@ -532,10 +533,11 @@ def main(args=None):
                 weight_decay=args.weight_decay,
                 repetition_penalty=args.repetition_penalty,
                 remat=remat_choice,
+                deliberation_mode=args.deliberation_mode,
             )
 
             def train_step_fn(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens=None, sampling_p=1.0):
-                loss_val, grads = compute_grad_step(p, q_batch, r_batch, feedback_tokens=feedback_tokens, sampling_p=sampling_p)
+                loss_val, grads = compute_grad_step(p, q_batch, r_batch, feedback_tokens=feedback_tokens, sampling_p=sampling_p, deliberation_mode=args.deliberation_mode)
                 new_p, new_opt_s = apply_opt_step(p, opt_s, grads, cur_lr)
                 return new_p, new_opt_s, loss_val
 
@@ -549,8 +551,8 @@ def main(args=None):
         opt_state = optimizer.init(params)
         compute_grad_step, apply_opt_step = None, None
 
-        @partial(jax.jit, static_argnames=("pure_tf",))
-        def _train_step_adamw_jit(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens, sampling_p, pure_tf: bool):
+        @partial(jax.jit, static_argnames=("pure_tf", "deliberation_mode"))
+        def _train_step_adamw_jit(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens, sampling_p, pure_tf: bool, deliberation_mode: str):
             def loss_fn(param_dict):
                 return training_rollout(
                     params=param_dict,
@@ -566,6 +568,7 @@ def main(args=None):
                     targets=r_batch,
                     remat=remat_choice,
                     pure_teacher_forcing=pure_tf,
+                    deliberation_mode=deliberation_mode,
                 )
             loss_val, grads = jax.value_and_grad(loss_fn)(p)
             updates, next_opt_s = optimizer.update(grads, opt_s, p)
@@ -573,9 +576,9 @@ def main(args=None):
             return next_p, next_opt_s, loss_val
 
         def train_step_fn(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens=None, sampling_p=1.0):
-            pure_tf = (not isinstance(sampling_p, jax.Array)) and (float(sampling_p) >= 1.0)
+            pure_tf = (args.deliberation_mode in ("teacher_forcing", "pure_tf")) and (not isinstance(sampling_p, jax.Array)) and (float(sampling_p) >= 1.0)
             return _train_step_adamw_jit(
-                p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens, sampling_p, pure_tf
+                p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens, sampling_p, pure_tf, args.deliberation_mode
             )
 
     # 7. Multi-Stream Ingestion & Prefetching
@@ -840,7 +843,7 @@ def main(args=None):
                 for _ in range(grad_accum):
                     prompt_b, target_b, feedback_b = _next_batch()
                     g_loss, micro_grads = compute_grad_step(
-                        params, prompt_b, target_b, feedback_tokens=feedback_b, sampling_p=cur_sampling_p
+                        params, prompt_b, target_b, feedback_tokens=feedback_b, sampling_p=cur_sampling_p, deliberation_mode=args.deliberation_mode
                     )
                     acc_grads = (
                         micro_grads

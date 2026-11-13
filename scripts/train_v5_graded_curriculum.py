@@ -141,6 +141,7 @@ class _CerebroDDPModule(nn.Module):
         perceptual_inputs: Optional[torch.Tensor] = None,
         compute_action: bool = False,
         persona_id: Optional[int] = None,
+        deliberation_mode: str = "scheduled",
     ):
         ce_loss, logits = self.model(
             input_ids,
@@ -151,6 +152,7 @@ class _CerebroDDPModule(nn.Module):
             pad_id=pad_id,
             perceptual_inputs=perceptual_inputs,
             persona_id=persona_id,
+            deliberation_mode=deliberation_mode,
         )
         action_logits = None
         if compute_action:
@@ -170,7 +172,7 @@ def parse_args(args_list: Optional[Sequence[str]] = None):
     parser.add_argument("--seq-len", type=int, default=256, help="Target sequence length in TPU-parity static mode (default: 256)")
     parser.add_argument("--target-seq-len", "--target_seq_len", dest="target_seq_len", type=int, default=None, help="Target sequence length to transition toward (e.g. 512 or 1024)")
     parser.add_argument("--seq-transition-steps", "--seq_transition_steps", dest="seq_transition_steps", type=int, default=0, help="Steps over which to transition sequence length (0 = immediate transition to target_seq_len)")
-    parser.add_argument("--deliberation-mode", "--deliberation_mode", dest="deliberation_mode", type=str, default="teacher_forcing", choices=["teacher_forcing", "scheduled", "pitfall_recovery", "internal"], help="Deliberation feedback mode: 'teacher_forcing' uses pure ground truth (peak throughput); 'scheduled' anneals sampling_p; 'pitfall_recovery' trains error recovery")
+    parser.add_argument("--deliberation-mode", "--deliberation_mode", dest="deliberation_mode", type=str, default="teacher_forcing", choices=["teacher_forcing", "scheduled", "pitfall_recovery", "internal", "interleaved", "dual_pass", "predictive_coding"], help="Deliberation feedback mode: 'teacher_forcing' uses pure ground truth (peak throughput); 'scheduled' anneals sampling_p; 'interleaved' alternates deliberation and teacher forcing; 'dual_pass' runs twin resonance passes; 'predictive_coding' trains predictive state innovation; 'pitfall_recovery' trains error recovery")
     parser.add_argument("--schedule-steps", "--schedule_steps", dest="schedule_steps", type=int, default=0, help="Steps to anneal from teacher-forcing down to min_sampling_p (default: 0)")
     parser.add_argument("--min-sampling-p", "--min_sampling_p", dest="min_sampling_p", type=float, default=1.0, help="Minimum teacher sampling floor (default: 1.0 for teacher-forcing)")
     parser.add_argument("--pitfall-prob", "--pitfall_prob", dest="pitfall_prob", type=float, default=0.15, help="Probability of exploring counterfactual/pitfall thoughts during deliberation (default: 0.15)")
@@ -806,6 +808,7 @@ def _run_training(
                             perceptual_inputs=perceptual_inputs,
                             compute_action=compute_action,
                             persona_id=args.persona_id,
+                            deliberation_mode=args.deliberation_mode,
                         )
                         if compute_action and action_logits is not None:
                             act_loss = action_loss_fn(action_logits, action_labels)

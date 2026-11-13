@@ -164,6 +164,7 @@ def _compute_loss_and_grads(
     feedback_tokens: Optional[jnp.ndarray],
     sampling_p: Any,
     pure_tf: bool,
+    deliberation_mode: str = "teacher_forcing",
 ):
     """Computes loss and gradients for SpheroidOptimizer with static teacher-forcing dispatch."""
     target_len = r_batch.shape[1]
@@ -182,6 +183,7 @@ def _compute_loss_and_grads(
             targets=r_batch,
             remat=remat,
             pure_teacher_forcing=pure_tf,
+            deliberation_mode=deliberation_mode,
         )
 
     return jax.value_and_grad(_loss_fn, allow_int=True)(p)
@@ -295,7 +297,9 @@ def _apply_spheroid_grads(
     return lax.cond(is_finite, _apply_step, _skip_step)
 
 
-def _is_pure_teacher_forcing(sampling_p: Any) -> bool:
+def _is_pure_teacher_forcing(sampling_p: Any, deliberation_mode: str = "teacher_forcing") -> bool:
+    if deliberation_mode not in ("teacher_forcing", "pure_tf"):
+        return False
     return (not isinstance(sampling_p, jax.Array)) and (float(sampling_p) >= 1.0 - 1e-4)
 
 
@@ -306,20 +310,21 @@ def build_spheroid_train_engine(
     weight_decay: float = 0.01,
     repetition_penalty: float = 1.25,
     remat: bool = True,
+    deliberation_mode: str = "teacher_forcing",
 ) -> Tuple[Callable, Callable]:
     """
     Builds decoupled JIT-compiled gradient computation and optimizer application functions.
     Enables gradient accumulation across batches with zero intermediate Python overhead.
     """
 
-    @partial(jax.jit, static_argnames=("pure_tf",))
-    def _compute_grad_jit(p, q_batch, r_batch, feedback_tokens, sampling_p, pure_tf: bool):
+    @partial(jax.jit, static_argnames=("pure_tf", "deliberation_mode"))
+    def _compute_grad_jit(p, q_batch, r_batch, feedback_tokens, sampling_p, pure_tf: bool, deliberation_mode: str):
         return _compute_loss_and_grads(
-            p, q_batch, r_batch, buffers, config, pad_id, repetition_penalty, remat, feedback_tokens, sampling_p, pure_tf
+            p, q_batch, r_batch, buffers, config, pad_id, repetition_penalty, remat, feedback_tokens, sampling_p, pure_tf, deliberation_mode=deliberation_mode
         )
 
-    def compute_grad_step(p, q_batch, r_batch, feedback_tokens=None, sampling_p=1.0):
-        return _compute_grad_jit(p, q_batch, r_batch, feedback_tokens, sampling_p, _is_pure_teacher_forcing(sampling_p))
+    def compute_grad_step(p, q_batch, r_batch, feedback_tokens=None, sampling_p=1.0, deliberation_mode=deliberation_mode):
+        return _compute_grad_jit(p, q_batch, r_batch, feedback_tokens, sampling_p, _is_pure_teacher_forcing(sampling_p, deliberation_mode), deliberation_mode)
 
     @jax.jit
     def apply_opt_step(p, opt_s, grads, base_lr):
@@ -335,20 +340,21 @@ def build_train_step_spheroid(
     weight_decay: float = 0.01,
     repetition_penalty: float = 1.25,
     remat: bool = True,
+    deliberation_mode: str = "teacher_forcing",
 ) -> Callable:
     """Builds a single fused JIT-compiled train_step combining forward, backward, and SpheroidOptimizer."""
 
-    @partial(jax.jit, static_argnames=("pure_tf",))
-    def _fused_train_step_jit(p, opt_s, q_batch, r_batch, base_lr, feedback_tokens, sampling_p, pure_tf: bool):
+    @partial(jax.jit, static_argnames=("pure_tf", "deliberation_mode"))
+    def _fused_train_step_jit(p, opt_s, q_batch, r_batch, base_lr, feedback_tokens, sampling_p, pure_tf: bool, deliberation_mode: str):
         loss_val, grads = _compute_loss_and_grads(
-            p, q_batch, r_batch, buffers, config, pad_id, repetition_penalty, remat, feedback_tokens, sampling_p, pure_tf
+            p, q_batch, r_batch, buffers, config, pad_id, repetition_penalty, remat, feedback_tokens, sampling_p, pure_tf, deliberation_mode=deliberation_mode
         )
         new_params, new_opt_s = _apply_spheroid_grads(p, opt_s, grads, base_lr, weight_decay)
         return new_params, new_opt_s, loss_val
 
-    def train_step(p, opt_s, q_batch, r_batch, base_lr, feedback_tokens=None, sampling_p=1.0):
+    def train_step(p, opt_s, q_batch, r_batch, base_lr, feedback_tokens=None, sampling_p=1.0, deliberation_mode=deliberation_mode):
         return _fused_train_step_jit(
-            p, opt_s, q_batch, r_batch, base_lr, feedback_tokens, sampling_p, _is_pure_teacher_forcing(sampling_p)
+            p, opt_s, q_batch, r_batch, base_lr, feedback_tokens, sampling_p, _is_pure_teacher_forcing(sampling_p, deliberation_mode), deliberation_mode
         )
 
     return train_step

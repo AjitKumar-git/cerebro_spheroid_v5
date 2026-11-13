@@ -188,3 +188,87 @@ def test_workload_hyperparameters_cli_and_model_parity(monkeypatch):
     assert tpu_args.max_thinking_cycles == 12
 
 
+def test_pytorch_alternating_deliberation_modes():
+    """Verifies that PyTorch supports interleaved, dual_pass, and predictive_coding deliberation modes with backward pass."""
+    cfg = dict(PRESETS_V5["v5_small"])
+    cfg["vocab_size"] = 500
+    cfg["num_shells"] = 4
+    config = ModelConfigV5(**cfg)
+    model = CerebroSpheroidV5(config).cpu()
+
+    B, L_p, L_t = 2, 8, 16
+    prompts = torch.randint(1, 500, (B, L_p))
+    targets = torch.randint(1, 500, (B, L_t))
+    feedback = torch.randint(1, 500, (B, L_t))
+
+    for mode in ["interleaved", "dual_pass", "predictive_coding"]:
+        model.zero_grad(set_to_none=True)
+        out = model(
+            prompts,
+            targets=targets,
+            feedback_tokens=feedback,
+            sampling_p=0.5,
+            deliberation_mode=mode,
+        )
+        loss = out[0] if isinstance(out, tuple) else out
+        assert loss is not None, f"Loss is None for mode {mode}"
+        assert math.isfinite(loss.item()), f"Loss non-finite for mode {mode}"
+        assert loss.item() > 0.0, f"Loss non-positive for mode {mode}"
+
+        loss.backward()
+        assert model.sensory_dnn.embedding.weight.grad is not None, f"Embedding grad None for mode {mode}"
+        assert model.sensory_dnn.embedding.weight.grad.norm().item() > 0.0, f"Embedding grad zero for mode {mode}"
+
+
+def test_jax_alternating_deliberation_modes():
+    """Verifies that JAX training_rollout supports interleaved, dual_pass, and predictive_coding with valid gradients."""
+    cfg = dict(PRESETS_V5["v5_small"])
+    cfg["vocab_size"] = 500
+    cfg["num_shells"] = 4
+    config = JAXConfigV5(**cfg)
+
+    key = jax.random.PRNGKey(42)
+    params, buffers = init_params_v5(key, config)
+
+    B, L_p, L_t = 2, 8, 16
+    prompts = jnp.ones((B, L_p), dtype=jnp.int32)
+    targets = jnp.ones((B, L_t), dtype=jnp.int32)
+    feedback = jnp.ones((B, L_t), dtype=jnp.int32)
+
+    for mode in ["interleaved", "dual_pass", "predictive_coding"]:
+        def loss_fn(p):
+            return training_rollout(
+                p,
+                prompts,
+                target_len=L_t,
+                buffers=buffers,
+                config=config,
+                feedback_tokens=feedback,
+                sampling_p=0.5,
+                targets=targets,
+                pure_teacher_forcing=False,
+                deliberation_mode=mode,
+            )
+
+        loss_val, grads = jax.value_and_grad(loss_fn)(params)
+        assert math.isfinite(float(loss_val)), f"JAX Loss non-finite for mode {mode}"
+        assert float(loss_val) > 0.0, f"JAX Loss non-positive for mode {mode}"
+        assert "sensory.embedding.weight" in grads
+        grad_norm = float(jnp.linalg.norm(grads["sensory.embedding.weight"]))
+        assert math.isfinite(grad_norm) and grad_norm > 0.0, f"JAX Embedding grad zero/non-finite for mode {mode}"
+
+
+def test_deliberation_mode_cli_parsing():
+    """Verifies that all deliberation modes are accepted by both GPU and TPU argument parsers."""
+    from scripts.train_v5_graded_curriculum import parse_args as parse_gpu_args
+    from training.train_v5_tpu_jax import parse_args as parse_tpu_args
+
+    for mode in ["teacher_forcing", "scheduled", "interleaved", "dual_pass", "predictive_coding"]:
+        gpu_args = parse_gpu_args(["--deliberation-mode", mode])
+        assert gpu_args.deliberation_mode == mode
+
+        tpu_args = parse_tpu_args(["--deliberation_mode", mode])
+        assert tpu_args.deliberation_mode == mode
+
+
+

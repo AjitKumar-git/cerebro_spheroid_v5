@@ -494,8 +494,51 @@ def training_rollout(
     feedback_is_shifted: bool = True,
     pure_teacher_forcing: Optional[bool] = None,
     seed_token_id: Optional[int] = None,
+    deliberation_mode: str = "scheduled",
+    interleave_stride: int = 2,
+    predictive_gain: float = 0.5,
 ) -> Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]]:
     """Differentiable training and autoregressive generation rollout in pure JAX."""
+    # Dual-Pass Twin Resonance: runs teacher-forcing pass and deliberative rollout pass on identical tokens
+    if deliberation_mode == "dual_pass" and targets is not None:
+        loss_tf = training_rollout(
+            params=params,
+            prompts=prompts,
+            target_len=target_len,
+            buffers=buffers,
+            config=config,
+            feedback_tokens=feedback_tokens,
+            sampling_p=1.0,
+            pitfall_prob=0.0,
+            pad_id=pad_id,
+            repetition_penalty=repetition_penalty,
+            targets=targets,
+            remat=remat,
+            persona_id=persona_id,
+            feedback_is_shifted=feedback_is_shifted,
+            pure_teacher_forcing=True,
+            deliberation_mode="teacher_forcing",
+        )
+        loss_delib = training_rollout(
+            params=params,
+            prompts=prompts,
+            target_len=target_len,
+            buffers=buffers,
+            config=config,
+            feedback_tokens=feedback_tokens,
+            sampling_p=sampling_p,
+            pitfall_prob=pitfall_prob,
+            pad_id=pad_id,
+            repetition_penalty=repetition_penalty,
+            targets=targets,
+            remat=remat,
+            persona_id=persona_id,
+            feedback_is_shifted=feedback_is_shifted,
+            pure_teacher_forcing=False,
+            deliberation_mode="scheduled",
+        )
+        return 0.5 * loss_tf + 0.5 * loss_delib
+
     B, L = prompts.shape
     sensory_flux, sensory_kv = encode_sensory(params, prompts, config=config, pos_offset=0)
     num_shells = config.num_shells if config is not None else 32
@@ -582,7 +625,15 @@ def training_rollout(
         cur_state, cur_trace, cur_plan, prev_thought = carry
         tf_aud = tf_flux[:, step_idx, :]
         internal_feed = jnp.where(step_idx == 0, 0.0, prev_thought)
-        feed = sampling_p * tf_aud + (1.0 - sampling_p) * internal_feed
+
+        if deliberation_mode == "interleaved":
+            is_delib = (step_idx % interleave_stride) == 1
+            step_p = jnp.where(is_delib, sampling_p, 1.0)
+            feed = step_p * tf_aud + (1.0 - step_p) * internal_feed
+        elif deliberation_mode == "predictive_coding":
+            feed = jnp.where(step_idx == 0, tf_aud, internal_feed + predictive_gain * (tf_aud - internal_feed))
+        else:
+            feed = sampling_p * tf_aud + (1.0 - sampling_p) * internal_feed
 
         # Causal Attention Mask: prev_tokens[0..step_idx] (up to L + step_idx) strictly precede targets[step_idx]
         total_len = causal_keys.shape[2]
@@ -628,6 +679,9 @@ def training_rollout(
             target_log_probs = jnp.take_along_axis(log_probs, safe_targets[:, None], axis=-1).squeeze(-1)
             mask_t = (cur_target >= 0).astype(jnp.float32)
             step_loss = -target_log_probs * mask_t
+            if deliberation_mode == "predictive_coding":
+                thought_err = jnp.mean((prev_thought.astype(jnp.float32) - lax.stop_gradient(tf_aud.astype(jnp.float32))) ** 2, axis=-1)
+                step_loss = step_loss + (0.1 * thought_err * mask_t * (step_idx > 0).astype(jnp.float32))
             return (nxt_s, nxt_t, nxt_p, nxt_thought), (step_loss, mask_t)
 
         return (nxt_s, nxt_t, nxt_p, nxt_thought), logits
@@ -688,6 +742,7 @@ def training_rollout(
     is_pure_tf = (
         (targets is not None)
         and (num_shells >= 2)
+        and (deliberation_mode in ("teacher_forcing", "pure_tf"))
         and (
             pure_teacher_forcing is True
             or (

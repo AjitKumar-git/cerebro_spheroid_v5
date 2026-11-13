@@ -1431,16 +1431,69 @@ class CerebroSpheroidV5(nn.Module):
         images: Optional[torch.Tensor] = None,
         audio: Optional[torch.Tensor] = None,
         persona_id: Optional[Union[int, torch.Tensor]] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        deliberation_mode: str = "scheduled",
+        interleave_stride: int = 2,
+        predictive_gain: float = 0.5,
+        alignment_weight: float = 0.1,
+        return_hidden_states: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """
         Differentiable training rollout engine:
         1. Encodes sensory prompt, raw images, and raw audio into Arcuate Fasciculus KV and centroid.
         2. Sets Shell K-1 (Surface) to prompt centroid.
         3. Executes subconscious deliberation cycles in subcortical core.
         4. Steps through motor emissions with scheduled sampling and thought re-afference.
+        Supports deliberation modes: 'teacher_forcing', 'scheduled', 'interleaved', 'dual_pass', 'predictive_coding'.
         """
         dev = prompts.device
         t_len = target_len if target_len is not None else (targets.shape[1] if targets is not None else 128)
+
+        # Dual-Pass Twin Resonance: runs teacher-forcing pass and deliberative rollout pass on identical tokens
+        if deliberation_mode == "dual_pass" and targets is not None and self.training:
+            out_tf = self.forward(
+                prompts=prompts,
+                targets=targets,
+                feedback_tokens=feedback_tokens,
+                feedback_is_shifted=feedback_is_shifted,
+                sampling_p=1.0,
+                pitfall_prob=0.0,
+                pad_id=pad_id,
+                target_len=target_len,
+                perceptual_inputs=perceptual_inputs,
+                images=images,
+                audio=audio,
+                persona_id=persona_id,
+                deliberation_mode="teacher_forcing",
+                return_hidden_states=True,
+            )
+            loss_tf, logits_tf, h_tf = out_tf[0], out_tf[1], out_tf[2]
+
+            out_delib = self.forward(
+                prompts=prompts,
+                targets=targets,
+                feedback_tokens=feedback_tokens,
+                feedback_is_shifted=feedback_is_shifted,
+                sampling_p=sampling_p,
+                pitfall_prob=pitfall_prob,
+                pad_id=pad_id,
+                target_len=target_len,
+                perceptual_inputs=perceptual_inputs,
+                images=images,
+                audio=audio,
+                persona_id=persona_id,
+                deliberation_mode="scheduled",
+                return_hidden_states=True,
+            )
+            loss_delib, logits_delib, h_delib = out_delib[0], out_delib[1], out_delib[2]
+
+            align_loss = torch.tensor(0.0, device=dev)
+            if h_tf is not None and h_delib is not None:
+                align_loss = F.mse_loss(h_delib, h_tf.detach())
+
+            total_loss = 0.5 * loss_tf + 0.5 * loss_delib + alignment_weight * align_loss
+            if return_hidden_states:
+                return total_loss, logits_delib, h_delib
+            return total_loss, logits_delib
 
         # 1. Sensory Ingestion (Multimodal Images, Audio, Perceptual Flux or Text)
         sensory_tokens_list = []
@@ -1561,11 +1614,13 @@ class CerebroSpheroidV5(nn.Module):
             and not getattr(self, "force_sequential", False)
             and tf_flux is not None
             and (sampling_p >= 1.0 - 1e-6)
+            and deliberation_mode in ("teacher_forcing", "scheduled")
         )
         has_mtp = len(self.mtp_heads) > 0 and targets is not None
+        need_hidden = has_mtp or return_hidden_states
 
         if use_fast_tf:
-            if has_mtp:
+            if need_hidden:
                 logits_stacked, state, plan, H = self.motor_decoder.forward_sequence(
                     state=state,
                     sensory_kv=sensory_kv,
@@ -1600,17 +1655,36 @@ class CerebroSpheroidV5(nn.Module):
             rep_penalty = 1.0 if targets is not None else 1.25
             prev_thought = torch.zeros(B, self.config.surface_dim, device=dev, dtype=state.dtype)
             all_logits = []
-            all_h = [] if has_mtp else None
+            all_h = [] if need_hidden else None
+            pred_loss_total = torch.tensor(0.0, device=dev)
 
             for t in range(t_len):
                 if tf_flux is not None:
                     tf_aud = tf_flux[:, t, :]
-                    if t == 0:
-                        auditory_in = torch.where(
-                            fb_valid_mask[:, 0:1], sampling_p * tf_aud, torch.zeros_like(tf_aud)
-                        )
+                    if deliberation_mode == "interleaved":
+                        # Alternating: odd steps deliberate from prior thought, even steps anchor from ground truth
+                        if t % interleave_stride == 1:
+                            auditory_in = sampling_p * tf_aud + (1.0 - sampling_p) * prev_thought
+                        else:
+                            auditory_in = tf_aud
+                    elif deliberation_mode == "predictive_coding":
+                        if t == 0:
+                            auditory_in = torch.where(
+                                fb_valid_mask[:, 0:1], tf_aud, torch.zeros_like(tf_aud)
+                            )
+                        else:
+                            # Innovation feedback: prev_thought + predictive_gain * (tf_aud - prev_thought)
+                            innovation = tf_aud - prev_thought
+                            auditory_in = prev_thought + predictive_gain * innovation
+                            if self.training:
+                                pred_loss_total = pred_loss_total + F.mse_loss(prev_thought, tf_aud.detach())
                     else:
-                        auditory_in = sampling_p * tf_aud + (1.0 - sampling_p) * prev_thought
+                        if t == 0:
+                            auditory_in = torch.where(
+                                fb_valid_mask[:, 0:1], sampling_p * tf_aud, torch.zeros_like(tf_aud)
+                            )
+                        else:
+                            auditory_in = sampling_p * tf_aud + (1.0 - sampling_p) * prev_thought
                 else:
                     auditory_in = prev_thought if t > 0 else None
 
@@ -1620,7 +1694,7 @@ class CerebroSpheroidV5(nn.Module):
                     causal_kv = (tf_keys[:, :, : t + 1, :], tf_values[:, :, : t + 1, :])
                     causal_kv_mask = fb_valid_mask[:, : t + 1] if fb_valid_mask is not None else None
 
-                if has_mtp:
+                if need_hidden:
                     logits, efference, refractory, plan, h_t = self.motor_decoder(
                         state=state,
                         sensory_kv=sensory_kv,
@@ -1667,7 +1741,7 @@ class CerebroSpheroidV5(nn.Module):
                 state = self.volumetric_core.step_efference_fast(state, efference)
 
             logits_stacked = torch.stack(all_logits, dim=1)
-            H = torch.stack(all_h, dim=1) if has_mtp else None
+            H = torch.stack(all_h, dim=1) if need_hidden else None
 
         self.current_spheroid_state = state
 
@@ -1678,6 +1752,10 @@ class CerebroSpheroidV5(nn.Module):
                 targets[:, :t_len].contiguous().view(-1),
                 ignore_index=-100,
             )
+
+            # Auxiliary predictive coding thought alignment loss
+            if deliberation_mode == "predictive_coding" and t_len > 1 and pred_loss_total.item() > 0:
+                loss = loss + 0.1 * (pred_loss_total / max(1, t_len - 1))
 
             # Auxiliary Multi-Token Prediction (MTP) loss for future token forecasting
             if has_mtp and H is not None:
@@ -1712,8 +1790,12 @@ class CerebroSpheroidV5(nn.Module):
             if use_adapt:
                 loss = loss + 0.001 * (halt_loss / max(cycles, 1))
 
+            if return_hidden_states:
+                return loss, logits_stacked, H
             return loss, logits_stacked
 
+        if return_hidden_states:
+            return logits_stacked, H
         return logits_stacked
 
     @torch.no_grad()
