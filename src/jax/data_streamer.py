@@ -51,8 +51,8 @@ class LinguisticDataStreamer:
     def __init__(
         self,
         batch_size: int = 32,
-        prompt_len: int = 32,
-        target_len: int = 256,
+        prompt_len: int = 256,
+        target_len: int = 512,
         vocab_size: int = 32000,
         data_dir: Optional[str] = None,
         queue_size: int = 8,

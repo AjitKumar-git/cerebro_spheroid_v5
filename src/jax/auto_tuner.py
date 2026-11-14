@@ -282,10 +282,10 @@ def benchmark_config(
     preset: str = "v5_small",
     batch_size: int = 32,
     remat: bool = True,
-    seq_len: int = 256,
+    seq_len: int = 512,
     num_steps: int = 3,
     dtype: str = "auto",
-    prompt_len: int = 32,
+    prompt_len: int = 256,
 ) -> Dict[str, Any]:
     """
     Benchmarks a single training configuration and returns step latency, steps/s,
@@ -448,7 +448,7 @@ def auto_tune_environment(
     cloud_token: Optional[str] = None,
     verbose: bool = True,
     tune_objective: str = "balanced",
-    prompt_len: int = 32,
+    prompt_len: int = 256,
     max_batch_size: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
