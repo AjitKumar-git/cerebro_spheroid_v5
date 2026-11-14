@@ -1,0 +1,244 @@
+{
+  "metadata": {
+    "checkpoint": "v5_small_latest_step700k.pt",
+    "step": 700500,
+    "train_loss": 2.170719861984253,
+    "eval_loss": 2.4575369358062744,
+    "device": "cuda",
+    "timestamp": "2026-11-15T01:29:14Z"
+  },
+  "scores": {
+    "MMLU": 12.5,
+    "ARC": 50.0,
+    "HellaSwag": 0.0,
+    "GSM8K": 0.0,
+    "HumanEval": 0.0,
+    "Composite": 12.5
+  },
+  "details": {
+    "MMLU": [
+      {
+        "domain": "MMLU: Physics / Mechanics",
+        "target": "B",
+        "predicted": "D",
+        "correct": false,
+        "losses": [
+          4.6453986167907715,
+          5.400593280792236,
+          5.458980560302734,
+          4.61123514175415
+        ]
+      },
+      {
+        "domain": "MMLU: Chemistry",
+        "target": "B",
+        "predicted": "A",
+        "correct": false,
+        "losses": [
+          5.935352802276611,
+          7.615786075592041,
+          6.834886074066162,
+          6.304399013519287
+        ]
+      },
+      {
+        "domain": "MMLU: Biology / Anatomy",
+        "target": "D",
+        "predicted": "B",
+        "correct": false,
+        "losses": [
+          10.108809471130371,
+          8.038772583007812,
+          9.397073745727539,
+          8.338135719299316
+        ]
+      },
+      {
+        "domain": "MMLU: Computer Science",
+        "target": "B",
+        "predicted": "D",
+        "correct": false,
+        "losses": [
+          8.16596508026123,
+          7.60271692276001,
+          7.698459625244141,
+          5.799830913543701
+        ]
+      },
+      {
+        "domain": "MMLU: Elementary Math",
+        "target": "C",
+        "predicted": "D",
+        "correct": false,
+        "losses": [
+          6.9742865562438965,
+          7.281332969665527,
+          33.64637756347656,
+          6.8456220626831055
+        ]
+      },
+      {
+        "domain": "MMLU: World History",
+        "target": "B",
+        "predicted": "A",
+        "correct": false,
+        "losses": [
+          5.522191047668457,
+          13.112424850463867,
+          6.47258186340332,
+          6.027635097503662
+        ]
+      },
+      {
+        "domain": "MMLU: Philosophy / Logic",
+        "target": "B",
+        "predicted": "C",
+        "correct": false,
+        "losses": [
+          8.222288131713867,
+          9.514219284057617,
+          5.073022365570068,
+          8.631913185119629
+        ]
+      },
+      {
+        "domain": "MMLU: Biochemistry",
+        "target": "C",
+        "predicted": "C",
+        "correct": true,
+        "losses": [
+          7.585178852081299,
+          11.134415626525879,
+          6.402782440185547,
+          7.4531025886535645
+        ]
+      }
+    ],
+    "ARC": [
+      {
+        "domain": "ARC: Science Reasoning",
+        "target": "A",
+        "predicted": "C",
+        "correct": false,
+        "losses": [
+          7.570531845092773,
+          7.1037750244140625,
+          6.637296199798584,
+          6.895065784454346
+        ]
+      },
+      {
+        "domain": "ARC: Science Reasoning",
+        "target": "B",
+        "predicted": "B",
+        "correct": true,
+        "losses": [
+          8.204780578613281,
+          6.499044895172119,
+          7.917251110076904,
+          9.379932403564453
+        ]
+      },
+      {
+        "domain": "ARC: Earth Science",
+        "target": "C",
+        "predicted": "B",
+        "correct": false,
+        "losses": [
+          8.388452529907227,
+          6.606738090515137,
+          7.647193431854248,
+          9.424362182617188
+        ]
+      },
+      {
+        "domain": "ARC: Biology",
+        "target": "B",
+        "predicted": "B",
+        "correct": true,
+        "losses": [
+          7.333764553070068,
+          7.296881675720215,
+          8.412671089172363,
+          8.68596363067627
+        ]
+      }
+    ],
+    "HellaSwag": [
+      {
+        "domain": "HellaSwag: Physical Commonsense",
+        "target": "A",
+        "predicted": "C",
+        "correct": false,
+        "losses": [
+          8.057697296142578,
+          7.438597679138184,
+          5.898459434509277,
+          6.576818466186523
+        ]
+      },
+      {
+        "domain": "HellaSwag: Activity Continuation",
+        "target": "A",
+        "predicted": "D",
+        "correct": false,
+        "losses": [
+          8.507402420043945,
+          8.36982250213623,
+          10.188029289245605,
+          7.506932258605957
+        ]
+      }
+    ],
+    "GSM8K": [
+      {
+        "question": "Natalia sold clips to 48 of her friends in Ap...",
+        "target": "72",
+        "extracted": null,
+        "raw_output": "About DL_E = CWAR, PwA with friends sold} - C-Cq E F_E MGw -...",
+        "correct": false
+      },
+      {
+        "question": "Weng earns $12 an hour babysitting. Yesterday...",
+        "target": "60",
+        "extracted": "62",
+        "raw_output": "cept earn from the bills to dollars by C.\n$90 for 7 in the e...",
+        "correct": false
+      },
+      {
+        "question": "Betty picked 16 apples from the orchard. She ...",
+        "target": "6",
+        "extracted": "2",
+        "raw_output": "Based on, we can divide 4 to the number of known for nira's ...",
+        "correct": false
+      },
+      {
+        "question": "A baker made 40 cupcakes. He sold 25 cupcakes...",
+        "target": "30",
+        "extracted": "12",
+        "raw_output": "Let's say you let div = C + P,\nMultakes A cupcakes in the gi...",
+        "correct": false
+      }
+    ],
+    "HumanEval": [
+      {
+        "prompt": "def is_even(n: int) -> bool:",
+        "syntax_valid": false,
+        "has_keywords": false,
+        "output": "Let's break down the information into x and y values of 1, n..."
+      },
+      {
+        "prompt": "def add(a: int, b: int) -> int:",
+        "syntax_valid": false,
+        "has_keywords": false,
+        "output": "u!\nFive  usages a total of x, where i is the first integer f..."
+      },
+      {
+        "prompt": "def is_prime(n: int) -> bool:",
+        "syntax_valid": false,
+        "has_keywords": false,
+        "output": "Here's a simple: CcheckGiven that we have 5, 'F' years befor..."
+      }
+    ]
+  }
+}
