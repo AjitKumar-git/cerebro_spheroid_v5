@@ -439,6 +439,22 @@ def main(args=None):
                     slot_model, remote_step, remote_loss = select_highest_step_slot(
                         remote_manifest, sync_model_name, args.resume_target
                     )
+                    # Safety Override: If 'best' was requested but 'latest' is significantly ahead,
+                    # prevent accidental regression (e.g. starting back at 586k when 666k is available)
+                    if args.resume_target == "best":
+                        _, latest_step, _ = select_highest_step_slot(
+                            remote_manifest, sync_model_name, "latest"
+                        )
+                        if latest_step > remote_step + 5000:
+                            print(
+                                f"🛡️ [SAFETY OVERRIDE] 'best.pt' (Step {remote_step:,}) is >5,000 steps behind 'latest.pt' (Step {latest_step:,})!\n"
+                                f"   Automatically switching resumption to 'latest.pt' to prevent step regression."
+                            )
+                            args.resume_target = "latest"
+                            slot_model, remote_step, remote_loss = select_highest_step_slot(
+                                remote_manifest, sync_model_name, "latest"
+                            )
+
                     print(
                         f"🔎 [cloud_sync] Selected remote slot model={slot_model or 'root'} "
                         f"(Step {remote_step:,}, Loss {remote_loss:.4f}) for {args.resume_target}.pt"

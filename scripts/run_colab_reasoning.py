@@ -164,9 +164,9 @@ def parse_args():
         "--resume_target",
         dest="resume_target",
         type=str,
-        default="best",
+        default="latest",
         choices=["latest", "best"],
-        help="Checkpoint resumption target ('best' or 'latest', default: best)",
+        help="Checkpoint resumption target ('latest' or 'best', default: latest)",
     )
     parser.add_argument(
         "--auto-tune",
