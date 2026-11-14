@@ -216,6 +216,10 @@ def adapt_and_load_checkpoint_weights(
     ):
         target_params["core.radial_up_out.weight"] = target_params["core.radial_up.weight"]
 
+    # Safety net: if sensory self-attention is absent from checkpoint, zero out_self so residual starts strictly at identity
+    if "sensory.out_self.weight" in target_params and "sensory.out_self.weight" not in restored_keys:
+        target_params["sensory.out_self.weight"] = jnp.zeros_like(target_params["sensory.out_self.weight"])
+
     missing = [k for k in target_params.keys() if k not in restored_keys and k != "core.radial_up_out.weight"]
     if missing:
         print(f"ℹ️ [adapt_weights] Unmapped JAX parameter arrays ({len(missing)}/{len(target_params)}): {missing}")

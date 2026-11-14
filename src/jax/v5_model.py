@@ -38,6 +38,7 @@ class ModelConfigV5:
     use_swiglu: bool = True
     use_shell_tap: bool = True
     use_plan: bool = True
+    use_sensory_self_attn: bool = True
     rope_theta: float = 500000.0
     max_seq_len: int = 32768
     top_k_resonance: int = 16
@@ -62,7 +63,7 @@ jax.tree_util.register_pytree_node(
     lambda c: ((), (
         c.vocab_size, c.surface_dim, c.radial_dim, c.num_shells, c.num_shortcut_tracts,
         c.num_heads, c.max_phase_steps, c.thinking_cycles, c.phase_scale,
-        c.use_tied_embeddings, c.use_swiglu, c.use_shell_tap, c.use_plan,
+        c.use_tied_embeddings, c.use_swiglu, c.use_shell_tap, c.use_plan, c.use_sensory_self_attn,
         c.rope_theta, c.max_seq_len, c.top_k_resonance, c.use_deliberation_probe,
         c.use_adaptive_thinking, c.max_thinking_cycles, c.thinking_halt_threshold,
         c.num_mtp_heads, c.use_sparse_mot, c.top_k_tracts, c.use_energy_regularization,
@@ -82,6 +83,11 @@ PRESETS_V5: Dict[str, Dict[str, Any]] = {
         "top_k_tracts": 16,
         "thinking_cycles": 4,
         "phase_scale": 2.0,
+        "use_sensory_self_attn": True,
+        "use_sparse_mot": False,
+        "use_deliberation_probe": False,
+        "use_adaptive_thinking": False,
+        "use_energy_regularization": False,
     },
     "tpu_v5e_1": {
         "surface_dim": 640,
@@ -92,6 +98,11 @@ PRESETS_V5: Dict[str, Dict[str, Any]] = {
         "top_k_tracts": 16,
         "thinking_cycles": 4,
         "phase_scale": 2.0,
+        "use_sensory_self_attn": True,
+        "use_sparse_mot": False,
+        "use_deliberation_probe": False,
+        "use_adaptive_thinking": False,
+        "use_energy_regularization": False,
     },
     "tpu_v6e_1": {
         "surface_dim": 640,
@@ -102,6 +113,11 @@ PRESETS_V5: Dict[str, Dict[str, Any]] = {
         "top_k_tracts": 16,
         "thinking_cycles": 4,
         "phase_scale": 2.0,
+        "use_sensory_self_attn": True,
+        "use_sparse_mot": False,
+        "use_deliberation_probe": False,
+        "use_adaptive_thinking": False,
+        "use_energy_regularization": False,
     },
     "tpu_v6e": {
         "surface_dim": 640,
@@ -112,6 +128,11 @@ PRESETS_V5: Dict[str, Dict[str, Any]] = {
         "top_k_tracts": 16,
         "thinking_cycles": 4,
         "phase_scale": 2.0,
+        "use_sensory_self_attn": True,
+        "use_sparse_mot": False,
+        "use_deliberation_probe": False,
+        "use_adaptive_thinking": False,
+        "use_energy_regularization": False,
     },
     "v5_compact": {
         "surface_dim": 768,
@@ -201,6 +222,12 @@ def init_params_v5(key: jax.random.PRNGKey, config: ModelConfigV5) -> Tuple[Dict
         "sensory.norm_out.weight": jnp.ones(s_dim, dtype=jnp.float32),
         "sensory.k_proj.weight": jax.random.normal(keys[4], (s_dim, s_dim)) * (1.0 / math.sqrt(s_dim)),
         "sensory.v_proj.weight": jax.random.normal(keys[5], (s_dim, s_dim)) * (1.0 / math.sqrt(s_dim)),
+        # Contextual Inter-Token Multi-Head Self-Attention (zero-initialized residual for lossless weight transfer)
+        "sensory.ctx_norm.weight": jnp.ones(s_dim, dtype=jnp.float32),
+        "sensory.q_self.weight": jax.random.normal(keys[34], (s_dim, s_dim)) * (1.0 / math.sqrt(s_dim)),
+        "sensory.k_self.weight": jax.random.normal(keys[35], (s_dim, s_dim)) * (1.0 / math.sqrt(s_dim)),
+        "sensory.v_self.weight": jax.random.normal(keys[36], (s_dim, s_dim)) * (1.0 / math.sqrt(s_dim)),
+        "sensory.out_self.weight": jnp.zeros((s_dim, s_dim), dtype=jnp.float32),
 
         # 2. Volumetric Core (concentric spherical shells)
         "core.shell_gains": jnp.ones(K, dtype=jnp.float32) * 0.1,
@@ -355,6 +382,7 @@ def encode_sensory(
     input_tokens_or_emb: jnp.ndarray,
     config: Optional[ModelConfigV5] = None,
     pos_offset: Union[int, jnp.ndarray] = 0,
+    is_causal: bool = False,
 ):
     """Encodes sensory input tokens into Arcuate KV pairs and position-aware representations."""
     w_emb = params["sensory.embedding.weight"]
@@ -384,6 +412,25 @@ def encode_sensory(
     h = rms_norm(x, params["sensory.norm_in.weight"])
     h_swiglu = swiglu(h, params["sensory.swiglu.fc_gate.weight"], params["sensory.swiglu.fc_val.weight"], params["sensory.swiglu.fc_down.weight"])
     flux = rms_norm(x + h_swiglu, params["sensory.norm_out.weight"])
+
+    # Contextual Inter-Token Multi-Head Self-Attention (zero-init residual)
+    if L > 1 and "sensory.out_self.weight" in params:
+        h_ctx = rms_norm(flux, params["sensory.ctx_norm.weight"])
+        q_s = jnp.matmul(h_ctx, params["sensory.q_self.weight"].T).reshape(B, L, num_heads, head_dim)
+        q_s = jnp.swapaxes(q_s, 1, 2)  # [B, H, L, head_dim]
+        k_s = jnp.matmul(h_ctx, params["sensory.k_self.weight"].T).reshape(B, L, num_heads, head_dim)
+        k_s = jnp.swapaxes(k_s, 1, 2)  # [B, H, L, head_dim]
+        v_s = jnp.matmul(h_ctx, params["sensory.v_self.weight"].T).reshape(B, L, num_heads, head_dim)
+        v_s = jnp.swapaxes(v_s, 1, 2)  # [B, H, L, head_dim]
+
+        scores = jnp.matmul(q_s, jnp.swapaxes(k_s, -1, -2)) / math.sqrt(head_dim)
+        if is_causal:
+            causal_mask = jnp.tril(jnp.ones((L, L), dtype=bool))[None, None, :, :]
+            scores = jnp.where(causal_mask, scores, -1e4)
+        attn_w = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(flux.dtype)
+        ctx = jnp.matmul(attn_w, v_s)  # [B, H, L, head_dim]
+        ctx = jnp.swapaxes(ctx, 1, 2).reshape(B, L, D)  # [B, L, D]
+        flux = flux + jnp.matmul(ctx, params["sensory.out_self.weight"].T)
 
     k = jnp.matmul(flux, params["sensory.k_proj.weight"].T).reshape(B, L, num_heads, head_dim)
     k = jnp.swapaxes(k, 1, 2)  # [B, H, L, head_dim]
@@ -745,7 +792,7 @@ def training_rollout(
     if prev_tokens is not None:
         safe_feed = jnp.maximum(prev_tokens, 0)
         valid_feed = (prev_tokens >= 0)[:, :, None].astype(target_dtype)
-        tf_flux, (tf_k, tf_v) = encode_sensory(params, safe_feed, config=config, pos_offset=total_prompt_L)
+        tf_flux, (tf_k, tf_v) = encode_sensory(params, safe_feed, config=config, pos_offset=total_prompt_L, is_causal=True)
         tf_flux = (tf_flux * valid_feed).astype(target_dtype)
 
         # Causal Key/Value Accumulation:
