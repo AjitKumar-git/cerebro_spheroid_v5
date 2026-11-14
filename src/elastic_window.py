@@ -47,13 +47,18 @@ def extract_prompt_response_pair(row: Any) -> Tuple[str, str]:
         convs = row.get("conversations", [])
         if convs:
             q_txt, r_txt = "", ""
+            sys_txt = ""
             for turn in convs:
                 sender = str(turn.get("from", "")).lower()
                 val = turn.get("value", "")
-                if ("human" in sender or "user" in sender) and not q_txt:
-                    q_txt = val
+                if "system" in sender and not sys_txt:
+                    sys_txt = str(val).strip()
+                elif ("human" in sender or "user" in sender) and not q_txt:
+                    q_txt = str(val).strip()
                 elif ("gpt" in sender or "assistant" in sender or "model" in sender) and not r_txt:
-                    r_txt = val
+                    r_txt = str(val).strip()
+            if sys_txt and q_txt:
+                q_txt = f"{sys_txt}\n\n{q_txt}"
             if q_txt and r_txt:
                 return str(q_txt), str(r_txt)
 
@@ -61,18 +66,23 @@ def extract_prompt_response_pair(row: Any) -> Tuple[str, str]:
         msgs = row.get("messages", [])
         if msgs:
             q_txt, r_txt = "", ""
+            sys_txt = ""
             for msg in msgs:
                 role = str(msg.get("role", "")).lower()
                 val = msg.get("content", "")
-                if ("user" in role or "human" in role) and not q_txt:
-                    q_txt = val
+                if "system" in role and not sys_txt:
+                    sys_txt = str(val).strip()
+                elif ("user" in role or "human" in role) and not q_txt:
+                    q_txt = str(val).strip()
                 elif ("assistant" in role or "model" in role or "gpt" in role) and not r_txt:
-                    r_txt = val
+                    r_txt = str(val).strip()
+            if sys_txt and q_txt:
+                q_txt = f"{sys_txt}\n\n{q_txt}"
             if q_txt and r_txt:
                 return str(q_txt), str(r_txt)
 
-        # 3. GSM8K / Q&A / Cosmopedia format
-        q_txt = row.get("question", row.get("prompt", row.get("input", "")))
+        # 3. GSM8K / MetaMathQA / Q&A / Cosmopedia format
+        q_txt = row.get("question", row.get("prompt", row.get("input", row.get("query", ""))))
         r_txt = row.get("answer", row.get("response", row.get("output", row.get("text", ""))))
         if q_txt and r_txt:
             return str(q_txt), str(r_txt)
@@ -267,22 +277,39 @@ def build_online_dataset_iterator(
         return _conv_gen()
 
     if source == "reasoning_anneal":
-        gsm_it: Optional[Iterator[Any]] = None
-        oh_it: Optional[Iterator[Any]] = None
+        math_it: Optional[Iterator[Any]] = None
+        tool_it: Optional[Iterator[Any]] = None
+        code_it: Optional[Iterator[Any]] = None
+        logic_it: Optional[Iterator[Any]] = None
 
         def _reason_gen():
-            nonlocal gsm_it, oh_it
+            nonlocal math_it, tool_it, code_it, logic_it
             turn = 0
             while True:
+                mod4 = turn % 4
                 try:
-                    if turn % 2 == 0:
-                        row, gsm_it = _next_or_reopen(
-                            gsm_it, lambda: _open_hf_stream("openai/gsm8k", "main", rank=rank, world_size=world_size)
+                    if mod4 == 0:
+                        # 1. Pure Mathematical Calculation & Chain-of-Thought (MetaMathQA - 395k clean proofs)
+                        row, math_it = _next_or_reopen(
+                            math_it, lambda: _open_hf_stream("meta-math/MetaMathQA", rank=rank, world_size=world_size)
                         )
-                        yield {"conversations": [{"from": "human", "value": row.get("question", "")}, {"from": "gpt", "value": row.get("answer", "")}]}
+                        yield row
+                    elif mod4 == 1:
+                        # 2. Advanced Tool Calling & Function Dispatch (SmolTalk apigen-80k)
+                        row, tool_it = _next_or_reopen(
+                            tool_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "apigen-80k", rank=rank, world_size=world_size)
+                        )
+                        yield row
+                    elif mod4 == 2:
+                        # 3. Python-Edu, Software Algorithms & Problem Solving (SmolTalk self-oss-instruct)
+                        row, code_it = _next_or_reopen(
+                            code_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct", rank=rank, world_size=world_size)
+                        )
+                        yield row
                     else:
-                        row, oh_it = _next_or_reopen(
-                            oh_it, lambda: _open_hf_stream("teknium/OpenHermes-2.5", rank=rank, world_size=world_size)
+                        # 4. Multi-Turn Deductive Reasoning & Logic (SmolTalk smol-magpie-ultra)
+                        row, logic_it = _next_or_reopen(
+                            logic_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "smol-magpie-ultra", rank=rank, world_size=world_size)
                         )
                         yield row
                 except Exception:
