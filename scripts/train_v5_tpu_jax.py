@@ -131,8 +131,8 @@ def parse_args(args_list=None):
     parser.add_argument("--seq-len", "--target_len", dest="seq_len", type=int, default=256, help="Target response sequence length (default: 256, transitioning to 512 for reasoning)")
     parser.add_argument("--target-seq-len", "--target_seq_len", dest="target_seq_len", type=int, default=None, help="Target sequence length to transition toward (e.g. 512 or 1024)")
     parser.add_argument("--seq-transition-steps", "--seq_transition_steps", dest="seq_transition_steps", type=int, default=0, help="Steps over which to transition sequence length (0 = immediate transition to target_seq_len)")
-    parser.add_argument("--prompt_len", type=int, default=32, help="Prompt context length (used when --elastic_window is disabled)")
-    parser.add_argument("--total_window", type=int, default=288, help="Total sequence budget for elastic sliding window (default: 288 tokens)")
+    parser.add_argument("--prompt_len", type=int, default=256, help="Prompt context length (used when --elastic_window is disabled, default: 256)")
+    parser.add_argument("--total_window", type=int, default=768, help="Total sequence budget for elastic sliding window (default: 768 tokens, 256 prompt + 512 target)")
     parser.add_argument("--elastic_window", action="store_true", default=False, help="Enable elastic sliding context window with complementary buckets")
 
     # Learning Rate & Optimization
@@ -300,7 +300,7 @@ def main(args=None):
         print(f"\n🔄 [Sequence Transition] Advancing target sequence length from {args.seq_len} -> {args.target_seq_len} tokens for deep reasoning!")
         args.seq_len = args.target_seq_len
 
-    if args.total_window == 288 and (args.seq_len != 256 or args.prompt_len != 32):
+    if args.total_window in (288, 768) and (args.seq_len != 512 or args.prompt_len != 256):
         args.total_window = args.prompt_len + args.seq_len
 
     # 1. Hardware Platform & Devices

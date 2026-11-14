@@ -386,6 +386,13 @@ def get_default_elastic_buckets(total_window: int = 1024) -> List[Tuple[str, int
             ("deep_reasoning", 256, 512),
             ("long_context", 768, 256),
         ]
+    elif total_window >= 768:
+        return [
+            ("short_cot", 128, 256),
+            ("standard_cot", 256, 256),
+            ("deep_reasoning", 256, 512),
+            ("long_context", 512, 256),
+        ]
     elif total_window >= 512:
         return [
             ("short_cot", 128, 128),
