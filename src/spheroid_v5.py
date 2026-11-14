@@ -311,6 +311,7 @@ class SensoryInputDNNV5(nn.Module):
             self.k_self = nn.Linear(surface_dim, surface_dim, bias=False)
             self.v_self = nn.Linear(surface_dim, surface_dim, bias=False)
             self.out_self = nn.Linear(surface_dim, surface_dim, bias=False)
+            nn.init.zeros_(self.out_self.weight)
         else:
             self.ctx_norm = None
             self.q_self = None
@@ -2169,7 +2170,8 @@ def infer_v5_config_from_state_dict(
     is_jax_ckpt = any(k.startswith(("sensory.", "core.", "motor.")) for k in raw_state.keys())
     if is_jax_ckpt:
         # Pure JAX TPU checkpoints omit PyTorch-only modules and RoPE/Top-K/Energy additions
-        cfg_kwargs["use_sensory_self_attn"] = False
+        if "sensory.out_self.weight" not in raw_state and "sensory_dnn.out_self.weight" not in raw_state and saved_cfg is None:
+            cfg_kwargs["use_sensory_self_attn"] = False
         cfg_kwargs["use_rope"] = False
         cfg_kwargs["top_k_resonance"] = 0
         cfg_kwargs["use_deliberation_probe"] = False
