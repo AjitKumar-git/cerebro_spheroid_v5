@@ -281,35 +281,42 @@ def build_online_dataset_iterator(
         tool_it: Optional[Iterator[Any]] = None
         code_it: Optional[Iterator[Any]] = None
         logic_it: Optional[Iterator[Any]] = None
+        know_it: Optional[Iterator[Any]] = None
 
         def _reason_gen():
-            nonlocal math_it, tool_it, code_it, logic_it
+            nonlocal math_it, tool_it, code_it, logic_it, know_it
             turn = 0
             while True:
-                mod4 = turn % 4
+                mod5 = turn % 5
                 try:
-                    if mod4 == 0:
+                    if mod5 == 0:
                         # 1. Pure Mathematical Calculation & Chain-of-Thought (MetaMathQA - 395k clean proofs)
                         row, math_it = _next_or_reopen(
                             math_it, lambda: _open_hf_stream("meta-math/MetaMathQA", rank=rank, world_size=world_size)
                         )
                         yield row
-                    elif mod4 == 1:
+                    elif mod5 == 1:
                         # 2. Advanced Tool Calling & Function Dispatch (SmolTalk apigen-80k)
                         row, tool_it = _next_or_reopen(
                             tool_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "apigen-80k", rank=rank, world_size=world_size)
                         )
                         yield row
-                    elif mod4 == 2:
+                    elif mod5 == 2:
                         # 3. Python-Edu, Software Algorithms & Problem Solving (SmolTalk self-oss-instruct)
                         row, code_it = _next_or_reopen(
                             code_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct", rank=rank, world_size=world_size)
                         )
                         yield row
-                    else:
+                    elif mod5 == 3:
                         # 4. Multi-Turn Deductive Reasoning & Logic (SmolTalk smol-magpie-ultra)
                         row, logic_it = _next_or_reopen(
                             logic_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "smol-magpie-ultra", rank=rank, world_size=world_size)
+                        )
+                        yield row
+                    else:
+                        # 5. World Knowledge Replay Anchor (FineWeb-Edu) - Prevents Catastrophic Forgetting!
+                        row, know_it = _next_or_reopen(
+                            know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-10BT", rank=rank, world_size=world_size)
                         )
                         yield row
                 except Exception:
