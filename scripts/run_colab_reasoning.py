@@ -35,9 +35,9 @@ def parse_args():
     parser.add_argument(
         "--preset",
         type=str,
-        default="tpu_v5e_1",
-        choices=["v5_small", "v5_compact", "v5_base", "tpu_v5e_1", "tpu_v6e_1"],
-        help="Model preset architecture (default: tpu_v5e_1)",
+        default="auto",
+        choices=["auto", "v5_small", "v5_compact", "v5_base", "tpu_v5e_1", "tpu_v6e_1"],
+        help="Model preset architecture (default: auto -> auto-detects tpu_v6e_1 / tpu_v5e_1)",
     )
     parser.add_argument(
         "--dataset-source",
@@ -164,9 +164,9 @@ def parse_args():
         "--resume_target",
         dest="resume_target",
         type=str,
-        default="latest",
+        default="best",
         choices=["latest", "best"],
-        help="Checkpoint resumption target ('latest' or 'best', default: latest)",
+        help="Checkpoint resumption target ('best' or 'latest', default: best)",
     )
     parser.add_argument(
         "--auto-tune",
@@ -287,6 +287,22 @@ def check_remote_status(preset: str):
 
 def main():
     args = parse_args()
+
+    # Hardware auto-detection when preset is 'auto'
+    if args.preset == "auto":
+        try:
+            import jax
+            devs = jax.devices()
+            dev_name = devs[0].device_kind.lower() if devs else ""
+            if "v6" in dev_name or "trillium" in dev_name:
+                args.preset = "tpu_v6e_1"
+            elif "v5" in dev_name:
+                args.preset = "tpu_v5e_1"
+            else:
+                args.preset = "v5_small"
+        except Exception:
+            args.preset = "tpu_v6e_1"
+        print(f"⚡ Hardware auto-detected preset: {args.preset}")
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 

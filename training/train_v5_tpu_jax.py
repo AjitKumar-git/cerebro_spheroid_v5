@@ -147,7 +147,7 @@ def parse_args(args_list=None):
     parser.add_argument("--repetition_penalty", type=float, default=1.25, help="Two-tier refractory repetition penalty multiplier")
 
     # Model & Precision
-    parser.add_argument("--preset", type=str, default="tpu_v5e_1", choices=["v5_small", "v5_compact", "v5_base", "v5_test", "tpu_v5e_1", "tpu_v6e_1", "tpu_v6e"], help="Model preset (default: tpu_v5e_1 / v5_small / tpu_v6e_1)")
+    parser.add_argument("--preset", type=str, default="auto", choices=["auto", "v5_small", "v5_compact", "v5_base", "v5_test", "tpu_v5e_1", "tpu_v6e_1", "tpu_v6e"], help="Model preset (default: auto -> auto-detects tpu_v6e_1 / tpu_v5e_1)")
     parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bf16", "fp16", "fp32"], help="Matrix execution precision ('auto' selects bf16 on TPU)")
     parser.add_argument("--remat", type=str, default="true", choices=["true", "false", "auto"], help="Activation remat scan to minimize HBM footprint (default: true)")
     parser.add_argument("--auto-tune", action="store_true", default=False, help="Micro-benchmark candidate batch sizes at startup to maximize steps/s, tok/s, and HBM/VRAM utilization")
@@ -308,6 +308,16 @@ def main(args=None):
     backend = jax.default_backend().upper()
     dev_kind = devices[0].device_kind.lower() if devices else ""
     num_devices = len(devices)
+
+    # Resolve 'auto' preset based on active hardware
+    if getattr(args, "preset", "tpu_v5e_1") == "auto":
+        dev_name = devices[0].device_kind.lower() if devices else ""
+        if "v6" in dev_name or "trillium" in dev_name:
+            args.preset = "tpu_v6e_1"
+        elif "v5" in dev_name:
+            args.preset = "tpu_v5e_1"
+        else:
+            args.preset = "v5_small"
 
     target_dtype, dtype_str = resolve_jax_compute_dtype(args.dtype)
 
