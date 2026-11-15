@@ -683,6 +683,12 @@ def main(args=None):
 
     # 7. Multi-Stream Ingestion & Prefetching
     current_step_holder = [start_step]
+    local_streamer = None
+    elastic_batcher = None
+    batcher = None
+    is_champion = False
+    save_latest = False
+    tok_per_sec = 0.0
 
     local_streamer, elastic_batcher = build_data_stream(
         dataset_source=args.dataset_source,
@@ -697,6 +703,7 @@ def main(args=None):
         step_getter=lambda: current_step_holder[0],
         total_steps=args.total_steps,
     )
+    batcher = elastic_batcher
 
     def _unpack_batch(batch_tuple):
         if len(batch_tuple) == 5:
@@ -940,6 +947,8 @@ def main(args=None):
             prev_step = step
             step += step_stride
             current_step_holder[0] = step
+            is_champion = False
+            save_latest = False
 
             cur_lr = get_learning_rate(step, args.total_steps, args.lr, args.min_lr, args.warmup_steps)
 
@@ -1260,35 +1269,38 @@ def main(args=None):
         import traceback
         traceback.print_exc()
     finally:
-        print(f"\n💾 Flushing final checkpoint state for Step {step:,}...")
+        step_val = step if "step" in locals() else start_step
+        print(f"\n💾 Flushing final checkpoint state for Step {step_val:,}...")
         final_fname = f"{args.preset}_latest.pt"
+        b_ref = batcher if ("batcher" in locals() and batcher is not None) else (elastic_batcher if ("elastic_batcher" in locals() and elastic_batcher is not None) else None)
+        ds_stats = b_ref.get_tokens_by_dataset() if (b_ref is not None and hasattr(b_ref, "get_tokens_by_dataset")) else {}
         final_meta = {
-            "step": step,
+            "step": step_val,
             "loss": float(loss) if "loss" in locals() else 0.0,
-            "ema_loss": ema_loss if ema_loss is not None else (float(loss) if "loss" in locals() else 0.0),
-            "eval_loss": best_eval_loss,
+            "ema_loss": ema_loss if ("ema_loss" in locals() and ema_loss is not None) else (float(loss) if "loss" in locals() else 0.0),
+            "eval_loss": best_eval_loss if "best_eval_loss" in locals() else float("inf"),
             "preset": args.preset,
-            "sync_model": sync_model_name,
+            "sync_model": sync_model_name if "sync_model_name" in locals() else args.preset,
             "cumulative_tokens": cumulative_tokens if "cumulative_tokens" in locals() else 0,
             "lifetime_tokens": lifetime_tokens if "lifetime_tokens" in locals() else 0,
             "target_tokens": getattr(args, "target_tokens", 200_000_000_000),
-            "effective_batch_size": args.batch_size * grad_accum,
-            "tokens_by_dataset": batcher.get_tokens_by_dataset() if hasattr(batcher, "get_tokens_by_dataset") else {},
+            "effective_batch_size": args.batch_size * (grad_accum if "grad_accum" in locals() else 1),
+            "tokens_by_dataset": ds_stats,
             "timestamp": time.time(),
         }
-        ckpt_mgr.flush(_get_host_params(), buffers, final_fname, meta_dict=final_meta)
-        ckpt_mgr.shutdown(wait=True)
+        if "ckpt_mgr" in locals() and ckpt_mgr is not None:
+            ckpt_mgr.flush(_get_host_params(), buffers, final_fname, meta_dict=final_meta)
+            ckpt_mgr.shutdown(wait=True)
 
         if args.cloud_sync:
             try:
-                ds_stats = batcher.get_tokens_by_dataset() if hasattr(batcher, "get_tokens_by_dataset") else {}
                 push_remote_token_tracker(
-                    model=sync_model_name or args.preset,
+                    model=(sync_model_name if "sync_model_name" in locals() else None) or args.preset,
                     cumulative_tokens=cumulative_tokens if "cumulative_tokens" in locals() else 0,
                     target_tokens=getattr(args, "target_tokens", 200_000_000_000),
                     tokens_by_dataset=ds_stats,
-                    effective_batch_size=args.batch_size * grad_accum,
-                    step=step,
+                    effective_batch_size=args.batch_size * (grad_accum if "grad_accum" in locals() else 1),
+                    step=step_val,
                     loss=float(loss) if "loss" in locals() else 0.0,
                     tok_per_sec=float(tok_per_sec) if 'tok_per_sec' in locals() else 0.0,
                     url=args.cloud_url,
@@ -1296,13 +1308,13 @@ def main(args=None):
                 )
             except Exception:
                 pass
-        if local_streamer is not None:
+        if "local_streamer" in locals() and local_streamer is not None:
             local_streamer.stop()
-        if elastic_batcher is not None:
-            if hasattr(elastic_batcher, "stop"):
-                elastic_batcher.stop()
-            elif hasattr(elastic_batcher, "shutdown"):
-                elastic_batcher.shutdown()
+        if b_ref is not None:
+            if hasattr(b_ref, "stop"):
+                b_ref.stop()
+            elif hasattr(b_ref, "shutdown"):
+                b_ref.shutdown()
         print(f"🎉 Training session completed at Step {step:,}!")
 
 
