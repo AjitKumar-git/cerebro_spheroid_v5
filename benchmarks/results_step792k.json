@@ -1,0 +1,244 @@
+{
+  "metadata": {
+    "checkpoint": "v5_small_latest_step792k.pt",
+    "step": 792300,
+    "train_loss": 2.1180148124694824,
+    "eval_loss": 2.412821054458618,
+    "device": "cuda",
+    "timestamp": "2026-11-15T10:14:39Z"
+  },
+  "scores": {
+    "MMLU": 37.5,
+    "ARC": 50.0,
+    "HellaSwag": 0.0,
+    "GSM8K": 0.0,
+    "HumanEval": 0.0,
+    "Composite": 17.5
+  },
+  "details": {
+    "MMLU": [
+      {
+        "domain": "MMLU: Physics / Mechanics",
+        "target": "B",
+        "predicted": "A",
+        "correct": false,
+        "losses": [
+          4.696171760559082,
+          6.468504428863525,
+          5.826636791229248,
+          5.912553310394287
+        ]
+      },
+      {
+        "domain": "MMLU: Chemistry",
+        "target": "B",
+        "predicted": "D",
+        "correct": false,
+        "losses": [
+          11.96375846862793,
+          6.215747833251953,
+          6.736846446990967,
+          5.551262855529785
+        ]
+      },
+      {
+        "domain": "MMLU: Biology / Anatomy",
+        "target": "D",
+        "predicted": "D",
+        "correct": true,
+        "losses": [
+          11.70615005493164,
+          9.256745338439941,
+          11.033125877380371,
+          7.467206954956055
+        ]
+      },
+      {
+        "domain": "MMLU: Computer Science",
+        "target": "B",
+        "predicted": "B",
+        "correct": true,
+        "losses": [
+          6.351413249969482,
+          6.174539089202881,
+          6.319565296173096,
+          6.277365684509277
+        ]
+      },
+      {
+        "domain": "MMLU: Elementary Math",
+        "target": "C",
+        "predicted": "A",
+        "correct": false,
+        "losses": [
+          9.770585060119629,
+          11.57006549835205,
+          10.889029502868652,
+          10.487227439880371
+        ]
+      },
+      {
+        "domain": "MMLU: World History",
+        "target": "B",
+        "predicted": "A",
+        "correct": false,
+        "losses": [
+          6.705550193786621,
+          11.017704963684082,
+          9.036112785339355,
+          10.246247291564941
+        ]
+      },
+      {
+        "domain": "MMLU: Philosophy / Logic",
+        "target": "B",
+        "predicted": "C",
+        "correct": false,
+        "losses": [
+          8.738405227661133,
+          14.381561279296875,
+          7.8778228759765625,
+          9.03811264038086
+        ]
+      },
+      {
+        "domain": "MMLU: Biochemistry",
+        "target": "C",
+        "predicted": "C",
+        "correct": true,
+        "losses": [
+          10.546708106994629,
+          18.32814598083496,
+          7.035295486450195,
+          8.740464210510254
+        ]
+      }
+    ],
+    "ARC": [
+      {
+        "domain": "ARC: Science Reasoning",
+        "target": "A",
+        "predicted": "B",
+        "correct": false,
+        "losses": [
+          7.409036159515381,
+          6.360317707061768,
+          7.772360801696777,
+          8.45400619506836
+        ]
+      },
+      {
+        "domain": "ARC: Science Reasoning",
+        "target": "B",
+        "predicted": "B",
+        "correct": true,
+        "losses": [
+          8.0994234085083,
+          5.856969356536865,
+          7.030457019805908,
+          9.62319564819336
+        ]
+      },
+      {
+        "domain": "ARC: Earth Science",
+        "target": "C",
+        "predicted": "B",
+        "correct": false,
+        "losses": [
+          10.259369850158691,
+          8.33012866973877,
+          10.624448776245117,
+          9.429977416992188
+        ]
+      },
+      {
+        "domain": "ARC: Biology",
+        "target": "B",
+        "predicted": "B",
+        "correct": true,
+        "losses": [
+          8.557926177978516,
+          7.687736988067627,
+          28.578845977783203,
+          8.397500991821289
+        ]
+      }
+    ],
+    "HellaSwag": [
+      {
+        "domain": "HellaSwag: Physical Commonsense",
+        "target": "A",
+        "predicted": "C",
+        "correct": false,
+        "losses": [
+          7.2098188400268555,
+          7.293633937835693,
+          6.991905212402344,
+          7.489191055297852
+        ]
+      },
+      {
+        "domain": "HellaSwag: Activity Continuation",
+        "target": "A",
+        "predicted": "B",
+        "correct": false,
+        "losses": [
+          9.436490058898926,
+          8.648348808288574,
+          10.04855728149414,
+          10.339889526367188
+        ]
+      }
+    ],
+    "GSM8K": [
+      {
+        "question": "Natalia sold clips to 48 of her friends in Ap...",
+        "target": "72",
+        "extracted": "2",
+        "raw_output": "wal interviewinia sold Splarenbine interview for 2: friends ...",
+        "correct": false
+      },
+      {
+        "question": "Weng earns $12 an hour babysitting. Yesterday...",
+        "target": "60",
+        "extracted": "7",
+        "raw_output": "(a+C) * Blogen earnings x 2 dollars]\n7....",
+        "correct": false
+      },
+      {
+        "question": "Betty picked 16 apples from the orchard. She ...",
+        "target": "6",
+        "extracted": "3",
+        "raw_output": "Beth and Bob have a total of about the given information, re...",
+        "correct": false
+      },
+      {
+        "question": "A baker made 40 cupcakes. He sold 25 cupcakes...",
+        "target": "30",
+        "extracted": "90",
+        "raw_output": "We first analyzed the morning, where A.72 is daked by first ...",
+        "correct": false
+      }
+    ],
+    "HumanEval": [
+      {
+        "prompt": "def is_even(n: int) -> bool:",
+        "syntax_valid": false,
+        "has_keywords": false,
+        "output": "Let's start with if you let C: Dl, F = 1\nF times n! A DT for..."
+      },
+      {
+        "prompt": "def add(a: int, b: int) -> int:",
+        "syntax_valid": false,
+        "has_keywords": false,
+        "output": "u! I'matic fraction, C loved to be 9th love we theorem. Now ..."
+      },
+      {
+        "prompt": "def is_prime(n: int) -> bool:",
+        "syntax_valid": false,
+        "has_keywords": false,
+        "output": "Let's start with you. \n12: C let that we can divide n times ..."
+      }
+    ]
+  }
+}
