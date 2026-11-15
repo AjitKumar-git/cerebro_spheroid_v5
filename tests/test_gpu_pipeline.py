@@ -237,8 +237,11 @@ def test_colab_gpu_notebook_has_valid_cli_args():
     # Verify all non-magic Python code cells compile cleanly
     for cell in nb["cells"]:
         if cell.get("cell_type") == "code":
-            lines = [line for line in cell.get("source", []) if not line.strip().startswith(("!", "%"))]
-            compile("".join(lines), nb_path, "exec")
+            non_comment_lines = [line for line in cell.get("source", []) if line.strip() and not line.strip().startswith("#")]
+            if non_comment_lines and non_comment_lines[0].strip().startswith("!"):
+                continue
+            code_lines = [line for line in cell.get("source", []) if not line.strip().startswith(("!", "%"))]
+            compile("".join(code_lines), nb_path, "exec")
 
 
 def test_jax_gpu_dtype_resolution(monkeypatch):

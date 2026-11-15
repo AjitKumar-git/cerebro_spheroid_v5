@@ -1,0 +1,100 @@
+{
+  "timestamp": 1794755728.5820303,
+  "source_model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+  "source_params": 134515008,
+  "target_model": "CerebroSpheroidV5",
+  "target_params": 102393560,
+  "transferred_params": 0,
+  "transferred_coverage_pct": 0.0,
+  "embedding_cosine_similarity": 1.0,
+  "results": [
+    {
+      "prompt": "The capital of France is",
+      "smol_output": "Paris. Paris is a major city in France, known for its historical landmarks, art, architecture, culture, and cuisine. It's the political, financial, and cultural center of France. Paris is",
+      "v5_native_output": "Based on, weicate: Dutyducation is 0 to guide if we import A,Z/C%. \n5. 5: Piven the surface of Q,",
+      "v5_transferred_output": "ToString*) est\u00e1 becformat verschmathbb Bal costru versch versch BalToString*) est\u00e1 bec ans verschformatmathbb versch versch versch\u041aToString*) est\u00e1 bec ans verschformatmathbb Bal costru versch\u0457\u0432ToString*) est\u00e1",
+      "kl_div_transferred": 120.00535583496094,
+      "kl_div_native": 13.727508544921875,
+      "top5_source": [
+        " Paris",
+        " the",
+        " located",
+        " called",
+        " Le"
+      ],
+      "top5_transferred": [
+        "versch",
+        "metrics",
+        "type",
+        "Calendar",
+        "prop"
+      ]
+    },
+    {
+      "prompt": "Question: If 2 + 2 = 4, then 4 + 4 equals what? Answer:",
+      "smol_output": "",
+      "v5_native_output": "First, C step:9 forts049! You can find C raise if A = k!qs for 'x'1 where F(t) import Difference Between",
+      "v5_transferred_output": "al toalal toal toalal toal toartal toal to toal toal toal to toal toal toal to toal to to toal to to",
+      "kl_div_transferred": 147.95323181152344,
+      "kl_div_native": 27.29720687866211,
+      "top5_source": [
+        "<|im_end|>",
+        " ",
+        " The",
+        "\n",
+        " If"
+      ],
+      "top5_transferred": [
+        "al",
+        "to",
+        "better",
+        "lock",
+        "["
+      ]
+    },
+    {
+      "prompt": "What is an atom?",
+      "smol_output": "",
+      "v5_native_output": "An traversal of integers ranging from 0 to ninding adt for dpper divots fordt = hx|_ynd^u for dhppersYellow Hz",
+      "v5_transferred_output": "to \u043eart folgender - -mathbbmathbb verschmathbb to to versch \u043eart folgender to versch versch folgender to versch versch folgender to \u043eart folgender versch folgender folgender folgender partitionmathbb to to versch \u043eart",
+      "kl_div_transferred": 172.84617614746094,
+      "kl_div_native": 19.846782684326172,
+      "top5_source": [
+        "<|im_end|>",
+        "\n",
+        " An",
+        " ",
+        " What"
+      ],
+      "top5_transferred": [
+        "an",
+        "to",
+        "al",
+        "vers",
+        "art"
+      ]
+    },
+    {
+      "prompt": "def is_even(n):",
+      "smol_output": "if n % 2 == 0:\n        return True\n    else:\n        return False\n```\n\nThis function works by first checking if the input number is even. If it is,",
+      "v5_native_output": "Letting h%.",
+      "v5_transferred_output": "better rappresformatdashargin partition versch gates folgender folgender rappres At folgender betterformatdashargin partition versch better gates folgender rappres better folgender Atformatdashargin partition versch folgender folgender folgender rappres better folgender betterformat",
+      "kl_div_transferred": 34.807106018066406,
+      "kl_div_native": 14.063480377197266,
+      "top5_source": [
+        "\n   ",
+        "\n       ",
+        " \n   ",
+        "\n ",
+        "\r\n   "
+      ],
+      "top5_transferred": [
+        "to",
+        "\u043e",
+        "Isra",
+        "art",
+        "West"
+      ]
+    }
+  ]
+}
