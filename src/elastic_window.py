@@ -993,10 +993,14 @@ def build_canonical_eval_split(
     from src.corpus import format_stimulus_prompt, format_motor_response
 
     domain_configs = [
-        ("Science (FineWeb-Edu)", lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-10BT")),
-        ("Commonsense (SmolTalk)", lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "everyday-conversations")),
+        ("Science (FineWeb-Edu >= 4)", lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-10BT")),
+        ("Textbooks (Cosmopedia-v2)", lambda: _open_hf_stream("HuggingFaceTB/cosmopedia-v2", "cosmopedia-v2")),
+        ("Math Proofs (MetaMathQA)", lambda: _open_hf_stream("meta-math/MetaMathQA")),
         ("Math-CoT (GSM8K Test)", lambda: _open_hf_stream("openai/gsm8k", "main", split="test")),
         ("Python Code (Self-OSS)", lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct")),
+        ("Commonsense (SmolTalk)", lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "everyday-conversations")),
+        ("Multi-Turn (Magpie Ultra)", lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "smol-magpie-ultra")),
+        ("STEM & Reasoning (Hermes)", lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "openhermes-100k")),
     ]
 
     eval_batches = []

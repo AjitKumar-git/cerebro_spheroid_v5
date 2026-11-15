@@ -181,9 +181,9 @@ def parse_args(args_list=None):
     parser.add_argument("--max_thinking_cycles", "--max-thinking-cycles", dest="max_thinking_cycles", type=int, default=16, help="Maximum thinking cycles when adaptive thinking is active (default: 16)")
 
     # Data Source & Tokenizer
-    parser.add_argument("--dataset_source", "--dataset-source", dest="dataset_source", type=str, default="dense_edu",
-                        choices=["dense_edu", "local", "conversation_sft", "balanced_mix", "reasoning_anneal", "fineweb_edu", "openhermes"],
-                        help="Data stream: 'dense_edu' (40%% Cosmo + 40%% FineWeb + 20%% Hermes), 'local' (offline 9,500 curated cognitive docs), 'conversation_sft', 'balanced_mix', 'reasoning_anneal'")
+    parser.add_argument("--dataset_source", "--dataset-source", dest="dataset_source", type=str, default="autonomous",
+                        choices=["autonomous", "v5_base", "reasoning_anneal", "dense_edu", "local", "conversation_sft", "balanced_mix", "tri_pillar", "fineweb_edu", "openhermes", "consolidation"],
+                        help="Data stream: 'autonomous' (4-phase developmental curriculum for v5_base), 'reasoning_anneal' (1:1:1 Tri-Pillar), 'dense_edu', 'conversation_sft', 'consolidation'")
     parser.add_argument("--tokenizer_name", type=str, default="llama", help="Tokenizer model name or path (default: 'llama' -> data/tokenizer)")
 
     # Checkpoint & Cloud Sync
@@ -201,6 +201,10 @@ def parse_args(args_list=None):
     parser.add_argument("--resume_target", type=str, default="latest", choices=["latest", "best"], help="Target checkpoint to pull from cloud ('latest' or 'best')")
     parser.add_argument("--reset_best", action="store_true", default=False, help="Reset best validation loss tracker")
     parser.add_argument("--from-scratch", "--from_scratch", dest="from_scratch", action="store_true", default=False, help="Start clean from Step 0 without loading any checkpoint")
+    parser.add_argument("--effective-batch-size", "--effective_batch_size", dest="effective_batch_size", type=int, default=None, help="Target global effective batch size (e.g. 256; automatically computes grad_accum)")
+    parser.add_argument("--target-tokens", "--target_tokens", dest="target_tokens", type=int, default=7_000_000_000, help="Target token ingestion budget for campaign (default: 7,000,000,000 tokens)")
+    parser.add_argument("--init_from_checkpoint", "--init-from-checkpoint", dest="init_from_checkpoint", type=str, default=None, help="Base foundation checkpoint to load weights from (e.g. step900k)")
+    parser.add_argument("--reset_step_counter", "--reset-step-counter", dest="reset_step_counter", action="store_true", default=False, help="Reset step counter to 0 after loading base weights to start new campaign from scratch")
 
     return parser.parse_args(args_list)
 
@@ -215,6 +219,8 @@ def build_data_stream(
     use_elastic_window: bool,
     vocab_size: int = 32000,
     prefetch_queue_size: int = 16,
+    step_getter: Optional[Any] = None,
+    total_steps: int = 1_500_000,
 ):
     """Initializes multi-corpus streaming engine with background prefetching and offline fallback."""
     # Check if HuggingFace datasets library is available for online streaming
@@ -244,7 +250,11 @@ def build_data_stream(
     try:
         import itertools
 
-        raw_iter = build_online_dataset_iterator(dataset_source=dataset_source)
+        raw_iter = build_online_dataset_iterator(
+            dataset_source=dataset_source,
+            step_getter=step_getter,
+            total_steps=total_steps,
+        )
         first_row = next(raw_iter)
         data_iter = itertools.chain([first_row], raw_iter)
 
@@ -363,6 +373,19 @@ def main(args=None):
     elif max_bs is not None:
         args.batch_size = min(int(args.batch_size), int(max_bs))
 
+    # Effective Batch Size & Gradient Accumulation
+    if getattr(args, "effective_batch_size", None) is not None and args.effective_batch_size > 0:
+        args.grad_accum = max(1, args.effective_batch_size // max(1, args.batch_size))
+        eff_bs = args.batch_size * args.grad_accum
+        print(f"⚡ [Batch Scaling] Target Effective Batch Size: {eff_bs} (Micro Batch: {args.batch_size} × Grad Accum: {args.grad_accum})")
+
+    eff_batch_size = args.batch_size * getattr(args, "grad_accum", 1)
+    tokens_per_opt_step = eff_batch_size * (args.prompt_len + args.seq_len)
+    if getattr(args, "target_tokens", None) is not None and args.target_tokens > 0:
+        calculated_steps = int(math.ceil(float(args.target_tokens) / max(1.0, float(tokens_per_opt_step))))
+        args.total_steps = calculated_steps
+        print(f"🎯 [Target Token Budget] {args.target_tokens/1e9:.2f} Billion Tokens -> Scheduled for {args.total_steps:,} Steps (at {tokens_per_opt_step:,} tok/step)")
+
     # 3. Model Configuration & Parameters
     config_preset = "v5_small" if args.preset in ("tpu_v5e_1", "tpu_v6e_1", "tpu_v6e") else args.preset
     if config_preset not in PRESETS_V5:
@@ -473,17 +496,21 @@ def main(args=None):
             except Exception as e:
                 print(f"⚠️ [cloud_sync] Notice: {e}")
 
-        # Discover and restore latest local checkpoint
-        if not os.path.exists(local_latest) and os.path.exists(fallback_latest):
+        # Discover and restore latest local checkpoint or explicit foundation checkpoint
+        discovered_ckpt = None
+        if getattr(args, "init_from_checkpoint", None) and os.path.exists(args.init_from_checkpoint):
+            discovered_ckpt = args.init_from_checkpoint
+            print(f"📦 Loading base model weights from explicit checkpoint: {discovered_ckpt}")
+        elif not os.path.exists(local_latest) and os.path.exists(fallback_latest):
             local_latest = fallback_latest
 
-        discovered_ckpt = None
-        if os.path.exists(local_latest):
-            discovered_ckpt = local_latest
-        else:
-            found_ckpt, found_step, found_loss = discover_latest_checkpoint(args.checkpoint_dir, preset=args.preset)
-            if found_ckpt:
-                discovered_ckpt = found_ckpt
+        if not discovered_ckpt:
+            if os.path.exists(local_latest):
+                discovered_ckpt = local_latest
+            else:
+                found_ckpt, found_step, found_loss = discover_latest_checkpoint(args.checkpoint_dir, preset=args.preset)
+                if found_ckpt:
+                    discovered_ckpt = found_ckpt
 
         if discovered_ckpt and os.path.exists(discovered_ckpt):
             try:
@@ -501,6 +528,14 @@ def main(args=None):
                     print(f"✅ Restored & adapted {restored}/{len(params)} parameter arrays into JAX engine (100% parity)!")
                 else:
                     print(f"⚠️ Restored & adapted {restored}/{len(params)} parameter arrays into JAX engine ({len(params) - restored} missing).")
+                
+                # Campaign Reset: Keep weights, reset schedule & step counter
+                if getattr(args, "reset_step_counter", False):
+                    start_step = 0
+                    best_eval_loss = float("inf")
+                    last_eval_loss = float("inf")
+                    initial_ema_loss = None
+                    print("🌱 [Campaign Reset Active] Step counter reset to 0! Calibrating fresh schedule from adapted base weights.")
             except Exception as e:
                 print(f"⚠️ Checkpoint load notice: {e}. Starting fresh.")
 
@@ -608,6 +643,8 @@ def main(args=None):
             )
 
     # 7. Multi-Stream Ingestion & Prefetching
+    current_step_holder = [start_step]
+
     local_streamer, elastic_batcher = build_data_stream(
         dataset_source=args.dataset_source,
         tokenizer=tokenizer,
@@ -618,6 +655,8 @@ def main(args=None):
         use_elastic_window=args.elastic_window,
         vocab_size=config.vocab_size,
         prefetch_queue_size=max(16, eff_num_devices * eff_local_steps * 2),
+        step_getter=lambda: current_step_holder[0],
+        total_steps=args.total_steps,
     )
 
     def _unpack_batch(batch_tuple):
@@ -675,36 +714,54 @@ def main(args=None):
     else:
         print(f"✓ XLA Compilation complete in {time.time() - t0_compile:.2f}s! Initial Loss: {init_loss_val:.4f}")
 
-    # 9. Clean Held-Out Validation Split (sampled from active data distribution with -100 target padding)
+    # 9. Clean Canonical Multi-Domain Held-Out Validation Split
     eval_batches = []
+    eval_domains = []
     try:
-        if elastic_batcher is not None:
-            for _ in range(4):
-                b_tup = (
-                    elastic_batcher.get_batch()
-                    if hasattr(elastic_batcher, "get_batch")
-                    else elastic_batcher.next_batch()
-                )
-                eval_batches.append(_unpack_batch(b_tup))
-        elif os.path.exists("data/tokenizer"):
-            stream_val = LinguisticDataStreamer(
-                batch_size=args.batch_size,
-                prompt_len=args.prompt_len,
-                target_len=args.seq_len,
-                vocab_size=config.vocab_size,
-                queue_size=4,
-                target_pad_id=-100,
-            )
-            try:
-                for _ in range(4):
-                    vp, vt = stream_val.get_batch()
-                    eval_batches.append((vp, vt, None))
-            finally:
-                if hasattr(stream_val, "stop"):
-                    stream_val.stop()
-        print(f"✅ Clean Benchmark Held-Out Validation: Prepared {len(eval_batches)} evaluation batches.")
+        from src.elastic_window import build_canonical_eval_split
+        eval_batches, eval_domains = build_canonical_eval_split(
+            tokenizer=tokenizer,
+            batch_size=args.batch_size,
+            prompt_len=args.prompt_len,
+            target_len=args.seq_len,
+            target_pad_id=-100,
+            pad_id=pad_id,
+        )
+        print(f"✅ Clean Benchmark Held-Out Validation: Prepared {len(eval_batches)} canonical evaluation domains:")
+        for d_name in eval_domains:
+            print(f"   ├─ Domain: {d_name}")
     except Exception as e:
-        print(f"⚠️ Validation setup notice: {e}")
+        print(f"⚠️ Canonical validation setup notice: {e}. Falling back to active stream.")
+        eval_batches = []
+        try:
+            if elastic_batcher is not None:
+                for _ in range(4):
+                    b_tup = (
+                        elastic_batcher.get_batch()
+                        if hasattr(elastic_batcher, "get_batch")
+                        else elastic_batcher.next_batch()
+                    )
+                    eval_batches.append(_unpack_batch(b_tup))
+            elif os.path.exists("data/tokenizer"):
+                stream_val = LinguisticDataStreamer(
+                    batch_size=args.batch_size,
+                    prompt_len=args.prompt_len,
+                    target_len=args.seq_len,
+                    vocab_size=config.vocab_size,
+                    queue_size=4,
+                    target_pad_id=-100,
+                )
+                try:
+                    for _ in range(4):
+                        vp, vt = stream_val.get_batch()
+                        eval_batches.append((vp, vt, None))
+                finally:
+                    if hasattr(stream_val, "stop"):
+                        stream_val.stop()
+            eval_domains = [f"Domain_{i}" for i in range(len(eval_batches))]
+            print(f"✅ Prepared {len(eval_batches)} fallback evaluation batches.")
+        except Exception as e_inner:
+            print(f"⚠️ Fallback validation setup notice: {e_inner}")
 
     @jax.jit
     def eval_step_loss(p, q_b, r_b, fb_b=None):
@@ -821,10 +878,21 @@ def main(args=None):
     step_window_count = 0
     ema_loss: Optional[float] = initial_ema_loss
 
+    # Persistent Cumulative Token Accounting
+    loaded_ckpt = ckpt if ("ckpt" in locals() and isinstance(ckpt, dict)) else {}
+    if getattr(args, "reset_step_counter", False):
+        cumulative_tokens = 0
+        initial_lifetime_tokens = int(loaded_ckpt.get("lifetime_tokens", 14_745_600_000))
+    else:
+        cumulative_tokens = int(loaded_ckpt.get("cumulative_tokens", 0))
+        initial_lifetime_tokens = int(loaded_ckpt.get("lifetime_tokens", 0))
+    lifetime_tokens = initial_lifetime_tokens + cumulative_tokens
+
     try:
         while step < args.total_steps and not shutdown_requested:
             prev_step = step
             step += step_stride
+            current_step_holder[0] = step
 
             cur_lr = get_learning_rate(step, args.total_steps, args.lr, args.min_lr, args.warmup_steps)
 
@@ -898,10 +966,16 @@ def main(args=None):
             if math.isfinite(loss_val):
                 # Smooth 0.96 / 0.04 EMA update to prevent single-batch spikes from oscillating the governor
                 ema_loss = loss_val if ema_loss is None else (0.96 * ema_loss + 0.04 * loss_val)
+            else:
+                print(f"\n⚠️ [Divergence Watchdog] Non-finite loss ({loss_val}) detected at Step {step:,}! Stabilizing optimizer momentum...")
+                ema_loss = last_eval_loss if math.isfinite(last_eval_loss) else 3.00
+                cur_lr = cur_lr * 0.75
 
             # Step & token throughput accounting
             step_window_tokens += step_tokens
             step_window_count += step_stride
+            cumulative_tokens += step_tokens
+            lifetime_tokens = initial_lifetime_tokens + cumulative_tokens
 
             # Console Progress Logging
             crossed_log = (prev_step == start_step) or ((step // max(1, args.log_every)) > (prev_step // max(1, args.log_every)))
@@ -911,14 +985,24 @@ def main(args=None):
                 tok_per_sec = step_window_tokens / max(elapsed_log, 1e-6)
 
                 gov_str = f" | Gov: {alpha_gov:.2f}" if getattr(args, "loss_window_governor", True) and alpha_gov > 0.01 else ""
+
+                tgt_tok = getattr(args, "target_tokens", 7_000_000_000)
+                if tgt_tok and tgt_tok > 0:
+                    pct = (cumulative_tokens / tgt_tok) * 100.0
+                    eta_sec = max(0.0, tgt_tok - cumulative_tokens) / max(tok_per_sec, 1e-6)
+                    eta_h = eta_sec / 3600.0
+                    tok_str = f"Tokens: {cumulative_tokens/1e9:5.3f}B/{tgt_tok/1e9:4.2f}B ({pct:5.2f}%) | ETA: {eta_h:4.1f}h | "
+                else:
+                    tok_str = f"Tokens: {cumulative_tokens/1e9:5.3f}B | "
+
                 print(
                     f"[Step {step:6d}/{args.total_steps}] "
+                    f"{tok_str}"
                     f"Loss: {loss_val:6.4f} | "
                     f"Steps/s: {steps_per_sec:5.2f} | "
                     f"Tok/s: {tok_per_sec:7,.0f} | "
                     f"LR: {cur_lr:.2e} | "
-                    f"Samp_p: {cur_sampling_p:.2f}{gov_str} | "
-                    f"Elapsed: {time.time() - t_start:5.1f}s"
+                    f"Samp_p: {cur_sampling_p:.2f}{gov_str}"
                 )
                 t_last_log = time.time()
                 step_window_tokens = 0
@@ -928,14 +1012,18 @@ def main(args=None):
             crossed_eval = bool(eval_batches) and ((step // max(1, args.eval_interval)) > (prev_step // max(1, args.eval_interval)))
             if crossed_eval:
                 eval_p = jax.device_put(_get_host_params(), devices[0]) if use_multi_tpu_local_sgd else params
-                val_losses = [eval_step_loss(eval_p, vp, vt, vfb) for vp, vt, vfb in eval_batches]
-                eval_loss = float(jnp.mean(jnp.stack(val_losses)))
+                val_losses = [float(eval_step_loss(eval_p, vp, vt, vfb)) for vp, vt, vfb in eval_batches]
+                eval_loss = float(np.mean(val_losses)) if val_losses else float("inf")
                 last_eval_loss = eval_loss
                 eval_ppl = math.exp(min(eval_loss, 20.0))
                 is_champion = eval_loss < best_eval_loss
 
                 champ_tag = "🏆 (NEW CHAMPION RECORD)" if is_champion else ""
-                print(f"📊 [Eval @ Step {step:,}] Held-Out Loss: {eval_loss:.4f} | PPL: {eval_ppl:.2f} {champ_tag}")
+                print(f"📊 [Eval @ Step {step:,}] Composite Held-Out Loss: {eval_loss:.4f} | PPL: {eval_ppl:.2f} {champ_tag}")
+                if len(val_losses) == len(eval_domains):
+                    for d_name, d_val in zip(eval_domains, val_losses):
+                        d_ppl = math.exp(min(d_val, 20.0))
+                        print(f"   ├─ {d_name:<26}: Loss {d_val:.4f} (PPL: {d_ppl:.2f})")
 
                 if is_champion:
                     best_eval_loss = eval_loss
@@ -948,6 +1036,10 @@ def main(args=None):
                         "ppl": eval_ppl,
                         "preset": args.preset,
                         "sync_model": sync_model_name,
+                        "cumulative_tokens": cumulative_tokens,
+                        "lifetime_tokens": lifetime_tokens,
+                        "target_tokens": getattr(args, "target_tokens", 7_000_000_000),
+                        "effective_batch_size": args.batch_size * grad_accum,
                         "timestamp": time.time(),
                     }
                     ckpt_mgr.dispatch(_get_host_params(), buffers, best_fname, meta_dict=meta_best, block_if_busy=True)
@@ -992,6 +1084,10 @@ def main(args=None):
                     "best_eval_loss": best_eval_loss,
                     "preset": args.preset,
                     "sync_model": sync_model_name,
+                    "cumulative_tokens": cumulative_tokens,
+                    "lifetime_tokens": lifetime_tokens,
+                    "target_tokens": getattr(args, "target_tokens", 7_000_000_000),
+                    "effective_batch_size": args.batch_size * grad_accum,
                     "timestamp": time.time(),
                 }
                 ckpt_mgr.dispatch(_get_host_params(), buffers, latest_fname, meta_dict=meta_latest)
@@ -1059,6 +1155,10 @@ def main(args=None):
             "eval_loss": best_eval_loss,
             "preset": args.preset,
             "sync_model": sync_model_name,
+            "cumulative_tokens": cumulative_tokens if "cumulative_tokens" in locals() else 0,
+            "lifetime_tokens": lifetime_tokens if "lifetime_tokens" in locals() else 0,
+            "target_tokens": getattr(args, "target_tokens", 7_000_000_000),
+            "effective_batch_size": args.batch_size * grad_accum,
             "timestamp": time.time(),
         }
         ckpt_mgr.flush(_get_host_params(), buffers, final_fname, meta_dict=final_meta)
