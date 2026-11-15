@@ -12,3 +12,8 @@ checkpoints/*
 
 loss_history_*.json
 loss_trajectory_*.png
+data/benchmark_cache/
+benchmarks/*.json
+.agents/
+WORK_STATE.md
+

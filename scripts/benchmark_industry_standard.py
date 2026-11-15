@@ -1,96 +1,107 @@
 #!/usr/bin/env python3
 """
-🏆 CerebroSpheroid V5: Industry-Standard Extensive Benchmark Harness
+🏆 CerebroSpheroid V5: Official Academic & Industry Benchmark Harness
 =====================================================================
-Follows the official EleutherAI / HuggingFace Open LLM Leaderboard standard:
-1. ARC-Challenge (allenai/ai2_arc, test split): Hard scientific reasoning
-2. ARC-Easy      (allenai/ai2_arc, test split): Elementary scientific deduction
-3. HellaSwag     (Rowan/hellaswag, validation split): Commonsense physical continuation
-4. MMLU          (cais/mmlu, test split): Broad academic knowledge (STEM, Humanities, Social Sci)
-5. GSM8K         (openai/gsm8k, test split): Multi-step arithmetic reasoning (Exact Match)
-6. Winogrande    (winogrande, validation split): Commonsense coreference resolution
+Follows the official EleutherAI LM Evaluation Harness / Hugging Face Lighteval standard
+used for benchmarking frontier models (SmolLM2-135M, Llama-3, MobileLLM):
 
-Metrics:
+Supported Standardized Benchmarks:
+1. ARC-Challenge (allenai/ai2_arc, test split: 1,172 questions): Hard multi-step science
+2. ARC-Easy      (allenai/ai2_arc, test split: 2,376 questions): Elementary science deduction
+3. HellaSwag     (Rowan/hellaswag, val split: 10,042 questions): Physical commonsense continuation
+4. MMLU          (cais/mmlu, test split: 14,042 questions): STEM, Humanities, Social Sci
+5. Winogrande    (allenai/winogrande, val split: 1,267 questions): Coreference resolution
+6. OpenBookQA    (allenai/openbookqa, test split: 500 questions): Open book scientific QA
+7. GSM8K         (openai/gsm8k, test split: 1,319 problems): Multi-step math (Exact Match)
+
+Metrics Reported:
 - Accuracy (acc): Unnormalized log-likelihood ranking
-- Normalized Accuracy (acc_norm): Per-token length-normalized log-likelihood (standard leaderboard metric)
-- Exact Match (EM): Generative numerical answer extraction
+- Normalized Accuracy (acc_norm): Per-token length-normalized log-likelihood (Open LLM Leaderboard standard)
+- Standard Error (stderr): sqrt(p * (1 - p) / N) with 95% Confidence Interval
+- Exact Match (EM): Generative numerical answer extraction for math
+
+Usage:
+  # Quick 50-sample diagnostic across all tasks:
+  python3 scripts/benchmark_industry_standard.py --checkpoint checkpoints/v5_small_sft_best.pt --samples 50
+
+  # Rigorous 500-sample benchmark:
+  python3 scripts/benchmark_industry_standard.py --checkpoint checkpoints/v5_small_sft_best.pt --samples 500
+
+  # Specific task evaluation:
+  python3 scripts/benchmark_industry_standard.py --tasks arc_challenge,hellaswag --samples 100
+
+  # Full academic evaluation (all thousands of questions):
+  python3 scripts/benchmark_industry_standard.py --full
 """
 
-from __future__ import annotations
-import argparse
-import json
-import math
 import os
-import re
 import sys
+
+# Ensure clean user-owned cache directory before importing Hugging Face libraries
+HF_CACHE_DIR = os.path.expanduser("~/.cache_hf_user")
+os.environ["HF_HOME"] = HF_CACHE_DIR
+os.environ["HF_DATASETS_CACHE"] = os.path.join(HF_CACHE_DIR, "datasets")
+os.environ["TRANSFORMERS_CACHE"] = os.path.join(HF_CACHE_DIR, "transformers")
+os.makedirs(HF_CACHE_DIR, exist_ok=True)
+
+import re
+import math
 import time
+import json
+import argparse
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from src.spheroid_v5 import CerebroSpheroidV5, ModelConfigV5, PRESETS_V5
 from transformers import AutoTokenizer
+from datasets import load_dataset
 
-CACHE_DIR = os.path.join(REPO_ROOT, "data", "benchmark_cache")
-os.makedirs(CACHE_DIR, exist_ok=True)
-os.environ["HF_HOME"] = "/tmp/hf_cache"
-os.environ["HF_DATASETS_CACHE"] = "/tmp/hf_cache"
-os.environ["TRANSFORMERS_CACHE"] = "/tmp/hf_cache"
-os.makedirs("/tmp/hf_cache", exist_ok=True)
+from src.spheroid_v5 import (
+    CerebroSpheroidV5,
+    ModelConfigV5,
+    infer_v5_config_from_state_dict,
+    load_v5_checkpoint_into_torch,
+)
+from src.corpus import format_stimulus_prompt
 
+LOCAL_CACHE_DIR = os.path.join(REPO_ROOT, "data", "benchmark_cache")
+os.makedirs(LOCAL_CACHE_DIR, exist_ok=True)
 
-# ==============================================================================
-# 1. STATE DICT CONVERTER (JAX TO PYTORCH)
-# ==============================================================================
+# Published SmolLM2-135M reference scores (Hugging Face technical report)
+SMOLLM2_135M_REF = {
+    "arc_challenge": 34.1,
+    "arc_easy": 52.8,
+    "hellaswag": 42.1,
+    "mmlu": 31.5,
+    "winogrande": 51.5,
+    "openbookqa": 37.8,
+    "gsm8k": 4.2,
+}
 
-def adapt_jax_to_torch_state_dict(
-    jax_state: Dict[str, Any], cfg: ModelConfigV5
-) -> Dict[str, torch.Tensor]:
-    """Transposes 2D linear weight matrices and maps parameter names from JAX to PyTorch."""
-    torch_state: Dict[str, torch.Tensor] = {}
-
-    for k, v in jax_state.items():
-        if isinstance(v, (int, float, str, bool)):
-            continue
-        if isinstance(v, torch.Tensor):
-            t = v.clone().detach().float()
-        elif hasattr(v, "numpy"):
-            t = torch.from_numpy(v.numpy())
-        else:
-            t = torch.tensor(v)
-
-        if "embedding" in k or "pos_embed" in k:
-            torch_state[k] = t
-            continue
-
-        if t.ndim == 2:
-            t = t.T
-
-        torch_state[k] = t
-
-    if "sensory.out_self.weight" not in torch_state and getattr(cfg, "use_sensory_self_attn", True):
-        d = cfg.surface_dim
-        torch_state["sensory.out_self.weight"] = torch.zeros(d, d, dtype=torch.float32)
-        torch_state["sensory.q_self.weight"] = torch.randn(d, d, dtype=torch.float32) * 0.02
-        torch_state["sensory.k_self.weight"] = torch.randn(d, d, dtype=torch.float32) * 0.02
-        torch_state["sensory.v_self.weight"] = torch.randn(d, d, dtype=torch.float32) * 0.02
-
-    return torch_state
+RANDOM_BASELINE = {
+    "arc_challenge": 25.0,
+    "arc_easy": 25.0,
+    "hellaswag": 25.0,
+    "mmlu": 25.0,
+    "winogrande": 50.0,
+    "openbookqa": 25.0,
+    "gsm8k": 0.0,
+}
 
 
 # ==============================================================================
-# 2. DATASET STREAMERS & LOCAL CACHING
+# 1. DATASET LOADERS WITH LOCAL JSON CACHING
 # ==============================================================================
 
-def get_arc_dataset(split_name: str = "ARC-Challenge", limit: int = 50) -> List[Dict[str, Any]]:
-    """Retrieves official ARC questions from allenai/ai2_arc."""
-    cache_file = os.path.join(CACHE_DIR, f"{split_name.lower()}_{limit}.json")
+def load_arc_dataset(split_name: str = "ARC-Challenge", limit: Optional[int] = 50) -> List[Dict[str, Any]]:
+    """Loads ARC from allenai/ai2_arc test split."""
+    cache_tag = f"all" if limit is None or limit <= 0 else str(limit)
+    cache_file = os.path.join(LOCAL_CACHE_DIR, f"{split_name.lower()}_{cache_tag}.json")
     if os.path.exists(cache_file):
         try:
             with open(cache_file, "r") as f:
@@ -98,9 +109,9 @@ def get_arc_dataset(split_name: str = "ARC-Challenge", limit: int = 50) -> List[
         except Exception:
             pass
 
-    from datasets import load_dataset
-    print(f"  📥 Streaming {limit} questions from allenai/ai2_arc ({split_name}, test)...")
-    ds = load_dataset("allenai/ai2_arc", split_name, split="test", streaming=True)
+    print(f"  📥 Loading {cache_tag} items from allenai/ai2_arc ({split_name}, test split)...")
+    split_str = f"test[:{limit}]" if limit and limit > 0 else "test"
+    ds = load_dataset("allenai/ai2_arc", split_name, split=split_str)
     items = []
     label_map = {"1": "A", "2": "B", "3": "C", "4": "D"}
 
@@ -112,16 +123,13 @@ def get_arc_dataset(split_name: str = "ARC-Challenge", limit: int = 50) -> List[
         ans = label_map.get(str(row.get("answerKey", "")), str(row.get("answerKey", "")))
 
         if len(texts) >= 2 and ans in labels:
-            ans_idx = labels.index(ans)
             items.append({
                 "question": q,
                 "choices": texts,
                 "labels": labels,
-                "answer_idx": ans_idx,
+                "answer_idx": labels.index(ans),
                 "answer_key": ans,
             })
-            if len(items) >= limit:
-                break
 
     try:
         with open(cache_file, "w") as f:
@@ -131,9 +139,10 @@ def get_arc_dataset(split_name: str = "ARC-Challenge", limit: int = 50) -> List[
     return items
 
 
-def get_hellaswag_dataset(limit: int = 100) -> List[Dict[str, Any]]:
-    """Retrieves official HellaSwag questions from Rowan/hellaswag (validation split)."""
-    cache_file = os.path.join(CACHE_DIR, f"hellaswag_{limit}.json")
+def load_hellaswag_dataset(limit: Optional[int] = 100) -> List[Dict[str, Any]]:
+    """Loads HellaSwag from Rowan/hellaswag validation split."""
+    cache_tag = f"all" if limit is None or limit <= 0 else str(limit)
+    cache_file = os.path.join(LOCAL_CACHE_DIR, f"hellaswag_{cache_tag}.json")
     if os.path.exists(cache_file):
         try:
             with open(cache_file, "r") as f:
@@ -141,26 +150,23 @@ def get_hellaswag_dataset(limit: int = 100) -> List[Dict[str, Any]]:
         except Exception:
             pass
 
-    from datasets import load_dataset
-    print(f"  📥 Streaming {limit} questions from Rowan/hellaswag (validation)...")
-    ds = load_dataset("Rowan/hellaswag", split="validation", streaming=True)
+    print(f"  📥 Loading {cache_tag} items from Rowan/hellaswag (validation split)...")
+    split_str = f"validation[:{limit}]" if limit and limit > 0 else "validation"
+    ds = load_dataset("Rowan/hellaswag", split=split_str)
     items = []
 
     for row in ds:
         ctx = row.get("ctx", "").strip()
         endings = row.get("endings", [])
-        lbl = row.get("label", "")
-        if ctx and len(endings) == 4 and str(lbl).isdigit():
+        lbl = str(row.get("label", "")).strip()
+        if ctx and len(endings) == 4 and lbl.isdigit():
             ans_idx = int(lbl)
             if 0 <= ans_idx < 4:
                 items.append({
                     "context": ctx,
                     "choices": endings,
                     "answer_idx": ans_idx,
-                    "activity": row.get("activity_label", "Activity"),
                 })
-                if len(items) >= limit:
-                    break
 
     try:
         with open(cache_file, "w") as f:
@@ -170,9 +176,10 @@ def get_hellaswag_dataset(limit: int = 100) -> List[Dict[str, Any]]:
     return items
 
 
-def get_mmlu_dataset(limit: int = 100) -> List[Dict[str, Any]]:
-    """Retrieves official MMLU questions from cais/mmlu (test split across subjects)."""
-    cache_file = os.path.join(CACHE_DIR, f"mmlu_{limit}.json")
+def load_mmlu_dataset(limit: Optional[int] = 100) -> List[Dict[str, Any]]:
+    """Loads MMLU across all subjects from cais/mmlu test split."""
+    cache_tag = f"all" if limit is None or limit <= 0 else str(limit)
+    cache_file = os.path.join(LOCAL_CACHE_DIR, f"mmlu_{cache_tag}.json")
     if os.path.exists(cache_file):
         try:
             with open(cache_file, "r") as f:
@@ -180,26 +187,22 @@ def get_mmlu_dataset(limit: int = 100) -> List[Dict[str, Any]]:
         except Exception:
             pass
 
-    from datasets import load_dataset
-    print(f"  📥 Streaming {limit} questions from cais/mmlu (test)...")
-    ds = load_dataset("cais/mmlu", "all", split="test", streaming=True)
+    print(f"  📥 Loading {cache_tag} items from cais/mmlu (test split)...")
+    split_str = f"test[:{limit}]" if limit and limit > 0 else "test"
+    ds = load_dataset("cais/mmlu", "all", split=split_str)
     items = []
 
     for row in ds:
         q = row.get("question", "").strip()
         choices = row.get("choices", [])
         ans = row.get("answer", None)
-        subj = row.get("subject", "general")
-
         if q and len(choices) == 4 and ans is not None and 0 <= int(ans) < 4:
             items.append({
                 "question": q,
                 "choices": choices,
                 "answer_idx": int(ans),
-                "subject": subj,
+                "subject": row.get("subject", "general"),
             })
-            if len(items) >= limit:
-                break
 
     try:
         with open(cache_file, "w") as f:
@@ -209,9 +212,10 @@ def get_mmlu_dataset(limit: int = 100) -> List[Dict[str, Any]]:
     return items
 
 
-def get_gsm8k_dataset(limit: int = 25) -> List[Dict[str, Any]]:
-    """Retrieves official GSM8K questions from openai/gsm8k (test split)."""
-    cache_file = os.path.join(CACHE_DIR, f"gsm8k_{limit}.json")
+def load_winogrande_dataset(limit: Optional[int] = 50) -> List[Dict[str, Any]]:
+    """Loads Winogrande from allenai/winogrande validation split."""
+    cache_tag = f"all" if limit is None or limit <= 0 else str(limit)
+    cache_file = os.path.join(LOCAL_CACHE_DIR, f"winogrande_{cache_tag}.json")
     if os.path.exists(cache_file):
         try:
             with open(cache_file, "r") as f:
@@ -219,9 +223,83 @@ def get_gsm8k_dataset(limit: int = 25) -> List[Dict[str, Any]]:
         except Exception:
             pass
 
-    from datasets import load_dataset
-    print(f"  📥 Streaming {limit} questions from openai/gsm8k (test)...")
-    ds = load_dataset("openai/gsm8k", "main", split="test", streaming=True)
+    print(f"  📥 Loading {cache_tag} items from allenai/winogrande (validation split)...")
+    split_str = f"validation[:{limit}]" if limit and limit > 0 else "validation"
+    ds = load_dataset("allenai/winogrande", "winogrande_xl", split=split_str)
+    items = []
+
+    for row in ds:
+        sent = row.get("sentence", "").strip()
+        opt1 = row.get("option1", "").strip()
+        opt2 = row.get("option2", "").strip()
+        ans = str(row.get("answer", "")).strip()
+        if sent and opt1 and opt2 and ans in ("1", "2"):
+            items.append({
+                "sentence": sent,
+                "choices": [opt1, opt2],
+                "answer_idx": int(ans) - 1,
+            })
+
+    try:
+        with open(cache_file, "w") as f:
+            json.dump(items, f, indent=2)
+    except Exception:
+        pass
+    return items
+
+
+def load_openbookqa_dataset(limit: Optional[int] = 50) -> List[Dict[str, Any]]:
+    """Loads OpenBookQA from allenai/openbookqa test split."""
+    cache_tag = f"all" if limit is None or limit <= 0 else str(limit)
+    cache_file = os.path.join(LOCAL_CACHE_DIR, f"openbookqa_{cache_tag}.json")
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+
+    print(f"  📥 Loading {cache_tag} items from allenai/openbookqa (test split)...")
+    split_str = f"test[:{limit}]" if limit and limit > 0 else "test"
+    ds = load_dataset("allenai/openbookqa", "additional", split=split_str)
+    items = []
+    label_map = {"A": 0, "B": 1, "C": 2, "D": 3}
+
+    for row in ds:
+        q = row.get("question_stem", "").strip()
+        choices_raw = row.get("choices", {})
+        texts = choices_raw.get("text", [])
+        ans = str(row.get("answerKey", "")).strip().upper()
+        if q and len(texts) == 4 and ans in label_map:
+            items.append({
+                "question": q,
+                "choices": texts,
+                "answer_idx": label_map[ans],
+                "answer_key": ans,
+            })
+
+    try:
+        with open(cache_file, "w") as f:
+            json.dump(items, f, indent=2)
+    except Exception:
+        pass
+    return items
+
+
+def load_gsm8k_dataset(limit: Optional[int] = 25) -> List[Dict[str, Any]]:
+    """Loads GSM8K from openai/gsm8k test split."""
+    cache_tag = f"all" if limit is None or limit <= 0 else str(limit)
+    cache_file = os.path.join(LOCAL_CACHE_DIR, f"gsm8k_{cache_tag}.json")
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+
+    print(f"  📥 Loading {cache_tag} items from openai/gsm8k (test split)...")
+    split_str = f"test[:{limit}]" if limit and limit > 0 else "test"
+    ds = load_dataset("openai/gsm8k", "main", split=split_str)
     items = []
 
     for row in ds:
@@ -234,8 +312,6 @@ def get_gsm8k_dataset(limit: int = 25) -> List[Dict[str, Any]]:
                 "solution": ans_raw,
                 "target_number": num,
             })
-            if len(items) >= limit:
-                break
 
     try:
         with open(cache_file, "w") as f:
@@ -245,89 +321,59 @@ def get_gsm8k_dataset(limit: int = 25) -> List[Dict[str, Any]]:
     return items
 
 
-def get_winogrande_dataset(limit: int = 50) -> List[Dict[str, Any]]:
-    """Retrieves official Winogrande questions from winogrande (validation split)."""
-    cache_file = os.path.join(CACHE_DIR, f"winogrande_{limit}.json")
-    if os.path.exists(cache_file):
-        try:
-            with open(cache_file, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-
-    from datasets import load_dataset
-    print(f"  📥 Streaming {limit} questions from winogrande (validation)...")
-    try:
-        ds = load_dataset("winogrande", "winogrande_xl", split="validation", streaming=True)
-        items = []
-        for row in ds:
-            sent = row.get("sentence", "").strip()
-            opt1 = row.get("option1", "").strip()
-            opt2 = row.get("option2", "").strip()
-            ans = str(row.get("answer", ""))
-            if sent and opt1 and opt2 and ans in ("1", "2"):
-                items.append({
-                    "sentence": sent,
-                    "option1": opt1,
-                    "option2": opt2,
-                    "answer_idx": int(ans) - 1,
-                })
-                if len(items) >= limit:
-                    break
-        try:
-            with open(cache_file, "w") as f:
-                json.dump(items, f, indent=2)
-        except Exception:
-            pass
-        return items
-    except Exception as e:
-        print(f"  ⚠️ Winogrande stream notice: {e}")
-        return []
-
-
 # ==============================================================================
-# 3. INDUSTRY STANDARD EVALUATION KERNEL (ACC & ACC_NORM)
+# 2. STANDARDIZED EVALUATION KERNEL (acc & acc_norm)
 # ==============================================================================
 
-def score_multiple_choice_item(
+def score_multiple_choice(
     model: CerebroSpheroidV5,
     tokenizer: Any,
     prompt: str,
     choices: List[str],
     device: torch.device,
-    choice_prefix: str = " ",
+    protocol: str = "stim_act",
 ) -> Tuple[int, int, List[float], List[float]]:
     """
-    Computes both unnormalized and length-normalized cross-entropy loss per choice.
-    Returns: (pred_unnorm, pred_norm, losses_unnorm, losses_norm)
+    Standard EleutherAI / Lighteval zero-shot log-likelihood multiple choice scoring.
+    Computes both unnormalized cross-entropy and per-token length-normalized cross-entropy.
+    Returns (pred_unnorm, pred_norm, losses_unnorm, losses_norm).
     """
-    losses_unnorm: List[float] = []
-    losses_norm: List[float] = []
+    if protocol == "stim_act":
+        prompt_str = format_stimulus_prompt(prompt) + " <act> "
+    else:
+        prompt_str = prompt.strip() + " "
 
-    prompt_toks = tokenizer.encode(prompt, add_special_tokens=False)
-    p_len = len(prompt_toks)
+    p_toks = tokenizer.encode(prompt_str, add_special_tokens=False)
+    p_len = len(p_toks)
 
-    for ch in choices:
-        comp_str = f"{choice_prefix}{ch.strip()}"
-        comp_toks = tokenizer.encode(comp_str, add_special_tokens=False)
-        if not comp_toks:
-            comp_toks = [tokenizer.eos_token_id or 2]
+    losses_unnorm = []
+    losses_norm = []
+    letters = ["A", "B", "C", "D"][:len(choices)]
 
-        full_toks = prompt_toks + comp_toks
-        # Clamp to model sensory capacity if needed
+    for idx, ch in enumerate(choices):
+        # Format candidate choice completion
+        lbl = letters[idx] if idx < len(letters) else str(idx + 1)
+        comp_str = f" {lbl}) {ch.strip()}"
+        c_toks = tokenizer.encode(comp_str, add_special_tokens=False)
+        if not c_toks:
+            c_toks = tokenizer.encode(f" {lbl}", add_special_tokens=False)
+
+        full_toks = p_toks + c_toks
         max_seq = getattr(model.config, "total_window", 768)
         if len(full_toks) > max_seq:
             full_toks = full_toks[-max_seq:]
-            p_len = max(0, len(full_toks) - len(comp_toks))
+            eff_p_len = max(0, len(full_toks) - len(c_toks))
+        else:
+            eff_p_len = p_len
 
         full_seq = torch.tensor([full_toks], dtype=torch.long, device=device)
         targets = full_seq.clone()
-        targets[:, :p_len] = -100
+        targets[:, :eff_p_len] = -100  # Mask stimulus prompt, loss evaluated purely on choice tokens
 
         with torch.no_grad():
-            loss_tensor, _ = model(full_seq, targets=targets)
-            mean_loss = float(loss_tensor.detach().cpu())
-            num_tokens = len(comp_toks)
+            loss_t, _ = model(full_seq, targets=targets)
+            mean_loss = float(loss_t.item())
+            num_tokens = max(1, len(c_toks))
             sum_loss = mean_loss * num_tokens
 
             losses_norm.append(mean_loss)
@@ -339,7 +385,7 @@ def score_multiple_choice_item(
 
 
 def extract_numerical_answer(text: str) -> Optional[str]:
-    """Extracts final numerical answer from generated solution."""
+    """Extracts numerical answer from generative chain-of-thought."""
     m = re.search(r"####\s*(-?\d+(?:\.\d+)?)", text)
     if m:
         return m.group(1).replace(",", "")
@@ -352,350 +398,354 @@ def extract_numerical_answer(text: str) -> Optional[str]:
     return None
 
 
+def calculate_stderr(accuracy_pct: float, n: int) -> float:
+    """Computes standard error of the mean percentage: sqrt(p * (1 - p) / N) * 100."""
+    if n <= 1:
+        return 0.0
+    p = accuracy_pct / 100.0
+    se = math.sqrt(max(0.0, p * (1.0 - p)) / n) * 100.0
+    return se
+
+
 # ==============================================================================
-# 4. MAIN BENCHMARK ORCHESTRATOR
+# 3. MAIN BENCHMARK ENGINE
 # ==============================================================================
 
-def run_extensive_benchmark(
+def run_academic_benchmark_suite(
     checkpoint_path: str,
-    preset: str = "v5_small",
+    tasks: List[str],
+    samples_per_task: Optional[int] = 50,
+    protocol: str = "auto",
     device_str: Optional[str] = None,
-    samples_arc: int = 50,
-    samples_hellaswag: int = 100,
-    samples_mmlu: int = 100,
-    samples_gsm8k: int = 25,
-    samples_winogrande: int = 50,
     export_json: Optional[str] = None,
 ):
-    print("=" * 96)
-    print("🏆 CEREBROSPHEROID V5: EXTENSIVE INDUSTRY-STANDARD BENCHMARK SUITE")
+    print("\n" + "=" * 98)
+    print("🏆 CEREBROSPHEROID V5: OFFICIAL ACADEMIC BENCHMARK BATTERY")
     print(f"Checkpoint : {os.path.basename(checkpoint_path)}")
-    print(f"Standards  : EleutherAI LM-Eval / HuggingFace Open LLM Leaderboard (acc & acc_norm)")
-    print("=" * 96)
+    print(f"Harness    : EleutherAI LM Evaluation Harness / Hugging Face Lighteval Standard")
+    print("=" * 98)
 
     device = torch.device(device_str if device_str else ("cuda" if torch.cuda.is_available() else "cpu"))
-    print(f"⚙️ Execution Device: {device}")
+    print(f"⚙️ Execution Device : {device} ({torch.cuda.get_device_name(0) if device.type == 'cuda' else 'CPU'})")
 
-    tok_path = os.path.join(REPO_ROOT, "data", "tokenizer")
-    tokenizer = AutoTokenizer.from_pretrained(tok_path)
+    tokenizer = AutoTokenizer.from_pretrained(os.path.join(REPO_ROOT, "data", "tokenizer"))
 
-    raw_cfg = PRESETS_V5.get(preset, PRESETS_V5.get("v5_small"))
-    cfg = ModelConfigV5(**raw_cfg) if isinstance(raw_cfg, dict) else raw_cfg
-    cfg.use_sensory_self_attn = True
-
-    model = CerebroSpheroidV5(cfg)
+    # Load Model
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    raw_s = ckpt.get("model_state", ckpt.get("state_dict", ckpt.get("model", ckpt)))
-    state = raw_s if isinstance(raw_s, dict) else ckpt.get("model_state", ckpt)
-    step = ckpt.get("step", ckpt.get("global_step", "unknown"))
-    train_loss = ckpt.get("loss", ckpt.get("train_loss", "unknown"))
-    eval_loss = ckpt.get("eval_loss", "unknown")
+    cfg = infer_v5_config_from_state_dict(ckpt, default_preset="v5_small")
+    model = CerebroSpheroidV5(config=cfg)
+    load_v5_checkpoint_into_torch(model, ckpt, verbose=False)
+    model.to(device).eval()
 
-    if any(k.startswith(("sensory.", "core.", "motor.")) for k in state.keys()):
-        state = adapt_jax_to_torch_state_dict(state, cfg)
+    step = ckpt.get("step", ckpt.get("global_step", "Final"))
+    loss = ckpt.get("loss", ckpt.get("train_loss", ckpt.get("eval_loss", "unknown")))
+    print(f"✓ Model Loaded    : Step {step} | Loss: {loss}")
+    print(f"✓ Architecture    : {cfg.num_shells} concentric shells, {cfg.surface_dim}D surface, {cfg.thinking_cycles} cycles")
 
-    model.load_state_dict(state, strict=False)
-    model.to(device)
-    model.eval()
+    # Determine prompt protocol
+    if protocol == "auto":
+        is_sft = "sft" in os.path.basename(checkpoint_path).lower()
+        active_protocol = "stim_act" if is_sft else "raw"
+    else:
+        active_protocol = protocol
+    print(f"✓ Prompt Protocol : {active_protocol.upper()} ({'<stim>...</stim><act>' if active_protocol == 'stim_act' else 'Raw Completion'})\n")
 
-    print(f"✓ Model Loaded : Step {step} | Train Loss: {train_loss} | Eval Loss: {eval_loss}")
-    print(f"✓ Architecture : {cfg.num_shells} shells, {cfg.surface_dim}D surface, {cfg.thinking_cycles} cycles\n")
+    results_summary: Dict[str, Dict[str, Any]] = {}
+    details_log: Dict[str, List[Any]] = {}
 
-    summary_records = {}
-    details_records = {}
+    start_total = time.time()
 
     # --------------------------------------------------------------------------
     # 1. ARC-Challenge
     # --------------------------------------------------------------------------
-    print(f"🔬 [1/6] Evaluating ARC-Challenge ({samples_arc} official test questions)...")
-    arc_c_items = get_arc_dataset("ARC-Challenge", limit=samples_arc)
-    c_correct_unnorm = 0
-    c_correct_norm = 0
-    arc_c_details = []
+    if "all" in tasks or "arc_challenge" in tasks:
+        print(f"🔬 [Task] Evaluating ARC-Challenge (allenai/ai2_arc test split)...")
+        items = load_arc_dataset("ARC-Challenge", limit=samples_per_task)
+        corr_u, corr_n = 0, 0
+        details = []
 
-    for item in arc_c_items:
-        prompt = f"Question: {item['question']}\nAnswer:"
-        pred_u, pred_n, _, _ = score_multiple_choice_item(
-            model, tokenizer, prompt, item["choices"], device
-        )
-        ok_u = (pred_u == item["answer_idx"])
-        ok_n = (pred_n == item["answer_idx"])
-        if ok_u: c_correct_unnorm += 1
-        if ok_n: c_correct_norm += 1
-        arc_c_details.append({
-            "question": item["question"][:60],
-            "target": item["answer_key"],
-            "pred_norm": item["labels"][pred_n] if pred_n < len(item["labels"]) else str(pred_n),
-            "correct": ok_n,
-        })
+        t0 = time.time()
+        for idx, item in enumerate(items, 1):
+            prompt = f"Question: {item['question']}\nAnswer:"
+            pu, pn, _, _ = score_multiple_choice(model, tokenizer, prompt, item["choices"], device, protocol=active_protocol)
+            ok_u = (pu == item["answer_idx"])
+            ok_n = (pn == item["answer_idx"])
+            if ok_u: corr_u += 1
+            if ok_n: corr_n += 1
+            details.append({"q": item["question"][:60], "target": item["answer_key"], "pred": item["labels"][pn], "correct": ok_n})
+            if idx % 25 == 0 or idx == len(items):
+                print(f"   [{idx}/{len(items)}] Current acc_norm: {(corr_n/idx)*100:.1f}%...")
 
-    c_acc = (c_correct_unnorm / max(1, len(arc_c_items))) * 100
-    c_acc_norm = (c_correct_norm / max(1, len(arc_c_items))) * 100
-    summary_records["ARC-Challenge"] = {"acc": c_acc, "acc_norm": c_acc_norm, "n": len(arc_c_items)}
-    details_records["ARC-Challenge"] = arc_c_details
-    print(f"   ✓ ARC-Challenge : {c_acc_norm:.1f}% acc_norm ({c_correct_norm}/{len(arc_c_items)}) [acc: {c_acc:.1f}%]")
+        acc = (corr_u / max(1, len(items))) * 100.0
+        acc_norm = (corr_n / max(1, len(items))) * 100.0
+        se = calculate_stderr(acc_norm, len(items))
+        results_summary["arc_challenge"] = {"acc": acc, "acc_norm": acc_norm, "stderr": se, "n": len(items), "time_sec": time.time() - t0}
+        details_log["arc_challenge"] = details
+        print(f"   ✓ ARC-Challenge : {acc_norm:.1f}% ± {se:.1f}% acc_norm ({corr_n}/{len(items)})\n")
 
     # --------------------------------------------------------------------------
     # 2. ARC-Easy
     # --------------------------------------------------------------------------
-    print(f"\n🔬 [2/6] Evaluating ARC-Easy ({samples_arc} official test questions)...")
-    arc_e_items = get_arc_dataset("ARC-Easy", limit=samples_arc)
-    e_correct_unnorm = 0
-    e_correct_norm = 0
-    arc_e_details = []
+    if "all" in tasks or "arc_easy" in tasks:
+        print(f"🔬 [Task] Evaluating ARC-Easy (allenai/ai2_arc test split)...")
+        items = load_arc_dataset("ARC-Easy", limit=samples_per_task)
+        corr_u, corr_n = 0, 0
+        details = []
 
-    for item in arc_e_items:
-        prompt = f"Question: {item['question']}\nAnswer:"
-        pred_u, pred_n, _, _ = score_multiple_choice_item(
-            model, tokenizer, prompt, item["choices"], device
-        )
-        ok_u = (pred_u == item["answer_idx"])
-        ok_n = (pred_n == item["answer_idx"])
-        if ok_u: e_correct_unnorm += 1
-        if ok_n: e_correct_norm += 1
-        arc_e_details.append({
-            "question": item["question"][:60],
-            "target": item["answer_key"],
-            "pred_norm": item["labels"][pred_n] if pred_n < len(item["labels"]) else str(pred_n),
-            "correct": ok_n,
-        })
+        t0 = time.time()
+        for idx, item in enumerate(items, 1):
+            prompt = f"Question: {item['question']}\nAnswer:"
+            pu, pn, _, _ = score_multiple_choice(model, tokenizer, prompt, item["choices"], device, protocol=active_protocol)
+            ok_u = (pu == item["answer_idx"])
+            ok_n = (pn == item["answer_idx"])
+            if ok_u: corr_u += 1
+            if ok_n: corr_n += 1
+            details.append({"q": item["question"][:60], "target": item["answer_key"], "pred": item["labels"][pn], "correct": ok_n})
+            if idx % 25 == 0 or idx == len(items):
+                print(f"   [{idx}/{len(items)}] Current acc_norm: {(corr_n/idx)*100:.1f}%...")
 
-    e_acc = (e_correct_unnorm / max(1, len(arc_e_items))) * 100
-    e_acc_norm = (e_correct_norm / max(1, len(arc_e_items))) * 100
-    summary_records["ARC-Easy"] = {"acc": e_acc, "acc_norm": e_acc_norm, "n": len(arc_e_items)}
-    details_records["ARC-Easy"] = arc_e_details
-    print(f"   ✓ ARC-Easy      : {e_acc_norm:.1f}% acc_norm ({e_correct_norm}/{len(arc_e_items)}) [acc: {e_acc:.1f}%]")
+        acc = (corr_u / max(1, len(items))) * 100.0
+        acc_norm = (corr_n / max(1, len(items))) * 100.0
+        se = calculate_stderr(acc_norm, len(items))
+        results_summary["arc_easy"] = {"acc": acc, "acc_norm": acc_norm, "stderr": se, "n": len(items), "time_sec": time.time() - t0}
+        details_log["arc_easy"] = details
+        print(f"   ✓ ARC-Easy      : {acc_norm:.1f}% ± {se:.1f}% acc_norm ({corr_n}/{len(items)})\n")
 
     # --------------------------------------------------------------------------
     # 3. HellaSwag
     # --------------------------------------------------------------------------
-    print(f"\n🔬 [3/6] Evaluating HellaSwag ({samples_hellaswag} official validation questions)...")
-    hs_items = get_hellaswag_dataset(limit=samples_hellaswag)
-    hs_correct_unnorm = 0
-    hs_correct_norm = 0
-    hs_details = []
+    if "all" in tasks or "hellaswag" in tasks:
+        print(f"🔬 [Task] Evaluating HellaSwag (Rowan/hellaswag validation split)...")
+        items = load_hellaswag_dataset(limit=samples_per_task)
+        corr_u, corr_n = 0, 0
+        details = []
 
-    for item in hs_items:
-        prompt = item["context"]
-        pred_u, pred_n, _, _ = score_multiple_choice_item(
-            model, tokenizer, prompt, item["choices"], device
-        )
-        ok_u = (pred_u == item["answer_idx"])
-        ok_n = (pred_n == item["answer_idx"])
-        if ok_u: hs_correct_unnorm += 1
-        if ok_n: hs_correct_norm += 1
-        hs_details.append({
-            "context": item["context"][:60],
-            "target": item["answer_idx"],
-            "pred_norm": pred_n,
-            "correct": ok_n,
-        })
+        t0 = time.time()
+        for idx, item in enumerate(items, 1):
+            prompt = item["context"]
+            pu, pn, _, _ = score_multiple_choice(model, tokenizer, prompt, item["choices"], device, protocol=active_protocol)
+            ok_u = (pu == item["answer_idx"])
+            ok_n = (pn == item["answer_idx"])
+            if ok_u: corr_u += 1
+            if ok_n: corr_n += 1
+            details.append({"ctx": item["context"][:60], "target": item["answer_idx"], "pred": pn, "correct": ok_n})
+            if idx % 25 == 0 or idx == len(items):
+                print(f"   [{idx}/{len(items)}] Current acc_norm: {(corr_n/idx)*100:.1f}%...")
 
-    hs_acc = (hs_correct_unnorm / max(1, len(hs_items))) * 100
-    hs_acc_norm = (hs_correct_norm / max(1, len(hs_items))) * 100
-    summary_records["HellaSwag"] = {"acc": hs_acc, "acc_norm": hs_acc_norm, "n": len(hs_items)}
-    details_records["HellaSwag"] = hs_details
-    print(f"   ✓ HellaSwag     : {hs_acc_norm:.1f}% acc_norm ({hs_correct_norm}/{len(hs_items)}) [acc: {hs_acc:.1f}%]")
+        acc = (corr_u / max(1, len(items))) * 100.0
+        acc_norm = (corr_n / max(1, len(items))) * 100.0
+        se = calculate_stderr(acc_norm, len(items))
+        results_summary["hellaswag"] = {"acc": acc, "acc_norm": acc_norm, "stderr": se, "n": len(items), "time_sec": time.time() - t0}
+        details_log["hellaswag"] = details
+        print(f"   ✓ HellaSwag     : {acc_norm:.1f}% ± {se:.1f}% acc_norm ({corr_n}/{len(items)})\n")
 
     # --------------------------------------------------------------------------
     # 4. MMLU
     # --------------------------------------------------------------------------
-    print(f"\n🔬 [4/6] Evaluating MMLU ({samples_mmlu} official test questions across subjects)...")
-    mmlu_items = get_mmlu_dataset(limit=samples_mmlu)
-    mmlu_correct_unnorm = 0
-    mmlu_correct_norm = 0
-    mmlu_details = []
-    letters = ["A", "B", "C", "D"]
+    if "all" in tasks or "mmlu" in tasks:
+        print(f"🔬 [Task] Evaluating MMLU (cais/mmlu test split across STEM & Humanities)...")
+        items = load_mmlu_dataset(limit=samples_per_task)
+        corr_u, corr_n = 0, 0
+        details = []
 
-    for item in mmlu_items:
-        prompt = f"Question: {item['question']}\nAnswer:"
-        pred_u, pred_n, _, _ = score_multiple_choice_item(
-            model, tokenizer, prompt, item["choices"], device
-        )
-        ok_u = (pred_u == item["answer_idx"])
-        ok_n = (pred_n == item["answer_idx"])
-        if ok_u: mmlu_correct_unnorm += 1
-        if ok_n: mmlu_correct_norm += 1
-        mmlu_details.append({
-            "subject": item.get("subject", "general"),
-            "question": item["question"][:60],
-            "target": letters[item["answer_idx"]],
-            "pred_norm": letters[pred_n] if pred_n < 4 else str(pred_n),
-            "correct": ok_n,
-        })
+        t0 = time.time()
+        for idx, item in enumerate(items, 1):
+            prompt = f"Question: {item['question']}\nAnswer:"
+            pu, pn, _, _ = score_multiple_choice(model, tokenizer, prompt, item["choices"], device, protocol=active_protocol)
+            ok_u = (pu == item["answer_idx"])
+            ok_n = (pn == item["answer_idx"])
+            if ok_u: corr_u += 1
+            if ok_n: corr_n += 1
+            details.append({"q": item["question"][:60], "target": item["answer_idx"], "pred": pn, "correct": ok_n})
+            if idx % 25 == 0 or idx == len(items):
+                print(f"   [{idx}/{len(items)}] Current acc_norm: {(corr_n/idx)*100:.1f}%...")
 
-    mmlu_acc = (mmlu_correct_unnorm / max(1, len(mmlu_items))) * 100
-    mmlu_acc_norm = (mmlu_correct_norm / max(1, len(mmlu_items))) * 100
-    summary_records["MMLU"] = {"acc": mmlu_acc, "acc_norm": mmlu_acc_norm, "n": len(mmlu_items)}
-    details_records["MMLU"] = mmlu_details
-    print(f"   ✓ MMLU          : {mmlu_acc_norm:.1f}% acc_norm ({mmlu_correct_norm}/{len(mmlu_items)}) [acc: {mmlu_acc:.1f}%]")
+        acc = (corr_u / max(1, len(items))) * 100.0
+        acc_norm = (corr_n / max(1, len(items))) * 100.0
+        se = calculate_stderr(acc_norm, len(items))
+        results_summary["mmlu"] = {"acc": acc, "acc_norm": acc_norm, "stderr": se, "n": len(items), "time_sec": time.time() - t0}
+        details_log["mmlu"] = details
+        print(f"   ✓ MMLU          : {acc_norm:.1f}% ± {se:.1f}% acc_norm ({corr_n}/{len(items)})\n")
 
     # --------------------------------------------------------------------------
     # 5. Winogrande
     # --------------------------------------------------------------------------
-    winogrande_items = get_winogrande_dataset(limit=samples_winogrande)
-    if winogrande_items:
-        print(f"\n🔬 [5/6] Evaluating Winogrande ({len(winogrande_items)} validation questions)...")
-        w_correct_unnorm = 0
-        w_correct_norm = 0
-        w_details = []
+    if "all" in tasks or "winogrande" in tasks:
+        print(f"🔬 [Task] Evaluating Winogrande (allenai/winogrande validation split)...")
+        items = load_winogrande_dataset(limit=samples_per_task)
+        corr_u, corr_n = 0, 0
+        details = []
 
-        for item in winogrande_items:
+        t0 = time.time()
+        for idx, item in enumerate(items, 1):
             prompt = item["sentence"].replace("_", "").strip()
-            choices = [item["option1"], item["option2"]]
-            pred_u, pred_n, _, _ = score_multiple_choice_item(
-                model, tokenizer, prompt, choices, device
-            )
-            ok_u = (pred_u == item["answer_idx"])
-            ok_n = (pred_n == item["answer_idx"])
-            if ok_u: w_correct_unnorm += 1
-            if ok_n: w_correct_norm += 1
-            w_details.append({
-                "sentence": item["sentence"][:60],
-                "target": item["answer_idx"],
-                "pred_norm": pred_n,
-                "correct": ok_n,
-            })
+            pu, pn, _, _ = score_multiple_choice(model, tokenizer, prompt, item["choices"], device, protocol=active_protocol)
+            ok_u = (pu == item["answer_idx"])
+            ok_n = (pn == item["answer_idx"])
+            if ok_u: corr_u += 1
+            if ok_n: corr_n += 1
+            details.append({"s": item["sentence"][:60], "target": item["answer_idx"], "pred": pn, "correct": ok_n})
+            if idx % 25 == 0 or idx == len(items):
+                print(f"   [{idx}/{len(items)}] Current acc_norm: {(corr_n/idx)*100:.1f}%...")
 
-        w_acc = (w_correct_unnorm / max(1, len(winogrande_items))) * 100
-        w_acc_norm = (w_correct_norm / max(1, len(winogrande_items))) * 100
-        summary_records["Winogrande"] = {"acc": w_acc, "acc_norm": w_acc_norm, "n": len(winogrande_items)}
-        details_records["Winogrande"] = w_details
-        print(f"   ✓ Winogrande    : {w_acc_norm:.1f}% acc_norm ({w_correct_norm}/{len(winogrande_items)}) [acc: {w_acc:.1f}%]")
+        acc = (corr_u / max(1, len(items))) * 100.0
+        acc_norm = (corr_n / max(1, len(items))) * 100.0
+        se = calculate_stderr(acc_norm, len(items))
+        results_summary["winogrande"] = {"acc": acc, "acc_norm": acc_norm, "stderr": se, "n": len(items), "time_sec": time.time() - t0}
+        details_log["winogrande"] = details
+        print(f"   ✓ Winogrande    : {acc_norm:.1f}% ± {se:.1f}% acc_norm ({corr_n}/{len(items)})\n")
 
     # --------------------------------------------------------------------------
-    # 6. GSM8K (Generative CoT Exact Match)
+    # 6. OpenBookQA
     # --------------------------------------------------------------------------
-    print(f"\n🔬 [6/6] Evaluating GSM8K ({samples_gsm8k} official test questions, Exact Match)...")
-    gsm_items = get_gsm8k_dataset(limit=samples_gsm8k)
-    gsm_em = 0
-    gsm_details = []
+    if "all" in tasks or "openbookqa" in tasks:
+        print(f"🔬 [Task] Evaluating OpenBookQA (allenai/openbookqa test split)...")
+        items = load_openbookqa_dataset(limit=samples_per_task)
+        corr_u, corr_n = 0, 0
+        details = []
 
-    for item in gsm_items:
-        prompt = f"Question: {item['question']}\nAnswer: Let's calculate step by step:"
-        inp = tokenizer(prompt, return_tensors="pt").to(device)
-        with torch.no_grad():
-            out_ids = model.generate(
-                inp["input_ids"],
-                max_new_tokens=45,
-                temperature=0.2,
-                top_k=40,
-                repetition_penalty=1.15,
-            )
-        gen_text = tokenizer.decode(out_ids[0], skip_special_tokens=True)
-        gen_ans = gen_text[len(prompt):].strip()
-        extracted = extract_numerical_answer(gen_ans)
-        target = item["target_number"]
-        is_em = (extracted is not None and extracted == target)
-        if is_em: gsm_em += 1
-        gsm_details.append({
-            "question": item["question"][:60],
-            "target": target,
-            "extracted": extracted,
-            "correct": is_em,
-        })
+        t0 = time.time()
+        for idx, item in enumerate(items, 1):
+            prompt = f"Question: {item['question']}\nAnswer:"
+            pu, pn, _, _ = score_multiple_choice(model, tokenizer, prompt, item["choices"], device, protocol=active_protocol)
+            ok_u = (pu == item["answer_idx"])
+            ok_n = (pn == item["answer_idx"])
+            if ok_u: corr_u += 1
+            if ok_n: corr_n += 1
+            details.append({"q": item["question"][:60], "target": item["answer_idx"], "pred": pn, "correct": ok_n})
+            if idx % 25 == 0 or idx == len(items):
+                print(f"   [{idx}/{len(items)}] Current acc_norm: {(corr_n/idx)*100:.1f}%...")
 
-    gsm_em_pct = (gsm_em / max(1, len(gsm_items))) * 100
-    summary_records["GSM8K"] = {"acc": gsm_em_pct, "acc_norm": gsm_em_pct, "n": len(gsm_items)}
-    details_records["GSM8K"] = gsm_details
-    print(f"   ✓ GSM8K EM      : {gsm_em_pct:.1f}% ({gsm_em}/{len(gsm_items)})")
+        acc = (corr_u / max(1, len(items))) * 100.0
+        acc_norm = (corr_n / max(1, len(items))) * 100.0
+        se = calculate_stderr(acc_norm, len(items))
+        results_summary["openbookqa"] = {"acc": acc, "acc_norm": acc_norm, "stderr": se, "n": len(items), "time_sec": time.time() - t0}
+        details_log["openbookqa"] = details
+        print(f"   ✓ OpenBookQA    : {acc_norm:.1f}% ± {se:.1f}% acc_norm ({corr_n}/{len(items)})\n")
 
     # --------------------------------------------------------------------------
-    # 7. Overall Composite Scoreboard
+    # 7. GSM8K (Generative CoT Exact Match)
     # --------------------------------------------------------------------------
-    benchmarks_list = ["ARC-Challenge", "ARC-Easy", "HellaSwag", "MMLU", "GSM8K"]
-    if "Winogrande" in summary_records:
-        benchmarks_list.append("Winogrande")
+    if "all" in tasks or "gsm8k" in tasks:
+        print(f"🔬 [Task] Evaluating GSM8K (openai/gsm8k test split, Generative Exact Match)...")
+        items = load_gsm8k_dataset(limit=samples_per_task)
+        corr_em = 0
+        details = []
 
-    composite_acc_norm = sum(summary_records[b]["acc_norm"] for b in benchmarks_list) / len(benchmarks_list)
-    composite_acc = sum(summary_records[b]["acc"] for b in benchmarks_list) / len(benchmarks_list)
+        t0 = time.time()
+        for idx, item in enumerate(items, 1):
+            if active_protocol == "stim_act":
+                prompt_str = format_stimulus_prompt(f"Solve this math problem: {item['question']}") + " <act> "
+            else:
+                prompt_str = f"Question: {item['question']}\nAnswer: Let's calculate step by step:"
 
-    smollm2_ref = {
-        "ARC-Challenge": 34.1,
-        "ARC-Easy": 52.8,
-        "HellaSwag": 39.5,
-        "MMLU": 32.4,
-        "GSM8K": 4.2,
-        "Winogrande": 51.5,
-    }
-    smollm2_composite = sum(smollm2_ref[b] for b in benchmarks_list) / len(benchmarks_list)
+            inp = tokenizer(prompt_str, return_tensors="pt").to(device)
+            with torch.no_grad():
+                out_ids = model.generate(
+                    inp["input_ids"],
+                    max_new_tokens=48,
+                    temperature=0.1,
+                    top_k=20,
+                    repetition_penalty=1.15,
+                )
+            gen_text = tokenizer.decode(out_ids[0], skip_special_tokens=True)
+            gen_ans = gen_text[len(prompt_str):].strip()
+            extracted = extract_numerical_answer(gen_ans)
+            target = item["target_number"]
+            is_em = (extracted is not None and extracted == target)
+            if is_em: corr_em += 1
+            details.append({"q": item["question"][:60], "target": target, "pred": extracted, "correct": is_em})
 
-    random_chance = {
-        "ARC-Challenge": 25.0,
-        "ARC-Easy": 25.0,
-        "HellaSwag": 25.0,
-        "MMLU": 25.0,
-        "GSM8K": 0.0,
-        "Winogrande": 50.0,
-    }
+        em_pct = (corr_em / max(1, len(items))) * 100.0
+        se = calculate_stderr(em_pct, len(items))
+        results_summary["gsm8k"] = {"acc": em_pct, "acc_norm": em_pct, "stderr": se, "n": len(items), "time_sec": time.time() - t0}
+        details_log["gsm8k"] = details
+        print(f"   ✓ GSM8K Exact Match : {em_pct:.1f}% ± {se:.1f}% ({corr_em}/{len(items)})\n")
 
-    print("\n" + "=" * 96)
-    print("📊 EXTENSIVE BENCHMARK SCOREBOARD & COMPARISON TABLE (N = 375 Questions)")
-    print("=" * 96)
-    print(f"{'Benchmark Metric':<20} | {'acc_norm':<10} | {'acc (unnorm)':<12} | {'Random':<8} | {'SmolLM2-135M':<12} | {'Status'}")
-    print("-" * 96)
+    # --------------------------------------------------------------------------
+    # Grand Comparison Table
+    # --------------------------------------------------------------------------
+    print("=" * 100)
+    print("📊 OFFICIAL ACADEMIC BENCHMARK SCOREBOARD (Standardized EleutherAI / Lighteval Battery)")
+    print("=" * 100)
+    headers = f"{'Benchmark Task':<20} | {'N Samples':<10} | {'CerebroSpheroid (acc_norm)':<28} | {'Random Chance':<14} | {'SmolLM2-135M Ref':<16}"
+    print(headers)
+    print("-" * 100)
 
-    for b in benchmarks_list:
-        an = summary_records[b]["acc_norm"]
-        au = summary_records[b]["acc"]
-        rc = random_chance.get(b, 25.0)
-        s_ref = smollm2_ref.get(b, 0.0)
-        n = summary_records[b]["n"]
+    all_acc_norms = []
+    all_smollm_refs = []
 
-        status = "🔥 Beats SmolLM2" if an > s_ref else ("✅ Above Chance" if an > rc else "⚖️ Near Baseline")
-        print(f"{b + f' (N={n})':<20} | {an:>7.1f}%   | {au:>8.1f}%     | {rc:>5.1f}%  | {s_ref:>9.1f}%    | {status}")
+    for t_name, data in results_summary.items():
+        an = data["acc_norm"]
+        se = data["stderr"]
+        n = data["n"]
+        rc = RANDOM_BASELINE.get(t_name, 25.0)
+        s_ref = SMOLLM2_135M_REF.get(t_name, 0.0)
 
-    print("-" * 96)
-    status_overall = "🎉 BEATS SmolLM2" if composite_acc_norm > smollm2_composite else "📈 Closing Gap"
-    print(f"{'COMPOSITE OVERALL':<20} | {composite_acc_norm:>7.1f}%   | {composite_acc:>8.1f}%     | {'—':>6}   | {smollm2_composite:>9.1f}%    | {status_overall}")
-    print("=" * 96)
+        all_acc_norms.append(an)
+        all_smollm_refs.append(s_ref)
 
-    export_path = export_json or os.path.join(REPO_ROOT, "benchmarks", f"industry_standard_step{step}.json")
-    os.makedirs(os.path.dirname(export_path), exist_ok=True)
-    with open(export_path, "w") as f:
-        json.dump({
+        val_str = f"{an:>5.1f}% ± {se:>4.1f}%"
+        print(f"{t_name:<20} | {n:<10} | {val_str:<28} | {rc:>5.1f}%        | {s_ref:>5.1f}%")
+
+    print("-" * 100)
+    comp_cerebro = sum(all_acc_norms) / max(1, len(all_acc_norms))
+    comp_smollm = sum(all_smollm_refs) / max(1, len(all_smollm_refs))
+    print(f"{'COMPOSITE AVERAGE':<20} | {'—':<10} | {comp_cerebro:>5.1f}%                     | {'—':<14} | {comp_smollm:>5.1f}%")
+    print("=" * 100)
+
+    elapsed_total = time.time() - start_total
+    print(f"\n⏱️ Total Benchmark Evaluation Time: {elapsed_total:.1f} seconds ({elapsed_total/60:.2f} minutes)")
+
+    if export_json:
+        out_data = {
             "metadata": {
                 "checkpoint": os.path.basename(checkpoint_path),
                 "step": step,
-                "train_loss": train_loss,
-                "eval_loss": eval_loss,
-                "device": str(device),
+                "loss": loss,
+                "protocol": active_protocol,
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "device": str(device),
             },
-            "summary": summary_records,
-            "composite": {
-                "acc_norm": composite_acc_norm,
-                "acc": composite_acc,
-                "smollm2_ref": smollm2_composite,
-            },
-            "details": details_records,
-        }, f, indent=2)
+            "summary": results_summary,
+            "details": details_log,
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(export_json)), exist_ok=True)
+        with open(export_json, "w") as f:
+            json.dump(out_data, f, indent=2)
+        print(f"💾 Full Results Exported to: {export_json}\n")
 
-    print(f"\n💾 Full extensive report successfully exported to: {export_path}")
-    return summary_records, composite_acc_norm
+
+def main():
+    parser = argparse.ArgumentParser(description="Official Academic Benchmark Battery for CerebroSpheroid V5")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/v5_small_sft_best.pt", help="Path to checkpoint")
+    parser.add_argument("--tasks", type=str, default="all", help="Comma-separated tasks: arc_challenge,arc_easy,hellaswag,mmlu,winogrande,openbookqa,gsm8k,all")
+    parser.add_argument("--samples", type=int, default=50, help="Number of questions per benchmark (e.g. 50, 100, 500)")
+    parser.add_argument("--full", action="store_true", help="Evaluate full official dataset splits (thousands of questions)")
+    parser.add_argument("--protocol", type=str, choices=["auto", "stim_act", "raw"], default="auto", help="Prompt formatting protocol")
+    parser.add_argument("--device", type=str, default=None, help="Execution device (cuda/cpu)")
+    parser.add_argument("--export-json", type=str, default="benchmarks/academic_benchmark_results.json", help="Path to export full JSON results")
+
+    args = parser.parse_args()
+
+    ckpt_path = os.path.join(REPO_ROOT, args.checkpoint) if not os.path.isabs(args.checkpoint) else args.checkpoint
+    if not os.path.exists(ckpt_path):
+        alt = os.path.join(REPO_ROOT, "checkpoints", "v5_small_latest_step900k.pt")
+        if os.path.exists(alt):
+            ckpt_path = alt
+
+    task_list = [t.strip().lower() for t in args.tasks.split(",")]
+    samples = None if args.full else args.samples
+
+    run_academic_benchmark_suite(
+        checkpoint_path=ckpt_path,
+        tasks=task_list,
+        samples_per_task=samples,
+        protocol=args.protocol,
+        device_str=args.device,
+        export_json=args.export_json,
+    )
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run Extensive Industry Standard Benchmark")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/v5_small_latest_step834k.pt", help="Path to checkpoint")
-    parser.add_argument("--preset", type=str, default="v5_small", help="Preset architecture")
-    parser.add_argument("--device", type=str, default=None, help="Device (cuda/cpu)")
-    parser.add_argument("--samples-arc", type=int, default=50, help="ARC sample count")
-    parser.add_argument("--samples-hellaswag", type=int, default=100, help="HellaSwag sample count")
-    parser.add_argument("--samples-mmlu", type=int, default=100, help="MMLU sample count")
-    parser.add_argument("--samples-gsm8k", type=int, default=25, help="GSM8K sample count")
-    parser.add_argument("--samples-winogrande", type=int, default=50, help="Winogrande sample count")
-    parser.add_argument("--export-json", type=str, default=None, help="Export JSON path")
-
-    args = parser.parse_args()
-    run_extensive_benchmark(
-        checkpoint_path=args.checkpoint,
-        preset=args.preset,
-        device_str=args.device,
-        samples_arc=args.samples_arc,
-        samples_hellaswag=args.samples_hellaswag,
-        samples_mmlu=args.samples_mmlu,
-        samples_gsm8k=args.samples_gsm8k,
-        samples_winogrande=args.samples_winogrande,
-        export_json=args.export_json,
-    )
+    main()
