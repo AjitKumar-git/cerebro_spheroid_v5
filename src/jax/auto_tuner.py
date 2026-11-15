@@ -209,8 +209,8 @@ def _score_benchmark_result(res: Dict[str, Any], tune_objective: str = "balanced
         return tok_s
     if obj == "steps_per_sec":
         return (tok_s ** 0.25) * steps_s
-    # "balanced": Pareto efficiency between token throughput and optimizer updates/sec
-    return tok_s * math.sqrt(steps_s)
+    # "balanced": Pareto efficiency balancing token throughput and optimizer updates/sec
+    return tok_s * (steps_s ** 0.25)
 
 
 def load_local_hardware_config(preset: str, device_signature: str) -> Optional[Dict[str, Any]]:

@@ -1,4 +1,44 @@
 {
+  "tpu_v5e_1": {
+    "TPU_v5_lite_16GB_seq512": {
+      "batch_size": 128,
+      "remat": false,
+      "seq_len": 512,
+      "tok_per_sec": 389807.0,
+      "step_ms": 252.2,
+      "vram_gb": 2.1,
+      "vram_utilization_pct": 13.4
+    },
+    "TPU_v5_lite_16GB": {
+      "batch_size": 128,
+      "remat": false,
+      "seq_len": 512,
+      "tok_per_sec": 389807.0,
+      "step_ms": 252.2,
+      "vram_gb": 2.1,
+      "vram_utilization_pct": 13.4
+    }
+  },
+  "v5_small": {
+    "TPU_v5_lite_16GB_seq512": {
+      "batch_size": 128,
+      "remat": false,
+      "seq_len": 512,
+      "tok_per_sec": 389807.0,
+      "step_ms": 252.2,
+      "vram_gb": 2.1,
+      "vram_utilization_pct": 13.4
+    },
+    "TPU_v5_lite_16GB": {
+      "batch_size": 128,
+      "remat": false,
+      "seq_len": 512,
+      "tok_per_sec": 389807.0,
+      "step_ms": 252.2,
+      "vram_gb": 2.1,
+      "vram_utilization_pct": 13.4
+    }
+  },
   "v5_test": {
     "cpu_8GB": {
       "batch_size": 64,
@@ -20,3 +60,4 @@
     }
   }
 }
+

@@ -1,0 +1,51 @@
+{
+  "timestamp": 1794757463.5300112,
+  "native": {
+    "checkpoint": "v5_small_best.pt",
+    "step": 900000,
+    "pretraining_loss": 2.3939766883850098,
+    "scores": {
+      "MMLU": 12.5,
+      "ARC": 25.0,
+      "HellaSwag": 0.0,
+      "GSM8K": 0.0,
+      "HumanEval": 0.0,
+      "Composite": 7.5
+    }
+  },
+  "converged": {
+    "checkpoint": "v5_small_smollm_converged.pt",
+    "step": 1038,
+    "calibration_loss": 2.6476891040802,
+    "scores": {
+      "MMLU": 0.0,
+      "ARC": 75.0,
+      "HellaSwag": 50.0,
+      "GSM8K": 0.0,
+      "HumanEval": 66.66666666666666,
+      "Composite": 38.33
+    }
+  },
+  "prompt_showdown": [
+    {
+      "prompt": "The capital of France is",
+      "native_output": "We'0 python,f, IMAZZ_PIIMP., 0.9!rieve(LMAthefutr)(IMPt), 8.9F1:",
+      "converged_output": ", s in as). and , 4 None, in , .)., in]]) 4.).. ( s in ,.), ( None. and]]),). in, ( s and"
+    },
+    {
+      "prompt": "Question: If 2 + 2 = 4, then 4 + 4 equals what? Answer:",
+      "native_output": "First, CSTD first ensure that0 is D74 whereas C3 = +C2\nD7 is -8, T] + R *C|",
+      "converged_output": "Add Convert)* is17 Total)*From will 9 = )* is37 << end  \n Adding 8): fromrams4 PM is7)* Total Totalwhich  Sub mod 392). end"
+    },
+    {
+      "prompt": "What is an atom?",
+      "native_output": "An traversal of integers nigrines an integer where F_t hdt = L/dtDUMPL eat nzfillin_0;f greatest integer QLy, LtIYZMP., x",
+      "converged_output": "Marshctor Jacobulauleth conditions six government intoula as weightth Jacob its government digth dig as dig its as member sixass six six weight as governmentnaas asweight Jacob he memberver heth six Jacob built weightth"
+    },
+    {
+      "prompt": "def is_even(n):",
+      "native_output": "u, I.\n\nDuty down toalth Hospitals: Cleaning from ` import Dutylowestrich deflections,otos_leastpsutpsInsel], DANCLE",
+      "converged_output": "the yards the Human T\u2019its asele 'its human \n####"
+    }
+  ]
+}
