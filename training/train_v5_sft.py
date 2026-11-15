@@ -500,6 +500,7 @@ def main(args=None):
                         "ppl": eval_ppl,
                         "preset": base_preset,
                         "model": sft_model_name,
+                        "sync_model": sft_model_name,
                         "timestamp": time.time(),
                     }
                     ckpt_mgr.dispatch(params, buffers, best_fname, meta_dict=meta_best, block_if_busy=True)
@@ -545,6 +546,7 @@ def main(args=None):
                     "best_eval_loss": best_eval_loss,
                     "preset": base_preset,
                     "model": sft_model_name,
+                    "sync_model": sft_model_name,
                     "timestamp": time.time(),
                 }
                 ckpt_mgr.dispatch(params, buffers, latest_fname, meta_dict=meta_latest)
@@ -582,6 +584,7 @@ def main(args=None):
             "eval_loss": best_eval_loss,
             "preset": base_preset,
             "model": sft_model_name,
+            "sync_model": sft_model_name,
             "timestamp": time.time(),
         }
         ckpt_mgr.flush(params, buffers, final_fname, meta_dict=final_meta)
