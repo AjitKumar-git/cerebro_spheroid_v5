@@ -98,6 +98,8 @@ from src.cloud_sync import (
     pull_checkpoint,
     push_checkpoint_async,
     push_remote_loss_history,
+    push_remote_token_tracker,
+    fetch_remote_token_tracker,
     detect_source_environment,
     wait_for_in_flight_uploads,
 )
@@ -201,7 +203,7 @@ def parse_args(args_list=None):
     parser.add_argument("--resume_target", type=str, default="latest", choices=["latest", "best"], help="Target checkpoint to pull from cloud ('latest' or 'best')")
     parser.add_argument("--reset_best", action="store_true", default=False, help="Reset best validation loss tracker")
     parser.add_argument("--from-scratch", "--from_scratch", dest="from_scratch", action="store_true", default=False, help="Start clean from Step 0 without loading any checkpoint")
-    parser.add_argument("--effective-batch-size", "--effective_batch_size", dest="effective_batch_size", type=int, default=None, help="Target global effective batch size (e.g. 256; automatically computes grad_accum)")
+    parser.add_argument("--effective-batch-size", "--effective_batch_size", dest="effective_batch_size", type=int, default=256, help="Target global effective batch size (default: 256 for TPU v5e-1, supports 128 / 126; automatically computes grad_accum)")
     parser.add_argument("--target-tokens", "--target_tokens", dest="target_tokens", type=int, default=200_000_000_000, help="Target token ingestion budget for campaign (default: 200,000,000,000 tokens)")
     parser.add_argument("--init_from_checkpoint", "--init-from-checkpoint", dest="init_from_checkpoint", type=str, default=None, help="Base foundation checkpoint to load weights from (e.g. step900k)")
     parser.add_argument("--reset_step_counter", "--reset-step-counter", dest="reset_step_counter", action="store_true", default=False, help="Reset step counter to 0 after loading base weights to start new campaign from scratch")
@@ -375,7 +377,20 @@ def main(args=None):
 
     # Effective Batch Size & Gradient Accumulation
     if getattr(args, "effective_batch_size", None) is not None and args.effective_batch_size > 0:
-        args.grad_accum = max(1, args.effective_batch_size // max(1, args.batch_size))
+        eff_target = args.effective_batch_size
+        if eff_target == 126:
+            if args.batch_size > 126:
+                args.batch_size = 126
+                args.grad_accum = 1
+            elif 126 % args.batch_size == 0:
+                args.grad_accum = 126 // args.batch_size
+            else:
+                args.batch_size = 126
+                args.grad_accum = 1
+        else:
+            if args.batch_size > eff_target:
+                args.batch_size = eff_target
+            args.grad_accum = max(1, eff_target // max(1, args.batch_size))
         eff_bs = args.batch_size * args.grad_accum
         print(f"⚡ [Batch Scaling] Target Effective Batch Size: {eff_bs} (Micro Batch: {args.batch_size} × Grad Accum: {args.grad_accum})")
 
@@ -888,6 +903,13 @@ def main(args=None):
         initial_lifetime_tokens = int(loaded_ckpt.get("lifetime_tokens", 0))
     lifetime_tokens = initial_lifetime_tokens + cumulative_tokens
 
+    # Restore per-dataset token attribution if present
+    if not getattr(args, "reset_step_counter", False):
+        loaded_ds_tokens = loaded_ckpt.get("tokens_by_dataset", {})
+        if loaded_ds_tokens and hasattr(batcher, "set_tokens_by_dataset"):
+            batcher.set_tokens_by_dataset(loaded_ds_tokens)
+            print(f"📦 [Checkpoint Restore] Restored per-dataset token stats: {loaded_ds_tokens}")
+
     try:
         while step < args.total_steps and not shutdown_requested:
             prev_step = step
@@ -1024,6 +1046,11 @@ def main(args=None):
                     for d_name, d_val in zip(eval_domains, val_losses):
                         d_ppl = math.exp(min(d_val, 20.0))
                         print(f"   ├─ {d_name:<26}: Loss {d_val:.4f} (PPL: {d_ppl:.2f})")
+                if hasattr(batcher, "get_tokens_by_dataset"):
+                    ds_stats = batcher.get_tokens_by_dataset()
+                    if ds_stats:
+                        parts = [f"{k}: {v/1e9:.3f}B" for k, v in sorted(ds_stats.items())]
+                        print(f"   └─ Ingested Tokens Breakdown: " + " | ".join(parts))
 
                 if is_champion:
                     best_eval_loss = eval_loss
@@ -1040,6 +1067,7 @@ def main(args=None):
                         "lifetime_tokens": lifetime_tokens,
                         "target_tokens": getattr(args, "target_tokens", 200_000_000_000),
                         "effective_batch_size": args.batch_size * grad_accum,
+                        "tokens_by_dataset": batcher.get_tokens_by_dataset() if hasattr(batcher, "get_tokens_by_dataset") else {},
                         "timestamp": time.time(),
                     }
                     ckpt_mgr.dispatch(_get_host_params(), buffers, best_fname, meta_dict=meta_best, block_if_busy=True)
@@ -1088,6 +1116,7 @@ def main(args=None):
                     "lifetime_tokens": lifetime_tokens,
                     "target_tokens": getattr(args, "target_tokens", 200_000_000_000),
                     "effective_batch_size": args.batch_size * grad_accum,
+                    "tokens_by_dataset": batcher.get_tokens_by_dataset() if hasattr(batcher, "get_tokens_by_dataset") else {},
                     "timestamp": time.time(),
                 }
                 ckpt_mgr.dispatch(_get_host_params(), buffers, latest_fname, meta_dict=meta_latest)
@@ -1111,6 +1140,26 @@ def main(args=None):
                         )
                     except Exception:
                         pass
+
+            # Live Cloud Token Tracker Sync (Periodic & on Milestones)
+            crossed_sync = (step % max(1, getattr(args, "cloud_sync_interval", 100)) == 0) or save_latest or is_champion
+            if args.cloud_sync and crossed_sync:
+                try:
+                    ds_stats = batcher.get_tokens_by_dataset() if hasattr(batcher, "get_tokens_by_dataset") else {}
+                    push_remote_token_tracker(
+                        model=sync_model_name or args.preset,
+                        cumulative_tokens=cumulative_tokens,
+                        target_tokens=getattr(args, "target_tokens", 200_000_000_000),
+                        tokens_by_dataset=ds_stats,
+                        effective_batch_size=args.batch_size * grad_accum,
+                        step=step,
+                        loss=float(loss_val),
+                        tok_per_sec=float(tok_per_sec) if 'tok_per_sec' in locals() else 0.0,
+                        url=args.cloud_url,
+                        token=args.cloud_token,
+                    )
+                except Exception:
+                    pass
 
             # Periodic Milestone Archive Saving
             if (step // max(1, args.periodic_every)) > (prev_step // max(1, args.periodic_every)):
@@ -1159,10 +1208,29 @@ def main(args=None):
             "lifetime_tokens": lifetime_tokens if "lifetime_tokens" in locals() else 0,
             "target_tokens": getattr(args, "target_tokens", 200_000_000_000),
             "effective_batch_size": args.batch_size * grad_accum,
+            "tokens_by_dataset": batcher.get_tokens_by_dataset() if hasattr(batcher, "get_tokens_by_dataset") else {},
             "timestamp": time.time(),
         }
         ckpt_mgr.flush(_get_host_params(), buffers, final_fname, meta_dict=final_meta)
         ckpt_mgr.shutdown(wait=True)
+
+        if args.cloud_sync:
+            try:
+                ds_stats = batcher.get_tokens_by_dataset() if hasattr(batcher, "get_tokens_by_dataset") else {}
+                push_remote_token_tracker(
+                    model=sync_model_name or args.preset,
+                    cumulative_tokens=cumulative_tokens if "cumulative_tokens" in locals() else 0,
+                    target_tokens=getattr(args, "target_tokens", 200_000_000_000),
+                    tokens_by_dataset=ds_stats,
+                    effective_batch_size=args.batch_size * grad_accum,
+                    step=step,
+                    loss=float(loss) if "loss" in locals() else 0.0,
+                    tok_per_sec=float(tok_per_sec) if 'tok_per_sec' in locals() else 0.0,
+                    url=args.cloud_url,
+                    token=args.cloud_token,
+                )
+            except Exception:
+                pass
         if local_streamer is not None:
             local_streamer.stop()
         if elastic_batcher is not None:

@@ -258,6 +258,12 @@ def build_online_dataset_iterator(
         def _autonomous_gen():
             nonlocal know_it, cosmo_it, everyday_it, openhermes_it, logic_it, code_it, pycode_it, gsm_it, math_it, finemath_it
             turn = 0
+
+            def _tag_yield(item: Any, ds_tag: str):
+                if isinstance(item, dict):
+                    item["_dataset"] = ds_tag
+                return item
+
             while True:
                 cur_step = _get_step_val()
                 tau = float(cur_step) / float(max(1, total_steps))
@@ -271,19 +277,19 @@ def build_online_dataset_iterator(
                             row, know_it = _next_filtered_fineweb(
                                 know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size), min_score=3.0
                             )
-                            yield row
+                            yield _tag_yield(row, "fineweb_edu")
                         elif mod10 in (1, 5):
                             row, cosmo_it = _next_or_reopen(
                                 cosmo_it, lambda: _open_hf_stream("HuggingFaceTB/cosmopedia-v2", "cosmopedia-v2", rank=rank, world_size=world_size)
                             )
                             p = (row.get("prompt") or "Explain the concept:").strip()
                             r = (row.get("text") or "").strip()
-                            yield {"conversations": [{"from": "human", "value": p}, {"from": "gpt", "value": r}]}
+                            yield _tag_yield({"conversations": [{"from": "human", "value": p}, {"from": "gpt", "value": r}]}, "cosmopedia")
                         elif mod10 == 3:
                             row, everyday_it = _next_or_reopen(
                                 everyday_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "everyday-conversations", rank=rank, world_size=world_size)
                             )
-                            yield row
+                            yield _tag_yield(row, "smoltalk")
                         elif mod10 == 7:
                             if (turn // 10) % 2 == 0:
                                 row, finemath_it = _next_or_reopen(
@@ -293,7 +299,7 @@ def build_online_dataset_iterator(
                                 row, math_it = _next_or_reopen(
                                     math_it, lambda: _open_hf_stream("meta-math/MetaMathQA", rank=rank, world_size=world_size)
                                 )
-                            yield row
+                            yield _tag_yield(row, "finemath")
                         else:
                             if (turn // 10) % 2 == 0:
                                 row, pycode_it = _next_or_reopen(
@@ -303,7 +309,7 @@ def build_online_dataset_iterator(
                                 row, code_it = _next_or_reopen(
                                     code_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct", rank=rank, world_size=world_size)
                                 )
-                            yield row
+                            yield _tag_yield(row, "python_code")
 
                     elif tau < 0.50:
                         # Phase 2: Broadening, Commonsense Expansion & Algorithmic Grounding (Cycle mod 10)
@@ -313,12 +319,12 @@ def build_online_dataset_iterator(
                             row, know_it = _next_filtered_fineweb(
                                 know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size), min_score=3.0
                             )
-                            yield row
+                            yield _tag_yield(row, "fineweb_edu")
                         elif mod10 in (1, 5, 8):
                             row, everyday_it = _next_or_reopen(
                                 everyday_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "everyday-conversations", rank=rank, world_size=world_size)
                             )
-                            yield row
+                            yield _tag_yield(row, "smoltalk")
                         elif mod10 in (2, 7):
                             if (turn // 10) % 2 == 0:
                                 row, pycode_it = _next_or_reopen(
@@ -328,7 +334,7 @@ def build_online_dataset_iterator(
                                 row, code_it = _next_or_reopen(
                                     code_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct", rank=rank, world_size=world_size)
                                 )
-                            yield row
+                            yield _tag_yield(row, "python_code")
                         else:
                             mod_math = (turn // 10) % 3
                             if mod_math == 0:
@@ -343,7 +349,7 @@ def build_online_dataset_iterator(
                                 row, math_it = _next_or_reopen(
                                     math_it, lambda: _open_hf_stream("meta-math/MetaMathQA", rank=rank, world_size=world_size)
                                 )
-                            yield row
+                            yield _tag_yield(row, "finemath")
 
                     elif tau < 0.85:
                         # Phase 3: Deep Deliberation & 1:1:1 Tri-Pillar Reasoning (Cycle mod 6)
@@ -353,12 +359,12 @@ def build_online_dataset_iterator(
                             row, know_it = _next_filtered_fineweb(
                                 know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size), min_score=3.0
                             )
-                            yield row
+                            yield _tag_yield(row, "fineweb_edu")
                         elif mod6 == 1:
                             row, everyday_it = _next_or_reopen(
                                 everyday_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "everyday-conversations", rank=rank, world_size=world_size)
                             )
-                            yield row
+                            yield _tag_yield(row, "smoltalk")
                         elif mod6 == 2:
                             if (turn // 6) % 2 == 0:
                                 row, pycode_it = _next_or_reopen(
@@ -368,7 +374,7 @@ def build_online_dataset_iterator(
                                 row, code_it = _next_or_reopen(
                                     code_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct", rank=rank, world_size=world_size)
                                 )
-                            yield row
+                            yield _tag_yield(row, "python_code")
                         elif mod6 == 4:
                             mod_math = (turn // 6) % 3
                             if mod_math == 0:
@@ -383,7 +389,7 @@ def build_online_dataset_iterator(
                                 row, math_it = _next_or_reopen(
                                     math_it, lambda: _open_hf_stream("meta-math/MetaMathQA", rank=rank, world_size=world_size)
                                 )
-                            yield row
+                            yield _tag_yield(row, "finemath")
                         else:
                             if (turn // 6) % 2 == 0:
                                 row, openhermes_it = _next_or_reopen(
@@ -393,7 +399,7 @@ def build_online_dataset_iterator(
                                 row, logic_it = _next_or_reopen(
                                     logic_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "smol-magpie-ultra", rank=rank, world_size=world_size)
                                 )
-                            yield row
+                            yield _tag_yield(row, "smoltalk")
 
                     else:
                         # Phase 4: Annealing Basin & Boundary Consolidation (Cycle mod 10)
@@ -403,7 +409,7 @@ def build_online_dataset_iterator(
                             row, know_it = _next_filtered_fineweb(
                                 know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size), min_score=3.0
                             )
-                            yield row
+                            yield _tag_yield(row, "fineweb_edu")
                         elif mod10 in (1, 4, 7):
                             mod_math = (turn // 10) % 3
                             if mod_math == 0:
@@ -418,7 +424,7 @@ def build_online_dataset_iterator(
                                 row, math_it = _next_or_reopen(
                                     math_it, lambda: _open_hf_stream("meta-math/MetaMathQA", rank=rank, world_size=world_size)
                                 )
-                            yield row
+                            yield _tag_yield(row, "finemath")
                         elif mod10 in (2, 8):
                             if (turn // 10) % 2 == 0:
                                 row, pycode_it = _next_or_reopen(
@@ -428,12 +434,12 @@ def build_online_dataset_iterator(
                                 row, code_it = _next_or_reopen(
                                     code_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct", rank=rank, world_size=world_size)
                                 )
-                            yield row
+                            yield _tag_yield(row, "python_code")
                         else:
                             row, logic_it = _next_or_reopen(
                                 logic_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "smol-magpie-ultra", rank=rank, world_size=world_size)
                             )
-                            yield row
+                            yield _tag_yield(row, "smoltalk")
 
                 except Exception:
                     time.sleep(0.5)
@@ -828,6 +834,18 @@ class ElasticBucketBatcher:
         self.pad_id = tokenizer.pad_token_id if (hasattr(tokenizer, "pad_token_id") and tokenizer.pad_token_id is not None) else 0
         # Queues per bucket index with bounded capacity
         self.queues: Dict[int, collections.deque] = {i: collections.deque(maxlen=self.max_queue_size) for i in range(len(self.buckets))}
+        self.tokens_by_dataset: Dict[str, int] = collections.defaultdict(int)
+        self._lock = threading.Lock()
+
+    def get_tokens_by_dataset(self) -> Dict[str, int]:
+        """Returns snapshot of ingested tokens categorized per dataset."""
+        with self._lock:
+            return dict(self.tokens_by_dataset)
+
+    def set_tokens_by_dataset(self, d: Dict[str, int]) -> None:
+        """Sets ingested token counts (useful when resuming from checkpoint)."""
+        with self._lock:
+            self.tokens_by_dataset = collections.defaultdict(int, {str(k): int(v) for k, v in d.items()})
 
     def _extract_text_pair(self, row: Any) -> Tuple[str, str]:
         """Extracts (prompt, response) from diverse dataset formats via shared extractor."""
@@ -888,7 +906,10 @@ class ElasticBucketBatcher:
                 if len(self.queues[b_idx]) >= self.batch_size:
                     name, p_len, t_len = self.buckets[b_idx]
                     batch_items = [self.queues[b_idx].popleft() for _ in range(self.batch_size)]
-                    p_list, t_list, c_list = zip(*batch_items)
+                    p_list, t_list, c_list, d_list = zip(*batch_items)
+                    with self._lock:
+                        for ds, p, t in zip(d_list, p_list, t_list):
+                            self.tokens_by_dataset[ds] += (len(p) + len(t))
                     return self._format_batch(b_idx, name, p_list, t_list, c_list)
 
             # Pull raw records (batch-tokenize when a fast Rust tokenizer is available)
@@ -908,6 +929,8 @@ class ElasticBucketBatcher:
                 if not q_txt or not r_txt:
                     continue
 
+                ds_name = row.get("_dataset", "corpus") if isinstance(row, dict) else "corpus"
+
                 # Format with enclosed biological delimiters: <stim> ... </stim> and <act> ... </act>
                 try:
                     from src.corpus import format_stimulus_prompt, format_motor_response
@@ -918,7 +941,7 @@ class ElasticBucketBatcher:
                         q_txt = f"<stim> {q_txt} </stim>"
                     if not r_txt.startswith("<act>"):
                         r_txt = f"<act> {r_txt} </act>"
-                raw_pairs.append((q_txt, r_txt))
+                raw_pairs.append((q_txt, r_txt, ds_name))
 
             if not raw_pairs and stream_ended:
                 # If stream exhausted, flush whatever bucket has the most items
@@ -930,13 +953,17 @@ class ElasticBucketBatcher:
                 while len(items) < self.batch_size:
                     items.append(items[0])
                 name, p_len, t_len = self.buckets[best_b]
-                p_list, t_list, c_list = zip(*items)
+                p_list, t_list, c_list, d_list = zip(*items)
+                with self._lock:
+                    for ds, p, t in zip(d_list, p_list, t_list):
+                        self.tokens_by_dataset[ds] += (len(p) + len(t))
                 return self._format_batch(best_b, name, p_list, t_list, c_list)
 
             # Tokenize bounded to prevent processing gigantic out-of-distribution text
             max_enc = self.total_window + 256
             q_texts = [pair[0] for pair in raw_pairs]
             r_texts = [pair[1] for pair in raw_pairs]
+            d_names = [pair[2] for pair in raw_pairs]
             tokenized_pairs = None
             if use_fast_batch and len(raw_pairs) > 1:
                 try:
@@ -946,23 +973,23 @@ class ElasticBucketBatcher:
                     r_ids_batch = self.tokenizer(
                         r_texts, max_length=max_enc, truncation=True, add_special_tokens=False
                     )["input_ids"]
-                    tokenized_pairs = list(zip(q_ids_batch, r_ids_batch))
+                    tokenized_pairs = list(zip(q_ids_batch, r_ids_batch, d_names))
                 except Exception:
                     tokenized_pairs = None
 
             if tokenized_pairs is None:
                 tokenized_pairs = []
-                for q_txt, r_txt in raw_pairs:
+                for q_txt, r_txt, ds in raw_pairs:
                     if hasattr(self.tokenizer, "encode"):
                         q_ids = encode_no_special(self.tokenizer, q_txt, max_length=max_enc)
                         r_ids = encode_no_special(self.tokenizer, r_txt, max_length=max_enc)
                     else:
                         q_ids = [1] * len(q_txt.split())
                         r_ids = [1] * len(r_txt.split())
-                    tokenized_pairs.append((q_ids, r_ids))
+                    tokenized_pairs.append((q_ids, r_ids, ds))
 
             eos_id = self.tokenizer.eos_token_id if (hasattr(self.tokenizer, "eos_token_id") and self.tokenizer.eos_token_id is not None) else 2
-            for q_ids, r_ids in tokenized_pairs:
+            for q_ids, r_ids, ds in tokenized_pairs:
                 if len(r_ids) == 0 or r_ids[-1] != eos_id:
                     r_ids = r_ids + [eos_id]
 
@@ -985,7 +1012,7 @@ class ElasticBucketBatcher:
                     context_token = None
                     r_padded = r_ids + [self.target_pad_id] * (bt - len(r_ids))
 
-                self.queues[b_idx].append((q_padded, r_padded, context_token))
+                self.queues[b_idx].append((q_padded, r_padded, context_token, ds))
 
 
 class PrefetchedBatcher:
@@ -1015,6 +1042,14 @@ class PrefetchedBatcher:
 
     def get_batch(self):
         return self.next_batch()
+
+    def get_tokens_by_dataset(self) -> Dict[str, int]:
+        """Forwards token breakdown request to underlying batcher."""
+        return self.batcher.get_tokens_by_dataset()
+
+    def set_tokens_by_dataset(self, d: Dict[str, int]) -> None:
+        """Forwards token setting to underlying batcher."""
+        self.batcher.set_tokens_by_dataset(d)
 
     def stop(self):
         self.shutdown()

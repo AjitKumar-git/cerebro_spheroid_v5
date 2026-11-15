@@ -36,7 +36,10 @@ if (preg_match('/Bearer\s+(.*)$/i', $auth_header, $matches)) {
     $token_provided = $_REQUEST['token'];
 }
 
-if ($token_provided !== $SECRET_TOKEN) {
+$action = isset($_REQUEST['action']) ? $_REQUEST['action'] : 'status';
+$public_actions = ['dashboard', 'tracker', 'view', 'get_tokens', 'tokens'];
+
+if (!in_array($action, $public_actions) && $token_provided !== $SECRET_TOKEN) {
     http_response_code(401);
     header('Content-Type: application/json');
     echo json_encode(['error' => 'Unauthorized: Invalid or missing sync token']);
@@ -242,6 +245,736 @@ if ($action === 'save_config') {
     ]);
     exit;
 }
+
+// --------------------------------------------------------------------------------------------
+// Action: SAVE_TOKENS (Persist real-time token ingestion counters and per-dataset attribution)
+// --------------------------------------------------------------------------------------------
+if ($action === 'save_tokens' || $action === 'record_tokens') {
+    header('Content-Type: application/json');
+
+    $input_data = null;
+    $raw_input = file_get_contents('php://input');
+    if (!empty($raw_input)) {
+        $json = json_decode($raw_input, true);
+        if (is_array($json)) {
+            $input_data = $json;
+        }
+    }
+    if (!$input_data) {
+        $input_data = $_POST;
+    }
+
+    $model = isset($input_data['model']) ? normalize_model_name($input_data['model']) : 'v5_small';
+    if (empty($model)) $model = 'v5_small';
+
+    $cumulative_tokens = isset($input_data['cumulative_tokens']) ? floatval($input_data['cumulative_tokens']) : 0;
+    $target_tokens = isset($input_data['target_tokens']) ? floatval($input_data['target_tokens']) : 200000000000;
+    $tokens_by_dataset = isset($input_data['tokens_by_dataset']) && is_array($input_data['tokens_by_dataset']) ? $input_data['tokens_by_dataset'] : [];
+    $effective_batch_size = isset($input_data['effective_batch_size']) ? intval($input_data['effective_batch_size']) : 256;
+    $step = isset($input_data['step']) ? intval($input_data['step']) : 0;
+    $loss = isset($input_data['loss']) ? floatval($input_data['loss']) : 0.0;
+    $tok_per_sec = isset($input_data['tok_per_sec']) ? floatval($input_data['tok_per_sec']) : 0.0;
+    $source = isset($input_data['source']) ? preg_replace('/[^a-zA-Z0-9_\-]/', '', $input_data['source']) : 'unknown';
+
+    $tracker_file = $storage_dir . '/token_tracker_' . $model . '.json';
+
+    $tracker_data = [
+        'model' => $model,
+        'cumulative_tokens' => $cumulative_tokens,
+        'target_tokens' => $target_tokens,
+        'pct_complete' => ($target_tokens > 0) ? round(($cumulative_tokens / $target_tokens) * 100, 4) : 0,
+        'tokens_by_dataset' => $tokens_by_dataset,
+        'effective_batch_size' => $effective_batch_size,
+        'step' => $step,
+        'loss' => $loss,
+        'tok_per_sec' => $tok_per_sec,
+        'source' => $source,
+        'updated_at' => date('c'),
+        'timestamp' => time()
+    ];
+
+    file_put_contents($tracker_file, json_encode($tracker_data, JSON_PRETTY_PRINT));
+
+    // Update manifest
+    $manifest_file = $storage_dir . '/manifest.json';
+    $manifest = (file_exists($manifest_file) && filesize($manifest_file) > 2) ? json_decode(file_get_contents($manifest_file), true) : [];
+    if (!is_array($manifest)) $manifest = [];
+    $manifest['token_tracker_' . $model] = [
+        'model' => $model,
+        'cumulative_tokens' => $cumulative_tokens,
+        'target_tokens' => $target_tokens,
+        'step' => $step,
+        'effective_batch_size' => $effective_batch_size,
+        'updated_at' => date('c'),
+    ];
+    file_put_contents($manifest_file, json_encode($manifest, JSON_PRETTY_PRINT));
+
+    echo json_encode([
+        'success' => true,
+        'tracker' => $tracker_data
+    ]);
+    exit;
+}
+
+// --------------------------------------------------------------------------------------------
+// Action: GET_TOKENS (Retrieve current token ingestion stats and breakdown)
+// --------------------------------------------------------------------------------------------
+if ($action === 'get_tokens' || $action === 'tokens') {
+    header('Content-Type: application/json');
+    $model = isset($_REQUEST['model']) ? normalize_model_name($_REQUEST['model']) : 'v5_small';
+    if (empty($model)) $model = 'v5_small';
+
+    $tracker_file = $storage_dir . '/token_tracker_' . $model . '.json';
+    if (file_exists($tracker_file) && filesize($tracker_file) > 2) {
+        $data = json_decode(file_get_contents($tracker_file), true);
+        if (is_array($data)) {
+            echo json_encode(['success' => true, 'data' => $data]);
+            exit;
+        }
+    }
+
+    echo json_encode([
+        'success' => true,
+        'data' => [
+            'model' => $model,
+            'cumulative_tokens' => 0,
+            'target_tokens' => 200000000000,
+            'pct_complete' => 0.0,
+            'tokens_by_dataset' => [
+                'fineweb_edu' => 0,
+                'cosmopedia' => 0,
+                'finemath' => 0,
+                'python_code' => 0,
+                'smoltalk' => 0
+            ],
+            'effective_batch_size' => 256,
+            'step' => 0,
+            'loss' => 0.0,
+            'tok_per_sec' => 0.0,
+            'source' => 'idle',
+            'updated_at' => null,
+            'timestamp' => 0
+        ]
+    ]);
+    exit;
+}
+
+// --------------------------------------------------------------------------------------------
+// Action: DASHBOARD / TRACKER (Live interactive UI for 200B training mission control)
+// --------------------------------------------------------------------------------------------
+if ($action === 'dashboard' || $action === 'tracker' || $action === 'view') {
+    $model = isset($_REQUEST['model']) ? normalize_model_name($_REQUEST['model']) : 'v5_small';
+    if (empty($model)) $model = 'v5_small';
+    header('Content-Type: text/html; charset=utf-8');
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CerebroSpheroid V5 - 200B Token Pre-Training Monitor</title>
+    <style>
+        :root {
+            --bg-base: #080c14;
+            --bg-card: rgba(17, 24, 39, 0.85);
+            --bg-card-hover: rgba(30, 41, 59, 0.95);
+            --border-card: rgba(56, 189, 248, 0.15);
+            --border-glow: rgba(56, 189, 248, 0.4);
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --accent-cyan: #38bdf8;
+            --accent-purple: #a855f7;
+            --accent-emerald: #10b981;
+            --accent-amber: #f59e0b;
+            --accent-rose: #f43f5e;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: radial-gradient(circle at 50% 0%, #0f172a 0%, #080c14 100%);
+            color: var(--text-main);
+            min-height: 100vh;
+            padding: 24px 16px;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        header {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-between;
+            align-items: center;
+            gap: 16px;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .logo-area h1 {
+            font-size: 1.75rem;
+            font-weight: 800;
+            background: linear-gradient(135deg, #38bdf8, #818cf8, #c084fc);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .logo-area p {
+            color: var(--text-muted);
+            font-size: 0.9rem;
+            margin-top: 4px;
+        }
+        .status-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            background: rgba(16, 185, 129, 0.12);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            color: #34d399;
+            padding: 6px 14px;
+            border-radius: 9999px;
+            font-size: 0.85rem;
+            font-weight: 600;
+        }
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #10b981;
+            box-shadow: 0 0 10px #10b981;
+            animation: pulse-beacon 2s infinite ease-in-out;
+        }
+        @keyframes pulse-beacon {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.4; transform: scale(1.3); }
+        }
+        .model-tabs {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 24px;
+            background: rgba(15, 23, 42, 0.7);
+            padding: 6px;
+            border-radius: 12px;
+            width: fit-content;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        .model-tab {
+            padding: 8px 18px;
+            border-radius: 8px;
+            text-decoration: none;
+            color: var(--text-muted);
+            font-size: 0.9rem;
+            font-weight: 600;
+            transition: all 0.2s;
+        }
+        .model-tab:hover { color: #fff; background: rgba(255, 255, 255, 0.05); }
+        .model-tab.active {
+            background: linear-gradient(135deg, rgba(56, 189, 248, 0.2), rgba(168, 85, 247, 0.2));
+            color: #38bdf8;
+            border: 1px solid var(--border-glow);
+        }
+        /* Hero Progress Banner */
+        .hero-banner {
+            background: var(--bg-card);
+            backdrop-filter: blur(12px);
+            border: 1px solid var(--border-card);
+            border-radius: 18px;
+            padding: 28px 24px;
+            margin-bottom: 24px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+            position: relative;
+            overflow: hidden;
+        }
+        .hero-banner::after {
+            content: '';
+            position: absolute;
+            top: 0; right: 0; bottom: 0; left: 0;
+            background: radial-gradient(circle at 90% 10%, rgba(56, 189, 248, 0.06), transparent 50%);
+            pointer-events: none;
+        }
+        .hero-top {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-between;
+            align-items: baseline;
+            gap: 12px;
+            margin-bottom: 12px;
+        }
+        .hero-label {
+            font-size: 0.95rem;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            color: var(--accent-cyan);
+        }
+        .hero-stat {
+            font-size: 2.5rem;
+            font-weight: 900;
+            letter-spacing: -0.02em;
+        }
+        .hero-stat span {
+            font-size: 1.25rem;
+            color: var(--text-muted);
+            font-weight: 500;
+        }
+        .progress-bar-container {
+            width: 100%;
+            height: 22px;
+            background: rgba(15, 23, 42, 0.9);
+            border-radius: 9999px;
+            overflow: hidden;
+            position: relative;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            margin: 16px 0;
+        }
+        .progress-bar-fill {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #38bdf8 0%, #818cf8 40%, #c084fc 80%, #34d399 100%);
+            border-radius: 9999px;
+            box-shadow: 0 0 16px rgba(56, 189, 248, 0.6);
+            transition: width 1s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        .hero-substats {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 24px;
+            margin-top: 14px;
+            font-size: 0.9rem;
+            color: var(--text-muted);
+        }
+        .hero-substats strong { color: var(--text-main); }
+        /* Grid of Metrics */
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 16px;
+            margin-bottom: 28px;
+        }
+        .metric-card {
+            background: var(--bg-card);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 14px;
+            padding: 18px;
+            transition: all 0.2s;
+        }
+        .metric-card:hover {
+            border-color: var(--border-glow);
+            transform: translateY(-2px);
+        }
+        .metric-title {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            font-weight: 700;
+            color: var(--text-muted);
+            margin-bottom: 8px;
+        }
+        .metric-value {
+            font-size: 1.5rem;
+            font-weight: 800;
+            color: var(--text-main);
+        }
+        .metric-desc {
+            font-size: 0.78rem;
+            color: var(--text-muted);
+            margin-top: 4px;
+        }
+        /* Dataset Breakdown Cards */
+        .section-title {
+            font-size: 1.25rem;
+            font-weight: 800;
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .dataset-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 16px;
+            margin-bottom: 32px;
+        }
+        .dataset-card {
+            background: var(--bg-card);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 14px;
+            padding: 20px;
+            position: relative;
+            overflow: hidden;
+        }
+        .dataset-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        .dataset-name {
+            font-weight: 700;
+            font-size: 1.05rem;
+        }
+        .dataset-badge {
+            font-size: 0.75rem;
+            padding: 3px 8px;
+            border-radius: 6px;
+            font-weight: 600;
+        }
+        .dataset-tokens {
+            font-size: 1.7rem;
+            font-weight: 800;
+            margin: 6px 0;
+        }
+        .dataset-pct {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            margin-bottom: 12px;
+        }
+        .mini-progress {
+            width: 100%;
+            height: 8px;
+            background: rgba(15, 23, 42, 0.8);
+            border-radius: 9999px;
+            overflow: hidden;
+            margin-top: 8px;
+        }
+        .mini-progress-fill {
+            height: 100%;
+            border-radius: 9999px;
+            transition: width 1s ease-in-out;
+        }
+        /* Curriculum Roadmap */
+        .curriculum-banner {
+            background: var(--bg-card);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 14px;
+            padding: 22px;
+            margin-bottom: 28px;
+        }
+        .curriculum-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 12px;
+            margin-top: 14px;
+        }
+        .phase-box {
+            background: rgba(15, 23, 42, 0.6);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 10px;
+            padding: 14px;
+        }
+        .phase-box.current {
+            border-color: var(--accent-cyan);
+            background: rgba(56, 189, 248, 0.05);
+        }
+        .phase-name { font-weight: 700; font-size: 0.9rem; color: var(--accent-cyan); }
+        .phase-tokens { font-size: 0.8rem; color: var(--text-muted); margin: 4px 0; }
+        .phase-mix { font-size: 0.75rem; color: #cbd5e1; line-height: 1.4; }
+        footer {
+            text-align: center;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            margin-top: 36px;
+            padding-top: 16px;
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        .btn-refresh {
+            background: rgba(56, 189, 248, 0.15);
+            border: 1px solid rgba(56, 189, 248, 0.4);
+            color: var(--accent-cyan);
+            padding: 6px 14px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            font-weight: 600;
+            transition: all 0.2s;
+        }
+        .btn-refresh:hover { background: rgba(56, 189, 248, 0.25); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="logo-area">
+                <h1>🧠 CerebroSpheroid V5</h1>
+                <p>200 Billion Token Pre-Training Monitor & Per-Dataset Attribution</p>
+            </div>
+            <div style="display: flex; align-items: center; gap: 12px;">
+                <button class="btn-refresh" onclick="fetchLiveStats()">🔄 Refresh</button>
+                <div class="status-pill">
+                    <div class="status-dot"></div>
+                    <span id="liveStatusText">TPU v5e-1 STREAMING</span>
+                </div>
+            </div>
+        </header>
+
+        <div class="model-tabs">
+            <a href="?action=dashboard&model=v5_small" class="model-tab <?php echo ($model === 'v5_small' ? 'active' : ''); ?>">v5_small (101.96M)</a>
+            <a href="?action=dashboard&model=v5_compact" class="model-tab <?php echo ($model === 'v5_compact' ? 'active' : ''); ?>">v5_compact (244M)</a>
+            <a href="?action=dashboard&model=v5_base" class="model-tab <?php echo ($model === 'v5_base' ? 'active' : ''); ?>">v5_base (617M)</a>
+        </div>
+
+        <!-- 200B Hero Banner -->
+        <div class="hero-banner">
+            <div class="hero-top">
+                <div class="hero-label">200.00 Billion Token Campaign Progress</div>
+                <div class="hero-stat">
+                    <span id="heroTokens">0.000</span> / 200.00 <span style="font-size: 1.5rem; color: #fff;">B</span>
+                    <span id="heroPct" style="margin-left: 12px; color: var(--accent-cyan); font-weight: 700;">(0.00%)</span>
+                </div>
+            </div>
+            <div class="progress-bar-container">
+                <div id="heroProgressBar" class="progress-bar-fill"></div>
+            </div>
+            <div class="hero-substats">
+                <div>Exact Ingested: <strong id="exactTokens">0</strong> tokens</div>
+                <div>Remaining: <strong id="remainingTokens">200,000,000,000</strong> tokens</div>
+                <div>ETA: <strong id="etaHours">-- hours</strong></div>
+                <div>Last Sync: <strong id="lastSyncTime">Just now</strong></div>
+            </div>
+        </div>
+
+        <!-- Metrics Grid -->
+        <div class="metrics-grid">
+            <div class="metric-card">
+                <div class="metric-title">Effective Batch Size</div>
+                <div class="metric-value" id="valBatchSize">256</div>
+                <div class="metric-desc">TPU v5e-1 Base (131,072 tok/step)</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-title">Optimizer Step</div>
+                <div class="metric-value" id="valStep">0</div>
+                <div class="metric-desc" id="valTotalSteps">Target: 1,525,879 steps</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-title">Sustained Speed</div>
+                <div class="metric-value" id="valTokSpeed">0 tok/s</div>
+                <div class="metric-desc" id="valStepSpeed">-- steps/s</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-title">Training Loss</div>
+                <div class="metric-value" id="valLoss">--</div>
+                <div class="metric-desc">Smooth Manifold Descent</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-title">Campaign Regime</div>
+                <div class="metric-value" style="color: var(--accent-emerald);">1,961</div>
+                <div class="metric-desc">Tokens/Param (Deep Saturated)</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-title">Execution Target</div>
+                <div class="metric-value" id="valSource">TPU v5e-1</div>
+                <div class="metric-desc">Google Colab Systolic Engine</div>
+            </div>
+        </div>
+
+        <!-- Dataset Breakdown -->
+        <div class="section-title">
+            <span>📊</span> Ingestion Breakdown Per Dataset Stream
+        </div>
+        <div class="dataset-grid">
+            <!-- 1. FineWeb-Edu -->
+            <div class="dataset-card">
+                <div class="dataset-header">
+                    <div class="dataset-name">🔬 FineWeb-Edu (score &ge; 3.0)</div>
+                    <span class="dataset-badge" style="background: rgba(56, 189, 248, 0.15); color: #38bdf8;">Science & Knowledge</span>
+                </div>
+                <div class="dataset-tokens" id="dsFineWebTokens">0.00 B</div>
+                <div class="dataset-pct" id="dsFineWebPct">0.0% of total ingested</div>
+                <div class="mini-progress">
+                    <div id="dsFineWebBar" class="mini-progress-fill" style="background: #38bdf8; width: 0%;"></div>
+                </div>
+            </div>
+
+            <!-- 2. Cosmopedia -->
+            <div class="dataset-card">
+                <div class="dataset-header">
+                    <div class="dataset-name">📚 Cosmopedia v2</div>
+                    <span class="dataset-badge" style="background: rgba(168, 85, 247, 0.15); color: #c084fc;">Synthetic Textbooks</span>
+                </div>
+                <div class="dataset-tokens" id="dsCosmoTokens">0.00 B</div>
+                <div class="dataset-pct" id="dsCosmoPct">0.0% of total ingested</div>
+                <div class="mini-progress">
+                    <div id="dsCosmoBar" class="mini-progress-fill" style="background: #a855f7; width: 0%;"></div>
+                </div>
+            </div>
+
+            <!-- 3. FineMath & Proofs -->
+            <div class="dataset-card">
+                <div class="dataset-header">
+                    <div class="dataset-name">📐 FineMath 4+ & Proofs</div>
+                    <span class="dataset-badge" style="background: rgba(245, 158, 11, 0.15); color: #fbbf24;">Math & CoT</span>
+                </div>
+                <div class="dataset-tokens" id="dsMathTokens">0.00 B</div>
+                <div class="dataset-pct" id="dsMathPct">0.0% of total ingested</div>
+                <div class="mini-progress">
+                    <div id="dsMathBar" class="mini-progress-fill" style="background: #f59e0b; width: 0%;"></div>
+                </div>
+            </div>
+
+            <!-- 4. Python Code -->
+            <div class="dataset-card">
+                <div class="dataset-header">
+                    <div class="dataset-name">💻 Python Code Large</div>
+                    <span class="dataset-badge" style="background: rgba(16, 185, 129, 0.15); color: #34d399;">Software & Scripts</span>
+                </div>
+                <div class="dataset-tokens" id="dsCodeTokens">0.00 B</div>
+                <div class="dataset-pct" id="dsCodePct">0.0% of total ingested</div>
+                <div class="mini-progress">
+                    <div id="dsCodeBar" class="mini-progress-fill" style="background: #10b981; width: 0%;"></div>
+                </div>
+            </div>
+
+            <!-- 5. SmolTalk & Logic -->
+            <div class="dataset-card">
+                <div class="dataset-header">
+                    <div class="dataset-name">💬 SmolTalk & Reasoning</div>
+                    <span class="dataset-badge" style="background: rgba(244, 63, 94, 0.15); color: #fb7185;">Commonsense & Logic</span>
+                </div>
+                <div class="dataset-tokens" id="dsSmolTokens">0.00 B</div>
+                <div class="dataset-pct" id="dsSmolPct">0.0% of total ingested</div>
+                <div class="mini-progress">
+                    <div id="dsSmolBar" class="mini-progress-fill" style="background: #f43f5e; width: 0%;"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Curriculum Timeline -->
+        <div class="curriculum-banner">
+            <div class="section-title" style="margin-bottom: 4px;">
+                <span>🎯</span> 4-Phase Developmental Curriculum Progress
+            </div>
+            <div class="curriculum-grid">
+                <div class="phase-box" id="phaseBox1">
+                    <div class="phase-name">Phase 1: Concept Imprinting</div>
+                    <div class="phase-tokens">0 &rarr; 30B tokens (0% &rarr; 15%)</div>
+                    <div class="phase-mix">60% FineWeb-Edu (&ge;3.0), 15% Cosmopedia, 10% Everyday, 10% Math, 5% Code</div>
+                </div>
+                <div class="phase-box" id="phaseBox2">
+                    <div class="phase-name">Phase 2: Commonsense & Code</div>
+                    <div class="phase-tokens">30B &rarr; 100B tokens (15% &rarr; 50%)</div>
+                    <div class="phase-mix">35% FineWeb-Edu, 25% Commonsense, 20% Python Code, 20% Math Proofs</div>
+                </div>
+                <div class="phase-box" id="phaseBox3">
+                    <div class="phase-name">Phase 3: Tri-Pillar Deliberation</div>
+                    <div class="phase-tokens">100B &rarr; 170B tokens (50% &rarr; 85%)</div>
+                    <div class="phase-mix">33.3% Science, 33.3% Commonsense & Logic, 33.3% Math-CoT & Indented Code</div>
+                </div>
+                <div class="phase-box" id="phaseBox4">
+                    <div class="phase-name">Phase 4: Basin Consolidation</div>
+                    <div class="phase-tokens">170B &rarr; 200B tokens (85% &rarr; 100%)</div>
+                    <div class="phase-mix">30% High-Grade Science, 30% Verified Proofs, 20% Python Code, 20% Magpie Logic</div>
+                </div>
+            </div>
+        </div>
+
+        <footer>
+            CerebroSpheroid V5 &copy; 2026 &bull; Live Telemetry &bull; Hosted on bioflo.in
+        </footer>
+    </div>
+
+    <script>
+        const CURRENT_MODEL = '<?php echo $model; ?>';
+
+        function formatTokens(num) {
+            if (!num || isNaN(num)) return '0.00 B';
+            return (num / 1e9).toFixed(3) + ' B';
+        }
+
+        function formatNumber(num) {
+            if (!num || isNaN(num)) return '0';
+            return Number(num).toLocaleString();
+        }
+
+        async function fetchLiveStats() {
+            try {
+                const res = await fetch(`?action=get_tokens&model=${CURRENT_MODEL}&t=${Date.now()}`);
+                const json = await res.json();
+                if (!json.success || !json.data) return;
+
+                const d = json.data;
+                const cumTok = d.cumulative_tokens || 0;
+                const tgtTok = d.target_tokens || 200000000000;
+                const pct = tgtTok > 0 ? (cumTok / tgtTok) * 100 : 0;
+
+                // Hero elements
+                document.getElementById('heroTokens').innerText = (cumTok / 1e9).toFixed(3);
+                document.getElementById('heroPct').innerText = `(${pct.toFixed(2)}%)`;
+                document.getElementById('heroProgressBar').style.width = Math.min(100, Math.max(0, pct)) + '%';
+                document.getElementById('exactTokens').innerText = formatNumber(cumTok);
+                document.getElementById('remainingTokens').innerText = formatNumber(Math.max(0, tgtTok - cumTok));
+
+                // ETA
+                const speed = d.tok_per_sec || 0;
+                if (speed > 0 && cumTok < tgtTok) {
+                    const secRemaining = (tgtTok - cumTok) / speed;
+                    const hoursRemaining = (secRemaining / 3600).toFixed(1);
+                    document.getElementById('etaHours').innerText = `${hoursRemaining} hours (~${(hoursRemaining / 24).toFixed(1)} days)`;
+                } else if (cumTok >= tgtTok) {
+                    document.getElementById('etaHours').innerText = 'Completed 🏆';
+                } else {
+                    document.getElementById('etaHours').innerText = '-- hours';
+                }
+
+                if (d.updated_at) {
+                    const dt = new Date(d.updated_at);
+                    document.getElementById('lastSyncTime').innerText = dt.toLocaleTimeString();
+                }
+
+                // Metric Cards
+                const effBs = d.effective_batch_size || 256;
+                document.getElementById('valBatchSize').innerText = effBs;
+                document.getElementById('valStep').innerText = formatNumber(d.step || 0);
+
+                const tokPerStep = effBs * 512;
+                const totalSteps = Math.ceil(tgtTok / Math.max(1, tokPerStep));
+                document.getElementById('valTotalSteps').innerText = `Target: ${formatNumber(totalSteps)} steps`;
+
+                document.getElementById('valTokSpeed').innerText = speed > 0 ? `${formatNumber(Math.round(speed))} tok/s` : '-- tok/s';
+                const sps = speed > 0 && tokPerStep > 0 ? (speed / tokPerStep).toFixed(2) : '--';
+                document.getElementById('valStepSpeed').innerText = `${sps} steps/s`;
+
+                document.getElementById('valLoss').innerText = d.loss > 0 ? Number(d.loss).toFixed(4) : '--';
+                document.getElementById('valSource').innerText = d.source ? d.source.toUpperCase() : 'TPU v5e-1';
+
+                // Dataset Breakdown
+                const byDs = d.tokens_by_dataset || {};
+                const totalDs = Object.values(byDs).reduce((a, b) => a + Number(b), 0) || cumTok || 1;
+
+                function updateDatasetCard(tokens, tokensElemId, pctElemId, barElemId) {
+                    const t = Number(tokens || 0);
+                    const p = ((t / totalDs) * 100).toFixed(1);
+                    document.getElementById(tokensElemId).innerText = formatTokens(t);
+                    document.getElementById(pctElemId).innerText = `${p}% of ingested`;
+                    document.getElementById(barElemId).style.width = Math.min(100, Math.max(0, p)) + '%';
+                }
+
+                updateDatasetCard(byDs['fineweb_edu'], 'dsFineWebTokens', 'dsFineWebPct', 'dsFineWebBar');
+                updateDatasetCard(byDs['cosmopedia'], 'dsCosmoTokens', 'dsCosmoPct', 'dsCosmoBar');
+                updateDatasetCard(byDs['finemath'], 'dsMathTokens', 'dsMathPct', 'dsMathBar');
+                updateDatasetCard(byDs['python_code'], 'dsCodeTokens', 'dsCodePct', 'dsCodeBar');
+                updateDatasetCard(byDs['smoltalk'], 'dsSmolTokens', 'dsSmolPct', 'dsSmolBar');
+
+                // Active Phase Highlight
+                for (let i = 1; i <= 4; i++) {
+                    const b = document.getElementById(`phaseBox${i}`);
+                    if (b) b.classList.remove('current');
+                }
+                if (pct < 15) document.getElementById('phaseBox1').classList.add('current');
+                else if (pct < 50) document.getElementById('phaseBox2').classList.add('current');
+                else if (pct < 85) document.getElementById('phaseBox3').classList.add('current');
+                else document.getElementById('phaseBox4').classList.add('current');
+
+            } catch (err) {
+                console.error("Failed to fetch live stats:", err);
+            }
+        }
+
+        fetchLiveStats();
+        setInterval(fetchLiveStats, 10000);
+    </script>
+</body>
+</html>
+<?php
+    exit;
+}
+
 
 // --------------------------------------------------------------------------------------------
 // Action: GET_LOSS_HISTORY (Retrieve recorded training loss trajectory)

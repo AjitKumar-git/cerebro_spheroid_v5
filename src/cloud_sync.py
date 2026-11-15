@@ -667,3 +667,80 @@ def fetch_remote_loss_history(
     except Exception as e:
         print(f"ℹ️ [cloud_sync] Could not retrieve remote loss history from {sync_url}: {e}")
     return None
+
+
+def push_remote_token_tracker(
+    model: str,
+    cumulative_tokens: int,
+    target_tokens: int = 200_000_000_000,
+    tokens_by_dataset: Optional[Dict[str, int]] = None,
+    effective_batch_size: int = 256,
+    step: int = 0,
+    loss: float = 0.0,
+    tok_per_sec: float = 0.0,
+    url: Optional[str] = None,
+    token: Optional[str] = None,
+) -> bool:
+    """
+    Pushes real-time token ingestion counters and per-dataset breakdowns to bioflo.in.
+    """
+    clean_model = "v5_small" if model in TPU_PRESET_ALIASES else model
+    sync_url = url or DEFAULT_URL
+    sync_token = token or DEFAULT_TOKEN
+
+    payload = {
+        "action": "save_tokens",
+        "model": clean_model,
+        "cumulative_tokens": int(cumulative_tokens),
+        "target_tokens": int(target_tokens),
+        "tokens_by_dataset": tokens_by_dataset or {},
+        "effective_batch_size": int(effective_batch_size),
+        "step": int(step),
+        "loss": float(loss),
+        "tok_per_sec": float(tok_per_sec),
+        "timestamp": time.time(),
+        "source": detect_source_environment(),
+    }
+
+    try:
+        req_data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{sync_url}?action=save_tokens",
+            data=req_data,
+            headers={
+                "Authorization": f"Bearer {sync_token}",
+                "Content-Type": "application/json",
+                "User-Agent": "CerebroV5CloudSync/1.0",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return bool(data.get("success", False))
+    except Exception:
+        return False
+
+
+def fetch_remote_token_tracker(
+    model: str,
+    url: Optional[str] = None,
+    token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Retrieves current token ingestion metrics and per-dataset counts from bioflo.in.
+    """
+    clean_model = "v5_small" if model in TPU_PRESET_ALIASES else model
+    sync_url = url or DEFAULT_URL
+    sync_token = token or DEFAULT_TOKEN
+
+    req_url = f"{sync_url}?action=get_tokens&model={clean_model}"
+    req = urllib.request.Request(
+        req_url,
+        headers={"Authorization": f"Bearer {sync_token}", "User-Agent": "CerebroV5CloudSync/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data.get("data", {})
+    except Exception:
+        return {}
