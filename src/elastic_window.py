@@ -302,34 +302,34 @@ def build_online_dataset_iterator(
                                 math_it, lambda: _open_hf_stream("meta-math/MetaMathQA", rank=rank, world_size=world_size)
                             )
                         yield row
-                    elif mod6 == 1:
-                        # 2. Everyday Commonsense Physical Scenarios & Actions (SmolTalk everyday-conversations) -> Targets HellaSwag (0% -> 35%+)
+                    elif mod6 in (1, 3):
+                        # 2 & 4. Science & Academic Anchor: FineWeb-Edu (score >= 4.0) -> 33.3% allocation!
+                        # Protects and locks in ARC-Challenge (40%+) and MMLU factual recall
+                        row, know_it = _next_or_reopen(
+                            know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-10BT", rank=rank, world_size=world_size)
+                        )
+                        yield row
+                    elif mod6 == 2:
+                        # 3. Everyday Commonsense Physical Actions (SmolTalk everyday-conversations) -> Targets HellaSwag
                         row, everyday_it = _next_or_reopen(
                             everyday_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "everyday-conversations", rank=rank, world_size=world_size)
                         )
                         yield row
-                    elif mod6 == 2:
-                        # 3. Multi-Subject STEM, Humanities & Multiple-Choice Logic (SmolTalk openhermes-100k) -> Targets MMLU (12.5% -> 30%+)
-                        row, openhermes_it = _next_or_reopen(
-                            openhermes_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "openhermes-100k", rank=rank, world_size=world_size)
-                        )
-                        yield row
-                    elif mod6 == 3:
-                        # 4. Python-Edu, Software Algorithms & Indented Code Blocks (SmolTalk self-oss-instruct) -> Targets HumanEval (0% -> 15%+)
-                        row, code_it = _next_or_reopen(
-                            code_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct", rank=rank, world_size=world_size)
-                        )
-                        yield row
                     elif mod6 == 4:
-                        # 5. Multi-Turn Deductive Reasoning & Logic Syllogisms (SmolTalk smol-magpie-ultra)
-                        row, logic_it = _next_or_reopen(
-                            logic_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "smol-magpie-ultra", rank=rank, world_size=world_size)
-                        )
+                        # 5. Multi-Subject Academic STEM & Logic (SmolTalk openhermes-100k + smol-magpie-ultra)
+                        if (turn // 6) % 2 == 0:
+                            row, openhermes_it = _next_or_reopen(
+                                openhermes_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "openhermes-100k", rank=rank, world_size=world_size)
+                            )
+                        else:
+                            row, logic_it = _next_or_reopen(
+                                logic_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "smol-magpie-ultra", rank=rank, world_size=world_size)
+                            )
                         yield row
                     else:
-                        # 6. World Knowledge Replay Anchor (FineWeb-Edu, score >= 4.0) -> Protects 75% ARC Science Score!
-                        row, know_it = _next_or_reopen(
-                            know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-10BT", rank=rank, world_size=world_size)
+                        # 6. Python-Edu Software Algorithms & Code Blocks (SmolTalk self-oss-instruct) -> Targets HumanEval
+                        row, code_it = _next_or_reopen(
+                            code_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct", rank=rank, world_size=world_size)
                         )
                         yield row
                 except Exception:
