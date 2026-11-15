@@ -385,7 +385,8 @@ def run_extensive_benchmark(
 
     model = CerebroSpheroidV5(cfg)
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    state = ckpt.get("model", ckpt.get("model_state", ckpt))
+    raw_s = ckpt.get("model_state", ckpt.get("state_dict", ckpt.get("model", ckpt)))
+    state = raw_s if isinstance(raw_s, dict) else ckpt.get("model_state", ckpt)
     step = ckpt.get("step", ckpt.get("global_step", "unknown"))
     train_loss = ckpt.get("loss", ckpt.get("train_loss", "unknown"))
     eval_loss = ckpt.get("eval_loss", "unknown")

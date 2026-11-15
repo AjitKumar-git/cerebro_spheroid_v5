@@ -1,0 +1,244 @@
+{
+  "metadata": {
+    "checkpoint": "v5_sft_latest_step24k.pt",
+    "step": 24250,
+    "train_loss": 2.297149181365967,
+    "eval_loss": 1.829873725771904,
+    "device": "cuda",
+    "timestamp": "2026-11-15T14:54:18Z"
+  },
+  "scores": {
+    "MMLU": 0.0,
+    "ARC": 25.0,
+    "HellaSwag": 0.0,
+    "GSM8K": 0.0,
+    "HumanEval": 0.0,
+    "Composite": 5.0
+  },
+  "details": {
+    "MMLU": [
+      {
+        "domain": "MMLU: Physics / Mechanics",
+        "target": "B",
+        "predicted": "A",
+        "correct": false,
+        "losses": [
+          8.01347827911377,
+          9.390345573425293,
+          8.206047058105469,
+          8.212385177612305
+        ]
+      },
+      {
+        "domain": "MMLU: Chemistry",
+        "target": "B",
+        "predicted": "C",
+        "correct": false,
+        "losses": [
+          15.276349067687988,
+          11.385374069213867,
+          10.814488410949707,
+          10.917012214660645
+        ]
+      },
+      {
+        "domain": "MMLU: Biology / Anatomy",
+        "target": "D",
+        "predicted": "B",
+        "correct": false,
+        "losses": [
+          14.184270858764648,
+          11.006049156188965,
+          13.54577350616455,
+          13.393675804138184
+        ]
+      },
+      {
+        "domain": "MMLU: Computer Science",
+        "target": "B",
+        "predicted": "D",
+        "correct": false,
+        "losses": [
+          13.575557708740234,
+          10.708934783935547,
+          11.65803337097168,
+          7.366803169250488
+        ]
+      },
+      {
+        "domain": "MMLU: Elementary Math",
+        "target": "C",
+        "predicted": "B",
+        "correct": false,
+        "losses": [
+          12.463062286376953,
+          9.139202117919922,
+          13.488126754760742,
+          10.984699249267578
+        ]
+      },
+      {
+        "domain": "MMLU: World History",
+        "target": "B",
+        "predicted": "A",
+        "correct": false,
+        "losses": [
+          7.84281587600708,
+          11.459429740905762,
+          9.724762916564941,
+          12.048558235168457
+        ]
+      },
+      {
+        "domain": "MMLU: Philosophy / Logic",
+        "target": "B",
+        "predicted": "C",
+        "correct": false,
+        "losses": [
+          10.480369567871094,
+          10.129692077636719,
+          6.932056427001953,
+          11.790369987487793
+        ]
+      },
+      {
+        "domain": "MMLU: Biochemistry",
+        "target": "C",
+        "predicted": "D",
+        "correct": false,
+        "losses": [
+          9.365249633789062,
+          13.320009231567383,
+          8.10156536102295,
+          7.227984428405762
+        ]
+      }
+    ],
+    "ARC": [
+      {
+        "domain": "ARC: Science Reasoning",
+        "target": "A",
+        "predicted": "D",
+        "correct": false,
+        "losses": [
+          10.554045677185059,
+          9.08537483215332,
+          10.253646850585938,
+          7.2058000564575195
+        ]
+      },
+      {
+        "domain": "ARC: Science Reasoning",
+        "target": "B",
+        "predicted": "B",
+        "correct": true,
+        "losses": [
+          8.932998657226562,
+          7.059085369110107,
+          9.010610580444336,
+          8.5318021774292
+        ]
+      },
+      {
+        "domain": "ARC: Earth Science",
+        "target": "C",
+        "predicted": "B",
+        "correct": false,
+        "losses": [
+          10.194299697875977,
+          9.007599830627441,
+          9.118941307067871,
+          10.88585090637207
+        ]
+      },
+      {
+        "domain": "ARC: Biology",
+        "target": "B",
+        "predicted": "A",
+        "correct": false,
+        "losses": [
+          6.9480485916137695,
+          17.263751983642578,
+          8.15666675567627,
+          8.597825050354004
+        ]
+      }
+    ],
+    "HellaSwag": [
+      {
+        "domain": "HellaSwag: Physical Commonsense",
+        "target": "A",
+        "predicted": "C",
+        "correct": false,
+        "losses": [
+          10.130834579467773,
+          9.62525463104248,
+          7.390400409698486,
+          9.390746116638184
+        ]
+      },
+      {
+        "domain": "HellaSwag: Activity Continuation",
+        "target": "A",
+        "predicted": "D",
+        "correct": false,
+        "losses": [
+          9.49032211303711,
+          9.78998851776123,
+          10.306231498718262,
+          8.944753646850586
+        ]
+      }
+    ],
+    "GSM8K": [
+      {
+        "question": "Natalia sold clips to 48 of her friends in Ap...",
+        "target": "72",
+        "extracted": "8",
+        "raw_output": "Sby, S pricein developed to set ss that DDVs with 8in rivers...",
+        "correct": false
+      },
+      {
+        "question": "Weng earns $12 an hour babysitting. Yesterday...",
+        "target": "60",
+        "extracted": null,
+        "raw_output": "Warr)$....",
+        "correct": false
+      },
+      {
+        "question": "Betty picked 16 apples from the orchard. She ...",
+        "target": "6",
+        "extracted": null,
+        "raw_output": "Btr blessstyle. Let C=Q + hf, where Mayeriork handles doors ...",
+        "correct": false
+      },
+      {
+        "question": "A baker made 40 cupcakes. He sold 25 cupcakes...",
+        "target": "30",
+        "extracted": "9",
+        "raw_output": "D: \n7. Clean up, we can break total number of _ done quickly...",
+        "correct": false
+      }
+    ],
+    "HumanEval": [
+      {
+        "prompt": "def is_even(n: int) -> bool:",
+        "syntax_valid": false,
+        "has_keywords": false,
+        "output": "Let' break calciize ourtes meets your input! Ilicated, chanc..."
+      },
+      {
+        "prompt": "def add(a: int, b: int) -> int:",
+        "syntax_valid": false,
+        "has_keywords": false,
+        "output": "latter'Cotoschemies:\nAnother approach is to first-tin senten..."
+      },
+      {
+        "prompt": "def is_prime(n: int) -> bool:",
+        "syntax_valid": false,
+        "has_keywords": false,
+        "output": "Let' breakistence. Let irk reads intisting fluorescqsizey! I..."
+      }
+    ]
+  }
+}
