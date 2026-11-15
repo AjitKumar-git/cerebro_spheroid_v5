@@ -1054,8 +1054,13 @@ def build_canonical_eval_split(
             else:
                 r_pad = r_ids + [target_pad_id] * (target_len - len(r_ids))
 
-            # Construct teacher-forcing feedback shifted tokens
-            fb_pad = [tok if tok != target_pad_id else pad_id for tok in r_pad]
+            # Construct strictly causal teacher-forcing feedback tokens shifted by 1:
+            # Prev token at step 0 is prompt continuation (or -100). Steps 1..N-1 are target[:-1].
+            # Padding positions where target == target_pad_id are masked with target_pad_id (-100).
+            valid_prompt = [tok for tok in q_ids if tok != pad_id]
+            continuation_tok = valid_prompt[-1] if len(valid_prompt) > 0 else target_pad_id
+            fb_pad = [continuation_tok] + r_pad[:-1]
+            fb_pad = [fb if r != target_pad_id else target_pad_id for fb, r in zip(fb_pad, r_pad)]
 
             prompts_batch.append(q_pad)
             targets_batch.append(r_pad)
