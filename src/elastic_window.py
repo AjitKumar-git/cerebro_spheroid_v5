@@ -190,11 +190,13 @@ def build_online_dataset_iterator(
       - 'consolidation': Final cooling replay mixture.
     """
     source = (dataset_source or "dense_edu").lower()
-    if source in ("foundation", "auto", "basic", "fineweb_edu"):
+    if source in ("sft", "instruction_sft", "chat_sft", "alignment"):
+        source = "sft"
+    elif source in ("foundation", "auto", "basic", "fineweb_edu"):
         source = "dense_edu"
     elif source in ("reasoning", "frontier", "beat_smollm", "smollm_pass", "frontier_mix", "tri_pillar"):
         source = "reasoning_anneal"
-    elif source in ("agentic", "workflows", "chat_sft"):
+    elif source in ("agentic", "workflows"):
         source = "conversation_sft"
     elif source in ("balanced_mix", "balanced", "gold"):
         source = "consolidation"
@@ -380,6 +382,84 @@ def build_online_dataset_iterator(
                 turn += 1
 
         return _autonomous_gen()
+
+    if source == "sft":
+        # Curated Conversational & Reasoning SFT Mixture:
+        # 30% SmolTalk Everyday + OpenHermes (Conversational & STEM Instruction)
+        # 25% Smol-Magpie-Ultra + Apigen-80k (Deep Multi-Turn Logic & Tool Dispatch)
+        # 20% GSM8K + MetaMathQA (Step-by-Step Mathematical Derivation with ####)
+        # 15% SmolTalk Self-OSS-Instruct (Python Coding & Algorithmic Implementation)
+        # 10% FineWeb-Edu (score >= 4.0) (Knowledge Retention Anchor)
+        everyday_it: Optional[Iterator[Any]] = None
+        openhermes_it: Optional[Iterator[Any]] = None
+        logic_it: Optional[Iterator[Any]] = None
+        tool_it: Optional[Iterator[Any]] = None
+        gsm_it: Optional[Iterator[Any]] = None
+        math_it: Optional[Iterator[Any]] = None
+        code_it: Optional[Iterator[Any]] = None
+        know_it: Optional[Iterator[Any]] = None
+
+        def _sft_gen():
+            nonlocal everyday_it, openhermes_it, logic_it, tool_it, gsm_it, math_it, code_it, know_it
+            turn = 0
+            while True:
+                mod10 = turn % 10
+                try:
+                    if mod10 in (0, 3, 6):
+                        # Conversational & Instruction following (SmolTalk everyday + openhermes)
+                        if (turn // 10) % 2 == 0:
+                            row, everyday_it = _next_or_reopen(
+                                everyday_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "everyday-conversations", rank=rank, world_size=world_size)
+                            )
+                        else:
+                            row, openhermes_it = _next_or_reopen(
+                                openhermes_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "openhermes-100k", rank=rank, world_size=world_size)
+                            )
+                        yield row
+
+                    elif mod10 in (1, 4):
+                        # Deep Logic & Agentic Tool Dispatch (Magpie Ultra + Apigen)
+                        if (turn // 10) % 2 == 0:
+                            row, logic_it = _next_or_reopen(
+                                logic_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "smol-magpie-ultra", rank=rank, world_size=world_size)
+                            )
+                        else:
+                            row, tool_it = _next_or_reopen(
+                                tool_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "apigen-80k", rank=rank, world_size=world_size)
+                            )
+                        yield row
+
+                    elif mod10 in (2, 7):
+                        # Math Reasoning & Derivation (GSM8K + MetaMathQA)
+                        if (turn // 10) % 2 == 0:
+                            row, gsm_it = _next_or_reopen(
+                                gsm_it, lambda: _open_hf_stream("openai/gsm8k", "main", rank=rank, world_size=world_size)
+                            )
+                        else:
+                            row, math_it = _next_or_reopen(
+                                math_it, lambda: _open_hf_stream("meta-math/MetaMathQA", rank=rank, world_size=world_size)
+                            )
+                        yield row
+
+                    elif mod10 in (5, 8):
+                        # Python Software & Algorithm Synthesis (Self-OSS-Instruct)
+                        row, code_it = _next_or_reopen(
+                            code_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct", rank=rank, world_size=world_size)
+                        )
+                        yield row
+
+                    else:
+                        # Knowledge Retention Anchor (FineWeb-Edu score >= 4.0) -> Prevents catastrophic forgetting!
+                        row, know_it = _next_or_reopen(
+                            know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-10BT", rank=rank, world_size=world_size)
+                        )
+                        yield row
+
+                except Exception:
+                    time.sleep(0.5)
+                turn += 1
+
+        return _sft_gen()
 
     if source == "dense_edu":
         cosmo_it: Optional[Iterator[Any]] = None
