@@ -181,9 +181,9 @@ def parse_args(args_list=None):
     parser.add_argument("--max_thinking_cycles", "--max-thinking-cycles", dest="max_thinking_cycles", type=int, default=16, help="Maximum thinking cycles when adaptive thinking is active (default: 16)")
 
     # Data Source & Tokenizer
-    parser.add_argument("--dataset_source", "--dataset-source", dest="dataset_source", type=str, default="dense_edu",
-                        choices=["dense_edu", "local", "conversation_sft", "balanced_mix", "reasoning_anneal", "fineweb_edu", "openhermes"],
-                        help="Data stream: 'dense_edu' (40%% Cosmo + 40%% FineWeb + 20%% Hermes), 'local' (offline 9,500 curated cognitive docs), 'conversation_sft', 'balanced_mix', 'reasoning_anneal'")
+    parser.add_argument("--dataset_source", "--dataset-source", dest="dataset_source", type=str, default="autonomous",
+                        choices=["autonomous", "v5_base", "reasoning_anneal", "dense_edu", "local", "conversation_sft", "balanced_mix", "tri_pillar", "fineweb_edu", "openhermes", "consolidation"],
+                        help="Data stream: 'autonomous' (4-phase developmental curriculum for v5_base), 'reasoning_anneal' (1:1:1 Tri-Pillar), 'dense_edu', 'conversation_sft', 'consolidation'")
     parser.add_argument("--tokenizer_name", type=str, default="llama", help="Tokenizer model name or path (default: 'llama' -> data/tokenizer)")
 
     # Checkpoint & Cloud Sync
@@ -215,6 +215,8 @@ def build_data_stream(
     use_elastic_window: bool,
     vocab_size: int = 32000,
     prefetch_queue_size: int = 16,
+    step_getter: Optional[Any] = None,
+    total_steps: int = 1_500_000,
 ):
     """Initializes multi-corpus streaming engine with background prefetching and offline fallback."""
     # Check if HuggingFace datasets library is available for online streaming
@@ -244,7 +246,11 @@ def build_data_stream(
     try:
         import itertools
 
-        raw_iter = build_online_dataset_iterator(dataset_source=dataset_source)
+        raw_iter = build_online_dataset_iterator(
+            dataset_source=dataset_source,
+            step_getter=step_getter,
+            total_steps=total_steps,
+        )
         first_row = next(raw_iter)
         data_iter = itertools.chain([first_row], raw_iter)
 
@@ -608,6 +614,8 @@ def main(args=None):
             )
 
     # 7. Multi-Stream Ingestion & Prefetching
+    current_step_holder = [start_step]
+
     local_streamer, elastic_batcher = build_data_stream(
         dataset_source=args.dataset_source,
         tokenizer=tokenizer,
@@ -618,6 +626,8 @@ def main(args=None):
         use_elastic_window=args.elastic_window,
         vocab_size=config.vocab_size,
         prefetch_queue_size=max(16, eff_num_devices * eff_local_steps * 2),
+        step_getter=lambda: current_step_holder[0],
+        total_steps=args.total_steps,
     )
 
     def _unpack_batch(batch_tuple):
@@ -675,36 +685,54 @@ def main(args=None):
     else:
         print(f"✓ XLA Compilation complete in {time.time() - t0_compile:.2f}s! Initial Loss: {init_loss_val:.4f}")
 
-    # 9. Clean Held-Out Validation Split (sampled from active data distribution with -100 target padding)
+    # 9. Clean Canonical Multi-Domain Held-Out Validation Split
     eval_batches = []
+    eval_domains = []
     try:
-        if elastic_batcher is not None:
-            for _ in range(4):
-                b_tup = (
-                    elastic_batcher.get_batch()
-                    if hasattr(elastic_batcher, "get_batch")
-                    else elastic_batcher.next_batch()
-                )
-                eval_batches.append(_unpack_batch(b_tup))
-        elif os.path.exists("data/tokenizer"):
-            stream_val = LinguisticDataStreamer(
-                batch_size=args.batch_size,
-                prompt_len=args.prompt_len,
-                target_len=args.seq_len,
-                vocab_size=config.vocab_size,
-                queue_size=4,
-                target_pad_id=-100,
-            )
-            try:
-                for _ in range(4):
-                    vp, vt = stream_val.get_batch()
-                    eval_batches.append((vp, vt, None))
-            finally:
-                if hasattr(stream_val, "stop"):
-                    stream_val.stop()
-        print(f"✅ Clean Benchmark Held-Out Validation: Prepared {len(eval_batches)} evaluation batches.")
+        from src.elastic_window import build_canonical_eval_split
+        eval_batches, eval_domains = build_canonical_eval_split(
+            tokenizer=tokenizer,
+            batch_size=args.batch_size,
+            prompt_len=args.prompt_len,
+            target_len=args.seq_len,
+            target_pad_id=-100,
+            pad_id=pad_id,
+        )
+        print(f"✅ Clean Benchmark Held-Out Validation: Prepared {len(eval_batches)} canonical evaluation domains:")
+        for d_name in eval_domains:
+            print(f"   ├─ Domain: {d_name}")
     except Exception as e:
-        print(f"⚠️ Validation setup notice: {e}")
+        print(f"⚠️ Canonical validation setup notice: {e}. Falling back to active stream.")
+        eval_batches = []
+        try:
+            if elastic_batcher is not None:
+                for _ in range(4):
+                    b_tup = (
+                        elastic_batcher.get_batch()
+                        if hasattr(elastic_batcher, "get_batch")
+                        else elastic_batcher.next_batch()
+                    )
+                    eval_batches.append(_unpack_batch(b_tup))
+            elif os.path.exists("data/tokenizer"):
+                stream_val = LinguisticDataStreamer(
+                    batch_size=args.batch_size,
+                    prompt_len=args.prompt_len,
+                    target_len=args.seq_len,
+                    vocab_size=config.vocab_size,
+                    queue_size=4,
+                    target_pad_id=-100,
+                )
+                try:
+                    for _ in range(4):
+                        vp, vt = stream_val.get_batch()
+                        eval_batches.append((vp, vt, None))
+                finally:
+                    if hasattr(stream_val, "stop"):
+                        stream_val.stop()
+            eval_domains = [f"Domain_{i}" for i in range(len(eval_batches))]
+            print(f"✅ Prepared {len(eval_batches)} fallback evaluation batches.")
+        except Exception as e_inner:
+            print(f"⚠️ Fallback validation setup notice: {e_inner}")
 
     @jax.jit
     def eval_step_loss(p, q_b, r_b, fb_b=None):
@@ -825,6 +853,7 @@ def main(args=None):
         while step < args.total_steps and not shutdown_requested:
             prev_step = step
             step += step_stride
+            current_step_holder[0] = step
 
             cur_lr = get_learning_rate(step, args.total_steps, args.lr, args.min_lr, args.warmup_steps)
 
@@ -898,6 +927,10 @@ def main(args=None):
             if math.isfinite(loss_val):
                 # Smooth 0.96 / 0.04 EMA update to prevent single-batch spikes from oscillating the governor
                 ema_loss = loss_val if ema_loss is None else (0.96 * ema_loss + 0.04 * loss_val)
+            else:
+                print(f"\n⚠️ [Divergence Watchdog] Non-finite loss ({loss_val}) detected at Step {step:,}! Stabilizing optimizer momentum...")
+                ema_loss = last_eval_loss if math.isfinite(last_eval_loss) else 3.00
+                cur_lr = cur_lr * 0.75
 
             # Step & token throughput accounting
             step_window_tokens += step_tokens
@@ -928,14 +961,18 @@ def main(args=None):
             crossed_eval = bool(eval_batches) and ((step // max(1, args.eval_interval)) > (prev_step // max(1, args.eval_interval)))
             if crossed_eval:
                 eval_p = jax.device_put(_get_host_params(), devices[0]) if use_multi_tpu_local_sgd else params
-                val_losses = [eval_step_loss(eval_p, vp, vt, vfb) for vp, vt, vfb in eval_batches]
-                eval_loss = float(jnp.mean(jnp.stack(val_losses)))
+                val_losses = [float(eval_step_loss(eval_p, vp, vt, vfb)) for vp, vt, vfb in eval_batches]
+                eval_loss = float(np.mean(val_losses)) if val_losses else float("inf")
                 last_eval_loss = eval_loss
                 eval_ppl = math.exp(min(eval_loss, 20.0))
                 is_champion = eval_loss < best_eval_loss
 
                 champ_tag = "🏆 (NEW CHAMPION RECORD)" if is_champion else ""
-                print(f"📊 [Eval @ Step {step:,}] Held-Out Loss: {eval_loss:.4f} | PPL: {eval_ppl:.2f} {champ_tag}")
+                print(f"📊 [Eval @ Step {step:,}] Composite Held-Out Loss: {eval_loss:.4f} | PPL: {eval_ppl:.2f} {champ_tag}")
+                if len(val_losses) == len(eval_domains):
+                    for d_name, d_val in zip(eval_domains, val_losses):
+                        d_ppl = math.exp(min(d_val, 20.0))
+                        print(f"   ├─ {d_name:<26}: Loss {d_val:.4f} (PPL: {d_ppl:.2f})")
 
                 if is_champion:
                     best_eval_loss = eval_loss

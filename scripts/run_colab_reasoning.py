@@ -45,8 +45,8 @@ def parse_args():
         dest="dataset_source",
         type=str,
         default="reasoning_anneal",
-        choices=["reasoning_anneal", "reasoning", "frontier_mix", "beat_smollm", "dense_edu", "consolidation"],
-        help="Dataset stream (default: reasoning_anneal for 6-way Frontier Curriculum: SmolTalk + GSM8K + FineWeb-Edu)",
+        choices=["autonomous", "v5_base", "tri_pillar", "reasoning_anneal", "reasoning", "frontier_mix", "beat_smollm", "dense_edu", "consolidation"],
+        help="Dataset stream (default: reasoning_anneal for Tri-Pillar Curriculum; 'autonomous' for 4-phase developmental v5_base curriculum)",
     )
     parser.add_argument(
         "--total-steps",
