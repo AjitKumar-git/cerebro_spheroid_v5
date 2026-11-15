@@ -251,7 +251,8 @@ def main(args=None):
     target_dtype = resolve_jax_compute_dtype(args.dtype)
 
     init_rng = jax.random.PRNGKey(42)
-    params, buffers = init_params_v5(init_rng, config=config, target_dtype=target_dtype)
+    params, buffers = init_params_v5(init_rng, config=config)
+    params = {k: v.astype(target_dtype) for k, v in params.items()}
 
     # 2. Base Checkpoint Loading or SFT Resumption
     sft_latest_path = os.path.join(args.checkpoint_dir, f"{sft_model_name}_latest.pt")
