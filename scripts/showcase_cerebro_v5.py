@@ -213,27 +213,34 @@ def print_banner(step, loss, device, params_m):
 
 
 def show_benchmark_scoreboard():
-    print(f"\n{BOLD}🏆 AXIS 1: STANDARDIZED BENCHMARK SHOWDOWN (Sample Efficiency){RESET}")
-    print(f"{DIM}Comparing CerebroSpheroid V5 (7.37B tokens) vs. SmolLM2-135M (600B tokens) & Random Chance{RESET}\n")
+    print(f"\n{BOLD}📊 AXIS 1: SCALING LAWS & TRAINING DATA COMPARISON{RESET}")
+    print(f"{DIM}Honest, rigorous comparison: SmolLM2-135M (Fully Overtrained) vs. CerebroSpheroid V5 Small (Protobrain Prototype){RESET}\n")
 
-    headers = f"{'Benchmark Metric':<28} | {'CerebroSpheroid V5':<20} | {'SmolLM2-135M (600B)':<20} | {'Baseline / Chance':<16}"
+    headers = f"{'Evaluation Dimension':<28} | {'CerebroSpheroid V5 Small':<26} | {'SmolLM2-135M (Hugging Face)':<28} | {'Status / Interpretation':<20}"
     sep = "-" * len(headers)
     print(BOLD + headers + RESET)
     print(sep)
 
     rows = [
-        ("ARC (Science Reasoning)", "50.0%  (2/4)", "34.1%", "25.0% (Random)", f"{GREEN}{BOLD}+15.9% Superiority{RESET}"),
-        ("HellaSwag (Commonsense)", "50.0%  (1/2)", "39.5%", "25.0% (Random)", f"{GREEN}{BOLD}+10.5% Superiority{RESET}"),
-        ("HumanEval-Mini (Code)", "33.3%  (1/3)", "12.5%", "0.0% (Syntax)", f"{GREEN}{BOLD}+20.8% Superiority{RESET}"),
-        ("Multi-Step Arithmetic", "100.0% (2/2)", "N/A (Variable)", "25.0% (Random)", f"{GREEN}{BOLD}+75.0% Superiority{RESET}"),
-        ("Token Budget Consumed", "7.37 Billion", "600.00 Billion", "—", f"{MAGENTA}{BOLD}81x Less Data!{RESET}"),
+        ("Parameter Count", "101.96 Million", "134.50 Million", "Comparable 100M Class"),
+        ("Active Recurrent Core", "77.40 Million (Spheroid)", "134.50 Million (Transformer)", "Recurrent Non-Transformer"),
+        ("Total Training Tokens", "7.37 Billion Tokens", "600.00 Billion Tokens", f"{YELLOW}81x Training Data Deficit{RESET}"),
+        ("Tokens Per Parameter", "72 Tokens / Param", "4,460 Tokens / Param", f"{YELLOW}Early Stage vs Overtrained{RESET}"),
+        ("Pretraining Cross-Entropy", "2.39 (PPL: 11.0)", "~1.35 (PPL: ~3.8)", "Early Concept Manifold"),
+        ("ARC-Challenge (N=1,172)", "~20.0% - 25.0% (At Chance)", "43.9% (Standard Lighteval)", f"{RED}Requires Data Scaling{RESET}"),
+        ("HellaSwag (N=10,042)", "~25.0% (At Chance)", "42.1% (Standard Lighteval)", f"{RED}Requires Data Scaling{RESET}"),
+        ("Inference Speed (RTX 3050)", "295 - 340 tok/s", "~120 - 150 tok/s", f"{GREEN}{BOLD}2.5x Faster Recurrent Speed{RESET}"),
+        ("Training Stability", "900,000 Steps (ρ = 0.926)", "Standard AdamW", f"{GREEN}{BOLD}Proven Contractive Manifold{RESET}"),
     ]
 
-    for metric, cerebro, smollm, base, note in rows:
-        print(f"{metric:<28} | {BOLD}{cerebro:<20}{RESET} | {smollm:<20} | {base:<16}  [{note}]")
+    for metric, cerebro, smollm, note in rows:
+        print(f"{metric:<28} | {BOLD}{cerebro:<26}{RESET} | {smollm:<28} | {note}")
     print(sep)
-    print(f"\n{BOLD}Key Takeaway:{RESET} Despite being trained on {MAGENTA}{BOLD}1.2% of the token volume{RESET} of SmolLM2,")
-    print(f"CerebroSpheroid's cortical geometry extracts significantly higher semantic structure per token.\n")
+    print(f"\n{BOLD}Scientific Reality:{RESET}")
+    print(f"  • Standard academic leaderboards (ARC, HellaSwag, MMLU) evaluate on {BOLD}thousands of questions{RESET} (3,548 ARC, 10,042 HellaSwag).")
+    print(f"  • At only 72 tokens/param (7.37B total), CerebroSpheroid is at the {BOLD}early protobrain stage{RESET} (chance level on massive test splits).")
+    print(f"  • SmolLM2 required {MAGENTA}{BOLD}600 Billion tokens{RESET} (81x more data) to reach 42-44% on those suites.")
+    print(f"  • The 900k steps proved {GREEN}{BOLD}100% numerical stability and recurrent feasibility{RESET}; true frontier accuracy requires scaling token volume to 100B+.\n")
 
 
 def show_manifold_vitals(model, tokenizer, device):
@@ -368,7 +375,7 @@ def main():
 
     while True:
         print(f"{BOLD}Showcase Menu:{RESET}")
-        print("  [1] 🏆 Benchmark Showdown (CerebroSpheroid vs SmolLM2-135M & Random Chance)")
+        print("  [1] 📊 Scaling Laws & Data Profile (CerebroSpheroid vs SmolLM2-135M Reality)")
         print("  [2] 🧠 Live Scientific & Cognitive Reasoning Demonstration (5 Domains)")
         print("  [3] ⚡ Biological Manifold Vitals & Generation Speed (tok/sec)")
         print("  [4] 🔬 Test Your Own Custom Query Live")
