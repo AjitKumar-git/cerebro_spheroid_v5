@@ -1,0 +1,1124 @@
+{
+  "metadata": {
+    "checkpoint": "v5_small_latest_step834k.pt",
+    "step": 834000,
+    "train_loss": 2.236799716949463,
+    "eval_loss": 2.42836332321167,
+    "device": "cuda",
+    "timestamp": "2026-11-15T06:07:17Z"
+  },
+  "summary": {
+    "ARC-Challenge": {
+      "acc": 20.0,
+      "acc_norm": 40.0,
+      "n": 25
+    },
+    "ARC-Easy": {
+      "acc": 20.0,
+      "acc_norm": 16.0,
+      "n": 25
+    },
+    "HellaSwag": {
+      "acc": 22.0,
+      "acc_norm": 24.0,
+      "n": 50
+    },
+    "MMLU": {
+      "acc": 18.0,
+      "acc_norm": 18.0,
+      "n": 50
+    },
+    "GSM8K": {
+      "acc": 0.0,
+      "acc_norm": 0.0,
+      "n": 20
+    }
+  },
+  "composite": {
+    "acc_norm": 19.6,
+    "acc": 16.0,
+    "smollm2_ref": 32.6
+  },
+  "details": {
+    "ARC-Challenge": [
+      {
+        "question": "An astronomer observes that a planet rotates faster after a ",
+        "target": "C",
+        "pred_norm": "A",
+        "correct": false
+      },
+      {
+        "question": "A group of engineers wanted to know how different building d",
+        "target": "B",
+        "pred_norm": "B",
+        "correct": true
+      },
+      {
+        "question": "The end result in the process of photosynthesis is the produ",
+        "target": "C",
+        "pred_norm": "D",
+        "correct": false
+      },
+      {
+        "question": "A physicist wants to determine the speed a car must reach to",
+        "target": "D",
+        "pred_norm": "D",
+        "correct": true
+      },
+      {
+        "question": "An astronaut drops a 1.0 kg object and a 5.0 kg object on th",
+        "target": "D",
+        "pred_norm": "D",
+        "correct": true
+      },
+      {
+        "question": "Devil facial tumor disease (DFTD) is a disease that is decim",
+        "target": "B",
+        "pred_norm": "B",
+        "correct": true
+      },
+      {
+        "question": "A type of small mammal from the mountain regions of the west",
+        "target": "C",
+        "pred_norm": "A",
+        "correct": false
+      },
+      {
+        "question": "Petrified palm trees are found in sedimentary rock near glac",
+        "target": "C",
+        "pred_norm": "B",
+        "correct": false
+      },
+      {
+        "question": "Farmers in Wyoming were concerned because some of their chic",
+        "target": "B",
+        "pred_norm": "B",
+        "correct": true
+      },
+      {
+        "question": "Copper is an element that is used in electrical wires. What ",
+        "target": "A",
+        "pred_norm": "C",
+        "correct": false
+      },
+      {
+        "question": "According to cell classification, prokaryotic cells are sepa",
+        "target": "B",
+        "pred_norm": "D",
+        "correct": false
+      },
+      {
+        "question": "Which statement best describes the effect of the Sun on the ",
+        "target": "A",
+        "pred_norm": "B",
+        "correct": false
+      },
+      {
+        "question": "The morning temperature in a city is 41\u00b0F. If a sunny, mild ",
+        "target": "C",
+        "pred_norm": "C",
+        "correct": true
+      },
+      {
+        "question": "A class plans an investigation to see which brand of light b",
+        "target": "C",
+        "pred_norm": "C",
+        "correct": true
+      },
+      {
+        "question": "Which of these gases is the most abundant greenhouse gas in ",
+        "target": "C",
+        "pred_norm": "D",
+        "correct": false
+      },
+      {
+        "question": "At which temperature does water freeze?",
+        "target": "A",
+        "pred_norm": "A",
+        "correct": true
+      },
+      {
+        "question": "Fossil bones and teeth of dinosaurs have been researched for",
+        "target": "C",
+        "pred_norm": "D",
+        "correct": false
+      },
+      {
+        "question": "Molly was making iced tea by putting tea bags in boiling wat",
+        "target": "B",
+        "pred_norm": "C",
+        "correct": false
+      },
+      {
+        "question": "Logging companies cut trees in a forest and send the trees t",
+        "target": "A",
+        "pred_norm": "A",
+        "correct": true
+      },
+      {
+        "question": "It was once thought that living organisms could come from no",
+        "target": "C",
+        "pred_norm": "D",
+        "correct": false
+      },
+      {
+        "question": "Cells take in food for energy. The part of the cell that aid",
+        "target": "B",
+        "pred_norm": "B",
+        "correct": true
+      },
+      {
+        "question": "When an electric current is passed through water (H_{2}O) us",
+        "target": "B",
+        "pred_norm": "D",
+        "correct": false
+      },
+      {
+        "question": "Which is a fact about penguins?",
+        "target": "A",
+        "pred_norm": "B",
+        "correct": false
+      },
+      {
+        "question": "A glass of water at 110\u00b0F is placed in a room next to a glas",
+        "target": "C",
+        "pred_norm": "B",
+        "correct": false
+      },
+      {
+        "question": "Snow, rain, hail, and fog are all forms of",
+        "target": "B",
+        "pred_norm": "D",
+        "correct": false
+      }
+    ],
+    "ARC-Easy": [
+      {
+        "question": "Which statement best explains why photosynthesis is the foun",
+        "target": "A",
+        "pred_norm": "B",
+        "correct": false
+      },
+      {
+        "question": "Which piece of safety equipment is used to keep mold spores ",
+        "target": "B",
+        "pred_norm": "A",
+        "correct": false
+      },
+      {
+        "question": "Meiosis is a type of cell division in which germ cells divid",
+        "target": "D",
+        "pred_norm": "C",
+        "correct": false
+      },
+      {
+        "question": "Which characteristic describes the texture of a kitten's fur",
+        "target": "D",
+        "pred_norm": "C",
+        "correct": false
+      },
+      {
+        "question": "Which best describes the structure of an atom?",
+        "target": "B",
+        "pred_norm": "C",
+        "correct": false
+      },
+      {
+        "question": "To express the distance between the Milky Way galaxy and oth",
+        "target": "C",
+        "pred_norm": "A",
+        "correct": false
+      },
+      {
+        "question": "A student has just completed a laboratory activity. What is ",
+        "target": "A",
+        "pred_norm": "A",
+        "correct": true
+      },
+      {
+        "question": "Students are investigating the effects of different fertiliz",
+        "target": "C",
+        "pred_norm": "B",
+        "correct": false
+      },
+      {
+        "question": "Plants use sunlight to make",
+        "target": "C",
+        "pred_norm": "A",
+        "correct": false
+      },
+      {
+        "question": "Which of these correctly identifies the way materials are tr",
+        "target": "A",
+        "pred_norm": "B",
+        "correct": false
+      },
+      {
+        "question": "When trees develop leaves in the spring, 10 changes occur on",
+        "target": "B",
+        "pred_norm": "D",
+        "correct": false
+      },
+      {
+        "question": "The circulatory system and the endocrine system work togethe",
+        "target": "B",
+        "pred_norm": "C",
+        "correct": false
+      },
+      {
+        "question": "A student throws a ball into the air. While the ball travels",
+        "target": "B",
+        "pred_norm": "C",
+        "correct": false
+      },
+      {
+        "question": "Which of these will most likely harm a habitat?",
+        "target": "B",
+        "pred_norm": "D",
+        "correct": false
+      },
+      {
+        "question": "All living and nonliving material is composed of",
+        "target": "B",
+        "pred_norm": "C",
+        "correct": false
+      },
+      {
+        "question": "Which process best explains how the Grand Canyon became so w",
+        "target": "B",
+        "pred_norm": "D",
+        "correct": false
+      },
+      {
+        "question": "As global temperatures increase, certain organisms will be m",
+        "target": "B",
+        "pred_norm": "B",
+        "correct": true
+      },
+      {
+        "question": "A dish of sugar water was left on a window sill. One week la",
+        "target": "D",
+        "pred_norm": "B",
+        "correct": false
+      },
+      {
+        "question": "Using a softball bat to hit a softball is an example of usin",
+        "target": "B",
+        "pred_norm": "A",
+        "correct": false
+      },
+      {
+        "question": "When an igneous intrusion comes into contact with surroundin",
+        "target": "D",
+        "pred_norm": "A",
+        "correct": false
+      },
+      {
+        "question": "A research scientist writes a paper on the initial regrowth ",
+        "target": "D",
+        "pred_norm": "C",
+        "correct": false
+      },
+      {
+        "question": "Where do plants get most of the energy they need to live and",
+        "target": "D",
+        "pred_norm": "D",
+        "correct": true
+      },
+      {
+        "question": "Which is a statement about climate?",
+        "target": "D",
+        "pred_norm": "C",
+        "correct": false
+      },
+      {
+        "question": "While on a movie set, a stuntman jumps off the roof of a bui",
+        "target": "C",
+        "pred_norm": "C",
+        "correct": true
+      },
+      {
+        "question": "Jessica wants to see cells in an oak tree leaf. Which tool i",
+        "target": "B",
+        "pred_norm": "D",
+        "correct": false
+      }
+    ],
+    "HellaSwag": [
+      {
+        "context": "A man is sitting on a roof. he",
+        "target": 3,
+        "pred_norm": 1,
+        "correct": false
+      },
+      {
+        "context": "A lady walks to a barbell. She bends down and grabs the pole",
+        "target": 3,
+        "pred_norm": 0,
+        "correct": false
+      },
+      {
+        "context": "Two women in a child are shown in a canoe while a man pulls ",
+        "target": 2,
+        "pred_norm": 2,
+        "correct": true
+      },
+      {
+        "context": "A boy is running down a track. the boy",
+        "target": 2,
+        "pred_norm": 1,
+        "correct": false
+      },
+      {
+        "context": "The boy lifts his body above the height of a pole. The boy l",
+        "target": 1,
+        "pred_norm": 0,
+        "correct": false
+      },
+      {
+        "context": "The boy lands on his back on to a red mat. The boy gets up f",
+        "target": 1,
+        "pred_norm": 0,
+        "correct": false
+      },
+      {
+        "context": "A man is standing in front of a camera. He starts playing a ",
+        "target": 2,
+        "pred_norm": 1,
+        "correct": false
+      },
+      {
+        "context": "A cartoon animation video is shown with people wandering aro",
+        "target": 0,
+        "pred_norm": 1,
+        "correct": false
+      },
+      {
+        "context": "A man is holding a pocket knife while sitting on some rocks ",
+        "target": 1,
+        "pred_norm": 2,
+        "correct": false
+      },
+      {
+        "context": "Then he takes a small stone from the flowing river and smash",
+        "target": 1,
+        "pred_norm": 1,
+        "correct": true
+      },
+      {
+        "context": "Then he takes a piece of bark and rubs the powered stone pie",
+        "target": 3,
+        "pred_norm": 1,
+        "correct": false
+      },
+      {
+        "context": "The stone particles stick to the wet piece of wood. He then ",
+        "target": 3,
+        "pred_norm": 1,
+        "correct": false
+      },
+      {
+        "context": "He then takes the knife and sharpens it against the wood pie",
+        "target": 2,
+        "pred_norm": 2,
+        "correct": true
+      },
+      {
+        "context": "He then notices a little black and green poisonous frog sitt",
+        "target": 2,
+        "pred_norm": 2,
+        "correct": true
+      },
+      {
+        "context": "A person is playing bagpipes out in a park. A man and two bo",
+        "target": 0,
+        "pred_norm": 3,
+        "correct": false
+      },
+      {
+        "context": "Two people are seen passing a ball back and fourth in a pool",
+        "target": 3,
+        "pred_norm": 3,
+        "correct": true
+      },
+      {
+        "context": "A woman is sitting at a table in a fast food restaurant whil",
+        "target": 2,
+        "pred_norm": 3,
+        "correct": false
+      },
+      {
+        "context": "A group of cheerleaders run onto a stage before a cheering a",
+        "target": 0,
+        "pred_norm": 2,
+        "correct": false
+      },
+      {
+        "context": "A group of cheerleaders run onto a stage before a cheering a",
+        "target": 1,
+        "pred_norm": 1,
+        "correct": true
+      },
+      {
+        "context": "They get into formation, then begin dancing and flipping as ",
+        "target": 1,
+        "pred_norm": 2,
+        "correct": false
+      },
+      {
+        "context": "A woman is reading a newspaper nearby while he speaks to her",
+        "target": 1,
+        "pred_norm": 1,
+        "correct": true
+      },
+      {
+        "context": "A man is outside of a building. He is using commercial lawn ",
+        "target": 0,
+        "pred_norm": 2,
+        "correct": false
+      },
+      {
+        "context": "Children bring desert out for their family member. the famil",
+        "target": 3,
+        "pred_norm": 1,
+        "correct": false
+      },
+      {
+        "context": "The family enjoys eating the desert together. The people in ",
+        "target": 3,
+        "pred_norm": 1,
+        "correct": false
+      },
+      {
+        "context": "A black female is shown in a room with a black scarf around ",
+        "target": 0,
+        "pred_norm": 0,
+        "correct": true
+      },
+      {
+        "context": "A black female is shown in a room with a black scarf around ",
+        "target": 3,
+        "pred_norm": 0,
+        "correct": false
+      },
+      {
+        "context": "A helicopter flies in some people who then start playing pai",
+        "target": 0,
+        "pred_norm": 1,
+        "correct": false
+      },
+      {
+        "context": "A young boy and girl are standing over a sink with their mot",
+        "target": 3,
+        "pred_norm": 1,
+        "correct": false
+      },
+      {
+        "context": "A young boy and girl are standing over a sink with their mot",
+        "target": 1,
+        "pred_norm": 1,
+        "correct": true
+      },
+      {
+        "context": "The mother instructs them on how to brush their teeth while ",
+        "target": 3,
+        "pred_norm": 3,
+        "correct": true
+      },
+      {
+        "context": "She gets them some water to gargle in their mouths. The boy ",
+        "target": 1,
+        "pred_norm": 3,
+        "correct": false
+      },
+      {
+        "context": "A cat is sitting in a cat bed. It is licking its paw. it",
+        "target": 0,
+        "pred_norm": 0,
+        "correct": true
+      },
+      {
+        "context": "A man in brown jacket is pulling out an arrow from the targe",
+        "target": 1,
+        "pred_norm": 0,
+        "correct": false
+      },
+      {
+        "context": "A man walks outside plugs his lawn mower in and gets ready t",
+        "target": 2,
+        "pred_norm": 3,
+        "correct": false
+      },
+      {
+        "context": "A man walks outside plugs his lawn mower in and gets ready t",
+        "target": 0,
+        "pred_norm": 1,
+        "correct": false
+      },
+      {
+        "context": "He starts mowing his lawn casually going over all the grass.",
+        "target": 0,
+        "pred_norm": 2,
+        "correct": false
+      },
+      {
+        "context": "A sea is shown with a green forest on seashore. Blond man is",
+        "target": 3,
+        "pred_norm": 0,
+        "correct": false
+      },
+      {
+        "context": "We see a bottle of face wash. we",
+        "target": 2,
+        "pred_norm": 0,
+        "correct": false
+      },
+      {
+        "context": "We see a person holding face wash then putting it on their f",
+        "target": 2,
+        "pred_norm": 0,
+        "correct": false
+      },
+      {
+        "context": "A person is seen throwing plaster onto a wall while the came",
+        "target": 1,
+        "pred_norm": 0,
+        "correct": false
+      },
+      {
+        "context": "More and more people begin talking and each of them has a bo",
+        "target": 2,
+        "pred_norm": 2,
+        "correct": true
+      },
+      {
+        "context": "A group of boys are standing in a room with many clear cups ",
+        "target": 2,
+        "pred_norm": 0,
+        "correct": false
+      },
+      {
+        "context": "The boys talk, laugh and tease each other before beginning a",
+        "target": 3,
+        "pred_norm": 1,
+        "correct": false
+      },
+      {
+        "context": "One of the ping pongs lands in the cup and one of the boys b",
+        "target": 2,
+        "pred_norm": 3,
+        "correct": false
+      },
+      {
+        "context": "There's a nbc news reporter wearing a red sweater and white ",
+        "target": 0,
+        "pred_norm": 3,
+        "correct": false
+      },
+      {
+        "context": "The representative from the company is talking about the ser",
+        "target": 0,
+        "pred_norm": 3,
+        "correct": false
+      },
+      {
+        "context": "A woman tries to eat ice cream to a child, but the child ref",
+        "target": 0,
+        "pred_norm": 1,
+        "correct": false
+      },
+      {
+        "context": "After, the woman gives ice cream to the child, and then the ",
+        "target": 0,
+        "pred_norm": 3,
+        "correct": false
+      },
+      {
+        "context": "Men are lifting heavy weights over their head several times.",
+        "target": 3,
+        "pred_norm": 0,
+        "correct": false
+      },
+      {
+        "context": "In home pet groomers demonstrate how to groom a pet. the per",
+        "target": 2,
+        "pred_norm": 0,
+        "correct": false
+      }
+    ],
+    "MMLU": [
+      {
+        "subject": "abstract_algebra",
+        "question": "Find the degree for the given field extension Q(sqrt(2), sqr",
+        "target": "B",
+        "pred_norm": "C",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Let p = (1, 2, 5, 4)(2, 3) in S_5 . Find the index of <p> in",
+        "target": "C",
+        "pred_norm": "B",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Find all zeros in the indicated finite field of the given po",
+        "target": "D",
+        "pred_norm": "D",
+        "correct": true
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Statement 1 | A factor group of a non-Abelian group is non-A",
+        "target": "B",
+        "pred_norm": "A",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Find the product of the given polynomials in the given polyn",
+        "target": "B",
+        "pred_norm": "C",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Statement 1 | If a group has an element of order 15 it must ",
+        "target": "A",
+        "pred_norm": "A",
+        "correct": true
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Statement 1 | Every homomorphic image of a group G is isomor",
+        "target": "A",
+        "pred_norm": "A",
+        "correct": true
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Statement 1 | A ring homomorphism is one to one if and only ",
+        "target": "D",
+        "pred_norm": "C",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Find the degree for the given field extension Q(sqrt(2) + sq",
+        "target": "B",
+        "pred_norm": "D",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Find all zeros in the indicated finite field of the given po",
+        "target": "C",
+        "pred_norm": "B",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Statement 1 | If H is a subgroup of G and a belongs to G the",
+        "target": "C",
+        "pred_norm": "A",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "If A = {1, 2, 3} then relation S = {(1, 1), (2, 2)} is",
+        "target": "C",
+        "pred_norm": "B",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Find the order of the factor group (Z_11 x Z_15)/(<1, 1>)",
+        "target": "A",
+        "pred_norm": "B",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "The polynomial x^3 + 2x^2 + 2x + 1 can be factored into line",
+        "target": "C",
+        "pred_norm": "B",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Find the maximum possible order for an element of S_n for n ",
+        "target": "C",
+        "pred_norm": "B",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Statement 1 | R is a splitting field of some polynomial over",
+        "target": "B",
+        "pred_norm": "C",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "The inverse of -i in the multiplicative group, {1, -1, i , -",
+        "target": "C",
+        "pred_norm": "A",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Compute the product in the given ring. (2,3)(3,5) in Z_5 x Z",
+        "target": "C",
+        "pred_norm": "B",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "The set of all real numbers under the usual multiplication o",
+        "target": "D",
+        "pred_norm": "B",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Statement 1| Every group of order p^2 where p is prime is Ab",
+        "target": "A",
+        "pred_norm": "A",
+        "correct": true
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Statement 1 | For finite groups G and H, |G + H| = |G||H|. (",
+        "target": "A",
+        "pred_norm": "B",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Find the sum of the given polynomials in the given polynomia",
+        "target": "A",
+        "pred_norm": "C",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Statement 1 | Any set of two vectors in R^2 is linearly inde",
+        "target": "D",
+        "pred_norm": "D",
+        "correct": true
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "The set of all nth roots of unity under multiplication of co",
+        "target": "D",
+        "pred_norm": "C",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Statement 1 | Every maximal ideal is a prime ideal. Statemen",
+        "target": "B",
+        "pred_norm": "C",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Let G denoted the set of all n x n non-singular matrices wit",
+        "target": "C",
+        "pred_norm": "D",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Statement 1 | Every group of order 42 has a normal subgroup ",
+        "target": "C",
+        "pred_norm": "A",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Determine whether the polynomial in Z[x] satisfies an Eisens",
+        "target": "B",
+        "pred_norm": "C",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Statement 1 | The image of a group of 6 elements under a hom",
+        "target": "D",
+        "pred_norm": "C",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Statement 1 | The homomorphic image of a cyclic group is cyc",
+        "target": "A",
+        "pred_norm": "A",
+        "correct": true
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Statement 1 | If H is a subgroup of a group G and a belongs ",
+        "target": "B",
+        "pred_norm": "A",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "If (G, .) is a group such that (ab)^-1 = a^-1b^-1, for all a",
+        "target": "B",
+        "pred_norm": "D",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Statement 1 | In a finite dimensional vector space every lin",
+        "target": "A",
+        "pred_norm": "B",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Some group (G, 0) is known to be abelian. Then which one of ",
+        "target": "C",
+        "pred_norm": "B",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Statement 1 | If T: V -> W is a linear transformation and di",
+        "target": "A",
+        "pred_norm": "D",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Find the degree for the given field extension Q(sqrt(2), sqr",
+        "target": "B",
+        "pred_norm": "D",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Compute the product in the given ring. (20)(-8) in Z_26",
+        "target": "D",
+        "pred_norm": "C",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Determine whether the polynomial in Z[x] satisfies an Eisens",
+        "target": "B",
+        "pred_norm": "B",
+        "correct": true
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Find the generator for the finite field Z_7.",
+        "target": "C",
+        "pred_norm": "B",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Statement 1 | Every permutation is a cycle. Statement 2 | Ev",
+        "target": "D",
+        "pred_norm": "C",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "The set of integers Z with the binary operation \"*\" defined ",
+        "target": "C",
+        "pred_norm": "D",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Find the characteristic of the ring Z_3 x 3Z.",
+        "target": "A",
+        "pred_norm": "C",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Statement 1 | Some abelian group of order 45 has a subgroup ",
+        "target": "B",
+        "pred_norm": "A",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Statement 1 | Every integral domain with characteristic 0 is",
+        "target": "C",
+        "pred_norm": "C",
+        "correct": true
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Let A and B be sets, f: A -> B and g: B -> A be functions su",
+        "target": "C",
+        "pred_norm": "B",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Statement 1 | For any two groups G and G', there exists a ho",
+        "target": "C",
+        "pred_norm": "B",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Statement 1 | A homomorphism may have an empty kernel. State",
+        "target": "B",
+        "pred_norm": "C",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Find all c in Z_3 such that Z_3[x]/(x^3 + x^2 + c) is a fiel",
+        "target": "B",
+        "pred_norm": "B",
+        "correct": true
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Statement 1 | If a R is an integral domain, then R[x] is an ",
+        "target": "C",
+        "pred_norm": "A",
+        "correct": false
+      },
+      {
+        "subject": "abstract_algebra",
+        "question": "Find the maximum possible order for some element of Z_8 x Z_",
+        "target": "B",
+        "pred_norm": "D",
+        "correct": false
+      }
+    ],
+    "GSM8K": [
+      {
+        "question": "Janet\u2019s ducks lay 16 eggs per day. She eats three for breakf",
+        "target": "18",
+        "extracted": null,
+        "correct": false
+      },
+      {
+        "question": "A robe takes 2 bolts of blue fiber and half that much white ",
+        "target": "3",
+        "extracted": null,
+        "correct": false
+      },
+      {
+        "question": "Josh decides to try flipping a house.  He buys a house for $",
+        "target": "70000",
+        "extracted": null,
+        "correct": false
+      },
+      {
+        "question": "James decides to run 3 sprints 3 times a week.  He runs 60 m",
+        "target": "540",
+        "extracted": null,
+        "correct": false
+      },
+      {
+        "question": "Every day, Wendi feeds each of her chickens three cups of mi",
+        "target": "20",
+        "extracted": null,
+        "correct": false
+      },
+      {
+        "question": "Kylar went to the store to buy glasses for his new apartment",
+        "target": "64",
+        "extracted": null,
+        "correct": false
+      },
+      {
+        "question": "Toulouse has twice as many sheep as Charleston. Charleston h",
+        "target": "260",
+        "extracted": null,
+        "correct": false
+      },
+      {
+        "question": "Carla is downloading a 200 GB file. Normally she can downloa",
+        "target": "160",
+        "extracted": null,
+        "correct": false
+      },
+      {
+        "question": "John drives for 3 hours at a speed of 60 mph and then turns ",
+        "target": "45",
+        "extracted": null,
+        "correct": false
+      },
+      {
+        "question": "Eliza's rate per hour for the first 40 hours she works each ",
+        "target": "460",
+        "extracted": null,
+        "correct": false
+      },
+      {
+        "question": "A new program had 60 downloads in the first month. The numbe",
+        "target": "366",
+        "extracted": null,
+        "correct": false
+      },
+      {
+        "question": "Toula went to the bakery and bought various types of pastrie",
+        "target": "694",
+        "extracted": null,
+        "correct": false
+      },
+      {
+        "question": "Carlos is planting a lemon tree. The tree will cost $90 to p",
+        "target": "13",
+        "extracted": null,
+        "correct": false
+      },
+      {
+        "question": "Melanie is a door-to-door saleswoman. She sold a third of he",
+        "target": "18",
+        "extracted": null,
+        "correct": false
+      },
+      {
+        "question": "In a dance class of 20 students, 20% enrolled in contemporar",
+        "target": "60",
+        "extracted": null,
+        "correct": false
+      },
+      {
+        "question": "A merchant wants to make a choice of purchase between 2 purc",
+        "target": "125",
+        "extracted": null,
+        "correct": false
+      },
+      {
+        "question": "Two trains leave San Rafael at the same time. They begin tra",
+        "target": "230",
+        "extracted": null,
+        "correct": false
+      },
+      {
+        "question": "Jill gets paid $20 per hour to teach and $30 to be a cheerle",
+        "target": "57500",
+        "extracted": null,
+        "correct": false
+      },
+      {
+        "question": "Claire makes a 3 egg omelet every morning for breakfast.  Ho",
+        "target": "7",
+        "extracted": null,
+        "correct": false
+      },
+      {
+        "question": "Marissa is hiking a 12-mile trail. She took 1 hour to walk t",
+        "target": "6",
+        "extracted": null,
+        "correct": false
+      }
+    ]
+  }
+}
