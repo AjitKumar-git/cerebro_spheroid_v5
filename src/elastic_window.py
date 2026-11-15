@@ -132,9 +132,14 @@ def _open_hf_stream(
         repo = "openai/gsm8k"
 
     if "HF_HOME" not in os.environ:
+        default_hub = os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub")
+        default_hf = os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
         default_cache = os.path.join(os.path.expanduser("~"), ".cache")
-        if not os.access(default_cache, os.W_OK):
+        if (os.path.exists(default_hub) and not os.access(default_hub, os.W_OK)) or \
+           (os.path.exists(default_hf) and not os.access(default_hf, os.W_OK)) or \
+           (not os.access(default_cache, os.W_OK)):
             os.environ["HF_HOME"] = "/tmp/hf_cache"
+            os.environ["HF_HUB_CACHE"] = "/tmp/hf_cache/hub"
 
     from datasets import load_dataset
 
