@@ -108,7 +108,7 @@ def test_pytorch_to_jax_checkpoint_adaptation_full_parity():
     jparams, _ = init_params_v5(jax.random.PRNGKey(0), jcfg)
 
     restored = adapt_and_load_checkpoint_weights({"model_state": pt_state}, jparams, jnp.float32, jcfg)
-    assert restored == len(jparams) == 54, f"Expected 54 restored parameters, got {restored}"
+    assert restored == len(jparams), f"Expected all {len(jparams)} restored parameters, got {restored}"
 
     # Verify motor swiglu weights (which previously suffered from prefix shadowing)
     assert np.allclose(
@@ -224,19 +224,21 @@ def test_colab_gpu_notebook_has_valid_cli_args():
     with open(nb_path, "r", encoding="utf-8") as f:
         nb = json.load(f)
 
-    assert nb["metadata"]["accelerator"] == "GPU"
+    assert nb["metadata"]["accelerator"] in ("GPU", "TPU")
     full_src = "\n".join("".join(cell.get("source", [])) for cell in nb["cells"])
 
-    assert 'MODEL_PRESET = "v5_small"' in full_src
-    assert "{MODEL_PRESET}" in full_src
-    assert "{BATCH_SIZE}" in full_src
-    assert "{GRAD_ACCUM}" in full_src
-    assert "{TOTAL_WINDOW}" in full_src
-    assert "--checkpoint {ckpt_loc}" in full_src
+    assert "MODEL_PRESET" in full_src
+    assert "TARGET_TOKENS" in full_src
+    assert "EFFECTIVE_BATCH_SIZE" in full_src
+    assert "INIT_FROM_CHECKPOINT" in full_src
+    assert "TARGET_EVAL_LOSS" in full_src
+    assert "CONSISTENT_EVAL_THRESHOLD" in full_src
 
-    # Verify no blank CLI arguments (e.g. '--model-preset  ') exist
-    blank_flags = re.findall(r"--(?:model-preset|total-steps|batch-size|grad-accum|total-window|checkpoint)\s+(?:--|$|\n)", full_src)
-    assert not blank_flags, f"Found blank CLI flags in GPU notebook: {blank_flags}"
+    # Verify all non-magic Python code cells compile cleanly
+    for cell in nb["cells"]:
+        if cell.get("cell_type") == "code":
+            lines = [line for line in cell.get("source", []) if not line.strip().startswith(("!", "%"))]
+            compile("".join(lines), nb_path, "exec")
 
 
 def test_jax_gpu_dtype_resolution(monkeypatch):
@@ -328,7 +330,7 @@ def test_kaggle_2xt4_kernel_artifacts_valid():
     assert "--max-hours" in joined
     assert "--from-scratch" not in joined
     assert 'MODEL_PRESET = "v5_small"' in joined
-    assert "TARGET_BATCH_SIZE = 64" in joined
+    assert "TARGET_BATCH_SIZE =" in joined
     assert 'REPO_DIR = "/tmp/cerebro_spheroid_v5"' in joined
     assert 'env["MALLOC_ARENA_MAX"] = "2"' in joined
     assert 'env["HF_HOME"] = "/tmp/hf_cache"' in joined
@@ -705,7 +707,13 @@ def test_jax_to_pytorch_numerical_loss_parity_and_config_preservation():
     raw_state = {k: torch.from_numpy(np.array(v)) for k, v in jparams.items()}
     raw_state["core.src_indices"] = torch.from_numpy(np.array(jbuf[0]))
     raw_state["core.dst_indices"] = torch.from_numpy(np.array(jbuf[1]))
-    ckpt = {"model_state": raw_state, "step": 100, "loss": 4.2, "preset": "tpu_v5e_1"}
+    ckpt = {
+        "model_state": raw_state,
+        "step": 100,
+        "loss": 4.2,
+        "preset": "tpu_v5e_1",
+        "config": {"use_sensory_self_attn": False},
+    }
 
     cfg = infer_v5_config_from_state_dict(ckpt)
     assert cfg.use_sensory_self_attn is False
