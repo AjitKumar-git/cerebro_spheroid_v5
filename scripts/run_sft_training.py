@@ -6,17 +6,19 @@ One-click CLI launcher for SFT alignment of CerebroSpheroid V5 models:
   • Automatically initializes from pre-trained champion checkpoint (Step 900k on bioflo.in).
   • Instruction-following alignment using curated SmolTalk, GSM8K-CoT, Self-OSS, and Magpie.
   • Invariant science anchor replay (10% FineWeb-Edu) guarantees zero knowledge forgetting.
-  • Live conversational probing every 500 steps.
-  • Asynchronous live synchronization with bioflo.in under {preset}_sft.
+  • Hardware Auto-Tuning: Adapts TPU v5e/v6e optimal batch sizes (Batch 128 @ 390k tok/s).
+  • Live conversational probing every 500 steps across 5 canonical task categories.
+  • Asynchronous live synchronization with bioflo.in under {preset}_sft with full token telemetry.
 
 Usage:
   # Launch SFT on Google Colab or Cloud TPU/GPU:
-  python3 scripts/run_sft_training.py --preset v5_small --total-steps 50000 --lr 3e-5
+  python3 scripts/run_sft_training.py --preset tpu_v5e_1 --effective-batch-size 256 --total-steps 50000 --lr 3e-5
   python3 scripts/run_sft_training.py --preset auto --total-steps 50000
 """
 
 import argparse
 import json
+import math
 import os
 import sys
 import urllib.request
@@ -72,6 +74,38 @@ def parse_args():
         help="Total SFT steps (default: 50,000)",
     )
     parser.add_argument(
+        "--target-tokens",
+        "--target_tokens",
+        dest="target_tokens",
+        type=int,
+        default=None,
+        help="Optional target token budget for SFT campaign",
+    )
+    parser.add_argument(
+        "--batch-size",
+        "--batch_size",
+        dest="batch_size",
+        type=int,
+        default=None,
+        help="Micro-batch size per device (auto-selected via hardware config if None)",
+    )
+    parser.add_argument(
+        "--effective-batch-size",
+        "--effective_batch_size",
+        dest="effective_batch_size",
+        type=int,
+        default=256,
+        help="Target effective batch size (default: 256 for TPU, 128 for GPU)",
+    )
+    parser.add_argument(
+        "--max-batch-size",
+        "--max_batch_size",
+        dest="max_batch_size",
+        type=int,
+        default=128,
+        help="Max micro-batch size cap for AutoTuner (default: 128)",
+    )
+    parser.add_argument(
         "--prompt-len",
         "--prompt_len",
         dest="prompt_len",
@@ -102,12 +136,12 @@ def parse_args():
         help="SFT floor learning rate (default: 3.0e-6)",
     )
     parser.add_argument(
-        "--batch-size",
-        "--batch_size",
-        dest="batch_size",
+        "--warmup-steps",
+        "--warmup_steps",
+        dest="warmup_steps",
         type=int,
-        default=None,
-        help="Batch size per device (auto-selected if None)",
+        default=500,
+        help="Linear warmup steps (default: 500)",
     )
     parser.add_argument(
         "--save-interval",
@@ -132,6 +166,22 @@ def parse_args():
         type=int,
         default=500,
         help="Live conversational generation probe interval (default: 500)",
+    )
+    parser.add_argument(
+        "--target-eval-loss",
+        "--target_eval_loss",
+        dest="target_eval_loss",
+        type=float,
+        default=1.40,
+        help="Target held-out evaluation loss for convergence (default: 1.40)",
+    )
+    parser.add_argument(
+        "--consistent-eval-threshold",
+        "--consistent_eval_threshold",
+        dest="consistent_eval_threshold",
+        type=int,
+        default=3,
+        help="Consecutive evaluations <= target-eval-loss required to confirm convergence (default: 3)",
     )
     parser.add_argument(
         "--checkpoint-dir",
@@ -164,6 +214,22 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable live bi-directional sync with bioflo.in (default: True)",
+    )
+    parser.add_argument(
+        "--auto-tune",
+        "--auto_tune",
+        dest="auto_tune",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Auto-tune or adopt verified hardware config (default: True)",
+    )
+    parser.add_argument(
+        "--force-tune",
+        "--force_tune",
+        dest="force_tune",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Force re-benchmarking ladder (default: False)",
     )
     return parser.parse_args()
 
@@ -230,6 +296,7 @@ def main():
     print(f"  Total SFT Steps     : {args.total_steps:,}")
     print(f"  Context Budget      : Prompt={args.prompt_len} tok | Target={args.seq_len} tok")
     print(f"  SFT Learning Rate   : {args.lr:g} -> {args.min_lr:g} (cosine cooldown)")
+    print(f"  Target Effective BS : {args.effective_batch_size}")
     print(f"  Loss Masking Mode   : Strict instruction masking (sensory stimuli masked with -100)")
     print(f"  Data Blend          : 30% SmolTalk + 25% Magpie/Tools + 20% GSM8K + 15% Code + 10% Edu")
     print(f"  Live Generation     : Every {args.probe_interval} steps")
@@ -256,16 +323,24 @@ def main():
         pretrained_checkpoint=args.pretrained_checkpoint,
         resume_sft=args.resume_sft,
         total_steps=args.total_steps,
+        target_tokens=args.target_tokens,
         batch_size=args.batch_size,
+        effective_batch_size=args.effective_batch_size,
+        max_batch_size=args.max_batch_size,
         prompt_len=args.prompt_len,
         seq_len=args.seq_len,
         lr=args.lr,
         min_lr=args.min_lr,
+        warmup_steps=args.warmup_steps,
         sampling_p=args.sampling_p,
         deliberation_mode=args.deliberation_mode,
+        auto_tune=args.auto_tune,
+        force_tune=args.force_tune,
         save_interval=args.save_interval,
         eval_interval=args.eval_interval,
         probe_interval=args.probe_interval,
+        target_eval_loss=args.target_eval_loss,
+        consistent_eval_threshold=args.consistent_eval_threshold,
         cloud_sync=args.cloud_sync,
         checkpoint_dir=args.checkpoint_dir,
     )

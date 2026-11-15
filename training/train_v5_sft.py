@@ -6,6 +6,9 @@ Specialized instruction-tuning and conversational alignment engine for CerebroSp
   • Base Checkpoint Loading : Automatically initializes from the 900k pre-trained champion weights.
   • Instruction Loss Masking: Strict -100 target padding on sensory stimuli (<stim>...</stim>);
                               loss is backpropagated solely on motor articulations (<act>...</act>).
+  • Hardware Auto-Tuning    : Full TPU v5e/v6e MXU hardware optimization, auto-adopting verified batch
+                              ladder parameters (Batch 128 @ 390k tok/s) and effective batch scaling.
+  • Gradient Accumulation   : Multi-micro-step gradient accumulation for target effective batch size (256/128).
   • Curated SFT Data Blend   :
       - 30% SmolTalk Everyday Conversations & OpenHermes-100k (Instruction following & STEM)
       - 25% Smol-Magpie-Ultra & Apigen-80k (Multi-turn deductive reasoning & agentic tool calls)
@@ -15,13 +18,14 @@ Specialized instruction-tuning and conversational alignment engine for CerebroSp
   • SFT Optimizer Dynamics   :
       - Spheroid Optimizer with low learning rate: 3.0e-5 -> 3.0e-6 (cosine cooldown)
       - Conservative weight decay: 0.01 (preserves foundational manifold topology)
-      - 500-step smooth linear warmup
+      - 500-step smooth linear warmup with Loss Window Governor
   • Continuous Live Probing  : Generates and logs actual assistant responses to test prompts every 500 steps.
-  • Bi-directional Cloud Sync: Asynchronously syncs SFT latest and champion checkpoints to bioflo.in.
+  • Bi-directional Cloud Sync: Asynchronously syncs SFT latest and champion checkpoints and live token
+                              telemetry (breakdown by dataset) to bioflo.in.
 
 Usage:
-  python3 training/train_v5_sft.py --preset v5_small --total-steps 50000 --lr 3e-5
-  python3 training/train_v5_sft.py --preset v5_base --total-steps 50000 --lr 2.5e-5
+  python3 training/train_v5_sft.py --preset tpu_v5e_1 --effective-batch-size 256 --total-steps 50000 --lr 3e-5
+  python3 training/train_v5_sft.py --preset auto --total-steps 50000
 """
 
 from __future__ import annotations
@@ -59,6 +63,7 @@ from src.cloud_sync import (
     fetch_remote_loss_history,
     check_remote_manifest,
     detect_source_environment,
+    push_remote_token_tracker,
 )
 from src.jax.v5_model import (
     ModelConfigV5,
@@ -69,7 +74,7 @@ from src.jax.v5_model import (
     rms_norm,
 )
 from src.jax.checkpoint import adapt_and_load_checkpoint_weights, discover_latest_checkpoint, AsyncCheckpointManager
-from src.jax.auto_tuner import resolve_jax_compute_dtype
+from src.jax.auto_tuner import resolve_jax_compute_dtype, run_auto_tuner
 from src.jax.data_streamer import LinguisticDataStreamer
 from src.jax.spheroid_optimizer import init_spheroid_opt_state, build_spheroid_train_engine
 from src.elastic_window import (
@@ -83,14 +88,18 @@ from src.elastic_window import (
 
 def parse_sft_args(args_list: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="CerebroSpheroid V5 Supervised Fine-Tuning (SFT) Engine"
+        description="CerebroSpheroid V5 Supervised Fine-Tuning (SFT) & Conversational Alignment Engine"
     )
     parser.add_argument("--preset", type=str, default="auto", choices=["auto", "v5_small", "v5_compact", "v5_base", "tpu_v5e_1", "tpu_v6e_1"], help="Architecture preset")
     parser.add_argument("--sft_model_name", "--sft-model-name", dest="sft_model_name", type=str, default=None, help="Cloud sync and checkpoint model name (default: {preset}_sft)")
     parser.add_argument("--pretrained_checkpoint", "--pretrained-checkpoint", dest="pretrained_checkpoint", type=str, default=None, help="Path to pre-trained base checkpoint (auto-discovered if None)")
     parser.add_argument("--resume_sft", "--resume-sft", dest="resume_sft", action="store_true", default=False, help="Resume an in-progress SFT run from {preset}_sft_latest.pt")
     parser.add_argument("--total_steps", "--total-steps", dest="total_steps", type=int, default=50_000, help="Total SFT steps (default: 50,000)")
-    parser.add_argument("--batch_size", "--batch-size", dest="batch_size", type=int, default=None, help="Batch size per device (auto-selected if None)")
+    parser.add_argument("--target_tokens", "--target-tokens", dest="target_tokens", type=int, default=None, help="Optional token ingestion budget for SFT")
+    parser.add_argument("--batch_size", "--batch-size", dest="batch_size", type=int, default=None, help="Micro-batch size per device (auto-selected via hardware config if None)")
+    parser.add_argument("--effective_batch_size", "--effective-batch-size", dest="effective_batch_size", type=int, default=256, help="Target global effective batch size (default: 256 for TPU, 128 for GPU; automatically computes grad_accum)")
+    parser.add_argument("--max_batch_size", "--max-batch-size", dest="max_batch_size", type=int, default=128, help="Cap on auto-tuned micro-batch size (default: 128)")
+    parser.add_argument("--grad_accum", "--grad-accum", dest="grad_accum", type=int, default=1, help="Gradient accumulation micro-steps per optimizer update")
     parser.add_argument("--prompt_len", "--prompt-len", dest="prompt_len", type=int, default=256, help="Sensory context prompt length (default: 256 tokens)")
     parser.add_argument("--seq_len", "--seq-len", dest="seq_len", type=int, default=512, help="Motor action target length (default: 512 tokens)")
     parser.add_argument("--lr", type=float, default=3.0e-5, help="Peak SFT learning rate (default: 3.0e-5)")
@@ -109,7 +118,15 @@ def parse_sft_args(args_list: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--sampling_p", "--sampling-p", dest="sampling_p", type=float, default=1.0, help="Sampling probability for deliberation (1.0 for teacher forcing, 0.5 for scheduled deliberation)")
     parser.add_argument("--deliberation_mode", dest="deliberation_mode", type=str, default="teacher_forcing", choices=["teacher_forcing", "scheduled", "pitfall_recovery", "internal"], help="Deliberation mode")
     parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bf16", "fp16", "fp32"], help="Matrix compute dtype")
-    parser.add_argument("--remat", type=str, default="true", choices=["true", "false", "auto"], help="Activation rematerialization")
+    parser.add_argument("--remat", type=str, default="false", choices=["true", "false", "auto"], help="Activation rematerialization (default: false for peak throughput)")
+    parser.add_argument("--auto_tune", "--auto-tune", dest="auto_tune", action=argparse.BooleanOptionalAction, default=True, help="Verify hardware config with AutoTuner or reuse cached optimal config")
+    parser.add_argument("--force_tune", "--force-tune", dest="force_tune", action=argparse.BooleanOptionalAction, default=False, help="Re-benchmark batch ladder even if cached config exists")
+    parser.add_argument("--tune_objective", "--tune-objective", dest="tune_objective", type=str, default="tok_per_sec", choices=["tok_per_sec", "balanced", "steps_per_sec"], help="AutoTuner objective")
+    parser.add_argument("--target_eval_loss", "--target-eval-loss", dest="target_eval_loss", type=float, default=1.40, help="Target held-out evaluation loss for convergence (default: 1.40)")
+    parser.add_argument("--consistent_eval_threshold", "--consistent-eval-threshold", dest="consistent_eval_threshold", type=int, default=3, help="Consecutive evaluations required <= target-eval-loss to confirm convergence (default: 3)")
+    parser.add_argument("--loss_window_governor", "--loss-window-governor", dest="loss_window_governor", action=argparse.BooleanOptionalAction, default=True, help="Automatically damp LR when loss climbs")
+    parser.add_argument("--loss_ceiling", "--loss-ceiling", dest="loss_ceiling", type=float, default=3.50, help="Loss ceiling threshold for governor")
+    parser.add_argument("--loss_floor", "--loss-floor", dest="loss_floor", type=float, default=1.50, help="Loss floor threshold for governor")
 
     return parser.parse_args(args_list)
 
@@ -119,6 +136,8 @@ SFT_PROBE_PROMPTS = [
     "Explain how a neural network learns using backpropagation in simple, clear terms:",
     "Solve step-by-step: If Tom has 15 books and gives 4 to Alice and 3 to Bob, how many books does Tom have left?",
     "Write a clean Python function that checks if a given string is a palindrome:",
+    "Why is the sky blue during the day and red during sunset? Explain the physics concisely:",
+    "Extract the intent and parameters from: 'Book a flight from London to New York on October 12th for 2 passengers' in JSON format:",
 ]
 
 
@@ -131,9 +150,9 @@ def run_live_probe(
     gen_len: int = 128,
 ):
     """Executes live greedy autoregressive rollout on test prompts to inspect conversational alignment."""
-    print("\n" + "-" * 72)
+    print("\n" + "-" * 76)
     print("🔬 [SFT Live Conversational & Reasoning Probe]")
-    print("-" * 72)
+    print("-" * 76)
 
     for idx, p_text in enumerate(SFT_PROBE_PROMPTS, 1):
         formatted_prompt = format_stimulus_prompt(p_text)
@@ -173,17 +192,15 @@ def run_live_probe(
                 answer = f"[Tokens: {len(valid_ids)}]"
 
             # Clean output display
-            if answer.startswith("<act>"):
-                answer = answer[5:].strip()
-            if answer.endswith("</act>"):
-                answer = answer[:-6].strip()
+            for tag in ("<act>", "</act>", "<stim>", "</stim>"):
+                answer = answer.replace(tag, "").strip()
 
             print(f"▶ Q{idx}: {p_text}")
             print(f"  A{idx}: {answer}\n")
         except Exception as e:
             print(f"  [Probe notice for Q{idx}: {e}]")
 
-    print("-" * 72 + "\n")
+    print("-" * 76 + "\n")
 
 
 def main(args=None):
@@ -204,13 +221,14 @@ def main(args=None):
     devices = jax.devices()
     num_devices = len(devices)
     dev_kind = devices[0].device_kind.lower() if devices else ""
-    is_tpu = "tpu" in dev_kind
+    backend = jax.default_backend().lower()
+    is_tpu = "tpu" in dev_kind or "tpu" in backend
 
     # Hardware & Preset Resolution
     if args.preset == "auto":
         if "v6" in dev_kind or "trillium" in dev_kind:
             args.preset = "tpu_v6e_1"
-        elif "v5" in dev_kind:
+        elif "v5" in dev_kind or is_tpu:
             args.preset = "tpu_v5e_1"
         else:
             args.preset = "v5_small"
@@ -218,12 +236,61 @@ def main(args=None):
     base_preset = "v5_small" if args.preset in ("tpu_v5e_1", "tpu_v6e_1") else args.preset
     sft_model_name = args.sft_model_name or f"{base_preset}_sft"
 
-    if args.batch_size is None:
-        # Optimal default SFT batch sizes
+    # Hardware Auto-Tuning & Micro-Batch Optimization
+    remat_choice = True if str(args.remat).lower() == "true" else False
+    max_bs = getattr(args, "max_batch_size", None) or 128
+
+    if getattr(args, "auto_tune", True):
+        best_cfg = run_auto_tuner(
+            preset=args.preset,
+            seq_len=args.seq_len,
+            dtype=args.dtype,
+            use_cached_config=not getattr(args, "force_tune", False),
+            force_tune=getattr(args, "force_tune", False),
+            upload_winner=True,
+            cloud_url=args.cloud_url,
+            cloud_token=args.cloud_token,
+            verbose=True,
+            tune_objective=getattr(args, "tune_objective", "tok_per_sec"),
+            prompt_len=args.prompt_len,
+            max_batch_size=max_bs,
+        )
+        args.batch_size = best_cfg["batch_size"]
+        remat_choice = best_cfg["remat"]
+        print(f"\n⚡ Applying Tuned Hyperparameters for SFT: batch_size={args.batch_size}, remat={remat_choice}")
+        if "tok_per_sec" in best_cfg and best_cfg["tok_per_sec"] > 0:
+            m_type = best_cfg.get("memory_type", "HBM" if is_tpu else "VRAM")
+            v_gb = best_cfg.get("memory_gb", best_cfg.get("vram_gb", 0))
+            v_pct = best_cfg.get("memory_utilization_pct", best_cfg.get("vram_utilization_pct", 0))
+            sps = best_cfg.get("steps_per_sec", 0.0)
+            sps_str = f"{sps:.2f} steps/s | " if sps and sps > 0 else ""
+            print(f"⚡ Target Benchmark Speed: {sps_str}{best_cfg['tok_per_sec']:,.0f} tok/s ({m_type}: {v_gb:.1f} GB, {v_pct:.1f}% utilization)")
+    elif args.batch_size is None:
         if is_tpu:
-            args.batch_size = 32 if "v6" in dev_kind else 16
+            args.batch_size = 128
         else:
-            args.batch_size = 8
+            args.batch_size = 16
+    elif max_bs is not None:
+        args.batch_size = min(int(args.batch_size), int(max_bs))
+
+    # Effective Batch Size & Gradient Accumulation
+    eff_target = getattr(args, "effective_batch_size", None)
+    if eff_target is not None and eff_target > 0:
+        if args.batch_size > eff_target:
+            args.batch_size = eff_target
+        args.grad_accum = max(1, eff_target // max(1, args.batch_size))
+        eff_bs = args.batch_size * args.grad_accum
+        print(f"⚡ [SFT Batch Scaling] Target Effective Batch Size: {eff_bs} (Micro Batch: {args.batch_size} × Grad Accum: {args.grad_accum})")
+    else:
+        args.grad_accum = getattr(args, "grad_accum", 1)
+        eff_bs = args.batch_size * args.grad_accum
+
+    eff_batch_size = eff_bs
+    tokens_per_opt_step = eff_batch_size * (args.prompt_len + args.seq_len)
+    if getattr(args, "target_tokens", None) is not None and args.target_tokens > 0:
+        calculated_steps = int(math.ceil(float(args.target_tokens) / max(1.0, float(tokens_per_opt_step))))
+        args.total_steps = calculated_steps
+        print(f"🎯 [Target Token Budget] {args.target_tokens/1e9:.2f} Billion Tokens -> Scheduled for {args.total_steps:,} Steps (at {tokens_per_opt_step:,} tok/step)")
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     os.makedirs(args.scratch_dir, exist_ok=True)
@@ -241,10 +308,11 @@ def main(args=None):
     print(f"  Architecture Preset : {args.preset} (Base: {base_preset})")
     print(f"  SFT Model Registry  : {sft_model_name}")
     print(f"  Total SFT Steps     : {args.total_steps:,}")
-    print(f"  Batch Size          : {args.batch_size} per device ({num_devices} active devices)")
+    print(f"  Batch Configuration : Micro Batch {args.batch_size} × Grad Accum {args.grad_accum} = Effective Batch {eff_batch_size}")
     print(f"  Context Budget      : Prompt={args.prompt_len} tok | Target={args.seq_len} tok")
     print(f"  Deliberation Policy : Mode={args.deliberation_mode} | Sampling P={args.sampling_p:.2f}")
     print(f"  Learning Rate Decay : {args.lr:g} -> {args.min_lr:g} ({args.warmup_steps} step warmup)")
+    print(f"  Convergence Target  : Held-out Loss <= {args.target_eval_loss:.4f} (Consecutive threshold: {args.consistent_eval_threshold})")
     print(f"  Weight Decay        : {args.weight_decay:g}")
     print(f"  Cloud Sync          : {args.cloud_sync} (Endpoint: {args.cloud_url})")
     print(f"  Checkpoints Dir     : {args.checkpoint_dir}")
@@ -277,25 +345,41 @@ def main(args=None):
         # Discover or download base pre-trained model
         cand_paths = [
             args.pretrained_checkpoint,
+            os.path.join(args.checkpoint_dir, f"{args.preset}_latest.pt"),
+            os.path.join(args.checkpoint_dir, f"{args.preset}_best.pt"),
+            os.path.join(args.checkpoint_dir, f"{base_preset}_latest_step900k.pt"),
             os.path.join(args.checkpoint_dir, f"{base_preset}_latest.pt"),
             os.path.join(args.checkpoint_dir, f"{base_preset}_best.pt"),
+            os.path.join(REPO_ROOT, "checkpoints", f"{base_preset}_latest_step900k.pt"),
             os.path.join(REPO_ROOT, "checkpoints", f"{base_preset}_latest.pt"),
             os.path.join(REPO_ROOT, "checkpoints", f"{base_preset}_best.pt"),
         ]
         base_ckpt_path = next((p for p in cand_paths if p and os.path.exists(p)), None)
 
         if not base_ckpt_path and args.cloud_sync:
-            print(f"\n📥 Base pre-trained checkpoint not found locally. Pulling latest {base_preset} from bioflo.in...")
-            dest_file = os.path.join(args.checkpoint_dir, f"{base_preset}_latest.pt")
-            success = pull_checkpoint(
-                local_dest=dest_file,
-                target_type="latest",
-                model=base_preset,
-                url=args.cloud_url,
-                token=args.cloud_token,
-            )
-            if success and os.path.exists(dest_file):
-                base_ckpt_path = dest_file
+            print(f"\n📥 Base pre-trained checkpoint not found locally. Inspecting remote manifest on bioflo.in...")
+            try:
+                manifest = check_remote_manifest(url=args.cloud_url, token=args.cloud_token)
+                models_dict = manifest.get("models", {})
+                target_remote_model = base_preset
+                if args.preset in models_dict:
+                    target_remote_model = args.preset
+                elif "v5_small" in models_dict:
+                    target_remote_model = "v5_small"
+
+                dest_file = os.path.join(args.checkpoint_dir, f"{args.preset}_latest.pt")
+                print(f"🔄 [cloud_sync] Downloading [{target_remote_model}] latest.pt from {args.cloud_url}...")
+                success = pull_checkpoint(
+                    local_dest=dest_file,
+                    target_type="latest",
+                    model=target_remote_model,
+                    url=args.cloud_url,
+                    token=args.cloud_token,
+                )
+                if success and os.path.exists(dest_file):
+                    base_ckpt_path = dest_file
+            except Exception as e:
+                print(f"⚠️ Remote sync notice: {e}")
 
         if base_ckpt_path and os.path.exists(base_ckpt_path):
             print(f"\n🚀 Loading base pre-trained weights from {os.path.basename(base_ckpt_path)}...")
@@ -326,7 +410,6 @@ def main(args=None):
     )
 
     # 5. Spheroid SFT Train Step Engine
-    remat_choice = (args.remat == "true") or (args.remat == "auto" and is_tpu)
     compute_grad_step, apply_opt_step = build_spheroid_train_engine(
         config,
         buffers,
@@ -337,9 +420,10 @@ def main(args=None):
         deliberation_mode=args.deliberation_mode,
     )
 
-    def sft_train_step_fn(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens=None):
+    @jax.jit
+    def sft_single_step_fn(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens=None, sampling_p=1.0):
         loss_val, grads = compute_grad_step(
-            p, q_batch, r_batch, feedback_tokens=feedback_tokens, sampling_p=args.sampling_p, deliberation_mode=args.deliberation_mode
+            p, q_batch, r_batch, feedback_tokens=feedback_tokens, sampling_p=sampling_p, deliberation_mode=args.deliberation_mode
         )
         new_p, new_opt_s = apply_opt_step(p, opt_s, grads, cur_lr)
         return new_p, new_opt_s, loss_val
@@ -413,6 +497,7 @@ def main(args=None):
     print("\n" + "=" * 84)
     print(f"🚀 Starting SFT Training ({start_step:,} -> {args.total_steps:,} Steps)")
     print(f"   • Peak SFT LR      : {args.lr:g} (cooldown floor: {args.min_lr:g})")
+    print(f"   • Effective Batch  : {eff_batch_size} (Micro: {args.batch_size} × Grad Accum: {args.grad_accum})")
     print(f"   • Prompt / Target  : {args.prompt_len} tok / {args.seq_len} tok (Prompt tokens masked: -100)")
     print(f"   • Live Probing     : Every {args.probe_interval} steps")
     print(f"   • Cloud Registry   : {sft_model_name}")
@@ -423,8 +508,11 @@ def main(args=None):
     t_last_log = time.time()
     step_window_tokens = 0
     step_window_count = 0
+    cumulative_tokens = 0
     last_eval_loss = float("inf")
     ema_loss: Optional[float] = None
+    consecutive_target_evals = 0
+    converged_target_met = False
 
     try:
         while step < args.total_steps and not shutdown_requested:
@@ -433,47 +521,90 @@ def main(args=None):
 
             cur_lr = get_sft_lr(step)
 
-            # Get pre-tokenized batch
-            b_tup = prefetched_sft.get_batch()
-            prompt_b, target_b, feedback_b = _unpack_batch(b_tup)
+            # SFT Loss Window Governor Dynamic Damping
+            if getattr(args, "loss_window_governor", True) and ema_loss is not None:
+                if ema_loss > args.loss_ceiling:
+                    alpha_gov = min(1.0, (ema_loss - args.loss_ceiling) / 0.5)
+                elif ema_loss < args.loss_floor:
+                    alpha_gov = -min(0.5, (args.loss_floor - ema_loss) / 0.5)
+                else:
+                    alpha_gov = 0.0
+            else:
+                alpha_gov = 0.0
 
-            # SFT Optimization Step
-            params, opt_state, loss = sft_train_step_fn(
-                params,
-                opt_state,
-                prompt_b,
-                target_b,
-                cur_lr,
-                feedback_tokens=feedback_b,
-            )
+            if alpha_gov > 0.0:
+                cur_lr = cur_lr * (1.0 - 0.4 * alpha_gov)
 
-            loss_val = float(loss)
-            if math.isfinite(loss_val):
+            # SFT Optimization Step with Multi-Step Gradient Accumulation
+            if args.grad_accum > 1:
+                acc_grads = None
+                loss_acc = 0.0
+                step_tokens = 0
+                inv_accum = 1.0 / float(args.grad_accum)
+                for _ in range(args.grad_accum):
+                    b_tup = prefetched_sft.get_batch()
+                    prompt_b, target_b, feedback_b = _unpack_batch(b_tup)
+                    g_loss, micro_grads = compute_grad_step(
+                        params, prompt_b, target_b, feedback_tokens=feedback_b,
+                        sampling_p=args.sampling_p, deliberation_mode=args.deliberation_mode
+                    )
+                    acc_grads = (
+                        micro_grads
+                        if acc_grads is None
+                        else jax.tree_util.tree_map(lambda a, b: a + b, acc_grads, micro_grads)
+                    )
+                    loss_acc = loss_acc + g_loss
+                    step_tokens += prompt_b.shape[0] * (prompt_b.shape[1] + target_b.shape[1])
+                acc_grads = jax.tree_util.tree_map(lambda a: a * inv_accum, acc_grads)
+                loss_val = float(loss_acc * inv_accum)
+                params, opt_state = apply_opt_step(params, opt_state, acc_grads, cur_lr)
+            else:
+                b_tup = prefetched_sft.get_batch()
+                prompt_b, target_b, feedback_b = _unpack_batch(b_tup)
+                params, opt_state, loss = sft_single_step_fn(
+                    params,
+                    opt_state,
+                    prompt_b,
+                    target_b,
+                    cur_lr,
+                    feedback_tokens=feedback_b,
+                    sampling_p=args.sampling_p,
+                )
+                loss_val = float(loss)
+                step_tokens = prompt_b.shape[0] * (prompt_b.shape[1] + target_b.shape[1])
+
+            # Divergence Watchdog
+            if math.isfinite(loss_val) and loss_val <= 4.5:
                 ema_loss = loss_val if ema_loss is None else (0.95 * ema_loss + 0.05 * loss_val)
+            else:
+                print(f"\n⚠️ [SFT Divergence Watchdog] Non-finite or elevated loss ({loss_val}) at Step {step:,}! Stabilizing optimizer momentum...")
+                ema_loss = last_eval_loss if math.isfinite(last_eval_loss) else 2.50
+                cur_lr = cur_lr * 0.75
 
-            step_tokens = prompt_b.shape[0] * (prompt_b.shape[1] + target_b.shape[1])
             step_window_tokens += step_tokens
             step_window_count += 1
+            cumulative_tokens += step_tokens
 
             # Console Progress
             if (prev_step == start_step) or (step % 10 == 0):
                 elapsed_log = time.time() - t_last_log
                 steps_per_sec = step_window_count / max(elapsed_log, 1e-6)
                 tok_per_sec = step_window_tokens / max(elapsed_log, 1e-6)
+                gov_str = f" | Gov: {alpha_gov:.2f}" if alpha_gov > 0.01 else ""
                 print(
                     f"[SFT Step {step:5d}/{args.total_steps}] "
                     f"Loss: {loss_val:6.4f} | "
                     f"EMA: {ema_loss:6.4f} | "
                     f"Steps/s: {steps_per_sec:5.2f} | "
                     f"Tok/s: {tok_per_sec:7,.0f} | "
-                    f"LR: {cur_lr:.2e} | "
+                    f"LR: {cur_lr:.2e}{gov_str} | "
                     f"Elapsed: {time.time() - t_start:5.1f}s"
                 )
                 t_last_log = time.time()
                 step_window_tokens = 0
                 step_window_count = 0
 
-            # Canonical SFT Evaluation
+            # Canonical SFT Evaluation Split
             crossed_eval = bool(eval_batches) and (step % args.eval_interval == 0)
             if crossed_eval:
                 val_losses = [float(eval_step_loss(params, vp, vt, vfb)) for vp, vt, vfb in eval_batches]
@@ -489,29 +620,48 @@ def main(args=None):
                         d_ppl = math.exp(min(d_val, 20.0))
                         print(f"   ├─ {d_name:<26}: Loss {d_val:.4f} (PPL: {d_ppl:.2f})")
 
-                if is_champion:
-                    best_eval_loss = eval_loss
+                # Convergence detection
+                if eval_loss <= args.target_eval_loss:
+                    consecutive_target_evals += 1
+                    print(f"🎯 [SFT Convergence] Step {step:,} eval loss {eval_loss:.4f} <= target {args.target_eval_loss:.4f} ({consecutive_target_evals}/{args.consistent_eval_threshold})")
+                    if consecutive_target_evals >= args.consistent_eval_threshold:
+                        converged_target_met = True
+                        print(f"🏆 [SFT Converged] Reached target held-out loss {args.target_eval_loss:.4f} consistently across {consecutive_target_evals} evaluations!")
+                else:
+                    consecutive_target_evals = 0
+
+                if is_champion or converged_target_met:
+                    if is_champion:
+                        best_eval_loss = eval_loss
                     best_fname = f"{sft_model_name}_best.pt"
                     meta_best = {
                         "step": step,
                         "eval_loss": eval_loss,
-                        "loss": float(loss),
-                        "ema_loss": ema_loss if ema_loss is not None else float(loss),
+                        "loss": float(loss_val),
+                        "ema_loss": ema_loss if ema_loss is not None else float(loss_val),
                         "ppl": eval_ppl,
                         "preset": base_preset,
                         "model": sft_model_name,
                         "sync_model": sft_model_name,
+                        "cumulative_tokens": cumulative_tokens,
+                        "effective_batch_size": eff_batch_size,
+                        "tokens_by_dataset": batcher.get_tokens_by_dataset() if hasattr(batcher, "get_tokens_by_dataset") else {},
+                        "converged": bool(converged_target_met),
                         "timestamp": time.time(),
                     }
                     ckpt_mgr.dispatch(params, buffers, best_fname, meta_dict=meta_best, block_if_busy=True)
+
+                    if converged_target_met:
+                        conv_fname = f"{sft_model_name}_converged.pt"
+                        ckpt_mgr.dispatch(params, buffers, conv_fname, meta_dict=meta_best, block_if_busy=True)
 
                     if args.cloud_sync:
                         try:
                             champ_rec = {
                                 "step": step,
-                                "loss": float(loss),
+                                "loss": float(loss_val),
                                 "eval_loss": eval_loss,
-                                "status": "NEW_SFT_CHAMPION",
+                                "status": "CONVERGED_SFT_CHAMPION" if converged_target_met else "NEW_SFT_CHAMPION",
                                 "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                                 "source": detect_source_environment(),
                             }
@@ -524,7 +674,7 @@ def main(args=None):
                         except Exception:
                             pass
 
-            # Live Conversational Probe
+            # Live Conversational & Reasoning Generation Probe
             if step % args.probe_interval == 0:
                 run_live_probe(
                     params=params,
@@ -535,18 +685,22 @@ def main(args=None):
                     gen_len=128,
                 )
 
-            # Checkpoint Saving
+            # Checkpoint Saving & Remote Token Telemetry
             if step % args.save_interval == 0:
                 latest_fname = f"{sft_model_name}_latest.pt"
                 meta_latest = {
                     "step": step,
-                    "loss": float(loss),
-                    "ema_loss": ema_loss if ema_loss is not None else float(loss),
-                    "eval_loss": last_eval_loss if math.isfinite(last_eval_loss) else float(loss),
+                    "loss": float(loss_val),
+                    "ema_loss": ema_loss if ema_loss is not None else float(loss_val),
+                    "eval_loss": last_eval_loss if math.isfinite(last_eval_loss) else float(loss_val),
                     "best_eval_loss": best_eval_loss,
                     "preset": base_preset,
                     "model": sft_model_name,
                     "sync_model": sft_model_name,
+                    "cumulative_tokens": cumulative_tokens,
+                    "effective_batch_size": eff_batch_size,
+                    "tokens_by_dataset": batcher.get_tokens_by_dataset() if hasattr(batcher, "get_tokens_by_dataset") else {},
+                    "converged": bool(converged_target_met),
                     "timestamp": time.time(),
                 }
                 ckpt_mgr.dispatch(params, buffers, latest_fname, meta_dict=meta_latest)
@@ -555,7 +709,7 @@ def main(args=None):
                     try:
                         latest_rec = {
                             "step": step,
-                            "loss": float(loss),
+                            "loss": float(loss_val),
                             "eval_loss": last_eval_loss if math.isfinite(last_eval_loss) else None,
                             "status": "SFT_ACTIVE",
                             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -564,6 +718,21 @@ def main(args=None):
                         push_remote_loss_history(
                             model=sft_model_name,
                             records=[latest_rec],
+                            url=args.cloud_url,
+                            token=args.cloud_token,
+                        )
+
+                        # Push live token ingestion metrics & dataset breakdown
+                        ds_stats = batcher.get_tokens_by_dataset() if hasattr(batcher, "get_tokens_by_dataset") else {}
+                        push_remote_token_tracker(
+                            model=sft_model_name,
+                            cumulative_tokens=cumulative_tokens,
+                            target_tokens=getattr(args, "target_tokens", None) or (args.total_steps * eff_batch_size * (args.prompt_len + args.seq_len)),
+                            tokens_by_dataset=ds_stats,
+                            effective_batch_size=eff_batch_size,
+                            step=step,
+                            loss=float(loss_val),
+                            tok_per_sec=float(tok_per_sec) if "tok_per_sec" in locals() else 0.0,
                             url=args.cloud_url,
                             token=args.cloud_token,
                         )
@@ -579,18 +748,39 @@ def main(args=None):
         final_fname = f"{sft_model_name}_latest.pt"
         final_meta = {
             "step": step,
-            "loss": float(loss) if "loss" in locals() else 0.0,
+            "loss": float(loss_val) if "loss_val" in locals() else 0.0,
             "ema_loss": ema_loss if ema_loss is not None else 0.0,
             "eval_loss": best_eval_loss,
             "preset": base_preset,
             "model": sft_model_name,
             "sync_model": sft_model_name,
+            "cumulative_tokens": cumulative_tokens if "cumulative_tokens" in locals() else 0,
+            "effective_batch_size": eff_batch_size if "eff_batch_size" in locals() else 256,
+            "tokens_by_dataset": batcher.get_tokens_by_dataset() if "batcher" in locals() and hasattr(batcher, "get_tokens_by_dataset") else {},
             "timestamp": time.time(),
         }
         ckpt_mgr.flush(params, buffers, final_fname, meta_dict=final_meta)
         ckpt_mgr.shutdown(wait=True)
         if prefetched_sft is not None:
             prefetched_sft.shutdown()
+
+        if args.cloud_sync and "batcher" in locals() and hasattr(batcher, "get_tokens_by_dataset"):
+            try:
+                push_remote_token_tracker(
+                    model=sft_model_name,
+                    cumulative_tokens=cumulative_tokens if "cumulative_tokens" in locals() else 0,
+                    target_tokens=getattr(args, "target_tokens", None) or (args.total_steps * (eff_batch_size if "eff_batch_size" in locals() else 256) * (args.prompt_len + args.seq_len)),
+                    tokens_by_dataset=batcher.get_tokens_by_dataset(),
+                    effective_batch_size=eff_batch_size if "eff_batch_size" in locals() else 256,
+                    step=step,
+                    loss=float(loss_val) if "loss_val" in locals() else 0.0,
+                    tok_per_sec=float(tok_per_sec) if "tok_per_sec" in locals() else 0.0,
+                    url=args.cloud_url,
+                    token=args.cloud_token,
+                )
+            except Exception:
+                pass
+
         print(f"🎉 SFT session successfully completed at Step {step:,}!")
 
 
@@ -602,6 +792,10 @@ def run_sft_training(**kwargs):
             setattr(args, k, v)
         elif k == "checkpoint_dir":
             setattr(args, "checkpoint_dir", v)
+        elif k == "max_steps":
+            setattr(args, "total_steps", v)
+        elif k == "batch_size":
+            setattr(args, "batch_size", v)
     return main(args)
 
 

@@ -475,10 +475,14 @@ def build_online_dataset_iterator(
                             row, everyday_it = _next_or_reopen(
                                 everyday_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "everyday-conversations", rank=rank, world_size=world_size)
                             )
+                            ds_name = "smoltalk_everyday"
                         else:
                             row, openhermes_it = _next_or_reopen(
                                 openhermes_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "openhermes-100k", rank=rank, world_size=world_size)
                             )
+                            ds_name = "openhermes_100k"
+                        if isinstance(row, dict):
+                            row["_dataset"] = ds_name
                         yield row
 
                     elif mod10 in (1, 4):
@@ -487,10 +491,14 @@ def build_online_dataset_iterator(
                             row, logic_it = _next_or_reopen(
                                 logic_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "smol-magpie-ultra", rank=rank, world_size=world_size)
                             )
+                            ds_name = "smol_magpie_ultra"
                         else:
                             row, tool_it = _next_or_reopen(
                                 tool_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "apigen-80k", rank=rank, world_size=world_size)
                             )
+                            ds_name = "apigen_80k"
+                        if isinstance(row, dict):
+                            row["_dataset"] = ds_name
                         yield row
 
                     elif mod10 in (2, 7):
@@ -499,10 +507,14 @@ def build_online_dataset_iterator(
                             row, gsm_it = _next_or_reopen(
                                 gsm_it, lambda: _open_hf_stream("openai/gsm8k", "main", rank=rank, world_size=world_size)
                             )
+                            ds_name = "gsm8k"
                         else:
                             row, math_it = _next_or_reopen(
                                 math_it, lambda: _open_hf_stream("meta-math/MetaMathQA", rank=rank, world_size=world_size)
                             )
+                            ds_name = "metamathqa"
+                        if isinstance(row, dict):
+                            row["_dataset"] = ds_name
                         yield row
 
                     elif mod10 in (5, 8):
@@ -510,6 +522,8 @@ def build_online_dataset_iterator(
                         row, code_it = _next_or_reopen(
                             code_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct", rank=rank, world_size=world_size)
                         )
+                        if isinstance(row, dict):
+                            row["_dataset"] = "self_oss_instruct"
                         yield row
 
                     else:
@@ -517,6 +531,8 @@ def build_online_dataset_iterator(
                         row, know_it = _next_filtered_fineweb(
                             know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size), min_score=3.0
                         )
+                        if isinstance(row, dict):
+                            row["_dataset"] = "fineweb_edu_anchor"
                         yield row
 
                 except Exception:

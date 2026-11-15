@@ -63,11 +63,10 @@ class CrossArchitectureTransferWorkflow:
         self.source_model_id = source_model_id
         self.target_config_path_or_preset = target_config_path_or_preset
         self.target_base_ckpt = target_base_ckpt
-        self.dtype = torch.bfloat16 if (self.device.type == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
 
         print("=" * 80)
         print("🧠 CEREBRO-SPHEROID CROSS-ARCHITECTURE WEIGHT TRANSFER WORKFLOW")
-        print(f"Device: {self.device} (Dtype: {self.dtype}) | Source: {source_model_id}")
+        print(f"Device: {self.device} | Source: {source_model_id}")
         print("=" * 80)
 
         # 1. Load Tokenizers
@@ -102,7 +101,7 @@ class CrossArchitectureTransferWorkflow:
         print(f"\n[Phase 1/6] Ingesting source model weights: {source_model_id}...")
         self.source_model = AutoModelForCausalLM.from_pretrained(
             source_model_id,
-            dtype=self.dtype,
+            torch_dtype=torch.float32,
             device_map="cpu",
         )
         source_param_count = sum(p.numel() for p in self.source_model.parameters())
@@ -160,9 +159,33 @@ class CrossArchitectureTransferWorkflow:
         mapped_multi = 0
         preserved_control = 0
 
+        # Pillar 3: Deliberate Control Token Calibration from source delimiters
+        control_token_candidates = {
+            31: ["<|im_start|>user\n", "[INST]", "<|start_header_id|>user<|end_header_id|>\n\n", "User: "],       # <stim>
+            32: ["<|im_end|>\n", "[/INST]", "<|eot_id|>\n", "\n\nAssistant: ", "\n\n"],                          # </stim>
+            33: ["<|im_start|>assistant\n", "<|start_header_id|>assistant<|end_header_id|>\n\n", "Assistant: "], # <act>
+            34: ["<|im_end|>", "<|eot_id|>", "</s>"],                                                             # </act>
+        }
+        calibrated_controls = 0
+        for ctrl_id, candidates in control_token_candidates.items():
+            for cand in candidates:
+                encoded = self.source_tok.encode(cand, add_special_tokens=False)
+                valid_ids = [idx for idx in encoded if idx < src_emb.shape[0]]
+                if valid_ids:
+                    pooled = src_emb[valid_ids, :transfer_dim].mean(dim=0)
+                    new_v5_emb[ctrl_id, :transfer_dim] = pooled
+                    calibrated_controls += 1
+                    break
+
         for i in range(self.v5_tok.vocab_size):
+            # Tokens 31-34 already calibrated above; preserve special 1, 2 (<unk>, <s>, </s>)
+            if i in (1, 2):
+                preserved_control += 1
+                continue
+            if i in (31, 32, 33, 34):
+                continue
             tok_str = self.v5_tok.decode([i])
-            if tok_str.strip() in bio_tokens or i in [1, 2, 31, 32, 33, 34]:
+            if tok_str.strip() in bio_tokens:
                 preserved_control += 1
                 continue
 
@@ -175,15 +198,16 @@ class CrossArchitectureTransferWorkflow:
             elif len(encoded) > 1:
                 valid_ids = [idx for idx in encoded if idx < src_emb.shape[0]]
                 if valid_ids:
-                    pooled = src_emb[valid_ids, :transfer_dim].to(torch.float32).mean(dim=0).to(new_v5_emb.dtype)
+                    pooled = src_emb[valid_ids, :transfer_dim].mean(dim=0)
                     new_v5_emb[i, :transfer_dim] = pooled
                     mapped_multi += 1
 
-        total_mapped = mapped_single + mapped_multi
-        coverage_pct = (total_mapped / max(1, self.v5_tok.vocab_size - preserved_control)) * 100.0
+        total_mapped = mapped_single + mapped_multi + calibrated_controls
+        coverage_pct = (total_mapped / (self.v5_tok.vocab_size - preserved_control)) * 100.0
         print(f"   ✓ Vocabulary Mapping Results:")
         print(f"     - Exact Single-Token Match:  {mapped_single:5d} tokens")
         print(f"     - Multi-Subword Pooled:      {mapped_multi:5d} tokens")
+        print(f"     - Calibrated Control Tokens: {calibrated_controls:5d} tokens (Pillar 3)")
         print(f"     - Preserved Control/Bio:     {preserved_control:5d} tokens")
         print(f"     - Semantic Coverage:         {coverage_pct:.2f}% of target vocabulary")
 
@@ -212,6 +236,7 @@ class CrossArchitectureTransferWorkflow:
         L = getattr(self.source_model.config, "num_hidden_layers", 24)
         print(f"Mapping {L} source Transformer layers -> {K} target Concentric Shells...")
 
+        # Find layer keys in source model
         mapped_shells = 0
         for k_idx in range(K):
             l_idx = int(round(k_idx * (L - 1) / max(1, K - 1)))
@@ -302,38 +327,68 @@ class CrossArchitectureTransferWorkflow:
         print(f"Initial LR: {initial_lr:.2e} -> Min LR: {min_lr:.2e} | Max Steps: {max_steps}")
         print("=" * 80)
 
-        # Move model to target device in bfloat16
-        self.v5_model = self.v5_model.to(self.dtype).to(self.device)
+        # Move model to target device in half precision to ensure tight VRAM usage
+        self.v5_model = self.v5_model.half().to(self.device)
         self.v5_model.train()
 
-        # Load Cognitive Trajectory Corpus
+        # Load Tri-Modal Cognitive Trajectory Corpus (Pillar 1)
         tok = AutoTokenizer.from_pretrained(os.path.join(WORKSPACE_ROOT, "data", "tokenizer"))
-        dataset_path = os.path.join(WORKSPACE_ROOT, "data", "cerebro_cognitive_8k", "cerebro_cognitive_10k.jsonl")
-        
-        print("Loading calibration QA trajectories...")
-        data_samples = []
-        with open(dataset_path, "r", encoding="utf-8") as f:
-            for idx, line in enumerate(f):
-                if idx >= 6000:
-                    break
-                entry = json.loads(line)
-                data_samples.append((entry["question"], entry["answer"]))
+        candidate_paths = [
+            os.path.join(WORKSPACE_ROOT, "data", "cerebro_cognitive_8k", "cerebro_tri_modal_sft_10k.jsonl"),
+            os.path.join(WORKSPACE_ROOT, "data", "cerebro_cognitive_8k", "cerebro_tri_modal_sft_10k.parquet"),
+            os.path.join(WORKSPACE_ROOT, "data", "cerebro_cognitive_8k", "cerebro_cognitive_10k.jsonl"),
+            os.path.join(WORKSPACE_ROOT, "data", "cerebro_cognitive_8k", "cerebro_cognitive_10k.parquet"),
+        ]
+        dataset_path = next((p for p in candidate_paths if os.path.exists(p)), candidate_paths[0])
+        print(f"Loading calibration QA trajectories from: {os.path.basename(dataset_path)}...")
 
+        data_samples = []
+        if dataset_path.endswith(".parquet"):
+            import pyarrow.parquet as pq
+            table = pq.read_table(dataset_path)
+            q_col = table["question"].to_pylist()
+            a_col = table["answer"].to_pylist()
+            for q, a in zip(q_col[:8000], a_col[:8000]):
+                data_samples.append((q, a))
+        else:
+            with open(dataset_path, "r", encoding="utf-8") as f:
+                for idx, line in enumerate(f):
+                    if idx >= 8000:
+                        break
+                    entry = json.loads(line)
+                    data_samples.append((entry["question"], entry["answer"]))
+
+        # Pillar 4: Truncation Trap Elimination - Expand horizon from [:80] to [:256] tokens
         tokenized_data = []
         for q, a in data_samples:
             prompt_str = format_stimulus_prompt(q)
             answer_str = format_motor_response(a)
-            p_ids = [t % self.target_cfg.vocab_size for t in encode_no_special(tok, prompt_str)][:80]
-            a_ids = [t % self.target_cfg.vocab_size for t in encode_no_special(tok, answer_str)][:80]
+            p_ids = [t % self.target_cfg.vocab_size for t in encode_no_special(tok, prompt_str)][:256]
+            a_ids = [t % self.target_cfg.vocab_size for t in encode_no_special(tok, answer_str)][:256]
             if len(p_ids) > 2 and len(a_ids) > 2:
                 tokenized_data.append((p_ids, a_ids))
 
-        print(f"   ✓ Ready with {len(tokenized_data)} tokenized QA pairs.")
+        print(f"   ✓ Ready with {len(tokenized_data)} full-horizon (256-tok) QA pairs.")
 
-        optimizer = torch.optim.AdamW(self.v5_model.parameters(), lr=initial_lr, weight_decay=0.01)
+        # Pillar 4: SCMOptimizer with Rank-Adaptive Gating Acceleration and Stiefel Manifold updates
+        try:
+            from src.scm_optimizer import SCMOptimizer
+            optimizer = SCMOptimizer(
+                self.v5_model.parameters(),
+                lr=initial_lr,
+                momentum=0.95,
+                weight_decay=0.01,
+                ns_steps=5,
+                rank_boost=4.0,
+                radial_gamma=0.5,
+            )
+            print("   ✓ Active Optimizer: SCMOptimizer (Stiefel Newton-Schulz 5 + Rank-Adaptive Gating Acceleration)")
+        except Exception as e:
+            print(f"   ⚠️ SCMOptimizer notice ({e}), defaulting to AdamW.")
+            optimizer = torch.optim.AdamW(self.v5_model.parameters(), lr=initial_lr, weight_decay=0.01)
 
         def get_lr(step_i):
-            prog = min(1.0, step_i / max(1, max_steps))
+            prog = min(1.0, step_i / max_steps)
             return min_lr + 0.5 * (initial_lr - min_lr) * (1.0 + math.cos(math.pi * prog))
 
         loss_history = []
@@ -365,12 +420,15 @@ class CrossArchitectureTransferWorkflow:
                 prompts_tensor[b_idx, :len(p)] = torch.tensor(p, dtype=torch.long, device=self.device)
                 targets_tensor[b_idx, :len(a)] = torch.tensor(a, dtype=torch.long, device=self.device)
 
-            with torch.amp.autocast("cuda", dtype=self.dtype):
+            with torch.amp.autocast("cuda", dtype=torch.float16):
+                # Pillar 2: Dynamic Answer-Anchor Loss Weighting (3.5x penalty on answer tokens)
                 loss, _ = self.v5_model(
                     prompts=prompts_tensor,
                     targets=targets_tensor,
                     sampling_p=1.0,
                     deliberation_mode="teacher_forcing",
+                    use_anchor_loss=True,
+                    anchor_weight=3.5,
                 )
                 loss_scaled = loss / accum_steps
 
@@ -393,7 +451,7 @@ class CrossArchitectureTransferWorkflow:
 
             final_step = step
 
-            if step % 25 == 0 or step == max_steps or loss_val <= target_loss:
+            if step % 50 == 0 or step == max_steps or loss_val <= target_loss:
                 elapsed = time.time() - start_time
                 rate = step / max(1e-3, elapsed)
                 vram_used = torch.cuda.memory_allocated(self.device) / 1e6 if torch.cuda.is_available() else 0
@@ -460,7 +518,7 @@ class CrossArchitectureTransferWorkflow:
             if letters[pred_idx] == item["answer"]:
                 mmlu_correct += 1
         results["MMLU"] = (mmlu_correct / len(MMLU_TASKS)) * 100.0
-        print(f"   ✓ MMLU Score:          {results['MMLU']:.1f}% ({mmlu_correct}/{len(MMLU_TASKS)})")
+        print(f"   ✓ MMLU Score:        {results['MMLU']:.1f}% ({mmlu_correct}/{len(MMLU_TASKS)})")
 
         # 2. ARC-Challenge
         arc_correct = 0
@@ -473,7 +531,7 @@ class CrossArchitectureTransferWorkflow:
             if letters[pred_idx] == item["answer"]:
                 arc_correct += 1
         results["ARC_Challenge"] = (arc_correct / len(ARC_TASKS)) * 100.0
-        print(f"   ✓ ARC-Challenge:       {results['ARC_Challenge']:.1f}% ({arc_correct}/{len(ARC_TASKS)})")
+        print(f"   ✓ ARC-Challenge:     {results['ARC_Challenge']:.1f}% ({arc_correct}/{len(ARC_TASKS)})")
 
         # 3. HellaSwag
         hella_correct = 0
@@ -486,7 +544,7 @@ class CrossArchitectureTransferWorkflow:
             if letters[pred_idx] == item["answer"]:
                 hella_correct += 1
         results["HellaSwag"] = (hella_correct / len(HELLASWAG_TASKS)) * 100.0
-        print(f"   ✓ HellaSwag:           {results['HellaSwag']:.1f}% ({hella_correct}/{len(HELLASWAG_TASKS)})")
+        print(f"   ✓ HellaSwag:         {results['HellaSwag']:.1f}% ({hella_correct}/{len(HELLASWAG_TASKS)})")
 
         # 4. GSM8K Exact Match
         gsm_correct = 0
@@ -497,7 +555,7 @@ class CrossArchitectureTransferWorkflow:
             if extracted == item["target_number"]:
                 gsm_correct += 1
         results["GSM8K"] = (gsm_correct / len(GSM8K_TASKS)) * 100.0
-        print(f"   ✓ GSM8K:               {results['GSM8K']:.1f}% ({gsm_correct}/{len(GSM8K_TASKS)})")
+        print(f"   ✓ GSM8K:             {results['GSM8K']:.1f}% ({gsm_correct}/{len(GSM8K_TASKS)})")
 
         # 5. HumanEval Python AST Validity
         he_correct = 0

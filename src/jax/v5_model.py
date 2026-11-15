@@ -632,6 +632,9 @@ def training_rollout(
     images: Optional[jnp.ndarray] = None,
     audio: Optional[jnp.ndarray] = None,
     perceptual_inputs: Optional[jnp.ndarray] = None,
+    anchor_token_id: int = 3191,
+    anchor_weight: float = 3.5,
+    use_anchor_loss: bool = True,
 ) -> Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]]:
     """Differentiable training and autoregressive generation rollout in pure JAX."""
     # Dual-Pass Twin Resonance: runs teacher-forcing pass and deliberative rollout pass on identical tokens
@@ -656,6 +659,9 @@ def training_rollout(
             images=images,
             audio=audio,
             perceptual_inputs=perceptual_inputs,
+            anchor_token_id=anchor_token_id,
+            anchor_weight=anchor_weight,
+            use_anchor_loss=use_anchor_loss,
         )
         loss_delib = training_rollout(
             params=params,
@@ -677,6 +683,9 @@ def training_rollout(
             images=images,
             audio=audio,
             perceptual_inputs=perceptual_inputs,
+            anchor_token_id=anchor_token_id,
+            anchor_weight=anchor_weight,
+            use_anchor_loss=use_anchor_loss,
         )
         return 0.5 * loss_tf + 0.5 * loss_delib
 
@@ -767,6 +776,20 @@ def training_rollout(
     else:
         init_refractory = jnp.zeros((B, vocab_size), dtype=target_dtype)
     init_thought = jnp.zeros((B, surface_dim), dtype=target_dtype)
+
+    # Pillar 2: Dynamic Answer-Anchor Loss Weighting (AALW)
+    if targets is not None and use_anchor_loss:
+        tgt_cur = targets[:, :target_len]
+        is_anchor = (tgt_cur == anchor_token_id)
+        after_anchor = (jnp.cumsum(is_anchor.astype(jnp.int32), axis=-1) > 0)
+        has_anchor = jnp.any(is_anchor, axis=-1, keepdims=True)
+        base_w = jnp.where(has_anchor, jnp.where(after_anchor, anchor_weight, 1.0), anchor_weight)
+        valid_mask = (tgt_cur >= 0) & (tgt_cur != -100)
+        target_weights = jnp.where(valid_mask, base_w, 0.0).astype(jnp.float32)
+    elif targets is not None:
+        target_weights = (targets[:, :target_len] >= 0).astype(jnp.float32)
+    else:
+        target_weights = None
 
     # Build strictly non-leaking prev_tokens[0..target_len-1] aligned 1:1 with emission step 0..target_len-1
     if feedback_tokens is None and targets is not None:
@@ -864,11 +887,13 @@ def training_rollout(
             safe_targets = jnp.maximum(cur_target, 0)
             target_log_probs = jnp.take_along_axis(log_probs, safe_targets[:, None], axis=-1).squeeze(-1)
             mask_t = (cur_target >= 0).astype(jnp.float32)
-            step_loss = -target_log_probs * mask_t
+            cur_w = target_weights[:, step_idx] if target_weights is not None else mask_t
+            eff_w = mask_t * cur_w
+            step_loss = -target_log_probs * eff_w
             if deliberation_mode == "predictive_coding":
                 thought_err = jnp.mean((prev_thought.astype(jnp.float32) - lax.stop_gradient(tf_aud.astype(jnp.float32))) ** 2, axis=-1)
-                step_loss = step_loss + (0.1 * thought_err * mask_t * (step_idx > 0).astype(jnp.float32))
-            return (nxt_s, nxt_t, nxt_p, nxt_thought), (step_loss, mask_t)
+                step_loss = step_loss + (0.1 * thought_err * eff_w * (step_idx > 0).astype(jnp.float32))
+            return (nxt_s, nxt_t, nxt_p, nxt_thought), (step_loss, eff_w)
 
         return (nxt_s, nxt_t, nxt_p, nxt_thought), logits
 
@@ -1048,24 +1073,27 @@ def training_rollout(
             total_tokens,
         )
         num_chunks = total_tokens // chunk_tokens
+        weights_flat = target_weights[:, :T].reshape(B * T) if target_weights is not None else jnp.ones(total_tokens, dtype=jnp.float32)
 
-        def _ce_loss_chunk(h_c, t_c):
+        def _ce_loss_chunk(h_c, t_c, w_c):
             logits_c = jnp.matmul(h_c, w_emb_t).astype(jnp.float32)
             safe_t = jnp.maximum(t_c, 0)
             tgt_logits = jnp.take_along_axis(logits_c, safe_t[:, None], axis=-1).squeeze(-1)
             lse = jax.nn.logsumexp(logits_c, axis=-1)
             mask_c = (t_c >= 0).astype(jnp.float32)
-            loss_c = (lse - tgt_logits) * mask_c
-            return jnp.sum(loss_c), jnp.sum(mask_c)
+            eff_w = mask_c * w_c
+            loss_c = (lse - tgt_logits) * eff_w
+            return jnp.sum(loss_c), jnp.sum(eff_w)
 
         if num_chunks == 1:
-            loss_sum, mask_sum = _ce_loss_chunk(h_scaled, targets_flat)
+            loss_sum, mask_sum = _ce_loss_chunk(h_scaled, targets_flat, weights_flat)
         else:
-            ce_fn = lambda _, inp: (None, _ce_loss_chunk(inp[0], inp[1]))
+            ce_fn = lambda _, inp: (None, _ce_loss_chunk(inp[0], inp[1], inp[2]))
             ce_scan = jax.checkpoint(ce_fn) if (use_remat or num_chunks > 2) else ce_fn
             h_chunks = h_scaled.reshape(num_chunks, chunk_tokens, surface_dim)
             t_chunks = targets_flat.reshape(num_chunks, chunk_tokens)
-            _, (chunk_losses, chunk_masks) = lax.scan(ce_scan, None, (h_chunks, t_chunks))
+            w_chunks = weights_flat.reshape(num_chunks, chunk_tokens)
+            _, (chunk_losses, chunk_masks) = lax.scan(ce_scan, None, (h_chunks, t_chunks, w_chunks))
             loss_sum = jnp.sum(chunk_losses)
             mask_sum = jnp.sum(chunk_masks)
 
@@ -1144,10 +1172,28 @@ def generate_text_jax(
     prompt_ids = encode_no_special(tokenizer, formatted_prompt)
     prompts_arr = jnp.array([prompt_ids], dtype=jnp.int32)
 
+    # Pillar 5: Dynamic Stopping Criteria & Prompt-Type Aware Decoding
+    slot_keywords = (
+        "analogy",
+        "::",
+        "is to",
+        "antonym",
+        "opposite of",
+        "synonym",
+        "what is the capital",
+        "what is the past tense",
+        "past tense of",
+        "plural of",
+        "definition of",
+        "define ",
+    )
+    is_slot = any(kw in prompt.lower() for kw in slot_keywords)
+    effective_max_tokens = min(max_new_tokens, 48) if is_slot else max_new_tokens
+
     logits = training_rollout(
         params=params,
         prompts=prompts_arr,
-        target_len=max_new_tokens,
+        target_len=effective_max_tokens,
         buffers=buffers,
         config=config,
         repetition_penalty=repetition_penalty,
@@ -1157,6 +1203,17 @@ def generate_text_jax(
         perceptual_inputs=perceptual_inputs,
     )
     token_ids = [int(x) for x in jnp.argmax(logits[0], axis=-1)]
+    if is_slot:
+        nl_id = getattr(tokenizer, "encode", lambda x: [13])("\n")
+        act_end_id = bio_ids.get("act_end", 34)
+        stop_set = set(nl_id) if isinstance(nl_id, list) else {nl_id}
+        if act_end_id is not None:
+            stop_set.add(act_end_id)
+        for idx_tok, tid in enumerate(token_ids):
+            if tid in stop_set and idx_tok > 0:
+                token_ids = token_ids[:idx_tok]
+                break
+
     if strict_act:
         return extract_strict_act_payload(token_ids, tokenizer)
     raw = tokenizer.decode(token_ids, skip_special_tokens=False)

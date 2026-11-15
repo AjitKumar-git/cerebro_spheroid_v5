@@ -122,6 +122,15 @@ PRESETS_V5: Dict[str, Dict[str, Any]] = {
         "thinking_cycles": 4,
         "phase_scale": 2.0,
     },
+    "v5_qwen_0_5b": {
+        "surface_dim": 896,
+        "radial_dim": 512,
+        "num_shells": 24,
+        "num_shortcut_tracts": 96,
+        "num_heads": 14,
+        "thinking_cycles": 4,
+        "phase_scale": 2.0,
+    },
     "v5_test": {
         "vocab_size": 2048,
         "surface_dim": 128,
@@ -1437,6 +1446,10 @@ class CerebroSpheroidV5(nn.Module):
         predictive_gain: float = 0.5,
         alignment_weight: float = 0.1,
         return_hidden_states: bool = False,
+        target_weights: Optional[torch.Tensor] = None,
+        anchor_token_id: int = 3191,
+        anchor_weight: float = 3.5,
+        use_anchor_loss: bool = True,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """
         Differentiable training rollout engine:
@@ -1466,6 +1479,10 @@ class CerebroSpheroidV5(nn.Module):
                 persona_id=persona_id,
                 deliberation_mode="teacher_forcing",
                 return_hidden_states=True,
+                target_weights=target_weights,
+                anchor_token_id=anchor_token_id,
+                anchor_weight=anchor_weight,
+                use_anchor_loss=use_anchor_loss,
             )
             loss_tf, logits_tf, h_tf = out_tf[0], out_tf[1], out_tf[2]
 
@@ -1484,6 +1501,10 @@ class CerebroSpheroidV5(nn.Module):
                 persona_id=persona_id,
                 deliberation_mode="scheduled",
                 return_hidden_states=True,
+                target_weights=target_weights,
+                anchor_token_id=anchor_token_id,
+                anchor_weight=anchor_weight,
+                use_anchor_loss=use_anchor_loss,
             )
             loss_delib, logits_delib, h_delib = out_delib[0], out_delib[1], out_delib[2]
 
@@ -1747,12 +1768,37 @@ class CerebroSpheroidV5(nn.Module):
         self.current_spheroid_state = state
 
         if targets is not None:
-            # Cross-entropy loss computed in float32 only on valid non-padded targets (target != -100)
-            loss = F.cross_entropy(
-                logits_stacked.view(-1, self.config.vocab_size).float(),
-                targets[:, :t_len].contiguous().view(-1),
-                ignore_index=-100,
-            )
+            # Pillar 2: Dynamic Answer-Anchor Loss Weighting (AALW)
+            tgt_slice = targets[:, :t_len]
+            if target_weights is not None or use_anchor_loss:
+                if target_weights is not None:
+                    token_weights = target_weights[:, :t_len].to(dev)
+                else:
+                    is_anchor = (tgt_slice == anchor_token_id)
+                    after_anchor = (torch.cumsum(is_anchor.long(), dim=-1) > 0)
+                    has_anchor = is_anchor.any(dim=-1, keepdim=True)
+                    # If anchor present: 1.0 before anchor, anchor_weight (3.5x) from anchor onwards
+                    # If direct slot (no anchor): entire sequence gets anchor_weight (3.5x)
+                    w = torch.where(has_anchor, torch.where(after_anchor, anchor_weight, 1.0), anchor_weight)
+                    valid_mask = (tgt_slice >= 0) & (tgt_slice != -100)
+                    token_weights = torch.where(valid_mask, w, torch.zeros_like(w))
+
+                loss_unreduced = F.cross_entropy(
+                    logits_stacked.view(-1, self.config.vocab_size).float(),
+                    tgt_slice.contiguous().view(-1),
+                    ignore_index=-100,
+                    reduction="none",
+                )
+                w_flat = token_weights.contiguous().view(-1).float()
+                valid_flat = (tgt_slice.contiguous().view(-1) != -100)
+                w_masked = w_flat * valid_flat.float()
+                loss = (loss_unreduced * w_masked).sum() / torch.clamp(w_masked.sum(), min=1e-5)
+            else:
+                loss = F.cross_entropy(
+                    logits_stacked.view(-1, self.config.vocab_size).float(),
+                    tgt_slice.contiguous().view(-1),
+                    ignore_index=-100,
+                )
 
             # Auxiliary predictive coding thought alignment loss
             if deliberation_mode == "predictive_coding" and t_len > 1 and pred_loss_total.item() > 0:
@@ -2043,8 +2089,37 @@ class CerebroSpheroidV5(nn.Module):
         bio_ids = get_bio_token_ids(tokenizer)
         raw_eos = getattr(tokenizer, "eos_token_id", 2)
         eos_id = int(raw_eos) if raw_eos is not None else 2
-        stop_ids = tuple(t for t in (eos_id, bio_ids.get("act_end")) if t is not None)
         seed_id = bio_ids.get("act")
+
+        # Pillar 5: Dynamic Stopping Criteria & Prompt-Type Aware Decoding
+        slot_keywords = (
+            "analogy",
+            "::",
+            "is to",
+            "antonym",
+            "opposite of",
+            "synonym",
+            "what is the capital",
+            "what is the past tense",
+            "past tense of",
+            "plural of",
+            "definition of",
+            "define ",
+        )
+        is_slot_query = any(kw in prompt.lower() for kw in slot_keywords)
+
+        stop_list = list(t for t in (eos_id, bio_ids.get("act_end")) if t is not None)
+        if is_slot_query:
+            try:
+                nl_tokens = encode_no_special(tokenizer, "\n")
+                for nlt in nl_tokens:
+                    if nlt not in stop_list:
+                        stop_list.append(nlt)
+            except Exception:
+                pass
+            max_new_tokens = min(max_new_tokens, 48)
+
+        stop_ids = tuple(stop_list)
 
         out_ids = self.generate(
             tok_tensor,
@@ -2153,7 +2228,14 @@ def infer_v5_config_from_state_dict(
 ) -> ModelConfigV5:
     """Infers a compatible ModelConfigV5 from either a PyTorch or JAX V5 checkpoint state dict."""
     raw_state, meta = _extract_raw_v5_state(ckpt_or_state)
-    preset_name = meta.get("model_preset") or meta.get("preset") or default_preset
+    inner_meta = meta.get("meta", {}) if isinstance(meta.get("meta"), dict) else {}
+    preset_name = (
+        meta.get("model_preset")
+        or meta.get("preset")
+        or inner_meta.get("target_config")
+        or meta.get("target_config")
+        or default_preset
+    )
     if preset_name in ("tpu_v5e_1", "tpu_v6e_1", "tpu_v6e", "tpu", "v5_tpu"):
         preset_name = "v5_small"
     cfg_kwargs = PRESETS_V5.get(preset_name, PRESETS_V5.get(default_preset, PRESETS_V5["v5_small"])).copy()

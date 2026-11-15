@@ -109,6 +109,15 @@ def load_arc_dataset(split_name: str = "ARC-Challenge", limit: Optional[int] = 5
         except Exception:
             pass
 
+    all_file = os.path.join(LOCAL_CACHE_DIR, f"{split_name.lower()}_all.json")
+    if os.path.exists(all_file):
+        try:
+            with open(all_file, "r") as f:
+                items = json.load(f)
+                return items[:limit] if limit and limit > 0 else items
+        except Exception:
+            pass
+
     print(f"  📥 Loading {cache_tag} items from allenai/ai2_arc ({split_name}, test split)...")
     split_str = f"test[:{limit}]" if limit and limit > 0 else "test"
     ds = load_dataset("allenai/ai2_arc", split_name, split=split_str)
@@ -150,6 +159,15 @@ def load_hellaswag_dataset(limit: Optional[int] = 100) -> List[Dict[str, Any]]:
         except Exception:
             pass
 
+    all_file = os.path.join(LOCAL_CACHE_DIR, "hellaswag_all.json")
+    if os.path.exists(all_file):
+        try:
+            with open(all_file, "r") as f:
+                items = json.load(f)
+                return items[:limit] if limit and limit > 0 else items
+        except Exception:
+            pass
+
     print(f"  📥 Loading {cache_tag} items from Rowan/hellaswag (validation split)...")
     split_str = f"validation[:{limit}]" if limit and limit > 0 else "validation"
     ds = load_dataset("Rowan/hellaswag", split=split_str)
@@ -184,6 +202,15 @@ def load_mmlu_dataset(limit: Optional[int] = 100) -> List[Dict[str, Any]]:
         try:
             with open(cache_file, "r") as f:
                 return json.load(f)
+        except Exception:
+            pass
+
+    all_file = os.path.join(LOCAL_CACHE_DIR, "mmlu_all.json")
+    if os.path.exists(all_file):
+        try:
+            with open(all_file, "r") as f:
+                items = json.load(f)
+                return items[:limit] if limit and limit > 0 else items
         except Exception:
             pass
 
@@ -223,6 +250,15 @@ def load_winogrande_dataset(limit: Optional[int] = 50) -> List[Dict[str, Any]]:
         except Exception:
             pass
 
+    all_file = os.path.join(LOCAL_CACHE_DIR, "winogrande_all.json")
+    if os.path.exists(all_file):
+        try:
+            with open(all_file, "r") as f:
+                items = json.load(f)
+                return items[:limit] if limit and limit > 0 else items
+        except Exception:
+            pass
+
     print(f"  📥 Loading {cache_tag} items from allenai/winogrande (validation split)...")
     split_str = f"validation[:{limit}]" if limit and limit > 0 else "validation"
     ds = load_dataset("allenai/winogrande", "winogrande_xl", split=split_str)
@@ -256,6 +292,15 @@ def load_openbookqa_dataset(limit: Optional[int] = 50) -> List[Dict[str, Any]]:
         try:
             with open(cache_file, "r") as f:
                 return json.load(f)
+        except Exception:
+            pass
+
+    all_file = os.path.join(LOCAL_CACHE_DIR, "openbookqa_all.json")
+    if os.path.exists(all_file):
+        try:
+            with open(all_file, "r") as f:
+                items = json.load(f)
+                return items[:limit] if limit and limit > 0 else items
         except Exception:
             pass
 
@@ -294,6 +339,15 @@ def load_gsm8k_dataset(limit: Optional[int] = 25) -> List[Dict[str, Any]]:
         try:
             with open(cache_file, "r") as f:
                 return json.load(f)
+        except Exception:
+            pass
+
+    all_file = os.path.join(LOCAL_CACHE_DIR, "gsm8k_all.json")
+    if os.path.exists(all_file):
+        try:
+            with open(all_file, "r") as f:
+                items = json.load(f)
+                return items[:limit] if limit and limit > 0 else items
         except Exception:
             pass
 
@@ -734,6 +788,8 @@ def run_academic_benchmark_suite(
         with open(export_json, "w") as f:
             json.dump(out_data, f, indent=2)
         print(f"💾 Full Results Exported to: {export_json}\n")
+
+    return results_summary, details_log
 
 
 def main():
