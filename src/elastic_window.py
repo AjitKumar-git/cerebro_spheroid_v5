@@ -86,6 +86,9 @@ def extract_prompt_response_pair(row: Any) -> Tuple[str, str]:
         r_txt = row.get("answer", row.get("response", row.get("output", row.get("text", ""))))
         if q_txt and r_txt:
             return str(q_txt), str(r_txt)
+        if not q_txt and "code" in row:
+            raw_c = str(row["code"]).strip()
+            return "Implement the following Python code:", raw_c
         if not q_txt and "text" in row:
             raw_t = str(row["text"]).strip()
             if "\n\n" in raw_t:
@@ -217,20 +220,30 @@ def build_online_dataset_iterator(
             it = opener()
             return next(it), it
 
+    def _next_filtered_fineweb(it: Optional[Iterator[Any]], opener, min_score: float = 3.0):
+        for _ in range(50):
+            row, it = _next_or_reopen(it, opener)
+            score = float(row.get("score", 0.0) or row.get("educational_score", 0.0) or row.get("int_score", 0.0))
+            if score >= min_score:
+                return row, it
+        return row, it
+
     if source == "autonomous":
-        # 4-Phase Developmental Autonomous Curriculum for V5 Base (512M)
-        # Phase 1 (0 -> 15%): Foundation World Knowledge & Educational Prose (60% FineWeb-Edu, 15% Cosmo, 10% Everyday, 10% Math, 5% Code)
-        # Phase 2 (15% -> 50%): Broadening & Algorithmic Grounding (35% FineWeb-Edu, 25% Everyday, 20% Code, 20% Math)
+        # 4-Phase Developmental Autonomous Curriculum for V5 Base / 200B Campaign
+        # Phase 1 (0 -> 15%): Foundation World Knowledge & Educational Prose (60% FineWeb-Edu >= 3, 15% Cosmo, 10% Everyday, 10% Math, 5% Code)
+        # Phase 2 (15% -> 50%): Broadening & Algorithmic Grounding (35% FineWeb-Edu >= 3, 25% Everyday, 20% Code, 20% Math)
         # Phase 3 (50% -> 85%): Balanced Tri-Pillar Reasoning (33.3% Science, 33.3% Commonsense & Logic, 33.3% Math-CoT & Code)
-        # Phase 4 (85% -> 100%): Annealing Basin & Boundary Consolidation (30% FineWeb-Edu, 30% GSM8K/MetaMath, 20% Code, 20% Magpie)
+        # Phase 4 (85% -> 100%): Annealing Basin & Boundary Consolidation (30% FineWeb-Edu >= 3, 30% FineMath/MetaMath, 20% Code, 20% Magpie)
         know_it: Optional[Iterator[Any]] = None
         cosmo_it: Optional[Iterator[Any]] = None
         everyday_it: Optional[Iterator[Any]] = None
         openhermes_it: Optional[Iterator[Any]] = None
         logic_it: Optional[Iterator[Any]] = None
         code_it: Optional[Iterator[Any]] = None
+        pycode_it: Optional[Iterator[Any]] = None
         gsm_it: Optional[Iterator[Any]] = None
         math_it: Optional[Iterator[Any]] = None
+        finemath_it: Optional[Iterator[Any]] = None
 
         def _get_step_val() -> int:
             if callable(step_getter):
@@ -243,7 +256,7 @@ def build_online_dataset_iterator(
             return 0
 
         def _autonomous_gen():
-            nonlocal know_it, cosmo_it, everyday_it, openhermes_it, logic_it, code_it, gsm_it, math_it
+            nonlocal know_it, cosmo_it, everyday_it, openhermes_it, logic_it, code_it, pycode_it, gsm_it, math_it, finemath_it
             turn = 0
             while True:
                 cur_step = _get_step_val()
@@ -252,11 +265,11 @@ def build_online_dataset_iterator(
                 try:
                     if tau < 0.15:
                         # Phase 1: Foundation & World Knowledge Imprinting (Cycle mod 10)
-                        # 60% FineWeb-Edu (score >= 4.0), 15% Cosmopedia, 10% Everyday Commonsense, 10% MetaMathQA, 5% Code
+                        # 60% FineWeb-Edu (score >= 3.0), 15% Cosmopedia, 10% Everyday Commonsense, 10% Math, 5% Code
                         mod10 = turn % 10
                         if mod10 in (0, 2, 4, 6, 8):
-                            row, know_it = _next_or_reopen(
-                                know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-10BT", rank=rank, world_size=world_size)
+                            row, know_it = _next_filtered_fineweb(
+                                know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size), min_score=3.0
                             )
                             yield row
                         elif mod10 in (1, 5):
@@ -272,23 +285,33 @@ def build_online_dataset_iterator(
                             )
                             yield row
                         elif mod10 == 7:
-                            row, math_it = _next_or_reopen(
-                                math_it, lambda: _open_hf_stream("meta-math/MetaMathQA", rank=rank, world_size=world_size)
-                            )
+                            if (turn // 10) % 2 == 0:
+                                row, finemath_it = _next_or_reopen(
+                                    finemath_it, lambda: _open_hf_stream("HuggingFaceTB/finemath", "finemath-4plus", rank=rank, world_size=world_size)
+                                )
+                            else:
+                                row, math_it = _next_or_reopen(
+                                    math_it, lambda: _open_hf_stream("meta-math/MetaMathQA", rank=rank, world_size=world_size)
+                                )
                             yield row
                         else:
-                            row, code_it = _next_or_reopen(
-                                code_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct", rank=rank, world_size=world_size)
-                            )
+                            if (turn // 10) % 2 == 0:
+                                row, pycode_it = _next_or_reopen(
+                                    pycode_it, lambda: _open_hf_stream("ajibawa-2023/Python-Code-Large", rank=rank, world_size=world_size)
+                                )
+                            else:
+                                row, code_it = _next_or_reopen(
+                                    code_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct", rank=rank, world_size=world_size)
+                                )
                             yield row
 
                     elif tau < 0.50:
                         # Phase 2: Broadening, Commonsense Expansion & Algorithmic Grounding (Cycle mod 10)
-                        # 35% FineWeb-Edu, 25% Everyday Commonsense, 20% Python Code, 20% Math Proofs
+                        # 35% FineWeb-Edu (score >= 3.0), 25% Everyday Commonsense, 20% Python Code, 20% Math Proofs
                         mod10 = turn % 10
                         if mod10 in (0, 3, 6):
-                            row, know_it = _next_or_reopen(
-                                know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-10BT", rank=rank, world_size=world_size)
+                            row, know_it = _next_filtered_fineweb(
+                                know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size), min_score=3.0
                             )
                             yield row
                         elif mod10 in (1, 5, 8):
@@ -297,12 +320,22 @@ def build_online_dataset_iterator(
                             )
                             yield row
                         elif mod10 in (2, 7):
-                            row, code_it = _next_or_reopen(
-                                code_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct", rank=rank, world_size=world_size)
-                            )
+                            if (turn // 10) % 2 == 0:
+                                row, pycode_it = _next_or_reopen(
+                                    pycode_it, lambda: _open_hf_stream("ajibawa-2023/Python-Code-Large", rank=rank, world_size=world_size)
+                                )
+                            else:
+                                row, code_it = _next_or_reopen(
+                                    code_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct", rank=rank, world_size=world_size)
+                                )
                             yield row
                         else:
-                            if (turn // 10) % 2 == 0:
+                            mod_math = (turn // 10) % 3
+                            if mod_math == 0:
+                                row, finemath_it = _next_or_reopen(
+                                    finemath_it, lambda: _open_hf_stream("HuggingFaceTB/finemath", "finemath-4plus", rank=rank, world_size=world_size)
+                                )
+                            elif mod_math == 1:
                                 row, gsm_it = _next_or_reopen(
                                     gsm_it, lambda: _open_hf_stream("openai/gsm8k", "main", rank=rank, world_size=world_size)
                                 )
@@ -314,11 +347,11 @@ def build_online_dataset_iterator(
 
                     elif tau < 0.85:
                         # Phase 3: Deep Deliberation & 1:1:1 Tri-Pillar Reasoning (Cycle mod 6)
-                        # 33.3% Science Anchor, 33.3% Commonsense & Multi-Turn Logic, 33.3% Math-CoT & Indented Code
+                        # 33.3% Science Anchor (score >= 3.0), 33.3% Commonsense & Multi-Turn Logic, 33.3% Math-CoT & Indented Code
                         mod6 = turn % 6
                         if mod6 in (0, 3):
-                            row, know_it = _next_or_reopen(
-                                know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-10BT", rank=rank, world_size=world_size)
+                            row, know_it = _next_filtered_fineweb(
+                                know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size), min_score=3.0
                             )
                             yield row
                         elif mod6 == 1:
@@ -327,12 +360,22 @@ def build_online_dataset_iterator(
                             )
                             yield row
                         elif mod6 == 2:
-                            row, code_it = _next_or_reopen(
-                                code_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct", rank=rank, world_size=world_size)
-                            )
+                            if (turn // 6) % 2 == 0:
+                                row, pycode_it = _next_or_reopen(
+                                    pycode_it, lambda: _open_hf_stream("ajibawa-2023/Python-Code-Large", rank=rank, world_size=world_size)
+                                )
+                            else:
+                                row, code_it = _next_or_reopen(
+                                    code_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct", rank=rank, world_size=world_size)
+                                )
                             yield row
                         elif mod6 == 4:
-                            if (turn // 6) % 2 == 0:
+                            mod_math = (turn // 6) % 3
+                            if mod_math == 0:
+                                row, finemath_it = _next_or_reopen(
+                                    finemath_it, lambda: _open_hf_stream("HuggingFaceTB/finemath", "finemath-4plus", rank=rank, world_size=world_size)
+                                )
+                            elif mod_math == 1:
                                 row, gsm_it = _next_or_reopen(
                                     gsm_it, lambda: _open_hf_stream("openai/gsm8k", "main", rank=rank, world_size=world_size)
                                 )
@@ -354,15 +397,20 @@ def build_online_dataset_iterator(
 
                     else:
                         # Phase 4: Annealing Basin & Boundary Consolidation (Cycle mod 10)
-                        # 30% FineWeb-Edu, 30% Verified GSM8K & MetaMath, 20% Indented Code, 20% Magpie Ultra Logic
+                        # 30% FineWeb-Edu (score >= 3.0), 30% Verified GSM8K/FineMath/MetaMath, 20% Indented Code, 20% Magpie Ultra Logic
                         mod10 = turn % 10
                         if mod10 in (0, 3, 6):
-                            row, know_it = _next_or_reopen(
-                                know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-10BT", rank=rank, world_size=world_size)
+                            row, know_it = _next_filtered_fineweb(
+                                know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size), min_score=3.0
                             )
                             yield row
                         elif mod10 in (1, 4, 7):
-                            if (turn // 10) % 2 == 0:
+                            mod_math = (turn // 10) % 3
+                            if mod_math == 0:
+                                row, finemath_it = _next_or_reopen(
+                                    finemath_it, lambda: _open_hf_stream("HuggingFaceTB/finemath", "finemath-4plus", rank=rank, world_size=world_size)
+                                )
+                            elif mod_math == 1:
                                 row, gsm_it = _next_or_reopen(
                                     gsm_it, lambda: _open_hf_stream("openai/gsm8k", "main", rank=rank, world_size=world_size)
                                 )
@@ -372,9 +420,14 @@ def build_online_dataset_iterator(
                                 )
                             yield row
                         elif mod10 in (2, 8):
-                            row, code_it = _next_or_reopen(
-                                code_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct", rank=rank, world_size=world_size)
-                            )
+                            if (turn // 10) % 2 == 0:
+                                row, pycode_it = _next_or_reopen(
+                                    pycode_it, lambda: _open_hf_stream("ajibawa-2023/Python-Code-Large", rank=rank, world_size=world_size)
+                                )
+                            else:
+                                row, code_it = _next_or_reopen(
+                                    code_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct", rank=rank, world_size=world_size)
+                                )
                             yield row
                         else:
                             row, logic_it = _next_or_reopen(
@@ -454,9 +507,9 @@ def build_online_dataset_iterator(
                         yield row
 
                     else:
-                        # Knowledge Retention Anchor (FineWeb-Edu score >= 4.0) -> Prevents catastrophic forgetting!
-                        row, know_it = _next_or_reopen(
-                            know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-10BT", rank=rank, world_size=world_size)
+                        # Knowledge Retention Anchor (FineWeb-Edu score >= 3.0) -> Prevents catastrophic forgetting!
+                        row, know_it = _next_filtered_fineweb(
+                            know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size), min_score=3.0
                         )
                         yield row
 
@@ -488,9 +541,9 @@ def build_online_dataset_iterator(
                     elif mod5 in (1, 4):
                         for _ in range(20):
                             row, fw_it = _next_or_reopen(
-                                fw_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-10BT", rank=rank, world_size=world_size)
+                                fw_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size)
                             )
-                            if float(row.get("score", 0.0) or row.get("educational_score", 0.0)) >= 4.0:
+                            if float(row.get("score", 0.0) or row.get("educational_score", 0.0) or row.get("int_score", 0.0)) >= 3.0:
                                 text = (row.get("text") or "").strip()
                                 if len(text) >= 50:
                                     p, r = text.split("\n\n", 1) if "\n\n" in text else ("Explain the concept:", text)
@@ -568,10 +621,10 @@ def build_online_dataset_iterator(
                             )
                         yield row
                     elif mod6 in (1, 3):
-                        # 2 & 4. Science & Academic Anchor: FineWeb-Edu (score >= 4.0) -> 33.3% allocation!
+                        # 2 & 4. Science & Academic Anchor: FineWeb-Edu (score >= 3.0) -> 33.3% allocation!
                         # Protects and locks in ARC-Challenge (40%+) and MMLU factual recall
-                        row, know_it = _next_or_reopen(
-                            know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-10BT", rank=rank, world_size=world_size)
+                        row, know_it = _next_filtered_fineweb(
+                            know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size), min_score=3.0
                         )
                         yield row
                     elif mod6 == 2:
@@ -993,7 +1046,7 @@ def build_canonical_eval_split(
     from src.corpus import format_stimulus_prompt, format_motor_response
 
     domain_configs = [
-        ("Science (FineWeb-Edu >= 4)", lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-10BT")),
+        ("Science (FineWeb-Edu >= 3)", lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT")),
         ("Textbooks (Cosmopedia-v2)", lambda: _open_hf_stream("HuggingFaceTB/cosmopedia-v2", "cosmopedia-v2")),
         ("Math Proofs (MetaMathQA)", lambda: _open_hf_stream("meta-math/MetaMathQA")),
         ("Math-CoT (GSM8K Test)", lambda: _open_hf_stream("openai/gsm8k", "main", split="test")),
