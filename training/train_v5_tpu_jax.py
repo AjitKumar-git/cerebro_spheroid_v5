@@ -202,7 +202,7 @@ def parse_args(args_list=None):
     parser.add_argument("--reset_best", action="store_true", default=False, help="Reset best validation loss tracker")
     parser.add_argument("--from-scratch", "--from_scratch", dest="from_scratch", action="store_true", default=False, help="Start clean from Step 0 without loading any checkpoint")
     parser.add_argument("--effective-batch-size", "--effective_batch_size", dest="effective_batch_size", type=int, default=None, help="Target global effective batch size (e.g. 256; automatically computes grad_accum)")
-    parser.add_argument("--target-tokens", "--target_tokens", dest="target_tokens", type=int, default=7_000_000_000, help="Target token ingestion budget for campaign (default: 7,000,000,000 tokens)")
+    parser.add_argument("--target-tokens", "--target_tokens", dest="target_tokens", type=int, default=200_000_000_000, help="Target token ingestion budget for campaign (default: 200,000,000,000 tokens)")
     parser.add_argument("--init_from_checkpoint", "--init-from-checkpoint", dest="init_from_checkpoint", type=str, default=None, help="Base foundation checkpoint to load weights from (e.g. step900k)")
     parser.add_argument("--reset_step_counter", "--reset-step-counter", dest="reset_step_counter", action="store_true", default=False, help="Reset step counter to 0 after loading base weights to start new campaign from scratch")
 
@@ -986,7 +986,7 @@ def main(args=None):
 
                 gov_str = f" | Gov: {alpha_gov:.2f}" if getattr(args, "loss_window_governor", True) and alpha_gov > 0.01 else ""
 
-                tgt_tok = getattr(args, "target_tokens", 7_000_000_000)
+                tgt_tok = getattr(args, "target_tokens", 200_000_000_000)
                 if tgt_tok and tgt_tok > 0:
                     pct = (cumulative_tokens / tgt_tok) * 100.0
                     eta_sec = max(0.0, tgt_tok - cumulative_tokens) / max(tok_per_sec, 1e-6)
@@ -1038,7 +1038,7 @@ def main(args=None):
                         "sync_model": sync_model_name,
                         "cumulative_tokens": cumulative_tokens,
                         "lifetime_tokens": lifetime_tokens,
-                        "target_tokens": getattr(args, "target_tokens", 7_000_000_000),
+                        "target_tokens": getattr(args, "target_tokens", 200_000_000_000),
                         "effective_batch_size": args.batch_size * grad_accum,
                         "timestamp": time.time(),
                     }
@@ -1086,7 +1086,7 @@ def main(args=None):
                     "sync_model": sync_model_name,
                     "cumulative_tokens": cumulative_tokens,
                     "lifetime_tokens": lifetime_tokens,
-                    "target_tokens": getattr(args, "target_tokens", 7_000_000_000),
+                    "target_tokens": getattr(args, "target_tokens", 200_000_000_000),
                     "effective_batch_size": args.batch_size * grad_accum,
                     "timestamp": time.time(),
                 }
@@ -1157,7 +1157,7 @@ def main(args=None):
             "sync_model": sync_model_name,
             "cumulative_tokens": cumulative_tokens if "cumulative_tokens" in locals() else 0,
             "lifetime_tokens": lifetime_tokens if "lifetime_tokens" in locals() else 0,
-            "target_tokens": getattr(args, "target_tokens", 7_000_000_000),
+            "target_tokens": getattr(args, "target_tokens", 200_000_000_000),
             "effective_batch_size": args.batch_size * grad_accum,
             "timestamp": time.time(),
         }
