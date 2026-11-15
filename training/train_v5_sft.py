@@ -71,7 +71,7 @@ from src.jax.v5_model import (
 from src.jax.checkpoint import adapt_and_load_checkpoint_weights, discover_latest_checkpoint, AsyncCheckpointManager
 from src.jax.auto_tuner import resolve_jax_compute_dtype
 from src.jax.data_streamer import LinguisticDataStreamer
-from src.jax.spheroid_optimizer import build_spheroid_train_engine
+from src.jax.spheroid_optimizer import init_spheroid_opt_state, build_spheroid_train_engine
 from src.elastic_window import (
     build_online_dataset_iterator,
     build_canonical_eval_split,
@@ -248,7 +248,7 @@ def main(args=None):
     # 1. Model Configuration & Memory Buffers
     config_dict = PRESETS_V5.get(base_preset, PRESETS_V5["v5_small"]).copy()
     config = ModelConfigV5(**config_dict)
-    target_dtype = resolve_jax_compute_dtype(args.dtype)
+    target_dtype, dtype_str = resolve_jax_compute_dtype(args.dtype)
 
     init_rng = jax.random.PRNGKey(42)
     params, buffers = init_params_v5(init_rng, config=config)
@@ -340,7 +340,7 @@ def main(args=None):
         return new_p, new_opt_s, loss_val
 
     # Initialize fresh Spheroid optimizer state
-    opt_state = {}
+    opt_state = init_spheroid_opt_state(params)
 
     # 6. SFT Multi-Corpus Data Ingestion & Prefetching
     print(f"\n📦 Initializing Curated Conversational & Reasoning SFT Streamer...")
