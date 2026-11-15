@@ -106,6 +106,7 @@ def parse_sft_args(args_list: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--cloud_sync", "--cloud-sync", dest="cloud_sync", action=argparse.BooleanOptionalAction, default=True, help="Live bi-directional sync with bioflo.in")
     parser.add_argument("--cloud_url", dest="cloud_url", type=str, default="https://bioflo.in/api/cerebro/sync.php", help="bioflo.in sync endpoint")
     parser.add_argument("--cloud_token", dest="cloud_token", type=str, default="CerebroSpheroid_Sync_Secure_2026", help="Sync token")
+    parser.add_argument("--sampling_p", "--sampling-p", dest="sampling_p", type=float, default=1.0, help="Sampling probability for deliberation (1.0 for teacher forcing, 0.5 for scheduled deliberation)")
     parser.add_argument("--deliberation_mode", dest="deliberation_mode", type=str, default="teacher_forcing", choices=["teacher_forcing", "scheduled", "pitfall_recovery", "internal"], help="Deliberation mode")
     parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bf16", "fp16", "fp32"], help="Matrix compute dtype")
     parser.add_argument("--remat", type=str, default="true", choices=["true", "false", "auto"], help="Activation rematerialization")
@@ -231,6 +232,9 @@ def main(args=None):
         os.environ["HF_HOME"] = "/tmp/hf_cache"
     os.makedirs(os.environ["HF_HOME"], exist_ok=True)
 
+    if args.sampling_p < 1.0 - 1e-4 and args.deliberation_mode == "teacher_forcing":
+        args.deliberation_mode = "scheduled"
+
     print("=" * 84)
     print("🧠 CEREBROSPHEROID V5: CONVERSATIONAL & REASONING SFT ENGINE")
     print("=" * 84)
@@ -239,6 +243,7 @@ def main(args=None):
     print(f"  Total SFT Steps     : {args.total_steps:,}")
     print(f"  Batch Size          : {args.batch_size} per device ({num_devices} active devices)")
     print(f"  Context Budget      : Prompt={args.prompt_len} tok | Target={args.seq_len} tok")
+    print(f"  Deliberation Policy : Mode={args.deliberation_mode} | Sampling P={args.sampling_p:.2f}")
     print(f"  Learning Rate Decay : {args.lr:g} -> {args.min_lr:g} ({args.warmup_steps} step warmup)")
     print(f"  Weight Decay        : {args.weight_decay:g}")
     print(f"  Cloud Sync          : {args.cloud_sync} (Endpoint: {args.cloud_url})")
@@ -334,7 +339,7 @@ def main(args=None):
 
     def sft_train_step_fn(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens=None):
         loss_val, grads = compute_grad_step(
-            p, q_batch, r_batch, feedback_tokens=feedback_tokens, sampling_p=1.0, deliberation_mode="teacher_forcing"
+            p, q_batch, r_batch, feedback_tokens=feedback_tokens, sampling_p=args.sampling_p, deliberation_mode=args.deliberation_mode
         )
         new_p, new_opt_s = apply_opt_step(p, opt_s, grads, cur_lr)
         return new_p, new_opt_s, loss_val

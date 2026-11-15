@@ -142,6 +142,23 @@ def parse_args():
         help="Local checkpoint directory",
     )
     parser.add_argument(
+        "--sampling-p",
+        "--sampling_p",
+        dest="sampling_p",
+        type=float,
+        default=1.0,
+        help="Teacher sampling probability (default: 1.0 for teacher-forcing, 0.5 for deliberative SFT)",
+    )
+    parser.add_argument(
+        "--deliberation-mode",
+        "--deliberation_mode",
+        dest="deliberation_mode",
+        type=str,
+        default="teacher_forcing",
+        choices=["teacher_forcing", "scheduled", "pitfall_recovery", "internal"],
+        help="Deliberation mode (default: teacher_forcing)",
+    )
+    parser.add_argument(
         "--cloud-sync",
         dest="cloud_sync",
         action=argparse.BooleanOptionalAction,
@@ -244,6 +261,8 @@ def main():
         seq_len=args.seq_len,
         lr=args.lr,
         min_lr=args.min_lr,
+        sampling_p=args.sampling_p,
+        deliberation_mode=args.deliberation_mode,
         save_interval=args.save_interval,
         eval_interval=args.eval_interval,
         probe_interval=args.probe_interval,
