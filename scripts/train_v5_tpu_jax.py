@@ -207,6 +207,8 @@ def parse_args(args_list=None):
     parser.add_argument("--target-tokens", "--target_tokens", dest="target_tokens", type=int, default=200_000_000_000, help="Target token ingestion budget for campaign (default: 200,000,000,000 tokens)")
     parser.add_argument("--init_from_checkpoint", "--init-from-checkpoint", dest="init_from_checkpoint", type=str, default=None, help="Base foundation checkpoint to load weights from (e.g. step900k)")
     parser.add_argument("--reset_step_counter", "--reset-step-counter", dest="reset_step_counter", action="store_true", default=False, help="Reset step counter to 0 after loading base weights to start new campaign from scratch")
+    parser.add_argument("--target-eval-loss", "--target_eval_loss", dest="target_eval_loss", type=float, default=1.60, help="Target held-out evaluation loss for convergence early stopping (default: 1.60)")
+    parser.add_argument("--consistent-eval-threshold", "--consistent_eval_threshold", dest="consistent_eval_threshold", type=int, default=3, help="Consecutive evaluations required <= target-eval-loss to confirm convergence (default: 3)")
 
     return parser.parse_args(args_list)
 
@@ -513,13 +515,31 @@ def main(args=None):
 
         # Discover and restore latest local checkpoint or explicit foundation checkpoint
         discovered_ckpt = None
-        if getattr(args, "init_from_checkpoint", None) and os.path.exists(args.init_from_checkpoint):
-            discovered_ckpt = args.init_from_checkpoint
-            print(f"📦 Loading base model weights from explicit checkpoint: {discovered_ckpt}")
-        elif not os.path.exists(local_latest) and os.path.exists(fallback_latest):
-            local_latest = fallback_latest
+        candidate_init = getattr(args, "init_from_checkpoint", None)
+        if candidate_init:
+            candidate_paths = [
+                candidate_init,
+                os.path.join(args.checkpoint_dir, candidate_init),
+                os.path.join(args.checkpoint_dir, f"{candidate_init}.pt"),
+                os.path.join("checkpoints", candidate_init),
+                os.path.join("checkpoints", f"{candidate_init}.pt"),
+                "/home/ajit/Documents/Startup/Active_Development/cerebro_spheroid_v5/checkpoints/v5_small_latest_step900k.pt"
+                if ("900" in str(candidate_init)) else None,
+                "/home/ajit/Documents/Startup/Active_Development/reasoning_agent/checkpoints/v5_small_latest_step900k.pt"
+                if ("900" in str(candidate_init)) else None,
+            ]
+            for p in candidate_paths:
+                if p and os.path.exists(p):
+                    discovered_ckpt = p
+                    break
+            if discovered_ckpt:
+                print(f"📦 Loading base model weights from explicit checkpoint: {discovered_ckpt}")
+            else:
+                print(f"⚠️ Explicit checkpoint '{candidate_init}' not found locally. Searching default checkpoint paths...")
 
         if not discovered_ckpt:
+            if not os.path.exists(local_latest) and os.path.exists(fallback_latest):
+                local_latest = fallback_latest
             if os.path.exists(local_latest):
                 discovered_ckpt = local_latest
             else:
@@ -551,6 +571,10 @@ def main(args=None):
                     last_eval_loss = float("inf")
                     initial_ema_loss = None
                     print("🌱 [Campaign Reset Active] Step counter reset to 0! Calibrating fresh schedule from adapted base weights.")
+                else:
+                    if args.total_steps <= start_step:
+                        args.total_steps = start_step + calculated_steps
+                        print(f"🎯 Resuming from Step {start_step:,} -> Extended campaign schedule to Step {args.total_steps:,} (+{calculated_steps:,} steps)")
             except Exception as e:
                 print(f"⚠️ Checkpoint load notice: {e}. Starting fresh.")
 
@@ -892,6 +916,7 @@ def main(args=None):
     step_window_tokens = 0
     step_window_count = 0
     ema_loss: Optional[float] = initial_ema_loss
+    consistent_target_count = 0
 
     # Persistent Cumulative Token Accounting
     loaded_ckpt = ckpt if ("ckpt" in locals() and isinstance(ckpt, dict)) else {}
@@ -1052,7 +1077,38 @@ def main(args=None):
                         parts = [f"{k}: {v/1e9:.3f}B" for k, v in sorted(ds_stats.items())]
                         print(f"   └─ Ingested Tokens Breakdown: " + " | ".join(parts))
 
-                if is_champion:
+                # Convergence Early Stopping Check
+                target_eval_loss = getattr(args, "target_eval_loss", None)
+                consistent_eval_threshold = max(1, int(getattr(args, "consistent_eval_threshold", 3)))
+                converged_target_met = False
+
+                if target_eval_loss is not None and math.isfinite(eval_loss):
+                    if eval_loss <= target_eval_loss:
+                        consistent_target_count += 1
+                        print(
+                            f"🎯 [Convergence Target] Held-out loss {eval_loss:.4f} <= {target_eval_loss:.4f} "
+                            f"({consistent_target_count}/{consistent_eval_threshold} consecutive checks)"
+                        )
+                        if consistent_target_count >= consistent_eval_threshold:
+                            converged_target_met = True
+                            print(
+                                f"\n"
+                                f"================================================================================\n"
+                                f"🏆 [CONVERGENCE ACHIEVED & VERIFIED CONSISTENT]\n"
+                                f"Held-out composite loss has reached {eval_loss:.4f} (Target <= {target_eval_loss:.4f})\n"
+                                f"Consistently sustained across {consistent_eval_threshold} consecutive evaluation cycles!\n"
+                                f"Final Step: {step:,} | Held-Out Loss: {eval_loss:.4f} | PPL: {eval_ppl:.2f}\n"
+                                f"================================================================================\n"
+                            )
+                    else:
+                        if consistent_target_count > 0:
+                            print(
+                                f"ℹ️ [Convergence Notice] Held-out loss {eval_loss:.4f} > target {target_eval_loss:.4f}. "
+                                f"Resetting consistent counter ({consistent_target_count} -> 0)."
+                            )
+                        consistent_target_count = 0
+
+                if is_champion or converged_target_met:
                     best_eval_loss = eval_loss
                     best_fname = f"{args.preset}_best.pt"
                     meta_best = {
@@ -1068,18 +1124,23 @@ def main(args=None):
                         "target_tokens": getattr(args, "target_tokens", 200_000_000_000),
                         "effective_batch_size": args.batch_size * grad_accum,
                         "tokens_by_dataset": batcher.get_tokens_by_dataset() if hasattr(batcher, "get_tokens_by_dataset") else {},
+                        "converged": bool(converged_target_met),
                         "timestamp": time.time(),
                     }
                     ckpt_mgr.dispatch(_get_host_params(), buffers, best_fname, meta_dict=meta_best, block_if_busy=True)
+                    if converged_target_met:
+                        converged_fname = f"{args.preset}_converged_1.6.pt"
+                        ckpt_mgr.dispatch(_get_host_params(), buffers, converged_fname, meta_dict=meta_best, block_if_busy=True)
 
                     if args.cloud_sync:
                         try:
                             import datetime
+                            status_tag = "CONVERGED_1.6" if converged_target_met else "NEW_CHAMPION"
                             champ_rec = {
                                 "step": step,
                                 "loss": float(loss),
                                 "eval_loss": eval_loss,
-                                "status": "NEW_CHAMPION",
+                                "status": status_tag,
                                 "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                                 "source": detect_source_environment(),
                             }
@@ -1091,6 +1152,10 @@ def main(args=None):
                             )
                         except Exception:
                             pass
+
+                    if converged_target_met:
+                        print("🏁 Gracefully completing training session as convergence target has been achieved!")
+                        break
 
             # Asynchronous Checkpoint Saving
             save_latest = False

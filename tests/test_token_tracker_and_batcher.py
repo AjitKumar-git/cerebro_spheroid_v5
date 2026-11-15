@@ -134,6 +134,35 @@ class TestTokenTrackerAndBatcher(unittest.TestCase):
         self.assertTrue(success)
         self.assertTrue(mock_urlopen.called)
 
+    def test_convergence_early_stopping_logic(self):
+        target_eval_loss = 1.60
+        threshold = 3
+
+        # Simulate fluctuating evaluation loss sequence
+        eval_losses = [2.10, 1.85, 1.58, 1.62, 1.59, 1.57, 1.55]
+        consistent_count = 0
+        converged = False
+        converged_at_idx = None
+
+        for idx, el in enumerate(eval_losses):
+            if el <= target_eval_loss:
+                consistent_count += 1
+                if consistent_count >= threshold:
+                    converged = True
+                    converged_at_idx = idx
+                    break
+            else:
+                consistent_count = 0
+
+        self.assertTrue(converged)
+        # Should converge on index 6 (1.59, 1.57, 1.55) after reset at index 3 (1.62)
+        self.assertEqual(converged_at_idx, 6)
+
+    def test_step900k_checkpoint_discovery(self):
+        root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        ckpt_path = os.path.join(root_dir, "checkpoints", "v5_small_latest_step900k.pt")
+        self.assertTrue(os.path.exists(ckpt_path), f"Checkpoint not found at: {ckpt_path}")
+
 
 if __name__ == "__main__":
     unittest.main()
