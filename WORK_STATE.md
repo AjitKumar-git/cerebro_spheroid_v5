@@ -1,15 +1,20 @@
 # Agent Work State & Activity Tracker
 
-> **Status**: 🟢 `COMPLETED` | **Last Updated**: `2026-11-16T21:43:45.767886+05:30` | **Session**: `734a32d4-30f9-4fa4-b9c2-5336e0f58c27`
+> **Status**: 🟢 `COMPLETED` | **Last Updated**: `2026-11-16T21:55:48.303042+05:30` | **Session**: `0f3587bb-eb4b-4589-908a-f9a86dcc5d7b`
 
 ## Current / Active Objective
-**Goal**: if we want to capture the relationship between token to correctly capture the the weights inside a model into a database like opening the ai blackbox, how much time and space would that take
+**Goal**: 🌱 [OPTION A: CLEAN SFT INITIALIZATION]
+   Warm-starting SFT Step 0 from the pre-trained Step 922.5k foundation model!
+   Zero textbook/physics contamination. Stream: Layman Conversational & CoT Reason...
 
 - **Phase**: `completed`
 - **Current Task**: Idle / Awaiting next request
 
 ## Summary of Completed Work
-To understand how much time and space it takes to "open the AI black box" by mapping token relationships and weights into a database, we have to look at what the model actually computes.
+The hardware and pipeline metrics are running with high efficiency:
+- **Throughput:** $1.06\text{ steps/s}$ ($416,800\text{ tok/s}$) on TPU v5e-1.
+- **HBM Usage:** $2.1\text{ GB}$ ($13.4\%$ of $15.7\text{ GB}$) with Remat=True.
+- **Base Model Restoration:** Step 922.5k foundation weights successfully loaded.
 
 ## Modified Files
 - [`scripts/run_weight_transfer_experiment.py`](scripts/run_weight_transfer_experiment.py)
