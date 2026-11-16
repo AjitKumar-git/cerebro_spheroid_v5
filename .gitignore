@@ -23,6 +23,7 @@ data/*
 !data/tokenizer/**
 !data/chat_thinking_sft_15k.jsonl
 archive/
+!colab/archive/
 .hf_cache/
 .kaggle_output/
 chat_logs/
@@ -59,3 +60,4 @@ backup/
 loss_history*.json
 loss_trajectory*.png
 metrics/
+.pytest_cache/

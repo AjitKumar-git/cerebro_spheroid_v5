@@ -195,8 +195,15 @@ def _apply_spheroid_grads(
     grads: Dict[str, jnp.ndarray],
     base_lr: Any,
     weight_decay: float,
+    param_masks: Optional[Dict[str, jnp.ndarray]] = None,
 ) -> Tuple[Dict[str, jnp.ndarray], Dict[str, Any]]:
     """Applies Polar Newton-Schulz, recurrent spectral clamp, and float32 master-weight AdamW."""
+    if param_masks is not None:
+        grads = {
+            k: (g * param_masks[k] if (k in param_masks and jnp.issubdtype(g.dtype, jnp.inexact)) else g)
+            for k, g in grads.items()
+        }
+
     grad_norm = jnp.sqrt(
         sum(jnp.sum(jnp.square(g.astype(jnp.float32))) for g in grads.values() if jnp.issubdtype(g.dtype, jnp.inexact))
     )
@@ -273,6 +280,18 @@ def _apply_spheroid_grads(
                 new_master_p[k] = p_updated.astype(jnp.float32)
                 new_params[k] = p_updated.astype(param.dtype)
 
+            if param_masks is not None and k in param_masks:
+                mask = param_masks[k]
+                p_updated = jnp.where(mask > 0.0, new_master_p[k], p_f32)
+                m_new = jnp.where(mask > 0.0, new_m[k], m_prev)
+                new_m[k] = m_new.astype(opt_s["m"][k].dtype)
+                if k in opt_s["v"]:
+                    v_prev = opt_s["v"][k].astype(jnp.float32)
+                    v_new = jnp.where(mask > 0.0, new_v[k], v_prev)
+                    new_v[k] = v_new.astype(opt_s["v"][k].dtype)
+                new_master_p[k] = p_updated.astype(jnp.float32)
+                new_params[k] = p_updated.astype(param.dtype)
+
         params_finite = jnp.all(jnp.array([jnp.all(jnp.isfinite(np_)) for np_ in new_params.values()]))
         safe_params = jax.tree_util.tree_map(lambda np_, op: jnp.where(params_finite, np_, op), new_params, p)
         safe_m = jax.tree_util.tree_map(lambda nm, om: jnp.where(params_finite, nm, om), new_m, opt_s["m"])
@@ -311,6 +330,7 @@ def build_spheroid_train_engine(
     repetition_penalty: float = 1.25,
     remat: bool = True,
     deliberation_mode: str = "teacher_forcing",
+    param_masks: Optional[Dict[str, jnp.ndarray]] = None,
 ) -> Tuple[Callable, Callable]:
     """
     Builds decoupled JIT-compiled gradient computation and optimizer application functions.
@@ -328,7 +348,7 @@ def build_spheroid_train_engine(
 
     @jax.jit
     def apply_opt_step(p, opt_s, grads, base_lr):
-        return _apply_spheroid_grads(p, opt_s, grads, base_lr, weight_decay)
+        return _apply_spheroid_grads(p, opt_s, grads, base_lr, weight_decay, param_masks=param_masks)
 
     return compute_grad_step, apply_opt_step
 
@@ -341,6 +361,7 @@ def build_train_step_spheroid(
     repetition_penalty: float = 1.25,
     remat: bool = True,
     deliberation_mode: str = "teacher_forcing",
+    param_masks: Optional[Dict[str, jnp.ndarray]] = None,
 ) -> Callable:
     """Builds a single fused JIT-compiled train_step combining forward, backward, and SpheroidOptimizer."""
 
@@ -349,7 +370,7 @@ def build_train_step_spheroid(
         loss_val, grads = _compute_loss_and_grads(
             p, q_batch, r_batch, buffers, config, pad_id, repetition_penalty, remat, feedback_tokens, sampling_p, pure_tf, deliberation_mode=deliberation_mode
         )
-        new_params, new_opt_s = _apply_spheroid_grads(p, opt_s, grads, base_lr, weight_decay)
+        new_params, new_opt_s = _apply_spheroid_grads(p, opt_s, grads, base_lr, weight_decay, param_masks=param_masks)
         return new_params, new_opt_s, loss_val
 
     def train_step(p, opt_s, q_batch, r_batch, base_lr, feedback_tokens=None, sampling_p=1.0, deliberation_mode=deliberation_mode):

@@ -90,7 +90,8 @@ def parse_sft_args(args_list: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="CerebroSpheroid V5 Supervised Fine-Tuning (SFT) & Conversational Alignment Engine"
     )
-    parser.add_argument("--preset", type=str, default="auto", choices=["auto", "v5_small", "v5_compact", "v5_base", "tpu_v5e_1", "tpu_v6e_1"], help="Architecture preset")
+    parser.add_argument("--preset", type=str, default="auto", choices=["auto", "v5_small", "v5_compact_32shells", "v5_compact", "v5_base", "tpu_v5e_1", "tpu_v6e_1"], help="Architecture preset")
+    parser.add_argument("--freeze_core", "--freeze-core", dest="freeze_core", action=argparse.BooleanOptionalAction, default=None, help="Freeze subcortical core (Shells 0-15) and headers, training only outer cortical mantle")
     parser.add_argument("--sft_model_name", "--sft-model-name", dest="sft_model_name", type=str, default=None, help="Cloud sync and checkpoint model name (default: {preset}_sft)")
     parser.add_argument("--pretrained_checkpoint", "--pretrained-checkpoint", dest="pretrained_checkpoint", type=str, default=None, help="Path to pre-trained base checkpoint (auto-discovered if None)")
     parser.add_argument("--resume_sft", "--resume-sft", dest="resume_sft", action="store_true", default=False, help="Resume an in-progress SFT run from {preset}_sft_latest.pt")
@@ -244,8 +245,16 @@ def main(args=None):
         else:
             args.preset = "v5_small"
 
-    base_preset = "v5_small" if args.preset in ("tpu_v5e_1", "tpu_v6e_1") else args.preset
-    sft_model_name = args.sft_model_name or f"{base_preset}_sft"
+    if args.preset == "v5_compact_32shells":
+        base_preset = "v5_compact_32shells"
+        sft_model_name = args.sft_model_name or "v5_compact_sft"
+        if args.freeze_core is None:
+            args.freeze_core = True
+    else:
+        if args.freeze_core is None:
+            args.freeze_core = False
+        base_preset = "v5_small" if args.preset in ("tpu_v5e_1", "tpu_v6e_1") else args.preset
+        sft_model_name = args.sft_model_name or f"{base_preset}_sft"
 
     # Hardware Auto-Tuning & Micro-Batch Optimization
     remat_choice = True if str(args.remat).lower() == "true" else False
@@ -412,9 +421,15 @@ def main(args=None):
             os.path.join(args.checkpoint_dir, f"{base_preset}_latest_step900k.pt"),
             os.path.join(args.checkpoint_dir, f"{base_preset}_latest.pt"),
             os.path.join(args.checkpoint_dir, f"{base_preset}_best.pt"),
+            os.path.join(args.checkpoint_dir, "v5_small_latest_step900k.pt"),
+            os.path.join(args.checkpoint_dir, "v5_small_latest.pt"),
+            os.path.join(args.checkpoint_dir, "v5_small_best.pt"),
             os.path.join(REPO_ROOT, "checkpoints", f"{base_preset}_latest_step900k.pt"),
             os.path.join(REPO_ROOT, "checkpoints", f"{base_preset}_latest.pt"),
             os.path.join(REPO_ROOT, "checkpoints", f"{base_preset}_best.pt"),
+            os.path.join(REPO_ROOT, "checkpoints", "v5_small_latest_step900k.pt"),
+            os.path.join(REPO_ROOT, "checkpoints", "v5_small_latest.pt"),
+            os.path.join(REPO_ROOT, "checkpoints", "v5_small_best.pt"),
         ]
         base_ckpt_path = next((p for p in cand_paths if p and os.path.exists(p)), None)
 
@@ -426,6 +441,8 @@ def main(args=None):
                 target_remote_model = base_preset
                 if args.preset in models_dict:
                     target_remote_model = args.preset
+                elif "v5_compact_sft" in models_dict and args.preset == "v5_compact_32shells":
+                    target_remote_model = "v5_compact_sft"
                 elif "v5_small" in models_dict:
                     target_remote_model = "v5_small"
 
@@ -472,6 +489,18 @@ def main(args=None):
     )
 
     # 5. Spheroid SFT Train Step Engine
+    param_masks = None
+    if getattr(args, "freeze_core", False):
+        from src.cortical_expansion import build_cortical_expansion_masks, count_cortical_expansion_params
+        param_masks = build_cortical_expansion_masks(params, num_frozen_shells=16, num_frozen_tracts=40)
+        stats = count_cortical_expansion_params(params, param_masks)
+        print("\n" + "=" * 84)
+        print("🧠 [Progressive Cortical Expansion Mode Enabled]")
+        print(f"   • Total Compact Parameters  : {stats['total_params']:,} ({stats['total_params']/1e6:.2f}M)")
+        print(f"   • Frozen Core & Headers      : {stats['frozen_params']:,} ({stats['frozen_pct']:.1f}%)")
+        print(f"   • Trainable Outer Mantle     : {stats['trainable_params']:,} ({stats['trainable_pct']:.1f}%)")
+        print("=" * 84 + "\n")
+
     compute_grad_step, apply_opt_step = build_spheroid_train_engine(
         config,
         buffers,
@@ -480,6 +509,7 @@ def main(args=None):
         repetition_penalty=args.repetition_penalty,
         remat=remat_choice,
         deliberation_mode=args.deliberation_mode,
+        param_masks=param_masks,
     )
 
     @jax.jit

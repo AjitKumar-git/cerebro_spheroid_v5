@@ -104,6 +104,18 @@ PRESETS_V5: Dict[str, Dict[str, Any]] = {
         "thinking_cycles": 4,
         "phase_scale": 2.0,
     },
+    "v5_compact_32shells": {
+        "surface_dim": 640,
+        "radial_dim": 256,
+        "num_shells": 32,
+        "num_shortcut_tracts": 96,
+        "num_heads": 8,
+        "top_k_tracts": 24,
+        "thinking_cycles": 4,
+        "phase_scale": 2.0,
+        "use_tied_embeddings": True,
+        "use_swiglu": True,
+    },
     "v5_compact": {
         "surface_dim": 768,
         "radial_dim": 512,

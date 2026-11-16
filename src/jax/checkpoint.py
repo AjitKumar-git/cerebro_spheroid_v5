@@ -204,6 +204,21 @@ def adapt_and_load_checkpoint_weights(
                 buf[:rows] = v[:rows]
                 target_params[target_k] = jnp.asarray(buf, dtype=target_dtype)
                 restored_keys.add(target_k)
+            elif (
+                len(t_shape) == len(v.shape)
+                and all(t_shape[i] >= v.shape[i] for i in range(len(t_shape)))
+                and any(t_shape[i] > v.shape[i] for i in range(len(t_shape)))
+            ):
+                # Concentric shell / tract expansion (e.g. 16 -> 32 shells, 40 -> 96 shortcut tracts)
+                buf = np.array(target_params[target_k])
+                if len(t_shape) == 1:
+                    buf[: v.shape[0]] = v
+                elif len(t_shape) == 2:
+                    buf[: v.shape[0], : v.shape[1]] = v
+                elif len(t_shape) == 3:
+                    buf[: v.shape[0], : v.shape[1], : v.shape[2]] = v
+                target_params[target_k] = jnp.asarray(buf, dtype=target_dtype)
+                restored_keys.add(target_k)
 
     # Weight transferability: legacy checkpoints share one radial_up across inward/outward waves
     has_radial_up_out = isinstance(raw_state, dict) and any(
