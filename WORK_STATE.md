@@ -1,15 +1,15 @@
 # Agent Work State & Activity Tracker
 
-> **Status**: 🟡 `IN_PROGRESS` | **Last Updated**: `2026-11-17T01:24:05.149993+05:30` | **Session**: `734a32d4-30f9-4fa4-b9c2-5336e0f58c27`
+> **Status**: 🟡 `IN_PROGRESS` | **Last Updated**: `2026-11-17T01:47:12.680358+05:30` | **Session**: `734a32d4-30f9-4fa4-b9c2-5336e0f58c27`
 
 ## Current / Active Objective
-**Goal**: fix the colab pretraining to support loading of weights from v5 small to v5 compact and freeze them to continue training, anneal for 100 steps every 1000 steps with same backing up as previous script ...
+**Goal**: sync to github
 
 - **Phase**: `executing`
-- **Current Task**: Executed run_command: Verify git status before commit
+- **Current Task**: Executed run_command: Verify CLI help on freeze_core arguments
 
 ## Summary of Completed Work
-I have updated and verified the **Continued Pretraining (CPT)** pipeline to support loading from `v5_small` (102M) $\to$ expanding to `v5_compact` (246M), with core freezing, 100-step periodic annealing every 1,000 steps, and full cloud/Google Drive backup.
+Successfully synchronized to GitHub on branch `main` ([`6a175a2`](https://github.com/AjitKumar-git/cerebro_spheroid_v5/commit/6a175a2)):
 
 ## Modified Files
 - [`scripts/run_weight_transfer_experiment.py`](scripts/run_weight_transfer_experiment.py)
@@ -56,20 +56,22 @@ I have updated and verified the **Continued Pretraining (CPT)** pipeline to supp
 - [`colab/CerebroSpheroid_V5_Compact_Growth_SFT.ipynb`](colab/CerebroSpheroid_V5_Compact_Growth_SFT.ipynb)
 - [`scripts/train_v5_compact_growth_pretrain.py`](scripts/train_v5_compact_growth_pretrain.py)
 - [`colab/CerebroSpheroid_V5_Colab_Pretraining.ipynb`](colab/CerebroSpheroid_V5_Colab_Pretraining.ipynb)
+- [`training/train_v5_tpu_jax.py`](training/train_v5_tpu_jax.py)
+- [`colab/CerebroSpheroid_V5_Colab_TPU_Pretraining.ipynb`](colab/CerebroSpheroid_V5_Colab_TPU_Pretraining.ipynb)
 
 ## Recent Actions (Last 10)
 | Time | Tool | Details |
 | :--- | :--- | :--- |
-| `01:24:05` | `run_command` | Verify git status before commit |
-| `01:23:57` | `run_command` | Stage files for commit |
-| `01:23:50` | `run_command` | Check git remotes |
-| `01:23:44` | `run_command` | Diff WORK_STATE.md |
-| `01:23:37` | `run_command` | Check git log for sft files |
-| `01:23:29` | `run_command` | Check compact files on disk |
-| `01:23:23` | `run_command` | Check full git status |
-| `01:23:16` | `run_command` | Check gitignore for sft files |
-| `01:23:09` | `run_command` | Check git status |
-| `01:18:12` | `write_file` | write_file |
+| `01:47:12` | `run_command` | Verify CLI help on freeze_core arguments |
+| `01:46:48` | `run_command` | Check git status |
+| `01:46:32` | `write_file` | write_file |
+| `01:45:48` | `run_command` | Check syntax of JAX training scripts |
+| `01:45:17` | `run_command` | Synchronize scripts/train_v5_tpu_jax.py |
+| `01:44:51` | `edit_file` | edit_file |
+| `01:44:35` | `read_file` | read_file |
+| `01:44:01` | `read_file` | read_file |
+| `01:43:25` | `edit_file` | edit_file |
+| `01:42:56` | `read_file` | read_file |
 
 ---
 *This file is automatically maintained by `auto-work-tracker`. Other agents can parse `.agents/work_state.json` or inspect this file directly to resume or review progress.*

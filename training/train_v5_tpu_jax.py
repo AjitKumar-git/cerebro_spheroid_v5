@@ -209,6 +209,9 @@ def parse_args(args_list=None):
     parser.add_argument("--reset_step_counter", "--reset-step-counter", dest="reset_step_counter", action="store_true", default=False, help="Reset step counter to 0 after loading base weights to start new campaign from scratch")
     parser.add_argument("--target-eval-loss", "--target_eval_loss", dest="target_eval_loss", type=float, default=1.60, help="Target held-out evaluation loss for convergence early stopping (default: 1.60)")
     parser.add_argument("--consistent-eval-threshold", "--consistent_eval_threshold", dest="consistent_eval_threshold", type=int, default=3, help="Consecutive evaluations required <= target-eval-loss to confirm convergence (default: 3)")
+    parser.add_argument("--freeze_core", "--freeze-core", dest="freeze_core", action=argparse.BooleanOptionalAction, default=False, help="Enable cyclical cortical expansion pretraining (freeze core for 900 steps, anneal for 100 steps every 1000 steps)")
+    parser.add_argument("--cycle_length", "--cycle-length", dest="cycle_length", type=int, default=1000, help="Cycle length in steps for freeze/anneal consolidation (default: 1000)")
+    parser.add_argument("--anneal_steps", "--anneal-steps", dest="anneal_steps", type=int, default=100, help="Steps within each cycle spent annealing/unfrozen (default: 100)")
 
     return parser.parse_args(args_list)
 
@@ -595,9 +598,27 @@ def main(args=None):
         print("ℹ️ Multi-TPU Local-SGD enforces fixed static shapes for uniform pmap shards; disabling --elastic_window.")
         args.elastic_window = False
 
+    param_masks = None
+    if getattr(args, "freeze_core", False):
+        from src.cortical_expansion import build_cortical_expansion_masks, count_cortical_expansion_params
+        param_masks = build_cortical_expansion_masks(params, num_frozen_shells=16, num_frozen_tracts=40, framework="jax")
+        stats = count_cortical_expansion_params(params, param_masks)
+        print("\n" + "=" * 84)
+        print("🧠 [Progressive Cortical Expansion TPU Mode Enabled]")
+        print(f"   • Total Compact Parameters  : {stats['total_params']:,} ({stats['total_params']/1e6:.2f}M)")
+        print(f"   • Frozen Core & Headers      : {stats['frozen_params']:,} ({stats['frozen_pct']:.1f}%)")
+        print(f"   • Trainable Outer Mantle     : {stats['trainable_params']:,} ({stats['trainable_pct']:.1f}%)")
+        print(f"   • Cyclical Anneal Schedule   : Freeze {args.cycle_length - args.anneal_steps} steps ➔ Anneal {args.anneal_steps} steps (every {args.cycle_length} steps)")
+        print("=" * 84 + "\n")
+
     pmap_round_fn = None
     rep_params = None
     rep_opt_state = None
+    apply_opt_step_frozen = None
+    apply_opt_step_anneal = None
+    train_step_fn_frozen = None
+    train_step_fn_anneal = None
+
     if args.optimizer == "spheroid":
         opt_state = init_spheroid_opt_state(params)
         if use_multi_tpu_local_sgd:
@@ -615,7 +636,7 @@ def main(args=None):
             rep_opt_state = replicate_for_pmap(opt_state, devices)
             compute_grad_step, apply_opt_step, train_step_fn = None, None, None
         elif grad_accum <= 1:
-            train_step_fn = build_train_step_spheroid(
+            train_step_fn_anneal = build_train_step_spheroid(
                 config,
                 buffers,
                 pad_id=pad_id,
@@ -623,10 +644,22 @@ def main(args=None):
                 repetition_penalty=args.repetition_penalty,
                 remat=remat_choice,
                 deliberation_mode=args.deliberation_mode,
+                param_masks=None,
             )
+            train_step_fn_frozen = build_train_step_spheroid(
+                config,
+                buffers,
+                pad_id=pad_id,
+                weight_decay=args.weight_decay,
+                repetition_penalty=args.repetition_penalty,
+                remat=remat_choice,
+                deliberation_mode=args.deliberation_mode,
+                param_masks=param_masks,
+            ) if param_masks is not None else train_step_fn_anneal
+            train_step_fn = train_step_fn_anneal
             compute_grad_step, apply_opt_step = None, None
         else:
-            compute_grad_step, apply_opt_step = build_spheroid_train_engine(
+            compute_grad_step, apply_opt_step_anneal = build_spheroid_train_engine(
                 config,
                 buffers,
                 pad_id=pad_id,
@@ -634,7 +667,19 @@ def main(args=None):
                 repetition_penalty=args.repetition_penalty,
                 remat=remat_choice,
                 deliberation_mode=args.deliberation_mode,
+                param_masks=None,
             )
+            _, apply_opt_step_frozen = build_spheroid_train_engine(
+                config,
+                buffers,
+                pad_id=pad_id,
+                weight_decay=args.weight_decay,
+                repetition_penalty=args.repetition_penalty,
+                remat=remat_choice,
+                deliberation_mode=args.deliberation_mode,
+                param_masks=param_masks,
+            ) if param_masks is not None else (None, apply_opt_step_anneal)
+            apply_opt_step = apply_opt_step_anneal
 
             def train_step_fn(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens=None, sampling_p=1.0):
                 loss_val, grads = compute_grad_step(p, q_batch, r_batch, feedback_tokens=feedback_tokens, sampling_p=sampling_p, deliberation_mode=args.deliberation_mode)
@@ -972,6 +1017,16 @@ def main(args=None):
                 cur_lr = cur_lr * (1.0 - 0.4 * alpha_gov)
 
             # Training Step
+            # Cyclical Core Freeze & Consolidation Anneal Schedule
+            is_anneal = False
+            if getattr(args, "freeze_core", False):
+                step_in_cycle = step % args.cycle_length
+                is_anneal = step_in_cycle >= (args.cycle_length - args.anneal_steps)
+                if is_anneal:
+                    anneal_prog = (step_in_cycle - (args.cycle_length - args.anneal_steps)) / max(1, args.anneal_steps)
+                    anneal_factor = 0.5 * (1.0 + math.cos(math.pi * anneal_prog))
+                    cur_lr = 2e-6 + (cur_lr - 2e-6) * anneal_factor
+
             if use_multi_tpu_local_sgd:
                 q_shard, r_shard, fb_shard = _next_multi_tpu_round()
                 rep_params, rep_opt_state, loss_rep = pmap_round_fn(
@@ -1004,10 +1059,12 @@ def main(args=None):
                     step_tokens += prompt_b.shape[0] * (prompt_b.shape[1] + target_b.shape[1])
                 acc_grads = jax.tree_util.tree_map(lambda a: a * inv_accum, acc_grads)
                 loss = loss_acc * inv_accum
-                params, opt_state = apply_opt_step(params, opt_state, acc_grads, cur_lr)
+                cur_apply_opt = apply_opt_step_anneal if (is_anneal or param_masks is None) else (apply_opt_step_frozen or apply_opt_step_anneal)
+                params, opt_state = cur_apply_opt(params, opt_state, acc_grads, cur_lr)
             else:
                 prompt_b, target_b, feedback_b = _next_batch()
-                params, opt_state, loss = train_step_fn(
+                cur_train_step = train_step_fn_anneal if (is_anneal or param_masks is None) else (train_step_fn_frozen or train_step_fn_anneal)
+                params, opt_state, loss = cur_train_step(
                     params,
                     opt_state,
                     prompt_b,
@@ -1051,8 +1108,9 @@ def main(args=None):
                 else:
                     tok_str = f"Tokens: {cumulative_tokens/1e9:5.3f}B | "
 
+                phase_tag = f" [{'ANNEAL' if is_anneal else 'FROZEN'}]" if getattr(args, "freeze_core", False) else ""
                 print(
-                    f"[Step {step:6d}/{args.total_steps}] "
+                    f"[Step {step:6d}/{args.total_steps}]{phase_tag} "
                     f"{tok_str}"
                     f"Loss: {loss_val:6.4f} | "
                     f"Steps/s: {steps_per_sec:5.2f} | "
