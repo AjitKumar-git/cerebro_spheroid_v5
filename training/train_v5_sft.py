@@ -344,15 +344,8 @@ def main(args=None):
     loaded_source = None
 
     # Candidate paths for resuming an in-progress SFT run
-    gdrive_dir = "/content/drive/MyDrive/cerebro_v5_checkpoints"
     sft_candidates = [
         args.pretrained_checkpoint if (args.pretrained_checkpoint and "sft" in os.path.basename(args.pretrained_checkpoint)) else None,
-        os.path.join(gdrive_dir, f"{sft_model_name}_latest.pt") if os.path.exists(gdrive_dir) else None,
-        os.path.join(gdrive_dir, f"{sft_model_name}_best.pt") if os.path.exists(gdrive_dir) else None,
-        os.path.join(gdrive_dir, f"{base_preset}_sft_latest.pt") if os.path.exists(gdrive_dir) else None,
-        os.path.join(gdrive_dir, f"{base_preset}_sft_best.pt") if os.path.exists(gdrive_dir) else None,
-        os.path.join(gdrive_dir, "v5_small_sft_latest.pt") if os.path.exists(gdrive_dir) else None,
-        os.path.join(gdrive_dir, "v5_small_sft_best.pt") if os.path.exists(gdrive_dir) else None,
         os.path.join(args.checkpoint_dir, f"{sft_model_name}_latest.pt"),
         os.path.join(args.checkpoint_dir, f"{sft_model_name}_best.pt"),
         os.path.join(args.checkpoint_dir, f"{base_preset}_sft_latest.pt"),
@@ -414,9 +407,6 @@ def main(args=None):
         # Discover or download base pre-trained foundation model
         cand_paths = [
             args.pretrained_checkpoint,
-            os.path.join(gdrive_dir, f"{args.preset}_latest.pt") if os.path.exists(gdrive_dir) else None,
-            os.path.join(gdrive_dir, f"{base_preset}_latest_step900k.pt") if os.path.exists(gdrive_dir) else None,
-            os.path.join(gdrive_dir, f"{base_preset}_latest.pt") if os.path.exists(gdrive_dir) else None,
             os.path.join(args.checkpoint_dir, f"{args.preset}_latest.pt"),
             os.path.join(args.checkpoint_dir, f"{args.preset}_best.pt"),
             os.path.join(args.checkpoint_dir, f"{base_preset}_latest_step900k.pt"),

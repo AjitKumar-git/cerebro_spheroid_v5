@@ -6,7 +6,7 @@ Features:
    Bi-directional lossless conversion between PyTorch state_dict and JAX PyTrees.
    Supports automatic 2D -> 3D tensor fusion for intra-shell SwiGLU weights and shortcuts.
 2. Autonomous Checkpoint Discovery (Zero Hardcoded Step Numbers):
-   Automatically inspects local and Google Drive/cloud directories to identify the most advanced checkpoint.
+   Automatically inspects local and bioflo.in cloud directories to identify the most advanced checkpoint.
 3. Asynchronous Background Checkpoint Manager (AsyncCheckpointManager):
    Offloads parameter conversion, PyTorch disk serialization, and remote cloud upload
    to an independent CPU thread pool, eliminating TPU latency stalls (0ms TPU pause).
@@ -436,16 +436,6 @@ class AsyncCheckpointManager:
 
             # Prune scratch disk
             self._prune_scratch()
-
-            # Mirror to persistent Google Drive if mounted in Colab environment
-            gdrive_dir = "/content/drive/MyDrive/cerebro_v5_checkpoints"
-            if os.path.exists(gdrive_dir) and os.path.abspath(self.target_dir) != os.path.abspath(gdrive_dir):
-                try:
-                    tmp_gd = os.path.join(gdrive_dir, f"{filename}.tmp.{os.getpid()}")
-                    shutil.copyfile(target_path if os.path.exists(target_path) else local_path, tmp_gd)
-                    os.replace(tmp_gd, os.path.join(gdrive_dir, filename))
-                except Exception:
-                    pass
 
             # Upload to cloud if active (rate-limit non-final uploads so high-step/s runs do not saturate network)
             if self.cloud_sync and ("latest" in filename or "best" in filename):
