@@ -780,16 +780,17 @@ def encode_no_special(tokenizer, text: str, max_length: Optional[int] = None) ->
     raise TypeError(f"Unsupported tokenizer type: {type(tokenizer)}")
 
 
-def get_bio_token_ids(tokenizer) -> Dict[str, Optional[int]]:
-    """Resolve single-token IDs for <stim>, </stim>, <act>, </act>, <think>, </think> if defined."""
+def get_bio_token_ids(tokenizer, include_thinking: bool = False) -> Dict[str, Optional[int]]:
+    """Resolve single-token IDs for <stim>, </stim>, <act>, </act> (and optionally <think>, </think>)."""
     tags = {
         "stim": "<stim>",
         "stim_end": "</stim>",
         "act": "<act>",
         "act_end": "</act>",
-        "think": "<think>",
-        "think_end": "</think>",
     }
+    if include_thinking:
+        tags["think"] = "<think>"
+        tags["think_end"] = "</think>"
     result: Dict[str, Optional[int]] = {k: None for k in tags}
     if tokenizer is None or not hasattr(tokenizer, "encode"):
         return result

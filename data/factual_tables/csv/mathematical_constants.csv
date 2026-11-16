@@ -1,9 +1,0 @@
-name,symbol,approx_value,exact_form,field
-Pi,pi,3.141592653589793,C / d (circumference over diameter),Geometry / Analysis
-Euler's number,e,2.718281828459045,lim_{n->inf} (1 + 1/n)^n,Calculus / Analysis
-Golden ratio,phi,1.618033988749895,(1 + sqrt(5)) / 2,Algebra / Geometry
-Pythagoras' constant,sqrt(2),1.414213562373095,sqrt(2),Number Theory
-Natural log of 2,ln(2),0.693147180559945,ln(2),Analysis
-Euler-Mascheroni constant,gamma,0.577215664901532,lim_{n->inf} (sum_{k=1}^n 1/k - ln(n)),Number Theory
-Apery's constant,zeta(3),1.202056903159594,sum_{n=1}^inf 1/n^3,Analytic Number Theory
-Plastic number,rho,1.324717957244746,unique real root of x^3 - x - 1 = 0,Algebra
