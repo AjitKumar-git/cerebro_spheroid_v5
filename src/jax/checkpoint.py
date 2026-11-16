@@ -18,10 +18,12 @@ import glob
 import json
 import shutil
 import time
-from typing import Dict, Tuple, Optional, Any, List
+from typing import Dict, Tuple, Optional, Any, List, Union
 import concurrent.futures
 
 import numpy as np
+
+from src.cortical_expansion import apply_net2net_cortical_init, generate_expanded_tract_wiring
 
 try:
     import torch
@@ -110,11 +112,13 @@ def adapt_and_load_checkpoint_weights(
     target_params: Dict[str, jnp.ndarray],
     target_dtype,
     config: ModelConfigV5,
-) -> int:
+    buffers: Optional[Tuple[jnp.ndarray, jnp.ndarray]] = None,
+    apply_net2net: bool = True,
+) -> Union[int, Tuple[int, Tuple[jnp.ndarray, jnp.ndarray]]]:
     """Adapts checkpoint weights from any previous run (PyTorch state_dict or JAX params, 2D or 3D SwiGLU)."""
     raw_state = ckpt.get("model_state") or ckpt.get("params") or ckpt.get("state_dict") or ckpt
     if not isinstance(raw_state, dict):
-        return 0
+        return (0, buffers) if buffers is not None else 0
 
     restored_keys = set()
     K = config.num_shells
@@ -243,10 +247,29 @@ def adapt_and_load_checkpoint_weights(
                 target_params[tri_k] = base_affine
                 restored_keys.add(tri_k)
 
+    # 4. Progressive Cortical Expansion: Preserve tract wiring and apply Net2Net zero-regression init
+    updated_buffers = buffers
+    if buffers is not None and "core.src_indices" in raw_state and "core.dst_indices" in raw_state:
+        base_src = _to_numpy(raw_state["core.src_indices"])
+        base_dst = _to_numpy(raw_state["core.dst_indices"])
+        updated_buffers = generate_expanded_tract_wiring(
+            num_shells=config.num_shells,
+            num_tracts=config.num_shortcut_tracts,
+            base_src=base_src,
+            base_dst=base_dst,
+            num_frozen_shells=16,
+            framework="jax",
+        )
+
+    if apply_net2net and config.num_shells > 16:
+        apply_net2net_cortical_init(target_params, num_frozen_shells=16, num_frozen_tracts=40)
+
     missing = [k for k in target_params.keys() if k not in restored_keys and k != "core.radial_up_out.weight"]
     if missing:
         print(f"ℹ️ [adapt_weights] Unmapped JAX parameter arrays ({len(missing)}/{len(target_params)}): {missing}")
 
+    if buffers is not None:
+        return len(restored_keys), updated_buffers
     return len(restored_keys)
 
 
@@ -334,7 +357,7 @@ def load_torch_pt_to_jax(
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     params, buffers = init_params_v5(jax.random.PRNGKey(seed), config)
-    restored = adapt_and_load_checkpoint_weights(ckpt, params, target_dtype, config)
+    restored, buffers = adapt_and_load_checkpoint_weights(ckpt, params, target_dtype, config, buffers=buffers)
     print(f"✓ Restored & adapted {restored}/{len(params)} parameter arrays into JAX V5 engine")
 
     meta = {}

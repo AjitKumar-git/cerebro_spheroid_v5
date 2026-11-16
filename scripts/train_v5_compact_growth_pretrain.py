@@ -67,6 +67,11 @@ from src.cloud_sync import (
     pull_checkpoint,
     check_remote_manifest,
 )
+from src.teacher_digester import (
+    create_digester,
+    QwenTeacherDigester,
+    HeuristicDigester,
+)
 
 DEFAULT_SMALL_CKPT = os.path.join(WORKSPACE_ROOT, "checkpoints", "v5_small_latest_step920k.pt")
 DEFAULT_COMPACT_CFG = os.path.join(WORKSPACE_ROOT, "configs", "v5_compact_250m.json")
@@ -215,7 +220,10 @@ def expand_v5_small_to_compact(
 
 
 class PretrainingTokenStream:
-    """Streams continuous pretraining token windows for Causal Language Modeling."""
+    """
+    Streams continuous pretraining token windows for Causal Language Modeling
+    with optional Teacher Digester dynamic next-token importance weights.
+    """
 
     def __init__(
         self,
@@ -223,14 +231,19 @@ class PretrainingTokenStream:
         tokenizer: Any,
         seq_len: int = 512,
         batch_size: int = 2,
+        digester: Optional[Any] = None,
     ):
         self.parquet_path = parquet_path
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.batch_size = batch_size
+        self.digester = digester
         self.buffer: List[int] = []
+        self.weight_buffer: List[float] = []
 
         print(f"📦 Initializing Pretraining Token Stream from: {parquet_path}")
+        if self.digester is not None:
+            print(f"  🧠 Teacher Digestion ACTIVE: Dynamic Next-Token Weighting enabled")
         if os.path.exists(parquet_path):
             df = pd.read_parquet(parquet_path)
             self.texts = []
@@ -259,22 +272,41 @@ class PretrainingTokenStream:
         ]
         return corpus * 500
 
-    def get_batch(self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_batch(self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         needed_tokens = self.batch_size * (self.seq_len + 1)
         while len(self.buffer) < needed_tokens:
             doc = self.texts[self.text_idx % len(self.texts)]
             self.text_idx += 1
-            toks = self.tokenizer.encode(doc, add_special_tokens=False) + [2]  # EOS
-            self.buffer.extend(toks)
 
-        chunk = self.buffer[:needed_tokens]
+            if self.digester is not None:
+                try:
+                    toks, weights = self.digester.digest_text(doc, self.tokenizer)
+                    toks = list(toks) + [2]  # EOS
+                    weights = list(weights) + [1.0]  # EOS weight
+                except Exception as e:
+                    # Robust fallback if teacher digestion encounters rare formatting anomaly
+                    toks = self.tokenizer.encode(doc, add_special_tokens=False) + [2]
+                    weights = [1.0] * len(toks)
+            else:
+                toks = self.tokenizer.encode(doc, add_special_tokens=False) + [2]  # EOS
+                weights = [1.0] * len(toks)
+
+            self.buffer.extend(toks)
+            self.weight_buffer.extend(weights)
+
+        chunk_toks = self.buffer[:needed_tokens]
+        chunk_weights = self.weight_buffer[:needed_tokens]
         self.buffer = self.buffer[needed_tokens:]
+        self.weight_buffer = self.weight_buffer[needed_tokens:]
 
         # Reshape into [batch_size, seq_len + 1]
-        x = torch.tensor(chunk, dtype=torch.long, device=device).view(self.batch_size, self.seq_len + 1)
+        x = torch.tensor(chunk_toks, dtype=torch.long, device=device).view(self.batch_size, self.seq_len + 1)
+        w = torch.tensor(chunk_weights, dtype=torch.float32, device=device).view(self.batch_size, self.seq_len + 1)
+
         prompts = x[:, : self.seq_len]
         targets = x[:, 1 :]
-        return prompts, targets
+        target_weights = w[:, 1 :]  # Aligned 1:1 with next-token prediction targets
+        return prompts, targets, target_weights
 
 
 def run_pretraining(
@@ -292,6 +324,11 @@ def run_pretraining(
     min_lr: float = 2e-6,
     cloud_sync: bool = True,
     device_str: str = "cuda" if torch.cuda.is_available() else "cpu",
+    teacher_model: str = "Qwen/Qwen2.5-1.5B-Instruct",
+    digest_mode: str = "online",
+    teacher_scale: float = 1.5,
+    min_weight: float = 0.2,
+    max_weight: float = 4.0,
 ):
     device = torch.device(device_str)
     dev_type = "cuda" if "cuda" in device_str else "cpu"
@@ -306,6 +343,8 @@ def run_pretraining(
     print("================================================================================")
     print(f"  Target Architecture       : v5_compact (245.6M params, 32 shells, d=768)")
     print(f"  Device                    : {device}")
+    print(f"  Teacher Digester          : {teacher_model if digest_mode != 'none' else 'DISABLED'} (mode: {digest_mode})")
+    print(f"  Dynamic Loss Weighting    : alpha={teacher_scale}, range=[{min_weight}, {max_weight}]")
     print(f"  Total Pretraining Steps   : {total_steps:,}")
     print(f"  Cycle Schedule            : Freeze {cycle_length - anneal_steps} steps ➔ Anneal {anneal_steps} steps (every {cycle_length} steps)")
     print(f"  Batch Config              : Micro {batch_size} × Accum {accum_steps} = Effective {batch_size * accum_steps}")
@@ -321,7 +360,9 @@ def run_pretraining(
         print(f"🔄 Auto-resuming from existing pretraining checkpoint: {latest_ckpt_path}")
         raw = torch.load(latest_ckpt_path, map_location="cpu", weights_only=False)
         with open(compact_config) as f:
-            cfg = ModelConfigV5(**json.load(f))
+            raw_cfg = json.load(f)
+        valid_keys = {k: v for k, v in raw_cfg.items() if k in ModelConfigV5.__dataclass_fields__}
+        cfg = ModelConfigV5(**valid_keys)
         model = CerebroSpheroidV5(cfg).to(device)
         model.load_state_dict(raw["model_state"], strict=False)
         start_step = int(raw.get("step", 0))
@@ -336,9 +377,32 @@ def run_pretraining(
         )
         model = model.to(device)
 
-    # 2. Tokenizer & Stream
+    # 2. Tokenizer, Teacher Digester & Pretraining Stream
     tokenizer = build_tokenizer(DEFAULT_TOKENIZER_DIR)
-    train_stream = PretrainingTokenStream(train_data, tokenizer, seq_len=512, batch_size=batch_size)
+
+    digester = None
+    if digest_mode != "none":
+        try:
+            digester = create_digester(
+                teacher_model=teacher_model,
+                device=device_str,
+                mode=digest_mode,
+                alpha=teacher_scale,
+                w_min=min_weight,
+                w_max=max_weight,
+            )
+            print(f"  ✓ Teacher Digester initialized: {teacher_model} (mode: {digest_mode})")
+        except Exception as e:
+            print(f"  ⚠️ Teacher Digester load failed ({e}). Falling back to heuristic digester.")
+            digester = create_digester(mode="heuristic", alpha=teacher_scale, w_min=min_weight, w_max=max_weight)
+
+    train_stream = PretrainingTokenStream(
+        train_data,
+        tokenizer,
+        seq_len=512,
+        batch_size=batch_size,
+        digester=digester,
+    )
 
     # 3. Parameter Group Separation (Core vs. Expansion)
     core_params = []
@@ -418,14 +482,26 @@ def run_pretraining(
                 p.requires_grad = False
             currently_annealing = False
 
-        # Fetch Pretraining Batch
-        p_t, t_t = train_stream.get_batch(device)
+        # Fetch Pretraining Batch with Dynamic Next-Token Weights
+        p_t, t_t, w_t = train_stream.get_batch(device)
 
         if dev_type == "cuda":
             with torch.amp.autocast("cuda", dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
-                loss, _ = model(prompts=p_t, targets=t_t, sampling_p=0.5, deliberation_mode="scheduled")
+                loss, _ = model(
+                    prompts=p_t,
+                    targets=t_t,
+                    target_weights=w_t,
+                    sampling_p=0.5,
+                    deliberation_mode="scheduled",
+                )
         else:
-            loss, _ = model(prompts=p_t, targets=t_t, sampling_p=0.5, deliberation_mode="scheduled")
+            loss, _ = model(
+                prompts=p_t,
+                targets=t_t,
+                target_weights=w_t,
+                sampling_p=0.5,
+                deliberation_mode="scheduled",
+            )
 
         loss_scaled = loss / accum_steps
         loss_scaled.backward()
@@ -451,7 +527,10 @@ def run_pretraining(
                 steps_per_sec = (step - start_step) / max(1e-3, elapsed)
                 vram_gb = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
                 phase_tag = "ANNEAL (UNFROZEN)" if is_anneal else "ACCUM (FROZEN)"
-                print(f"[{phase_tag}] Step {step:5d}/{total_steps} | Loss: {loss_val:.4f} | EMA: {ema_loss:.4f} | ExpLR: {exp_lr:.2e} | CoreLR: {core_lr:.2e} | Speed: {steps_per_sec:.2f} st/s | VRAM: {vram_gb:.2f} GB")
+                w_mean = w_t.mean().item()
+                w_max = w_t.max().item()
+                w_min = w_t.min().item()
+                print(f"[{phase_tag}] Step {step:5d}/{total_steps} | Loss: {loss_val:.4f} | EMA: {ema_loss:.4f} | W:[{w_min:.2f}/{w_mean:.2f}/{w_max:.2f}] | ExpLR: {exp_lr:.2e} | CoreLR: {core_lr:.2e} | Speed: {steps_per_sec:.2f} st/s | VRAM: {vram_gb:.2f} GB")
 
             # Checkpoint & Cloud Backup at Anneal Milestones (every 1,000 steps) or every 200 steps
             is_cycle_end = (step % cycle_length == 0)
@@ -532,6 +611,11 @@ def main():
     parser.add_argument("--cloud-sync", action="store_true", default=True)
     parser.add_argument("--no-cloud-sync", dest="cloud_sync", action="store_false")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--teacher-model", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
+    parser.add_argument("--digest-mode", type=str, choices=["online", "heuristic", "none"], default="online")
+    parser.add_argument("--teacher-scale", type=float, default=1.5)
+    parser.add_argument("--min-weight", type=float, default=0.2)
+    parser.add_argument("--max-weight", type=float, default=4.0)
     args = parser.parse_args()
 
     run_pretraining(
@@ -549,6 +633,11 @@ def main():
         min_lr=args.min_lr,
         cloud_sync=args.cloud_sync,
         device_str=args.device,
+        teacher_model=args.teacher_model,
+        digest_mode=args.digest_mode,
+        teacher_scale=args.teacher_scale,
+        min_weight=args.min_weight,
+        max_weight=args.max_weight,
     )
 
 

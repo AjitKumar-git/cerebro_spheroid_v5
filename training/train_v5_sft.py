@@ -130,6 +130,7 @@ def parse_sft_args(args_list: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--loss_window_governor", "--loss-window-governor", dest="loss_window_governor", action=argparse.BooleanOptionalAction, default=True, help="Automatically damp LR when loss climbs")
     parser.add_argument("--loss_ceiling", "--loss-ceiling", dest="loss_ceiling", type=float, default=2.50, help="Loss ceiling threshold for governor")
     parser.add_argument("--loss_floor", "--loss-floor", dest="loss_floor", type=float, default=0.40, help="Loss floor threshold for governor")
+    parser.add_argument("--encephalization_warmup_steps", "--encephalization-warmup-steps", dest="encephalization_warmup_steps", type=int, default=1000, help="Steps to smoothly transition motor surface readout from core to outer mantle")
 
     return parser.parse_args(args_list)
 
@@ -409,7 +410,7 @@ def main(args=None):
         ckpt = torch.load(sft_resume_path, map_location="cpu", weights_only=False)
         start_step = int(ckpt.get("step", 0))
         best_eval_loss = float(ckpt.get("eval_loss", float("inf")))
-        restored = adapt_and_load_checkpoint_weights(ckpt, params, target_dtype, config)
+        restored, buffers = adapt_and_load_checkpoint_weights(ckpt, params, target_dtype, config, buffers=buffers)
         print(f"✓ Resumed SFT Step {start_step:,} (Eval Loss: {best_eval_loss:.4f}, Restored: {restored}/{len(params)} arrays)")
         loaded_source = sft_resume_path
     else:
@@ -465,7 +466,7 @@ def main(args=None):
             ckpt = torch.load(base_ckpt_path, map_location="cpu", weights_only=False)
             pretrain_step = int(ckpt.get("step", 0))
             pretrain_loss = float(ckpt.get("loss", ckpt.get("eval_loss", 0.0)))
-            restored = adapt_and_load_checkpoint_weights(ckpt, params, target_dtype, config)
+            restored, buffers = adapt_and_load_checkpoint_weights(ckpt, params, target_dtype, config, buffers=buffers)
             print(f"✅ Foundation Model Loaded: Step {pretrain_step:,} (Loss: {pretrain_loss:.4f}) | Adapted {restored}/{len(params)} arrays.")
             print("🌱 Initializing SFT Step 0 with calibrated pre-trained weights!")
             start_step = 0
@@ -513,9 +514,9 @@ def main(args=None):
     )
 
     @jax.jit
-    def sft_single_step_fn(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens=None, sampling_p=1.0):
+    def sft_single_step_fn(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens=None, sampling_p=1.0, encephalization_alpha=1.0):
         loss_val, grads = compute_grad_step(
-            p, q_batch, r_batch, feedback_tokens=feedback_tokens, sampling_p=sampling_p, deliberation_mode=args.deliberation_mode
+            p, q_batch, r_batch, feedback_tokens=feedback_tokens, sampling_p=sampling_p, deliberation_mode=args.deliberation_mode, encephalization_alpha=encephalization_alpha
         )
         new_p, new_opt_s = apply_opt_step(p, opt_s, grads, cur_lr)
         return new_p, new_opt_s, loss_val
@@ -627,6 +628,13 @@ def main(args=None):
             if alpha_gov > 0.0:
                 cur_lr = cur_lr * (1.0 - 0.4 * alpha_gov)
 
+            # Progressive Encephalization schedule (smooth transition from core surface to mantle)
+            if args.freeze_core and config.num_shells > 16:
+                enc_warmup = max(1, getattr(args, "encephalization_warmup_steps", 1000))
+                enc_alpha = min(1.0, float(step - start_step) / float(enc_warmup))
+            else:
+                enc_alpha = 1.0
+
             # SFT Optimization Step with Multi-Step Gradient Accumulation
             if args.grad_accum > 1:
                 acc_grads = None
@@ -638,7 +646,8 @@ def main(args=None):
                     prompt_b, target_b, feedback_b = _unpack_batch(b_tup)
                     g_loss, micro_grads = compute_grad_step(
                         params, prompt_b, target_b, feedback_tokens=feedback_b,
-                        sampling_p=args.sampling_p, deliberation_mode=args.deliberation_mode
+                        sampling_p=args.sampling_p, deliberation_mode=args.deliberation_mode,
+                        encephalization_alpha=enc_alpha,
                     )
                     acc_grads = (
                         micro_grads
@@ -661,6 +670,7 @@ def main(args=None):
                     cur_lr,
                     feedback_tokens=feedback_b,
                     sampling_p=args.sampling_p,
+                    encephalization_alpha=enc_alpha,
                 )
                 loss_val = float(loss)
                 step_tokens = prompt_b.shape[0] * (prompt_b.shape[1] + target_b.shape[1])

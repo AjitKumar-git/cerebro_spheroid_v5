@@ -527,14 +527,19 @@ def emit_step(
     repetition_penalty: float = 1.25,
     attn_mask: Optional[jnp.ndarray] = None,
     return_hidden: bool = False,
+    encephalization_alpha: float = 1.0,
 ) -> Union[
     Tuple[jnp.ndarray, jnp.ndarray, Optional[jnp.ndarray], jnp.ndarray],
     Tuple[jnp.ndarray, jnp.ndarray, Optional[jnp.ndarray], jnp.ndarray, jnp.ndarray],
 ]:
-    """Single motor emission step with affine-tied dictionary projection."""
+    """Single motor emission step with affine-tied dictionary projection and progressive encephalization."""
     B, K, D = state.shape
     st_dtype = state.dtype
-    surface, core = state[:, -1, :], state[:, 0, :]
+    core = state[:, 0, :]
+    if K > 16 and encephalization_alpha < 1.0 - 1e-6:
+        surface = (1.0 - encephalization_alpha) * state[:, 15, :] + encephalization_alpha * state[:, -1, :]
+    else:
+        surface = state[:, -1, :]
     num_heads = config.num_heads if config is not None else 8
     head_dim = D // num_heads
 
@@ -665,6 +670,8 @@ def training_rollout(
     anchor_token_id: int = 3191,
     anchor_weight: float = 3.5,
     use_anchor_loss: bool = True,
+    encephalization_alpha: float = 1.0,
+    target_weights: Optional[jnp.ndarray] = None,
 ) -> Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]]:
     """Differentiable training and autoregressive generation rollout in pure JAX."""
     # Dual-Pass Twin Resonance: runs teacher-forcing pass and deliberative rollout pass on identical tokens
@@ -692,6 +699,7 @@ def training_rollout(
             anchor_token_id=anchor_token_id,
             anchor_weight=anchor_weight,
             use_anchor_loss=use_anchor_loss,
+            encephalization_alpha=encephalization_alpha,
         )
         loss_delib = training_rollout(
             params=params,
@@ -786,7 +794,10 @@ def training_rollout(
 
     # Initial concentric state
     init_state = jnp.zeros((B, num_shells, surface_dim), dtype=target_dtype)
-    state = init_state.at[:, -1, :].set(prompt_flux)
+    if num_shells > 16:
+        state = init_state.at[:, 15, :].set(prompt_flux).at[:, -1, :].set(prompt_flux)
+    else:
+        state = init_state.at[:, -1, :].set(prompt_flux)
 
     # Subconscious deliberation cycles (4 full radial+shortcut cycles before emission)
     for _ in range(thinking_cycles):
@@ -807,8 +818,10 @@ def training_rollout(
         init_refractory = jnp.zeros((B, vocab_size), dtype=target_dtype)
     init_thought = jnp.zeros((B, surface_dim), dtype=target_dtype)
 
-    # Pillar 2: Dynamic Answer-Anchor Loss Weighting (AALW)
-    if targets is not None and use_anchor_loss:
+    # Pillar 2: Dynamic Answer-Anchor Loss Weighting (AALW) or Teacher Digested Weights
+    if target_weights is not None:
+        target_weights = target_weights[:, :target_len].astype(jnp.float32)
+    elif targets is not None and use_anchor_loss:
         tgt_cur = targets[:, :target_len]
         is_anchor = (tgt_cur == anchor_token_id)
         after_anchor = (jnp.cumsum(is_anchor.astype(jnp.int32), axis=-1) > 0)
@@ -892,6 +905,7 @@ def training_rollout(
             auditory_feedback=feed,
             repetition_penalty=repetition_penalty,
             attn_mask=step_mask,
+            encephalization_alpha=encephalization_alpha,
         )
 
         # Scheduled sampling re-afference using full sensory encoder (position + SwiGLU aligned)
@@ -954,6 +968,7 @@ def training_rollout(
                 auditory_feedback=internal_feed,
                 repetition_penalty=repetition_penalty,
                 attn_mask=step_mask,
+                encephalization_alpha=encephalization_alpha,
             )
 
             tok_idx = lax.stop_gradient(jnp.argmax(logits, axis=-1))
@@ -996,7 +1011,10 @@ def training_rollout(
 
     if is_pure_tf:
         T = int(target_len)
-        surface = state[:, -1, :]
+        if num_shells > 16 and encephalization_alpha < 1.0 - 1e-6:
+            surface = (1.0 - encephalization_alpha) * state[:, 15, :] + encephalization_alpha * state[:, -1, :]
+        else:
+            surface = state[:, -1, :]
         init_core = state[:, 0, :]
 
         # 1. Precompute all T normalized phase clocks and motor surface vectors outside scan

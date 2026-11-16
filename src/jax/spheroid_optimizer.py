@@ -165,6 +165,8 @@ def _compute_loss_and_grads(
     sampling_p: Any,
     pure_tf: bool,
     deliberation_mode: str = "teacher_forcing",
+    encephalization_alpha: float = 1.0,
+    target_weights: Optional[jnp.ndarray] = None,
 ):
     """Computes loss and gradients for SpheroidOptimizer with static teacher-forcing dispatch."""
     target_len = r_batch.shape[1]
@@ -184,6 +186,8 @@ def _compute_loss_and_grads(
             remat=remat,
             pure_teacher_forcing=pure_tf,
             deliberation_mode=deliberation_mode,
+            encephalization_alpha=encephalization_alpha,
+            target_weights=target_weights,
         )
 
     return jax.value_and_grad(_loss_fn, allow_int=True)(p)
@@ -338,13 +342,13 @@ def build_spheroid_train_engine(
     """
 
     @partial(jax.jit, static_argnames=("pure_tf", "deliberation_mode"))
-    def _compute_grad_jit(p, q_batch, r_batch, feedback_tokens, sampling_p, pure_tf: bool, deliberation_mode: str):
+    def _compute_grad_jit(p, q_batch, r_batch, feedback_tokens, sampling_p, pure_tf: bool, deliberation_mode: str, encephalization_alpha: float = 1.0, target_weights: Optional[jnp.ndarray] = None):
         return _compute_loss_and_grads(
-            p, q_batch, r_batch, buffers, config, pad_id, repetition_penalty, remat, feedback_tokens, sampling_p, pure_tf, deliberation_mode=deliberation_mode
+            p, q_batch, r_batch, buffers, config, pad_id, repetition_penalty, remat, feedback_tokens, sampling_p, pure_tf, deliberation_mode=deliberation_mode, encephalization_alpha=encephalization_alpha, target_weights=target_weights
         )
 
-    def compute_grad_step(p, q_batch, r_batch, feedback_tokens=None, sampling_p=1.0, deliberation_mode=deliberation_mode):
-        return _compute_grad_jit(p, q_batch, r_batch, feedback_tokens, sampling_p, _is_pure_teacher_forcing(sampling_p, deliberation_mode), deliberation_mode)
+    def compute_grad_step(p, q_batch, r_batch, feedback_tokens=None, sampling_p=1.0, deliberation_mode=deliberation_mode, encephalization_alpha=1.0, target_weights=None):
+        return _compute_grad_jit(p, q_batch, r_batch, feedback_tokens, sampling_p, _is_pure_teacher_forcing(sampling_p, deliberation_mode), deliberation_mode, encephalization_alpha, target_weights)
 
     @jax.jit
     def apply_opt_step(p, opt_s, grads, base_lr):
@@ -366,16 +370,16 @@ def build_train_step_spheroid(
     """Builds a single fused JIT-compiled train_step combining forward, backward, and SpheroidOptimizer."""
 
     @partial(jax.jit, static_argnames=("pure_tf", "deliberation_mode"))
-    def _fused_train_step_jit(p, opt_s, q_batch, r_batch, base_lr, feedback_tokens, sampling_p, pure_tf: bool, deliberation_mode: str):
+    def _fused_train_step_jit(p, opt_s, q_batch, r_batch, base_lr, feedback_tokens, sampling_p, pure_tf: bool, deliberation_mode: str, target_weights: Optional[jnp.ndarray] = None):
         loss_val, grads = _compute_loss_and_grads(
-            p, q_batch, r_batch, buffers, config, pad_id, repetition_penalty, remat, feedback_tokens, sampling_p, pure_tf, deliberation_mode=deliberation_mode
+            p, q_batch, r_batch, buffers, config, pad_id, repetition_penalty, remat, feedback_tokens, sampling_p, pure_tf, deliberation_mode=deliberation_mode, target_weights=target_weights
         )
         new_params, new_opt_s = _apply_spheroid_grads(p, opt_s, grads, base_lr, weight_decay, param_masks=param_masks)
         return new_params, new_opt_s, loss_val
 
-    def train_step(p, opt_s, q_batch, r_batch, base_lr, feedback_tokens=None, sampling_p=1.0, deliberation_mode=deliberation_mode):
+    def train_step(p, opt_s, q_batch, r_batch, base_lr, feedback_tokens=None, sampling_p=1.0, deliberation_mode=deliberation_mode, target_weights=None):
         return _fused_train_step_jit(
-            p, opt_s, q_batch, r_batch, base_lr, feedback_tokens, sampling_p, _is_pure_teacher_forcing(sampling_p, deliberation_mode), deliberation_mode
+            p, opt_s, q_batch, r_batch, base_lr, feedback_tokens, sampling_p, _is_pure_teacher_forcing(sampling_p, deliberation_mode), deliberation_mode, target_weights
         )
 
     return train_step
