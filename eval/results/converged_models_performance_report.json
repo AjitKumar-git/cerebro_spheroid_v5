@@ -1,0 +1,442 @@
+[
+  {
+    "name": "Qwen-0.5B Champion (Milestone 6)",
+    "path": "checkpoints/v5_qwen_0_5b_champion.pt",
+    "tier": "280M UWBL + AALW",
+    "loss": 4.090295486450195,
+    "ppl": 59.757546640948746,
+    "qa_acc": 0.0,
+    "qa_details": [
+      {
+        "prompt": "Complete the analogy: hot is to cold as day is to ____.",
+        "target": "night",
+        "emitted": "code language\"; math math.\nyo, oryo code",
+        "correct": false
+      },
+      {
+        "prompt": "Complete the analogy: bird is to fly as fish is to ____.",
+        "target": "swim",
+        "emitted": "code; print math\".\n by language code by ",
+        "correct": false
+      },
+      {
+        "prompt": "Complete the analogy: pen is to write as knife is to ____.",
+        "target": "cut",
+        "emitted": "code; print.\n; language, cities. to\" by ",
+        "correct": false
+      },
+      {
+        "prompt": "Complete the analogy: author is to book as artist is to ____.",
+        "target": "painting",
+        "emitted": "code; print math\".\nIn language code, ory",
+        "correct": false
+      },
+      {
+        "prompt": "What is the opposite of 'dark'?",
+        "target": "light",
+        "emitted": "tevery and cities, p = <<4.\n#### nations",
+        "correct": false
+      },
+      {
+        "prompt": "What is the opposite of 'fast'?",
+        "target": "slow",
+        "emitted": "ververy and p, p.\n#### nations.\n40 kilan",
+        "correct": false
+      },
+      {
+        "prompt": "What is the exact antonym of the word 'author'?",
+        "target": "reader",
+        "emitted": "and booksan' appear, cities.\n####ver\" co",
+        "correct": false
+      },
+      {
+        "prompt": "What is the opposite of 'strong'?",
+        "target": "weak",
+        "emitted": "very and day, p = <<3.\n#### nations byy ",
+        "correct": false
+      },
+      {
+        "prompt": "What is the simple past tense of the irregular verb 'drink'?",
+        "target": "drank",
+        "emitted": "codey and day after cities, ores = <<40\n",
+        "correct": false
+      },
+      {
+        "prompt": "What is the past tense of 'run'?",
+        "target": "ran",
+        "emitted": "booksweb booksan andvery, cities.\n#### p",
+        "correct": false
+      },
+      {
+        "prompt": "What is the past tense of 'eat'?",
+        "target": "ate",
+        "emitted": "bookscodean booksverimport = <<40.\n#### ",
+        "correct": false
+      },
+      {
+        "prompt": "What is the capital of France?",
+        "target": "Paris",
+        "emitted": "veryan\" inc.\n#### None\"ver light = <<30.",
+        "correct": false
+      },
+      {
+        "prompt": "What is the capital of Japan?",
+        "target": "Tokyo",
+        "emitted": "veryan\".\n#### None.ver cities = <<3 by l",
+        "correct": false
+      },
+      {
+        "prompt": "What is the capital of Germany?",
+        "target": "Berlin",
+        "emitted": "veryanes.\n#### cities = <<3 = 4.\nver lig",
+        "correct": false
+      },
+      {
+        "prompt": "If John has 3 apples and buys 2 more, how many apples does he have?",
+        "target": "5",
+        "emitted": "of 4/, she has.\n = <<10 ( was 4/.\nles th",
+        "correct": false
+      },
+      {
+        "prompt": "What is 15 + 27?",
+        "target": "42",
+        "emitted": "40 = <<3.\n26>>7-8=9.\n4-5.\n36",
+        "correct": false
+      }
+    ],
+    "mmlu": 24.0,
+    "openbookqa": 20.0,
+    "winogrande": 44.0,
+    "arc_easy": 20.0
+  },
+  {
+    "name": "Qwen-0.5B Refined SFT (Milestone 5)",
+    "path": "checkpoints/v5_qwen_0_5b_refined_sft.pt",
+    "tier": "280M UWBL + SCM",
+    "loss": 4.092857208251953,
+    "ppl": 59.91082509555478,
+    "qa_acc": 12.5,
+    "qa_details": [
+      {
+        "prompt": "Complete the analogy: hot is to cold as day is to ____.",
+        "target": "night",
+        "emitted": "code language\"; print math code, oryo co",
+        "correct": false
+      },
+      {
+        "prompt": "Complete the analogy: bird is to fly as fish is to ____.",
+        "target": "swim",
+        "emitted": "code; print math\" language.\nTh code, cit",
+        "correct": false
+      },
+      {
+        "prompt": "Complete the analogy: pen is to write as knife is to ____.",
+        "target": "cut",
+        "emitted": "code language language; print;, cities b",
+        "correct": false
+      },
+      {
+        "prompt": "Complete the analogy: author is to book as artist is to ____.",
+        "target": "painting",
+        "emitted": "code; language language\".\nTh. math code ",
+        "correct": false
+      },
+      {
+        "prompt": "What is the opposite of 'dark'?",
+        "target": "light",
+        "emitted": "very and cities, p = <<40.\n#### nationsa",
+        "correct": false
+      },
+      {
+        "prompt": "What is the opposite of 'fast'?",
+        "target": "slow",
+        "emitted": "tey and cities, p = <<3.\n#### nationsani",
+        "correct": false
+      },
+      {
+        "prompt": "What is the exact antonym of the word 'author'?",
+        "target": "reader",
+        "emitted": "and booksan' andver.\n40 = <<15, cities.\n",
+        "correct": false
+      },
+      {
+        "prompt": "What is the opposite of 'strong'?",
+        "target": "weak",
+        "emitted": "tey and cities, p = <<40.\n#### nationsan",
+        "correct": false
+      },
+      {
+        "prompt": "What is the simple past tense of the irregular verb 'drink'?",
+        "target": "drank",
+        "emitted": "y andveran.\n#### cities, or = <<40 corre",
+        "correct": false
+      },
+      {
+        "prompt": "What is the past tense of 'run'?",
+        "target": "ran",
+        "emitted": "bookscode booksan andver cities, cities.",
+        "correct": false
+      },
+      {
+        "prompt": "What is the past tense of 'eat'?",
+        "target": "ate",
+        "emitted": "ateanveran = <<40.\n#### p, citiesimport ",
+        "correct": true
+      },
+      {
+        "prompt": "What is the capital of France?",
+        "target": "Paris",
+        "emitted": "veryanes.\n#### cities = <<30 incy.\n#### ",
+        "correct": false
+      },
+      {
+        "prompt": "What is the capital of Japan?",
+        "target": "Tokyo",
+        "emitted": "veryanes.\n#### None\"ver cities = <<3.\n##",
+        "correct": false
+      },
+      {
+        "prompt": "What is the capital of Germany?",
+        "target": "Berlin",
+        "emitted": "veryan\" inc.\n#### None\"ver light = <<3 b",
+        "correct": false
+      },
+      {
+        "prompt": "If John has 3 apples and buys 2 more, how many apples does he have?",
+        "target": "5",
+        "emitted": "a total of 4/, and.\n = <<10 ( 5 * the to",
+        "correct": true
+      },
+      {
+        "prompt": "What is 15 + 27?",
+        "target": "42",
+        "emitted": "15 = <<3.\n2>>7>>6-, 8 * $<<4 = <<2",
+        "correct": false
+      }
+    ],
+    "mmlu": 24.0,
+    "openbookqa": 20.0,
+    "winogrande": 44.0,
+    "arc_easy": 20.0
+  },
+  {
+    "name": "Native V5 Master Diverse (Milestone 4)",
+    "path": "checkpoints/v5_small_sft_master_diverse.pt",
+    "tier": "102M Native SFT",
+    "loss": 2.6633004034432814,
+    "ppl": 14.343550568503634,
+    "qa_acc": 87.5,
+    "qa_details": [
+      {
+        "prompt": "Complete the analogy: hot is to cold as day is to ____.",
+        "target": "night",
+        "emitted": "night",
+        "correct": true
+      },
+      {
+        "prompt": "Complete the analogy: bird is to fly as fish is to ____.",
+        "target": "swim",
+        "emitted": "swim",
+        "correct": true
+      },
+      {
+        "prompt": "Complete the analogy: pen is to write as knife is to ____.",
+        "target": "cut",
+        "emitted": "cut",
+        "correct": true
+      },
+      {
+        "prompt": "Complete the analogy: author is to book as artist is to ____.",
+        "target": "painting",
+        "emitted": "painting",
+        "correct": true
+      },
+      {
+        "prompt": "What is the opposite of 'dark'?",
+        "target": "light",
+        "emitted": "EN",
+        "correct": false
+      },
+      {
+        "prompt": "What is the opposite of 'fast'?",
+        "target": "slow",
+        "emitted": "slow",
+        "correct": true
+      },
+      {
+        "prompt": "What is the exact antonym of the word 'author'?",
+        "target": "reader",
+        "emitted": "finite: the author'scial and inverse_ re",
+        "correct": true
+      },
+      {
+        "prompt": "What is the opposite of 'strong'?",
+        "target": "weak",
+        "emitted": "weak",
+        "correct": true
+      },
+      {
+        "prompt": "What is the simple past tense of the irregular verb 'drink'?",
+        "target": "drank",
+        "emitted": "drank",
+        "correct": true
+      },
+      {
+        "prompt": "What is the past tense of 'run'?",
+        "target": "ran",
+        "emitted": "ran",
+        "correct": true
+      },
+      {
+        "prompt": "What is the past tense of 'eat'?",
+        "target": "ate",
+        "emitted": "ate",
+        "correct": true
+      },
+      {
+        "prompt": "What is the capital of France?",
+        "target": "Paris",
+        "emitted": "cote: Rome Python with a mecage:)(xicate",
+        "correct": false
+      },
+      {
+        "prompt": "What is the capital of Japan?",
+        "target": "Tokyo",
+        "emitted": "City: wondering. fungireasesque repeated",
+        "correct": true
+      },
+      {
+        "prompt": "What is the capital of Germany?",
+        "target": "Berlin",
+        "emitted": "Berlin",
+        "correct": true
+      },
+      {
+        "prompt": "If John has 3 apples and buys 2 more, how many apples does he have?",
+        "target": "5",
+        "emitted": "5",
+        "correct": true
+      },
+      {
+        "prompt": "What is 15 + 27?",
+        "target": "42",
+        "emitted": "42",
+        "correct": true
+      }
+    ],
+    "mmlu": 40.0,
+    "openbookqa": 28.000000000000004,
+    "winogrande": 56.00000000000001,
+    "arc_easy": 32.0
+  },
+  {
+    "name": "Native V5 SFT Best (Milestone 2)",
+    "path": "checkpoints/v5_small_sft_best.pt",
+    "tier": "102M Native SFT",
+    "loss": 10.598229370117188,
+    "ppl": 40063.836365232964,
+    "qa_acc": 6.25,
+    "qa_details": [
+      {
+        "prompt": "Complete the analogy: hot is to cold as day is to ____.",
+        "target": "night",
+        "emitted": "Nether slighttabular Free\uc774 officialsrang",
+        "correct": false
+      },
+      {
+        "prompt": "Complete the analogy: bird is to fly as fish is to ____.",
+        "target": "swim",
+        "emitted": "Nether Europe exped \u043e\u043f\u0448\u0442\u0438 symmetry print",
+        "correct": false
+      },
+      {
+        "prompt": "Complete the analogy: pen is to write as knife is to ____.",
+        "target": "cut",
+        "emitted": "\u043d\u044b issues Alt Italy bashComplete dim sou",
+        "correct": false
+      },
+      {
+        "prompt": "Complete the analogy: author is to book as artist is to ____.",
+        "target": "painting",
+        "emitted": "attempting clar fab \u041c\u0438\u0445\u0430\u0439doorcri serait ",
+        "correct": false
+      },
+      {
+        "prompt": "What is the opposite of 'dark'?",
+        "target": "light",
+        "emitted": "prac pity eingesetztague corn Voir\u03bb sour",
+        "correct": false
+      },
+      {
+        "prompt": "What is the opposite of 'fast'?",
+        "target": "slow",
+        "emitted": "\u00fchrungAuthorketlauarchitecture \u043c\u043d\u043e\u0433\u0438obmo",
+        "correct": false
+      },
+      {
+        "prompt": "What is the exact antonym of the word 'author'?",
+        "target": "reader",
+        "emitted": "df graduated fot\u03b8opo\u0432\u0438\u0441\u0438*` astero trou R",
+        "correct": false
+      },
+      {
+        "prompt": "What is the opposite of 'strong'?",
+        "target": "weak",
+        "emitted": "ipping \u043d\u0435\u0441\u043a\u043e\u043b\u044c\u043a\u043e ``` appeared provocBF r",
+        "correct": false
+      },
+      {
+        "prompt": "What is the simple past tense of the irregular verb 'drink'?",
+        "target": "drank",
+        "emitted": ")`, calcio Rad ME wpEurope eitherminus c",
+        "correct": false
+      },
+      {
+        "prompt": "What is the past tense of 'run'?",
+        "target": "ran",
+        "emitted": "cr\u00e9ationth chefigaResources \u0436\u0443\u0440\u043d\u0430\u043d\u044b\u043c\u0438 re",
+        "correct": false
+      },
+      {
+        "prompt": "What is the past tense of 'eat'?",
+        "target": "ate",
+        "emitted": "investigatemale Qu\u00e9bec NSinci hosted\u0441\u043d\u0443 ",
+        "correct": true
+      },
+      {
+        "prompt": "What is the capital of France?",
+        "target": "Paris",
+        "emitted": "Ok Orth \u0440\u043e\u043c\u0430\u043dgreenPOST vistodouble Cente",
+        "correct": false
+      },
+      {
+        "prompt": "What is the capital of Japan?",
+        "target": "Tokyo",
+        "emitted": "debido pro\uacfc TaiwanLi aunque GarcDraw \u00f6ss",
+        "correct": false
+      },
+      {
+        "prompt": "What is the capital of Germany?",
+        "target": "Berlin",
+        "emitted": "noiseValid retourthewd CHECK\u043d\u0438\u043c\u0430Mat\u043c\u0443\u753b w",
+        "correct": false
+      },
+      {
+        "prompt": "If John has 3 apples and buys 2 more, how many apples does he have?",
+        "target": "5",
+        "emitted": "absence dressedaudHandler erreichteyleln",
+        "correct": false
+      },
+      {
+        "prompt": "What is 15 + 27?",
+        "target": "42",
+        "emitted": "ction Qt \u0432\u0456\u0446\u0456useppe \u0414\u0440\u0443ografie retourkre",
+        "correct": false
+      }
+    ],
+    "mmlu": 16.0,
+    "openbookqa": 24.0,
+    "winogrande": 44.0,
+    "arc_easy": 40.0
+  }
+]

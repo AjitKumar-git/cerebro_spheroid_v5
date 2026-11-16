@@ -1,0 +1,2177 @@
+{
+  "metadata": {
+    "checkpoint": "v5_small_latest_step900k.pt",
+    "step": 900000,
+    "loss": 2.3939766883850098,
+    "protocol": "raw",
+    "timestamp": "2026-11-15T16:41:25Z",
+    "device": "cuda"
+  },
+  "summary": {
+    "arc_challenge": {
+      "acc": 16.0,
+      "acc_norm": 22.0,
+      "stderr": 5.858327406350724,
+      "n": 50,
+      "time_sec": 6.764326572418213
+    },
+    "arc_easy": {
+      "acc": 18.0,
+      "acc_norm": 42.0,
+      "stderr": 6.979971346646059,
+      "n": 50,
+      "time_sec": 1.723891258239746
+    },
+    "hellaswag": {
+      "acc": 38.0,
+      "acc_norm": 36.0,
+      "stderr": 6.788225099390856,
+      "n": 50,
+      "time_sec": 1.8887815475463867
+    },
+    "mmlu": {
+      "acc": 14.000000000000002,
+      "acc_norm": 24.0,
+      "stderr": 6.0398675482166,
+      "n": 50,
+      "time_sec": 1.8718223571777344
+    },
+    "winogrande": {
+      "acc": 38.0,
+      "acc_norm": 40.0,
+      "stderr": 6.928203230275509,
+      "n": 50,
+      "time_sec": 3.8769848346710205
+    },
+    "openbookqa": {
+      "acc": 16.0,
+      "acc_norm": 24.0,
+      "stderr": 6.0398675482166,
+      "n": 50,
+      "time_sec": 1.5004992485046387
+    },
+    "gsm8k": {
+      "acc": 0.0,
+      "acc_norm": 0.0,
+      "stderr": 0.0,
+      "n": 50,
+      "time_sec": 8.033276319503784
+    }
+  },
+  "details": {
+    "arc_challenge": [
+      {
+        "q": "An astronomer observes that a planet rotates faster after a ",
+        "target": "C",
+        "pred": "A",
+        "correct": false
+      },
+      {
+        "q": "A group of engineers wanted to know how different building d",
+        "target": "B",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "The end result in the process of photosynthesis is the produ",
+        "target": "C",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "A physicist wants to determine the speed a car must reach to",
+        "target": "D",
+        "pred": "D",
+        "correct": true
+      },
+      {
+        "q": "An astronaut drops a 1.0 kg object and a 5.0 kg object on th",
+        "target": "D",
+        "pred": "D",
+        "correct": true
+      },
+      {
+        "q": "Devil facial tumor disease (DFTD) is a disease that is decim",
+        "target": "B",
+        "pred": "C",
+        "correct": false
+      },
+      {
+        "q": "A type of small mammal from the mountain regions of the west",
+        "target": "C",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "Petrified palm trees are found in sedimentary rock near glac",
+        "target": "C",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "Farmers in Wyoming were concerned because some of their chic",
+        "target": "B",
+        "pred": "B",
+        "correct": true
+      },
+      {
+        "q": "Copper is an element that is used in electrical wires. What ",
+        "target": "A",
+        "pred": "C",
+        "correct": false
+      },
+      {
+        "q": "According to cell classification, prokaryotic cells are sepa",
+        "target": "B",
+        "pred": "C",
+        "correct": false
+      },
+      {
+        "q": "Which statement best describes the effect of the Sun on the ",
+        "target": "A",
+        "pred": "C",
+        "correct": false
+      },
+      {
+        "q": "The morning temperature in a city is 41\u00b0F. If a sunny, mild ",
+        "target": "C",
+        "pred": "C",
+        "correct": true
+      },
+      {
+        "q": "A class plans an investigation to see which brand of light b",
+        "target": "C",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "Which of these gases is the most abundant greenhouse gas in ",
+        "target": "C",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "At which temperature does water freeze?",
+        "target": "A",
+        "pred": "C",
+        "correct": false
+      },
+      {
+        "q": "Fossil bones and teeth of dinosaurs have been researched for",
+        "target": "C",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "Molly was making iced tea by putting tea bags in boiling wat",
+        "target": "B",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "Logging companies cut trees in a forest and send the trees t",
+        "target": "A",
+        "pred": "B",
+        "correct": false
+      },
+      {
+        "q": "It was once thought that living organisms could come from no",
+        "target": "C",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "Cells take in food for energy. The part of the cell that aid",
+        "target": "B",
+        "pred": "C",
+        "correct": false
+      },
+      {
+        "q": "When an electric current is passed through water (H_{2}O) us",
+        "target": "B",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "Which is a fact about penguins?",
+        "target": "A",
+        "pred": "A",
+        "correct": true
+      },
+      {
+        "q": "A glass of water at 110\u00b0F is placed in a room next to a glas",
+        "target": "C",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "Snow, rain, hail, and fog are all forms of",
+        "target": "B",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "Scott filled a tray with juice and put it in a freezer. The ",
+        "target": "D",
+        "pred": "B",
+        "correct": false
+      },
+      {
+        "q": "On August 21, a flash flood warning was issued for the Las V",
+        "target": "B",
+        "pred": "C",
+        "correct": false
+      },
+      {
+        "q": "Students heated three objects to different temperatures duri",
+        "target": "B",
+        "pred": "A",
+        "correct": false
+      },
+      {
+        "q": "Tiny organisms called plankton live in oceans. Some plankton",
+        "target": "C",
+        "pred": "C",
+        "correct": true
+      },
+      {
+        "q": "Which statement best explains why a tree branch floats on wa",
+        "target": "B",
+        "pred": "B",
+        "correct": true
+      },
+      {
+        "q": "Students are observing two fossils in a lab. They are told b",
+        "target": "D",
+        "pred": "C",
+        "correct": false
+      },
+      {
+        "q": "Earth's distance from the Sun enables water to be readily av",
+        "target": "C",
+        "pred": "C",
+        "correct": true
+      },
+      {
+        "q": "Which statement correctly describes a property of a type of ",
+        "target": "A",
+        "pred": "B",
+        "correct": false
+      },
+      {
+        "q": "Which statement describes a positive effect of a scientific ",
+        "target": "C",
+        "pred": "B",
+        "correct": false
+      },
+      {
+        "q": "Which natural event occurs with the most frequency?",
+        "target": "A",
+        "pred": "B",
+        "correct": false
+      },
+      {
+        "q": "A scientist maps a long region in which earthquakes originat",
+        "target": "A",
+        "pred": "B",
+        "correct": false
+      },
+      {
+        "q": "Which best describes how the sun might compare to a differen",
+        "target": "B",
+        "pred": "C",
+        "correct": false
+      },
+      {
+        "q": "Which statement is true about the solar system?",
+        "target": "B",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "What is the main function of photosynthetic cells within a p",
+        "target": "C",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "Which of the following is the primary difference between hyd",
+        "target": "B",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "In the spring and early summer, bears often scratch their ba",
+        "target": "C",
+        "pred": "C",
+        "correct": true
+      },
+      {
+        "q": "Which event occurs once per day?",
+        "target": "A",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "What is the mass of a carbon atom that has 6 protons, 7 neut",
+        "target": "C",
+        "pred": "C",
+        "correct": true
+      },
+      {
+        "q": "The speed of a sound wave varies as it travels through diffe",
+        "target": "D",
+        "pred": "B",
+        "correct": false
+      },
+      {
+        "q": "Which statement best describes the energy changes that occur",
+        "target": "B",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "The best way to separate salt from water is with the use of",
+        "target": "B",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "Which is the best piece of equipment to determine the topogr",
+        "target": "C",
+        "pred": "A",
+        "correct": false
+      },
+      {
+        "q": "Which tool would be best to use to determine how long it tak",
+        "target": "C",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "To determine how closely related organisms are, scientists c",
+        "target": "C",
+        "pred": "A",
+        "correct": false
+      },
+      {
+        "q": "Which is an example of a learned behavior?",
+        "target": "A",
+        "pred": "A",
+        "correct": true
+      }
+    ],
+    "arc_easy": [
+      {
+        "q": "Which statement best explains why photosynthesis is the foun",
+        "target": "A",
+        "pred": "A",
+        "correct": true
+      },
+      {
+        "q": "Which piece of safety equipment is used to keep mold spores ",
+        "target": "B",
+        "pred": "C",
+        "correct": false
+      },
+      {
+        "q": "Meiosis is a type of cell division in which germ cells divid",
+        "target": "D",
+        "pred": "D",
+        "correct": true
+      },
+      {
+        "q": "Which characteristic describes the texture of a kitten's fur",
+        "target": "D",
+        "pred": "D",
+        "correct": true
+      },
+      {
+        "q": "Which best describes the structure of an atom?",
+        "target": "B",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "To express the distance between the Milky Way galaxy and oth",
+        "target": "C",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "A student has just completed a laboratory activity. What is ",
+        "target": "A",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "Students are investigating the effects of different fertiliz",
+        "target": "C",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "Plants use sunlight to make",
+        "target": "C",
+        "pred": "B",
+        "correct": false
+      },
+      {
+        "q": "Which of these correctly identifies the way materials are tr",
+        "target": "A",
+        "pred": "C",
+        "correct": false
+      },
+      {
+        "q": "When trees develop leaves in the spring, 10 changes occur on",
+        "target": "B",
+        "pred": "B",
+        "correct": true
+      },
+      {
+        "q": "The circulatory system and the endocrine system work togethe",
+        "target": "B",
+        "pred": "C",
+        "correct": false
+      },
+      {
+        "q": "A student throws a ball into the air. While the ball travels",
+        "target": "B",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "Which of these will most likely harm a habitat?",
+        "target": "B",
+        "pred": "B",
+        "correct": true
+      },
+      {
+        "q": "All living and nonliving material is composed of",
+        "target": "B",
+        "pred": "C",
+        "correct": false
+      },
+      {
+        "q": "Which process best explains how the Grand Canyon became so w",
+        "target": "B",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "As global temperatures increase, certain organisms will be m",
+        "target": "B",
+        "pred": "B",
+        "correct": true
+      },
+      {
+        "q": "A dish of sugar water was left on a window sill. One week la",
+        "target": "D",
+        "pred": "A",
+        "correct": false
+      },
+      {
+        "q": "Using a softball bat to hit a softball is an example of usin",
+        "target": "B",
+        "pred": "A",
+        "correct": false
+      },
+      {
+        "q": "When an igneous intrusion comes into contact with surroundin",
+        "target": "D",
+        "pred": "D",
+        "correct": true
+      },
+      {
+        "q": "A research scientist writes a paper on the initial regrowth ",
+        "target": "D",
+        "pred": "B",
+        "correct": false
+      },
+      {
+        "q": "Where do plants get most of the energy they need to live and",
+        "target": "D",
+        "pred": "D",
+        "correct": true
+      },
+      {
+        "q": "Which is a statement about climate?",
+        "target": "D",
+        "pred": "B",
+        "correct": false
+      },
+      {
+        "q": "While on a movie set, a stuntman jumps off the roof of a bui",
+        "target": "C",
+        "pred": "C",
+        "correct": true
+      },
+      {
+        "q": "Jessica wants to see cells in an oak tree leaf. Which tool i",
+        "target": "B",
+        "pred": "A",
+        "correct": false
+      },
+      {
+        "q": "Biologists conduct investigations to learn about living orga",
+        "target": "C",
+        "pred": "C",
+        "correct": true
+      },
+      {
+        "q": "Which factor is most likely to cause the number of rabbits l",
+        "target": "B",
+        "pred": "B",
+        "correct": true
+      },
+      {
+        "q": "Seeds that remain inactive until the right conditions of lig",
+        "target": "B",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "What allows a light bulb to give off light?",
+        "target": "A",
+        "pred": "A",
+        "correct": true
+      },
+      {
+        "q": "What causes sound?",
+        "target": "B",
+        "pred": "C",
+        "correct": false
+      },
+      {
+        "q": "Photosynthesis occurs in which of these organisms?",
+        "target": "A",
+        "pred": "A",
+        "correct": true
+      },
+      {
+        "q": "In order for cells to grow at a normal rate, they must",
+        "target": "C",
+        "pred": "C",
+        "correct": true
+      },
+      {
+        "q": "Marshall learned that plants need a substance from the air t",
+        "target": "A",
+        "pred": "A",
+        "correct": true
+      },
+      {
+        "q": "Antarctica is a continent at Earth's south pole. Fossils of ",
+        "target": "A",
+        "pred": "B",
+        "correct": false
+      },
+      {
+        "q": "Which two theories of Moon formation propose that much or al",
+        "target": "C",
+        "pred": "C",
+        "correct": true
+      },
+      {
+        "q": "When white, fluffy clouds appear in Massachusetts, the weath",
+        "target": "A",
+        "pred": "C",
+        "correct": false
+      },
+      {
+        "q": "Plants and animals are composed of organic compounds. Which ",
+        "target": "D",
+        "pred": "D",
+        "correct": true
+      },
+      {
+        "q": "New research uncovers information that proves that the data ",
+        "target": "C",
+        "pred": "C",
+        "correct": true
+      },
+      {
+        "q": "Which is the greatest benefit of sexual reproduction?",
+        "target": "C",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "The speed at which sound waves travel depends on the",
+        "target": "B",
+        "pred": "A",
+        "correct": false
+      },
+      {
+        "q": "Which scientist is credited with discovering the first four ",
+        "target": "A",
+        "pred": "B",
+        "correct": false
+      },
+      {
+        "q": "During science class, a teacher explains that the samples th",
+        "target": "B",
+        "pred": "A",
+        "correct": false
+      },
+      {
+        "q": "When the Northern Hemisphere is tilted away from the Sun cau",
+        "target": "A",
+        "pred": "C",
+        "correct": false
+      },
+      {
+        "q": "A scientist found fossils of ocean shells on a mountain top.",
+        "target": "C",
+        "pred": "C",
+        "correct": true
+      },
+      {
+        "q": "A student sees many plants around a pond. The student can de",
+        "target": "A",
+        "pred": "C",
+        "correct": false
+      },
+      {
+        "q": "Darryl learns that freezing temperatures may help cause weat",
+        "target": "D",
+        "pred": "D",
+        "correct": true
+      },
+      {
+        "q": "A bond is formed when an electron is transferred from a sodi",
+        "target": "D",
+        "pred": "D",
+        "correct": true
+      },
+      {
+        "q": "A group of fish was released into a local lake. This species",
+        "target": "C",
+        "pred": "B",
+        "correct": false
+      },
+      {
+        "q": "On a career day at school, an X-ray technician discusses her",
+        "target": "D",
+        "pred": "B",
+        "correct": false
+      },
+      {
+        "q": "In the United States, windmills have been used for farming f",
+        "target": "D",
+        "pred": "C",
+        "correct": false
+      }
+    ],
+    "hellaswag": [
+      {
+        "ctx": "A man is sitting on a roof. he",
+        "target": 3,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "ctx": "A lady walks to a barbell. She bends down and grabs the pole",
+        "target": 3,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "ctx": "Two women in a child are shown in a canoe while a man pulls ",
+        "target": 2,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "ctx": "A boy is running down a track. the boy",
+        "target": 2,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "ctx": "The boy lifts his body above the height of a pole. The boy l",
+        "target": 1,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "ctx": "The boy lands on his back on to a red mat. The boy gets up f",
+        "target": 1,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "ctx": "A man is standing in front of a camera. He starts playing a ",
+        "target": 2,
+        "pred": 2,
+        "correct": true
+      },
+      {
+        "ctx": "A cartoon animation video is shown with people wandering aro",
+        "target": 0,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "ctx": "A man is holding a pocket knife while sitting on some rocks ",
+        "target": 1,
+        "pred": 1,
+        "correct": true
+      },
+      {
+        "ctx": "Then he takes a small stone from the flowing river and smash",
+        "target": 1,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "ctx": "Then he takes a piece of bark and rubs the powered stone pie",
+        "target": 3,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "ctx": "The stone particles stick to the wet piece of wood. He then ",
+        "target": 3,
+        "pred": 3,
+        "correct": true
+      },
+      {
+        "ctx": "He then takes the knife and sharpens it against the wood pie",
+        "target": 2,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "ctx": "He then notices a little black and green poisonous frog sitt",
+        "target": 2,
+        "pred": 2,
+        "correct": true
+      },
+      {
+        "ctx": "A person is playing bagpipes out in a park. A man and two bo",
+        "target": 0,
+        "pred": 0,
+        "correct": true
+      },
+      {
+        "ctx": "Two people are seen passing a ball back and fourth in a pool",
+        "target": 3,
+        "pred": 3,
+        "correct": true
+      },
+      {
+        "ctx": "A woman is sitting at a table in a fast food restaurant whil",
+        "target": 2,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "ctx": "A group of cheerleaders run onto a stage before a cheering a",
+        "target": 0,
+        "pred": 0,
+        "correct": true
+      },
+      {
+        "ctx": "A group of cheerleaders run onto a stage before a cheering a",
+        "target": 1,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "ctx": "They get into formation, then begin dancing and flipping as ",
+        "target": 1,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "ctx": "A woman is reading a newspaper nearby while he speaks to her",
+        "target": 1,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "ctx": "A man is outside of a building. He is using commercial lawn ",
+        "target": 0,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "ctx": "Children bring desert out for their family member. the famil",
+        "target": 3,
+        "pred": 3,
+        "correct": true
+      },
+      {
+        "ctx": "The family enjoys eating the desert together. The people in ",
+        "target": 3,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "ctx": "A black female is shown in a room with a black scarf around ",
+        "target": 0,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "ctx": "A black female is shown in a room with a black scarf around ",
+        "target": 3,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "ctx": "A helicopter flies in some people who then start playing pai",
+        "target": 0,
+        "pred": 0,
+        "correct": true
+      },
+      {
+        "ctx": "A young boy and girl are standing over a sink with their mot",
+        "target": 3,
+        "pred": 3,
+        "correct": true
+      },
+      {
+        "ctx": "A young boy and girl are standing over a sink with their mot",
+        "target": 1,
+        "pred": 1,
+        "correct": true
+      },
+      {
+        "ctx": "The mother instructs them on how to brush their teeth while ",
+        "target": 3,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "ctx": "She gets them some water to gargle in their mouths. The boy ",
+        "target": 1,
+        "pred": 1,
+        "correct": true
+      },
+      {
+        "ctx": "A cat is sitting in a cat bed. It is licking its paw. it",
+        "target": 0,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "ctx": "A man in brown jacket is pulling out an arrow from the targe",
+        "target": 1,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "ctx": "A man walks outside plugs his lawn mower in and gets ready t",
+        "target": 2,
+        "pred": 2,
+        "correct": true
+      },
+      {
+        "ctx": "A man walks outside plugs his lawn mower in and gets ready t",
+        "target": 0,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "ctx": "He starts mowing his lawn casually going over all the grass.",
+        "target": 0,
+        "pred": 0,
+        "correct": true
+      },
+      {
+        "ctx": "A sea is shown with a green forest on seashore. Blond man is",
+        "target": 3,
+        "pred": 3,
+        "correct": true
+      },
+      {
+        "ctx": "We see a bottle of face wash. we",
+        "target": 2,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "ctx": "We see a person holding face wash then putting it on their f",
+        "target": 2,
+        "pred": 2,
+        "correct": true
+      },
+      {
+        "ctx": "A person is seen throwing plaster onto a wall while the came",
+        "target": 1,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "ctx": "More and more people begin talking and each of them has a bo",
+        "target": 2,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "ctx": "A group of boys are standing in a room with many clear cups ",
+        "target": 2,
+        "pred": 2,
+        "correct": true
+      },
+      {
+        "ctx": "The boys talk, laugh and tease each other before beginning a",
+        "target": 3,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "ctx": "One of the ping pongs lands in the cup and one of the boys b",
+        "target": 2,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "ctx": "There's a nbc news reporter wearing a red sweater and white ",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "ctx": "The representative from the company is talking about the ser",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "ctx": "A woman tries to eat ice cream to a child, but the child ref",
+        "target": 0,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "ctx": "After, the woman gives ice cream to the child, and then the ",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "ctx": "Men are lifting heavy weights over their head several times.",
+        "target": 3,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "ctx": "In home pet groomers demonstrate how to groom a pet. the per",
+        "target": 2,
+        "pred": 2,
+        "correct": true
+      }
+    ],
+    "mmlu": [
+      {
+        "q": "Find the degree for the given field extension Q(sqrt(2), sqr",
+        "target": 1,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "Let p = (1, 2, 5, 4)(2, 3) in S_5 . Find the index of <p> in",
+        "target": 2,
+        "pred": 2,
+        "correct": true
+      },
+      {
+        "q": "Find all zeros in the indicated finite field of the given po",
+        "target": 3,
+        "pred": 3,
+        "correct": true
+      },
+      {
+        "q": "Statement 1 | A factor group of a non-Abelian group is non-A",
+        "target": 1,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "Find the product of the given polynomials in the given polyn",
+        "target": 1,
+        "pred": 1,
+        "correct": true
+      },
+      {
+        "q": "Statement 1 | If a group has an element of order 15 it must ",
+        "target": 0,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "Statement 1 | Every homomorphic image of a group G is isomor",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "q": "Statement 1 | A ring homomorphism is one to one if and only ",
+        "target": 3,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "q": "Find the degree for the given field extension Q(sqrt(2) + sq",
+        "target": 1,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "Find all zeros in the indicated finite field of the given po",
+        "target": 2,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "q": "Statement 1 | If H is a subgroup of G and a belongs to G the",
+        "target": 2,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "q": "If A = {1, 2, 3} then relation S = {(1, 1), (2, 2)} is",
+        "target": 2,
+        "pred": 2,
+        "correct": true
+      },
+      {
+        "q": "Find the order of the factor group (Z_11 x Z_15)/(<1, 1>)",
+        "target": 0,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "The polynomial x^3 + 2x^2 + 2x + 1 can be factored into line",
+        "target": 2,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "q": "Find the maximum possible order for an element of S_n for n ",
+        "target": 2,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "q": "Statement 1 | R is a splitting field of some polynomial over",
+        "target": 1,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "The inverse of -i in the multiplicative group, {1, -1, i , -",
+        "target": 2,
+        "pred": 2,
+        "correct": true
+      },
+      {
+        "q": "Compute the product in the given ring. (2,3)(3,5) in Z_5 x Z",
+        "target": 2,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "q": "The set of all real numbers under the usual multiplication o",
+        "target": 3,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "Statement 1| Every group of order p^2 where p is prime is Ab",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "q": "Statement 1 | For finite groups G and H, |G + H| = |G||H|. (",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "q": "Find the sum of the given polynomials in the given polynomia",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "q": "Statement 1 | Any set of two vectors in R^2 is linearly inde",
+        "target": 3,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "The set of all nth roots of unity under multiplication of co",
+        "target": 3,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "q": "Statement 1 | Every maximal ideal is a prime ideal. Statemen",
+        "target": 1,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "Let G denoted the set of all n x n non-singular matrices wit",
+        "target": 2,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "q": "Statement 1 | Every group of order 42 has a normal subgroup ",
+        "target": 2,
+        "pred": 2,
+        "correct": true
+      },
+      {
+        "q": "Determine whether the polynomial in Z[x] satisfies an Eisens",
+        "target": 1,
+        "pred": 1,
+        "correct": true
+      },
+      {
+        "q": "Statement 1 | The image of a group of 6 elements under a hom",
+        "target": 3,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "Statement 1 | The homomorphic image of a cyclic group is cyc",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "q": "Statement 1 | If H is a subgroup of a group G and a belongs ",
+        "target": 1,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "If (G, .) is a group such that (ab)^-1 = a^-1b^-1, for all a",
+        "target": 1,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "Statement 1 | In a finite dimensional vector space every lin",
+        "target": 0,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "Some group (G, 0) is known to be abelian. Then which one of ",
+        "target": 2,
+        "pred": 2,
+        "correct": true
+      },
+      {
+        "q": "Statement 1 | If T: V -> W is a linear transformation and di",
+        "target": 0,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "Find the degree for the given field extension Q(sqrt(2), sqr",
+        "target": 1,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "Compute the product in the given ring. (20)(-8) in Z_26",
+        "target": 3,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "Determine whether the polynomial in Z[x] satisfies an Eisens",
+        "target": 1,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "Find the generator for the finite field Z_7.",
+        "target": 2,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "q": "Statement 1 | Every permutation is a cycle. Statement 2 | Ev",
+        "target": 3,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "The set of integers Z with the binary operation \"*\" defined ",
+        "target": 2,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "q": "Find the characteristic of the ring Z_3 x 3Z.",
+        "target": 0,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "q": "Statement 1 | Some abelian group of order 45 has a subgroup ",
+        "target": 1,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "Statement 1 | Every integral domain with characteristic 0 is",
+        "target": 2,
+        "pred": 2,
+        "correct": true
+      },
+      {
+        "q": "Let A and B be sets, f: A -> B and g: B -> A be functions su",
+        "target": 2,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "q": "Statement 1 | For any two groups G and G', there exists a ho",
+        "target": 2,
+        "pred": 2,
+        "correct": true
+      },
+      {
+        "q": "Statement 1 | A homomorphism may have an empty kernel. State",
+        "target": 1,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "Find all c in Z_3 such that Z_3[x]/(x^3 + x^2 + c) is a fiel",
+        "target": 1,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "q": "Statement 1 | If a R is an integral domain, then R[x] is an ",
+        "target": 2,
+        "pred": 2,
+        "correct": true
+      },
+      {
+        "q": "Find the maximum possible order for some element of Z_8 x Z_",
+        "target": 1,
+        "pred": 1,
+        "correct": true
+      }
+    ],
+    "winogrande": [
+      {
+        "s": "Sarah was a much better surgeon than Maria so _ always got t",
+        "target": 1,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "s": "Sarah was a much better surgeon than Maria so _ always got t",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "s": "They were worried the wine would ruin the bed and the blanke",
+        "target": 1,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "s": "Terry tried to bake the eggplant in the toaster oven but the",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "s": "At night, Jeffrey always stays up later than Hunter to watch",
+        "target": 0,
+        "pred": 0,
+        "correct": true
+      },
+      {
+        "s": "The cat of Sarah has some mouth problems, so she takes it to",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "s": "The home that my parents had when I was in school was a lot ",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "s": "The home that my parents had when I was in school was a lot ",
+        "target": 1,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "s": "Natalie has a rich husband and lots of money, Jennifer is po",
+        "target": 1,
+        "pred": 1,
+        "correct": true
+      },
+      {
+        "s": "Joe immediately went to bakery before the bank because the _",
+        "target": 0,
+        "pred": 0,
+        "correct": true
+      },
+      {
+        "s": "Joe immediately went to bakery before the bank because the _",
+        "target": 1,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "s": "I had to read an entire story for class tomorrow. Luckily, t",
+        "target": 1,
+        "pred": 1,
+        "correct": true
+      },
+      {
+        "s": "I had to read an entire story for class tomorrow. Luckily, t",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "s": "He had enough time between classes to go to a cafe or to the",
+        "target": 0,
+        "pred": 0,
+        "correct": true
+      },
+      {
+        "s": "He had enough time between classes to go to a cafe or to the",
+        "target": 1,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "s": "Lindsey like to read graphic novels but Natalie liked classi",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "s": "Michael just bought brand new wheels for his truck unlike Le",
+        "target": 1,
+        "pred": 1,
+        "correct": true
+      },
+      {
+        "s": "Michael just bought brand new wheels for his truck unlike Le",
+        "target": 0,
+        "pred": 0,
+        "correct": true
+      },
+      {
+        "s": "Leslie was nervous around parrots but Neil was not, since _ ",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "s": "Christmas was a special holiday to Eric but not Adam since _",
+        "target": 1,
+        "pred": 1,
+        "correct": true
+      },
+      {
+        "s": "To make frosting I needed pudding that was at a store 15 min",
+        "target": 1,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "s": "Benjamin was chosen instead of Brett to be the makeup artist",
+        "target": 1,
+        "pred": 1,
+        "correct": true
+      },
+      {
+        "s": "Cynthia violated the rights of Amy, because _ had too much p",
+        "target": 1,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "s": "They had to eat a lot to gain the strength they had lost and",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "s": "They had to eat a lot to gain the strength they had lost and",
+        "target": 1,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "s": "The roof of Rachel's home is old and falling apart, while Be",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "s": "All the clutter in the house excited Leslie but not Derrick ",
+        "target": 0,
+        "pred": 0,
+        "correct": true
+      },
+      {
+        "s": "The portions of food today were bigger than the sizes yester",
+        "target": 0,
+        "pred": 0,
+        "correct": true
+      },
+      {
+        "s": "Since Craig threw aluminum cans in the trash and Benjamin re",
+        "target": 0,
+        "pred": 0,
+        "correct": true
+      },
+      {
+        "s": "Christine was going to Jessica's house to do some cleaning i",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "s": "The students were at their desks taking tests with pencils, ",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "s": "Mary thought poodles were a cool dog but Rachel thought Grea",
+        "target": 0,
+        "pred": 0,
+        "correct": true
+      },
+      {
+        "s": "Mary thought poodles were a cool dog but Rachel thought Grea",
+        "target": 1,
+        "pred": 1,
+        "correct": true
+      },
+      {
+        "s": "Leslie had a lot of issues that Kyle was tired of dealing wi",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "s": "Jessica enjoyed a simple, basic life with Betty, but _ was b",
+        "target": 1,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "s": "I wanted to build a bathroom on the third floor of the house",
+        "target": 1,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "s": "Joel researched laws and helped to open a preschool for Eric",
+        "target": 1,
+        "pred": 1,
+        "correct": true
+      },
+      {
+        "s": "Tanya told Emily she couldn't come to work because her cat h",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "s": "Angela thinks her husband might be cheating with Lindsey, an",
+        "target": 1,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "s": "Donald's understanding of math isn't as good as Joseph's, so",
+        "target": 1,
+        "pred": 1,
+        "correct": true
+      },
+      {
+        "s": "Brian was jealous of Brett's new car because _ couldn't affo",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "s": "The man used  his eyes to read the letters but the _ were to",
+        "target": 0,
+        "pred": 0,
+        "correct": true
+      },
+      {
+        "s": "Jill was on a budget so she only bought a new dress for the ",
+        "target": 1,
+        "pred": 1,
+        "correct": true
+      },
+      {
+        "s": "Jill was on a budget so she only bought a new dress for the ",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "s": "On Monday, Patricia made Felicia eggs for an early breakfast",
+        "target": 1,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "s": "Since Craig wears clear contacts and William wears colored o",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "s": "Since Craig wears clear contacts and William wears colored o",
+        "target": 1,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "s": "It was easy for Angela to become a vegetarian although Kayla",
+        "target": 1,
+        "pred": 1,
+        "correct": true
+      },
+      {
+        "s": "Hunter was a better baker than Logan so _ made the kitchen a",
+        "target": 1,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "s": "Tanya spent more on the children's birthday party than Amy. ",
+        "target": 0,
+        "pred": 0,
+        "correct": true
+      }
+    ],
+    "openbookqa": [
+      {
+        "q": "A person wants to start saving money so that they can afford",
+        "target": 1,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "q": "There is most likely going to be fog around:",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "q": "Predators eat",
+        "target": 2,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "q": "Oak tree seeds are planted and a sidewalk is paved right nex",
+        "target": 2,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "q": "An electric car runs on electricity via",
+        "target": 2,
+        "pred": 2,
+        "correct": true
+      },
+      {
+        "q": "As the rain forest is deforested the atmosphere will increas",
+        "target": 2,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "q": "an electric car contains a motor that runs on",
+        "target": 2,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "q": "The middle of the day usually involves the bright star neare",
+        "target": 1,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "The summer solstice in the northern hemisphere is four month",
+        "target": 3,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "The main component in dirt is",
+        "target": 1,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "q": "It's easier for human's to survive in:",
+        "target": 2,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "q": "A cactus stem is used to store",
+        "target": 1,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "q": "A red-tailed hawk is searching for prey. It is most likely t",
+        "target": 2,
+        "pred": 2,
+        "correct": true
+      },
+      {
+        "q": "The chance of wildfires is increased by",
+        "target": 0,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "A positive effect of burning biofuel is",
+        "target": 2,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "q": "As gasoline costs rise, alternative fuels are being used, wh",
+        "target": 3,
+        "pred": 3,
+        "correct": true
+      },
+      {
+        "q": "A person wants to be able to have more natural power in thei",
+        "target": 2,
+        "pred": 2,
+        "correct": true
+      },
+      {
+        "q": "A Mola Mola might live where?",
+        "target": 2,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "q": "Which requires energy to move?",
+        "target": 0,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "q": "An animal that only eats plants is a",
+        "target": 1,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "There was a lot more water vapor in the air when we went on ",
+        "target": 0,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "An example of conservation is avoiding the use of",
+        "target": 0,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "What can feathers on Spheniscidae be used for?",
+        "target": 0,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "Overpopulation can cause",
+        "target": 1,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "q": "Shining a light through a diamond can",
+        "target": 1,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "q": "If you were attacked by a shark and had to punch it sharply ",
+        "target": 1,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "q": "which of these would stop a car quicker?",
+        "target": 3,
+        "pred": 3,
+        "correct": true
+      },
+      {
+        "q": "what system is needed for a body to get its needed supply of",
+        "target": 0,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "q": "Every evening a child can look into the night sky and see th",
+        "target": 3,
+        "pred": 3,
+        "correct": true
+      },
+      {
+        "q": "When it's flying, a plane has no friction with the",
+        "target": 1,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "To grow plants require",
+        "target": 2,
+        "pred": 2,
+        "correct": true
+      },
+      {
+        "q": "What is the best way to guess a babies eye color?",
+        "target": 3,
+        "pred": 3,
+        "correct": true
+      },
+      {
+        "q": "What animal eats plants?",
+        "target": 1,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "q": "Which of these is a hypothesis?",
+        "target": 0,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "What explains the characteristic lunar formations?",
+        "target": 1,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "Tadpoles start their lives as",
+        "target": 0,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "q": "If a person puts out four apples around their home on the sa",
+        "target": 0,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "What is used for sensing visual things?",
+        "target": 3,
+        "pred": 3,
+        "correct": true
+      },
+      {
+        "q": "They studied the soil by using",
+        "target": 3,
+        "pred": 3,
+        "correct": true
+      },
+      {
+        "q": "Bill's arm got cold when he put it inside the",
+        "target": 0,
+        "pred": 0,
+        "correct": true
+      },
+      {
+        "q": "A recyclable material can be",
+        "target": 3,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "What is different about birth in humans and chickens?",
+        "target": 3,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "q": "Which of these situations is an example of pollutants?",
+        "target": 0,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "Human reproduction requires",
+        "target": 3,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "q": "Thermometers",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "q": "if the earth was a living room, what can be done to melt the",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "q": "What would happen when balloons heat up?",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "q": "A balloon is filled with helium for a party. After the party",
+        "target": 0,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "q": "Seals are most likely to be found in what type of environmen",
+        "target": 1,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "When the eggs hatch, the offspring are",
+        "target": 2,
+        "pred": 2,
+        "correct": true
+      }
+    ],
+    "gsm8k": [
+      {
+        "q": "Janet\u2019s ducks lay 16 eggs per day. She eats three for breakf",
+        "target": "18",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "A robe takes 2 bolts of blue fiber and half that much white ",
+        "target": "3",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Josh decides to try flipping a house.  He buys a house for $",
+        "target": "70000",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "James decides to run 3 sprints 3 times a week.  He runs 60 m",
+        "target": "540",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Every day, Wendi feeds each of her chickens three cups of mi",
+        "target": "20",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Kylar went to the store to buy glasses for his new apartment",
+        "target": "64",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Toulouse has twice as many sheep as Charleston. Charleston h",
+        "target": "260",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Carla is downloading a 200 GB file. Normally she can downloa",
+        "target": "160",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "John drives for 3 hours at a speed of 60 mph and then turns ",
+        "target": "45",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Eliza's rate per hour for the first 40 hours she works each ",
+        "target": "460",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "A new program had 60 downloads in the first month. The numbe",
+        "target": "366",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Toula went to the bakery and bought various types of pastrie",
+        "target": "694",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Carlos is planting a lemon tree. The tree will cost $90 to p",
+        "target": "13",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Melanie is a door-to-door saleswoman. She sold a third of he",
+        "target": "18",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "In a dance class of 20 students, 20% enrolled in contemporar",
+        "target": "60",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "A merchant wants to make a choice of purchase between 2 purc",
+        "target": "125",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Two trains leave San Rafael at the same time. They begin tra",
+        "target": "230",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Jill gets paid $20 per hour to teach and $30 to be a cheerle",
+        "target": "57500",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Claire makes a 3 egg omelet every morning for breakfast.  Ho",
+        "target": "7",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Marissa is hiking a 12-mile trail. She took 1 hour to walk t",
+        "target": "6",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "I have 10 liters of orange drink that are two-thirds water a",
+        "target": "15",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Raymond and Samantha are cousins. Raymond was born 6 years b",
+        "target": "14",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Billy sells DVDs. He has 8 customers on Tuesday. His first 3",
+        "target": "7",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "A candle melts by 2 centimeters every hour that it burns. Ho",
+        "target": "8",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Kyle bought last year's best-selling book for $19.50. This i",
+        "target": "26",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Marie ordered one chicken meal that costs $12, 5 packs of mi",
+        "target": "2",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Mishka bought 3 pairs of shorts, 3 pairs of pants, and 3 pai",
+        "target": "243",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Cynthia eats one serving of ice cream every night.  She buys",
+        "target": "16",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Henry made two stops during his 60-mile bike trip. He first ",
+        "target": "25",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Gloria is shoe shopping when she comes across a pair of boot",
+        "target": "104",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Darrell and Allen's ages are in the ratio of 7:11. If their ",
+        "target": "109",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Gunter is trying to count the jelly beans in a jar. He asks ",
+        "target": "80",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "John takes care of 10 dogs.  Each dog takes .5 hours a day t",
+        "target": "35",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Gretchen has 110 coins. There are 30 more gold coins than si",
+        "target": "70",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Siobhan has 2 fewer jewels than Aaron. Aaron has 5 more jewe",
+        "target": "23",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Mike plays ping pong for 40 minutes.  In the first 20 minute",
+        "target": "9",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Terry eats 2 yogurts a day.  They are currently on sale at 4",
+        "target": "75",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "John plans to sell all his toys and use the money to buy vid",
+        "target": "2",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "John runs 60 miles a week. He runs 3 days a week.  He runs 3",
+        "target": "10",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Dana can run at a rate of speed four times faster than she c",
+        "target": "18",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Brandon's iPhone is four times as old as Ben's iPhone. Ben's",
+        "target": "8",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "The great dragon, Perg, sat high atop mount Farbo, breathing",
+        "target": "200",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Grandma Jones baked 5 apple pies for the fireman's luncheon.",
+        "target": "26",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "According to its nutritional info, a bag of chips has 250 ca",
+        "target": "48",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Charlie wants to sell beeswax candles.  For every pound of b",
+        "target": "20",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Meredith is a freelance blogger who writes about health topi",
+        "target": "104",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Candice put 80 post-it notes in her purse before she headed ",
+        "target": "163",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "John buys twice as many red ties as blue ties.  The red ties",
+        "target": "800",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Tracy used a piece of wire 4 feet long to support tomato pla",
+        "target": "8",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "Richard lives in an apartment building with 15 floors. Each ",
+        "target": "30",
+        "pred": null,
+        "correct": false
+      }
+    ]
+  }
+}

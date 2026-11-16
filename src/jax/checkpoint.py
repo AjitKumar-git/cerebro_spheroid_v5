@@ -220,6 +220,14 @@ def adapt_and_load_checkpoint_weights(
     if "sensory.out_self.weight" in target_params and "sensory.out_self.weight" not in restored_keys:
         target_params["sensory.out_self.weight"] = jnp.zeros_like(target_params["sensory.out_self.weight"])
 
+    # Tri-head transferability: if checkpoint has motor.affine_scale, initialize tri-heads
+    if "motor.affine_scale" in target_params:
+        base_affine = target_params["motor.affine_scale"]
+        for tri_k in ("motor.affine_think", "motor.affine_act", "motor.affine_answer"):
+            if tri_k in target_params and tri_k not in restored_keys:
+                target_params[tri_k] = base_affine
+                restored_keys.add(tri_k)
+
     missing = [k for k in target_params.keys() if k not in restored_keys and k != "core.radial_up_out.weight"]
     if missing:
         print(f"ℹ️ [adapt_weights] Unmapped JAX parameter arrays ({len(missing)}/{len(target_params)}): {missing}")
@@ -428,6 +436,16 @@ class AsyncCheckpointManager:
 
             # Prune scratch disk
             self._prune_scratch()
+
+            # Mirror to persistent Google Drive if mounted in Colab environment
+            gdrive_dir = "/content/drive/MyDrive/cerebro_v5_checkpoints"
+            if os.path.exists(gdrive_dir) and os.path.abspath(self.target_dir) != os.path.abspath(gdrive_dir):
+                try:
+                    tmp_gd = os.path.join(gdrive_dir, f"{filename}.tmp.{os.getpid()}")
+                    shutil.copyfile(target_path if os.path.exists(target_path) else local_path, tmp_gd)
+                    os.replace(tmp_gd, os.path.join(gdrive_dir, filename))
+                except Exception:
+                    pass
 
             # Upload to cloud if active (rate-limit non-final uploads so high-step/s runs do not saturate network)
             if self.cloud_sync and ("latest" in filename or "best" in filename):

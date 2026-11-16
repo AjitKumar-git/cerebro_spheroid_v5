@@ -94,14 +94,15 @@ def parse_sft_args(args_list: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--sft_model_name", "--sft-model-name", dest="sft_model_name", type=str, default=None, help="Cloud sync and checkpoint model name (default: {preset}_sft)")
     parser.add_argument("--pretrained_checkpoint", "--pretrained-checkpoint", dest="pretrained_checkpoint", type=str, default=None, help="Path to pre-trained base checkpoint (auto-discovered if None)")
     parser.add_argument("--resume_sft", "--resume-sft", dest="resume_sft", action="store_true", default=False, help="Resume an in-progress SFT run from {preset}_sft_latest.pt")
+    parser.add_argument("--fresh_sft", "--fresh-sft", dest="fresh_sft", action="store_true", default=False, help="Force fresh SFT initialization from foundation pre-trained base model, ignoring any existing SFT checkpoints")
     parser.add_argument("--total_steps", "--total-steps", dest="total_steps", type=int, default=50_000, help="Total SFT steps (default: 50,000)")
     parser.add_argument("--target_tokens", "--target-tokens", dest="target_tokens", type=int, default=None, help="Optional token ingestion budget for SFT")
     parser.add_argument("--batch_size", "--batch-size", dest="batch_size", type=int, default=None, help="Micro-batch size per device (auto-selected via hardware config if None)")
     parser.add_argument("--effective_batch_size", "--effective-batch-size", dest="effective_batch_size", type=int, default=256, help="Target global effective batch size (default: 256 for TPU, 128 for GPU; automatically computes grad_accum)")
     parser.add_argument("--max_batch_size", "--max-batch-size", dest="max_batch_size", type=int, default=128, help="Cap on auto-tuned micro-batch size (default: 128)")
     parser.add_argument("--grad_accum", "--grad-accum", dest="grad_accum", type=int, default=1, help="Gradient accumulation micro-steps per optimizer update")
-    parser.add_argument("--prompt_len", "--prompt-len", dest="prompt_len", type=int, default=256, help="Sensory context prompt length (default: 256 tokens)")
-    parser.add_argument("--seq_len", "--seq-len", dest="seq_len", type=int, default=512, help="Motor action target length (default: 512 tokens)")
+    parser.add_argument("--prompt_len", "--prompt-len", dest="prompt_len", type=int, default=512, help="Sensory context prompt length (default: 512 tokens)")
+    parser.add_argument("--seq_len", "--seq-len", dest="seq_len", type=int, default=1024, help="Motor action target length (default: 1024 tokens)")
     parser.add_argument("--lr", type=float, default=3.0e-5, help="Peak SFT learning rate (default: 3.0e-5)")
     parser.add_argument("--min_lr", "--min-lr", dest="min_lr", type=float, default=3.0e-6, help="SFT floor learning rate (default: 3.0e-6)")
     parser.add_argument("--warmup_steps", "--warmup-steps", dest="warmup_steps", type=int, default=500, help="Linear warmup steps (default: 500)")
@@ -122,22 +123,27 @@ def parse_sft_args(args_list: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--auto_tune", "--auto-tune", dest="auto_tune", action=argparse.BooleanOptionalAction, default=True, help="Verify hardware config with AutoTuner or reuse cached optimal config")
     parser.add_argument("--force_tune", "--force-tune", dest="force_tune", action=argparse.BooleanOptionalAction, default=False, help="Re-benchmark batch ladder even if cached config exists")
     parser.add_argument("--tune_objective", "--tune-objective", dest="tune_objective", type=str, default="tok_per_sec", choices=["tok_per_sec", "balanced", "steps_per_sec"], help="AutoTuner objective")
-    parser.add_argument("--target_eval_loss", "--target-eval-loss", dest="target_eval_loss", type=float, default=1.40, help="Target held-out evaluation loss for convergence (default: 1.40)")
+    parser.add_argument("--target_eval_loss", "--target-eval-loss", dest="target_eval_loss", type=float, default=0.60, help="Target held-out evaluation loss for convergence (default: 0.60)")
     parser.add_argument("--consistent_eval_threshold", "--consistent-eval-threshold", dest="consistent_eval_threshold", type=int, default=3, help="Consecutive evaluations required <= target-eval-loss to confirm convergence (default: 3)")
+    parser.add_argument("--dataset_source", "--data-source", dest="dataset_source", type=str, default="chat_thinking", help="SFT streaming dataset mixture ('chat_thinking' for database-augmented chat, CoT, math, SQL, code)")
     parser.add_argument("--loss_window_governor", "--loss-window-governor", dest="loss_window_governor", action=argparse.BooleanOptionalAction, default=True, help="Automatically damp LR when loss climbs")
-    parser.add_argument("--loss_ceiling", "--loss-ceiling", dest="loss_ceiling", type=float, default=3.50, help="Loss ceiling threshold for governor")
-    parser.add_argument("--loss_floor", "--loss-floor", dest="loss_floor", type=float, default=1.50, help="Loss floor threshold for governor")
+    parser.add_argument("--loss_ceiling", "--loss-ceiling", dest="loss_ceiling", type=float, default=2.50, help="Loss ceiling threshold for governor")
+    parser.add_argument("--loss_floor", "--loss-floor", dest="loss_floor", type=float, default=0.40, help="Loss floor threshold for governor")
 
     return parser.parse_args(args_list)
 
 
 # Interactive test prompts for live generation probing during SFT
 SFT_PROBE_PROMPTS = [
-    "Explain how a neural network learns using backpropagation in simple, clear terms:",
-    "Solve step-by-step: If Tom has 15 books and gives 4 to Alice and 3 to Bob, how many books does Tom have left?",
+    "hi",
+    "what is earth?",
+    "python script to sort a list",
+    "What is 15 + 27?",
+    "what is a pixel?",
+    "what is the capital of Germany?",
     "Write a clean Python function that checks if a given string is a palindrome:",
-    "Why is the sky blue during the day and red during sunset? Explain the physics concisely:",
-    "Extract the intent and parameters from: 'Book a flight from London to New York on October 12th for 2 passengers' in JSON format:",
+    "select all users from database where age > 21",
+    "If Tom has 15 books and gives 4 to Alice and 3 to Bob, how many books does Tom have left?",
 ]
 
 
@@ -187,16 +193,21 @@ def run_live_probe(
                 valid_ids.append(int(t_id))
 
             if hasattr(tokenizer, "decode"):
-                answer = tokenizer.decode(valid_ids).strip()
+                raw_text = tokenizer.decode(valid_ids).strip()
             else:
-                answer = f"[Tokens: {len(valid_ids)}]"
+                raw_text = f"[Tokens: {len(valid_ids)}]"
 
-            # Clean output display
-            for tag in ("<act>", "</act>", "<stim>", "</stim>"):
-                answer = answer.replace(tag, "").strip()
+            # Clean output display using 3-tier cognitive parser
+            from src.corpus import parse_model_output
+            parsed = parse_model_output(raw_text)
 
             print(f"▶ Q{idx}: {p_text}")
-            print(f"  A{idx}: {answer}\n")
+            if parsed.get("thinking"):
+                print(f"  💭 Thought: {parsed['thinking']}")
+            if parsed.get("tool_calls"):
+                print(f"  ⚡ Action : {parsed['tool_calls']}")
+            ans_display = parsed.get("answer") or parsed.get("raw") or "..."
+            print(f"  🧠 Answer : {ans_display}\n")
         except Exception as e:
             print(f"  [Probe notice for Q{idx}: {e}]")
 
@@ -328,23 +339,84 @@ def main(args=None):
     params = {k: v.astype(target_dtype) for k, v in params.items()}
 
     # 2. Base Checkpoint Loading or SFT Resumption
-    sft_latest_path = os.path.join(args.checkpoint_dir, f"{sft_model_name}_latest.pt")
     start_step = 0
     best_eval_loss = float("inf")
-
     loaded_source = None
-    if args.resume_sft and os.path.exists(sft_latest_path):
-        print(f"\n🔄 [SFT Resume] Resuming in-progress SFT from {sft_latest_path}...")
-        ckpt = torch.load(sft_latest_path, map_location="cpu", weights_only=False)
+
+    # Candidate paths for resuming an in-progress SFT run
+    gdrive_dir = "/content/drive/MyDrive/cerebro_v5_checkpoints"
+    sft_candidates = [
+        args.pretrained_checkpoint if (args.pretrained_checkpoint and "sft" in os.path.basename(args.pretrained_checkpoint)) else None,
+        os.path.join(gdrive_dir, f"{sft_model_name}_latest.pt") if os.path.exists(gdrive_dir) else None,
+        os.path.join(gdrive_dir, f"{sft_model_name}_best.pt") if os.path.exists(gdrive_dir) else None,
+        os.path.join(gdrive_dir, f"{base_preset}_sft_latest.pt") if os.path.exists(gdrive_dir) else None,
+        os.path.join(gdrive_dir, f"{base_preset}_sft_best.pt") if os.path.exists(gdrive_dir) else None,
+        os.path.join(gdrive_dir, "v5_small_sft_latest.pt") if os.path.exists(gdrive_dir) else None,
+        os.path.join(gdrive_dir, "v5_small_sft_best.pt") if os.path.exists(gdrive_dir) else None,
+        os.path.join(args.checkpoint_dir, f"{sft_model_name}_latest.pt"),
+        os.path.join(args.checkpoint_dir, f"{sft_model_name}_best.pt"),
+        os.path.join(args.checkpoint_dir, f"{base_preset}_sft_latest.pt"),
+        os.path.join(args.checkpoint_dir, f"{base_preset}_sft_best.pt"),
+        os.path.join(args.checkpoint_dir, "v5_small_sft_latest.pt"),
+        os.path.join(args.checkpoint_dir, "v5_small_sft_best.pt"),
+        os.path.join(REPO_ROOT, "checkpoints", f"{sft_model_name}_latest.pt"),
+        os.path.join(REPO_ROOT, "checkpoints", f"{sft_model_name}_best.pt"),
+        os.path.join(REPO_ROOT, "checkpoints", f"{base_preset}_sft_latest.pt"),
+        os.path.join(REPO_ROOT, "checkpoints", f"{base_preset}_sft_best.pt"),
+        os.path.join(REPO_ROOT, "checkpoints", "v5_small_sft_master_diverse.pt"),
+        os.path.join(REPO_ROOT, "checkpoints", "v5_small_sft_best.pt"),
+    ]
+    sft_resume_path = next((p for p in sft_candidates if p and os.path.exists(p)), None)
+
+    if getattr(args, "fresh_sft", False):
+        args.resume_sft = False
+        sft_resume_path = None
+        print("🌱 [Option A] Fresh SFT requested: discarding any existing SFT checkpoints and loading pre-trained foundation weights.")
+
+    # If resume_sft is requested but not found locally, attempt remote pull from bioflo.in
+    if args.resume_sft and not sft_resume_path and args.cloud_sync:
+        print(f"\n📥 SFT checkpoint not found locally. Checking remote manifest for [{sft_model_name}] on bioflo.in...")
+        try:
+            manifest = check_remote_manifest(url=args.cloud_url, token=args.cloud_token)
+            models_dict = manifest.get("models", {})
+            target_remote_sft = None
+            if sft_model_name in models_dict:
+                target_remote_sft = sft_model_name
+            elif f"{base_preset}_sft" in models_dict:
+                target_remote_sft = f"{base_preset}_sft"
+            elif "v5_small_sft" in models_dict:
+                target_remote_sft = "v5_small_sft"
+
+            if target_remote_sft:
+                dest_file = os.path.join(args.checkpoint_dir, f"{sft_model_name}_latest.pt")
+                print(f"🔄 [cloud_sync] Pulling remote SFT checkpoint [{target_remote_sft}] to {dest_file}...")
+                success = pull_checkpoint(
+                    local_dest=dest_file,
+                    target_type="latest",
+                    model=target_remote_sft,
+                    url=args.cloud_url,
+                    token=args.cloud_token,
+                )
+                if success and os.path.exists(dest_file):
+                    sft_resume_path = dest_file
+        except Exception as e:
+            print(f"⚠️ Remote SFT pull notice: {e}")
+
+    if args.resume_sft and sft_resume_path:
+        print(f"\n🔄 [SFT Resume] Resuming in-progress SFT from: {sft_resume_path}")
+        ckpt = torch.load(sft_resume_path, map_location="cpu", weights_only=False)
         start_step = int(ckpt.get("step", 0))
         best_eval_loss = float(ckpt.get("eval_loss", float("inf")))
         restored = adapt_and_load_checkpoint_weights(ckpt, params, target_dtype, config)
         print(f"✓ Resumed SFT Step {start_step:,} (Eval Loss: {best_eval_loss:.4f}, Restored: {restored}/{len(params)} arrays)")
-        loaded_source = sft_latest_path
+        loaded_source = sft_resume_path
     else:
-        # Discover or download base pre-trained model
+        # Discover or download base pre-trained foundation model
         cand_paths = [
             args.pretrained_checkpoint,
+            os.path.join(gdrive_dir, f"{args.preset}_latest.pt") if os.path.exists(gdrive_dir) else None,
+            os.path.join(gdrive_dir, f"{base_preset}_latest_step900k.pt") if os.path.exists(gdrive_dir) else None,
+            os.path.join(gdrive_dir, f"{base_preset}_latest.pt") if os.path.exists(gdrive_dir) else None,
             os.path.join(args.checkpoint_dir, f"{args.preset}_latest.pt"),
             os.path.join(args.checkpoint_dir, f"{args.preset}_best.pt"),
             os.path.join(args.checkpoint_dir, f"{base_preset}_latest_step900k.pt"),
@@ -382,7 +454,7 @@ def main(args=None):
                 print(f"⚠️ Remote sync notice: {e}")
 
         if base_ckpt_path and os.path.exists(base_ckpt_path):
-            print(f"\n🚀 Loading base pre-trained weights from {os.path.basename(base_ckpt_path)}...")
+            print(f"\n🚀 Loading base pre-trained foundation weights from: {os.path.basename(base_ckpt_path)}...")
             ckpt = torch.load(base_ckpt_path, map_location="cpu", weights_only=False)
             pretrain_step = int(ckpt.get("step", 0))
             pretrain_loss = float(ckpt.get("loss", ckpt.get("eval_loss", 0.0)))
@@ -432,8 +504,8 @@ def main(args=None):
     opt_state = init_spheroid_opt_state(params)
 
     # 6. SFT Multi-Corpus Data Ingestion & Prefetching
-    print(f"\n📦 Initializing Curated Conversational & Reasoning SFT Streamer...")
-    sft_data_iter = build_online_dataset_iterator(dataset_source="sft", total_steps=args.total_steps)
+    print(f"\n📦 Initializing Curated Reasoning & Conversational SFT Streamer (Source: {args.dataset_source})...")
+    sft_data_iter = build_online_dataset_iterator(dataset_source=args.dataset_source, total_steps=args.total_steps)
     first_row = next(sft_data_iter)
     import itertools
     sft_chain_iter = itertools.chain([first_row], sft_data_iter)

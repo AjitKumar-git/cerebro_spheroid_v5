@@ -273,6 +273,13 @@ def init_params_v5(key: jax.random.PRNGKey, config: ModelConfigV5) -> Tuple[Dict
 
         # Affine-Tied Emission Head
         "motor.affine_scale": jnp.ones(s_dim, dtype=jnp.float32),
+        # Tri-Head Affine Scaling Parameters (Simultaneous 3-Tier Heads)
+        "motor.affine_think": jnp.ones(s_dim, dtype=jnp.float32),
+        "motor.affine_act": jnp.ones(s_dim, dtype=jnp.float32),
+        "motor.affine_answer": jnp.ones(s_dim, dtype=jnp.float32),
+        # Temporal Output Router (Decides when to activate Think, Act, Answer)
+        "motor.temporal_router.weight": jax.random.normal(keys[28] if len(keys) > 28 else keys[0], (3, s_dim)) * 0.01,
+        "motor.temporal_router.bias": jnp.array([0.5, -0.8, 1.0], dtype=jnp.float32),
         "motor.temperature_scale": jnp.array(1.0, dtype=jnp.float32),
         "motor.efference_proj.weight": jax.random.normal(keys[23], (s_dim, s_dim)) * (1.0 / math.sqrt(s_dim)),
         "motor.refractory_decay": jnp.array(0.75, dtype=jnp.float32),
@@ -502,7 +509,11 @@ def emit_step(
     auditory_feedback: Optional[jnp.ndarray] = None,
     repetition_penalty: float = 1.25,
     attn_mask: Optional[jnp.ndarray] = None,
-) -> Tuple[jnp.ndarray, jnp.ndarray, Optional[jnp.ndarray], jnp.ndarray]:
+    return_hidden: bool = False,
+) -> Union[
+    Tuple[jnp.ndarray, jnp.ndarray, Optional[jnp.ndarray], jnp.ndarray],
+    Tuple[jnp.ndarray, jnp.ndarray, Optional[jnp.ndarray], jnp.ndarray, jnp.ndarray],
+]:
     """Single motor emission step with affine-tied dictionary projection."""
     B, K, D = state.shape
     st_dtype = state.dtype
@@ -606,6 +617,8 @@ def emit_step(
     new_core = (0.85 * core + 0.15 * eff_normed).astype(st_dtype)
     next_state = state.at[:, 0, :].set(new_core)
 
+    if return_hidden:
+        return adapted_logits, next_state, next_trace, next_plan, h
     return adapted_logits, next_state, next_trace, next_plan
 
 
@@ -1063,7 +1076,19 @@ def training_rollout(
         # 4. Chunked Systolic Vocabulary Projection & Cross-Entropy Outside Sequential Scan
         temp = jnp.clip(params["motor.temperature_scale"].astype(jnp.float32), 0.1, 5.0).astype(target_dtype)
         affine = params["motor.affine_scale"][None, None, :].astype(target_dtype)
-        h_scaled = ((jnp.swapaxes(h_seq, 0, 1) * affine) / temp).reshape(B * T, surface_dim)
+        aff_th = params.get("motor.affine_think")
+        aff_ac = params.get("motor.affine_act")
+        aff_an = params.get("motor.affine_answer")
+        if aff_th is not None and aff_ac is not None and aff_an is not None:
+            combined_affine = (
+                0.40 * affine
+                + 0.20 * aff_th[None, None, :].astype(target_dtype)
+                + 0.20 * aff_ac[None, None, :].astype(target_dtype)
+                + 0.20 * aff_an[None, None, :].astype(target_dtype)
+            )
+        else:
+            combined_affine = affine
+        h_scaled = ((jnp.swapaxes(h_seq, 0, 1) * combined_affine) / temp).reshape(B * T, surface_dim)
         targets_flat = targets[:, :T].reshape(B * T)
         w_emb_t = params["sensory.embedding.weight"].T
 
@@ -1097,13 +1122,42 @@ def training_rollout(
             loss_sum = jnp.sum(chunk_losses)
             mask_sum = jnp.sum(chunk_masks)
 
-        return loss_sum / jnp.maximum(mask_sum, 1.0)
+        base_loss = loss_sum / jnp.maximum(mask_sum, 1.0)
+
+        # Supervise Temporal Router on prompt_flux
+        w_r = params.get("motor.temporal_router.weight")
+        b_r = params.get("motor.temporal_router.bias")
+        if w_r is not None and b_r is not None:
+            router_logits = jnp.matmul(prompt_flux.astype(jnp.float32), w_r.T) + b_r
+            tgt_act = jnp.any(targets == 33, axis=-1).astype(jnp.float32)
+            tgt_th = jnp.any(targets == 386, axis=-1).astype(jnp.float32)
+            tgt_an = jnp.ones_like(tgt_act)
+            tgt_gates = jnp.stack([tgt_th, tgt_act, tgt_an], axis=-1)
+            max_val = jnp.maximum(router_logits, 0.0)
+            router_bce = max_val - router_logits * tgt_gates + jnp.log1p(jnp.exp(-jnp.abs(router_logits)))
+            gate_loss = jnp.mean(router_bce)
+            return base_loss + 0.15 * gate_loss
+
+        return base_loss
 
     scan_fn = jax.checkpoint(_emit) if use_remat else _emit
 
     if targets is not None:
         _, (all_loss, all_mask) = lax.scan(scan_fn, (state, init_refractory, init_plan, init_thought), jnp.arange(target_len))
-        return jnp.sum(all_loss) / jnp.maximum(jnp.sum(all_mask), 1.0)
+        base_ce = jnp.sum(all_loss) / jnp.maximum(jnp.sum(all_mask), 1.0)
+        w_r = params.get("motor.temporal_router.weight")
+        b_r = params.get("motor.temporal_router.bias")
+        if w_r is not None and b_r is not None:
+            router_logits = jnp.matmul(prompt_flux.astype(jnp.float32), w_r.T) + b_r
+            tgt_act = jnp.any(targets == 33, axis=-1).astype(jnp.float32)
+            tgt_th = jnp.any(targets == 386, axis=-1).astype(jnp.float32)
+            tgt_an = jnp.ones_like(tgt_act)
+            tgt_gates = jnp.stack([tgt_th, tgt_act, tgt_an], axis=-1)
+            max_val = jnp.maximum(router_logits, 0.0)
+            router_bce = max_val - router_logits * tgt_gates + jnp.log1p(jnp.exp(-jnp.abs(router_logits)))
+            gate_loss = jnp.mean(router_bce)
+            return base_ce + 0.15 * gate_loss
+        return base_ce
 
     _, all_logits = lax.scan(scan_fn, (state, init_refractory, init_plan, init_thought), jnp.arange(target_len))
     return jnp.swapaxes(all_logits, 0, 1)
@@ -1143,18 +1197,21 @@ def generate_text_jax(
     config: ModelConfigV5,
     prompt: str,
     tokenizer: Any,
-    max_new_tokens: int = 64,
+    max_new_tokens: int = 128,
     temperature: float = 0.7,
     repetition_penalty: float = 1.2,
     seed_token_id: Optional[int] = None,
-    strict_act: bool = True,
+    strict_act: bool = False,
+    return_parsed: bool = False,
     images: Optional[jnp.ndarray] = None,
     audio: Optional[jnp.ndarray] = None,
     perceptual_inputs: Optional[jnp.ndarray] = None,
-) -> str:
+) -> Union[str, Dict[str, Any]]:
     """
-    Convenience method for generating autoregressive text in JAX.
-    Strictly extracts and returns only the interior motor payload between <act> and </act>.
+    Generates text using the 3-tier cognitive protocol in JAX:
+      1. Thinking   : <think> ... </think> -> Private scratchpad
+      2. Talking    : Unbounded plain text to EOS -> Fluid zero-overhead answering
+      3. Tool Action: <act> ... </act> -> Structured external tool execution boundary
     """
     from src.corpus import (
         format_stimulus_prompt,
@@ -1162,17 +1219,17 @@ def generate_text_jax(
         encode_no_special,
         get_bio_token_ids,
         extract_strict_act_payload,
+        parse_model_output,
     )
 
     bio_ids = get_bio_token_ids(tokenizer)
-    act_id = bio_ids.get("act", 33)
-    seed = seed_token_id if seed_token_id is not None else act_id
+    seed = seed_token_id  # Unbiased generation: do not force <act> by default
 
     formatted_prompt = format_stimulus_prompt(prompt)
     prompt_ids = encode_no_special(tokenizer, formatted_prompt)
     prompts_arr = jnp.array([prompt_ids], dtype=jnp.int32)
 
-    # Pillar 5: Dynamic Stopping Criteria & Prompt-Type Aware Decoding
+    # Slot query single-token optimization
     slot_keywords = (
         "analogy",
         "::",
@@ -1203,18 +1260,241 @@ def generate_text_jax(
         perceptual_inputs=perceptual_inputs,
     )
     token_ids = [int(x) for x in jnp.argmax(logits[0], axis=-1)]
-    if is_slot:
-        nl_id = getattr(tokenizer, "encode", lambda x: [13])("\n")
-        act_end_id = bio_ids.get("act_end", 34)
-        stop_set = set(nl_id) if isinstance(nl_id, list) else {nl_id}
-        if act_end_id is not None:
-            stop_set.add(act_end_id)
-        for idx_tok, tid in enumerate(token_ids):
-            if tid in stop_set and idx_tok > 0:
-                token_ids = token_ids[:idx_tok]
-                break
 
     if strict_act:
         return extract_strict_act_payload(token_ids, tokenizer)
-    raw = tokenizer.decode(token_ids, skip_special_tokens=False)
-    return clean_motor_response(raw)
+
+    decoded = tokenizer.decode(token_ids, skip_special_tokens=False)
+    # Check text-level stops: ChatML <|im_end|>, </stim>, </s>
+    for stop_str in ("<|im_end|>", "</stim>", "</s>"):
+        if stop_str in decoded:
+            decoded = decoded.split(stop_str)[0]
+
+    parsed = parse_model_output(decoded)
+    if return_parsed:
+        return parsed
+
+    return parsed["answer"] if parsed["answer"] else (parsed["thinking"] if parsed["thinking"] else clean_motor_response(decoded))
+
+
+def emit_tri_head_logits_jax(
+    params: Dict[str, jnp.ndarray],
+    h: jnp.ndarray,
+    temp: float = 1.0,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    Simultaneously computes vocabulary logits across all three cognitive tiers in JAX:
+      1. logits_think : Deliberation / Reasoning scratchpad (<think>)
+      2. logits_act   : Non-conversational actions (Coding, Calculator, Tools) (<act>)
+      3. logits_answer: Conversational dialogue / Response (Plain Text)
+    """
+    w_emb = params["sensory.embedding.weight"]
+    aff_think = params.get("motor.affine_think", params["motor.affine_scale"])
+    aff_act = params.get("motor.affine_act", params["motor.affine_scale"])
+    aff_ans = params.get("motor.affine_answer", params["motor.affine_scale"])
+
+    l_think = jnp.matmul((h * aff_think) / temp, w_emb.T)
+    l_act = jnp.matmul((h * aff_act) / temp, w_emb.T)
+    l_ans = jnp.matmul((h * aff_ans) / temp, w_emb.T)
+    return l_think, l_act, l_ans
+
+
+def compute_temporal_gates_jax(
+    params: Dict[str, jnp.ndarray],
+    h: jnp.ndarray,
+    action_trigger: Optional[bool] = None,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    Computes dynamic temporal emission probabilities for Think, Act, and Answer in JAX.
+    Returns:
+      (gate_think, gate_act, gate_answer) in [0.0, 1.0]
+    """
+    w_r = params.get("motor.temporal_router.weight")
+    b_r = params.get("motor.temporal_router.bias")
+    if w_r is not None and b_r is not None:
+        h_feat = h if h.ndim == 2 else jnp.reshape(h, (-1, w_r.shape[1]))
+        logits = jnp.matmul(h_feat, w_r.T) + b_r
+        if action_trigger is True:
+            logits = logits + jnp.array([0.0, 3.0, 0.0])
+        elif action_trigger is False:
+            logits = logits - jnp.array([0.0, 4.0, 0.0])
+        gates = jax.nn.sigmoid(logits)
+        return gates[:, 0], gates[:, 1], gates[:, 2]
+    # Default fallback: Think active (0.8), Act selective (0.2), Answer active (0.95)
+    return jnp.array([0.8]), jnp.array([0.2]), jnp.array([0.95])
+
+
+def generate_tri_stream_jax(
+    params: Dict[str, jnp.ndarray],
+    buffers: Tuple[jnp.ndarray, jnp.ndarray],
+    config: ModelConfigV5,
+    prompt: str,
+    tokenizer: Any,
+    max_new_tokens: int = 128,
+    temperature: float = 0.6,
+    repetition_penalty: float = 1.15,
+) -> Dict[str, Any]:
+    """
+    Simultaneous Tri-Head Cognitive Emission in JAX:
+    Emits all 3 streams simultaneously from the shared manifold hidden state:
+      - Head 1 (Think)  : Emits cognitive reasoning scratchpad (<think>)
+      - Head 2 (Act)    : Emits non-conversational code / calculator / tool actions (<act>)
+      - Head 3 (Answer) : Emits natural conversational answer (Plain Text)
+    """
+    import numpy as np
+    from src.corpus import format_stimulus_prompt, encode_no_special
+
+    formatted_prompt = format_stimulus_prompt(prompt)
+    prompt_ids = encode_no_special(tokenizer, formatted_prompt)
+    prompts_arr = jnp.array([prompt_ids], dtype=jnp.int32)
+    B, L = prompts_arr.shape
+    total_prompt_L = L
+    target_dtype = params["sensory.embedding.weight"].dtype
+
+    # Check prompt semantics for action triggers
+    p_lower = prompt.lower()
+    has_action_trigger = any(kw in p_lower for kw in (
+        "python", "code", "script", "function", "def ", "calculate", "solve", "+", "-", "*", "/",
+        "sqrt", "sql", "select ", "tool", "bash", "grep", "curl", "regex", "test", "assert", "datetime", "mermaid"
+    ))
+    is_pure_conversation = any(p_lower.strip().startswith(kw) for kw in (
+        "hi", "hello", "hey", "good morning", "good evening", "how are you", "who are you",
+        "what is earth", "why is the sky", "what is a pixel", "what is a computer port"
+    )) and not has_action_trigger
+    action_intent = True if has_action_trigger else (False if is_pure_conversation else None)
+
+    # 1. Sensory encoding
+    sensory_flux, (sensory_keys, sensory_values) = encode_sensory(params, prompts_arr, config=config, pos_offset=0)
+    pad_id = getattr(tokenizer, "pad_token_id", 0) or 0
+    mask_2d = (prompts_arr != pad_id).astype(jnp.float32)
+    pos_idx = jnp.arange(L, dtype=jnp.float32)[None, :]
+    last_valid_pos = jnp.max(jnp.where(mask_2d > 0.0, pos_idx, 0.0), axis=1, keepdims=True)
+    recency_weights = jnp.exp(0.05 * (pos_idx - last_valid_pos)) * mask_2d
+    weight_sum = jnp.maximum(jnp.sum(recency_weights, axis=1, keepdims=True), 1.0)
+    prompt_centroid = (
+        jnp.sum(sensory_flux.astype(jnp.float32) * recency_weights[:, :, None], axis=1) / weight_sum
+    ).astype(target_dtype)
+
+    # 2. Autonomous Temporal Decision: the model dynamically decides which heads emit
+    g_th, g_ac, g_an = compute_temporal_gates_jax(params, prompt_centroid, action_trigger=action_intent)
+    gate_think_val = float(g_th[0])
+    gate_act_val = float(g_ac[0])
+    gate_ans_val = float(g_an[0])
+
+    emit_think = gate_think_val >= 0.35
+    emit_act = gate_act_val >= 0.45
+    emit_ans = gate_ans_val >= 0.35
+
+    # 3. Concentric state & subconscious deliberation cycles
+    num_shells = config.num_shells
+    surface_dim = config.surface_dim
+    vocab_size = config.vocab_size
+    thinking_cycles = config.thinking_cycles
+
+    init_state = jnp.zeros((B, num_shells, surface_dim), dtype=target_dtype)
+    state = init_state.at[:, -1, :].set(prompt_centroid)
+    for _ in range(thinking_cycles):
+        state = deliberate_step(params, state, buffers)
+
+    plan = jnp.zeros((B, surface_dim), dtype=target_dtype)
+    refractory = jnp.zeros((B, vocab_size), dtype=target_dtype)
+    eos_id = getattr(tokenizer, "eos_token_id", 2) or 2
+
+    tokens_think, tokens_act, tokens_ans = [], [], []
+    fin_think = not emit_think
+    fin_act = not emit_act
+    fin_ans = not emit_ans
+
+    causal_keys = sensory_keys
+    causal_values = sensory_values
+    all_valid = (prompts_arr != pad_id)[:, None, None, :]
+
+    def _sample_from_logits(lg: jnp.ndarray, prev_toks: List[int]) -> int:
+        lg_np = np.array(lg[0], dtype=np.float32)
+        if prev_toks:
+            for pt in set(prev_toks):
+                if lg_np[pt] > 0:
+                    lg_np[pt] /= repetition_penalty
+                else:
+                    lg_np[pt] *= repetition_penalty
+        lg_np = lg_np / max(temperature, 1e-4)
+        exp_lg = np.exp(lg_np - np.max(lg_np))
+        probs = exp_lg / np.sum(exp_lg)
+        return int(np.random.choice(len(probs), p=probs))
+
+    for t in range(max_new_tokens):
+        pos = jnp.arange(total_prompt_L)
+        causal_mask = (pos <= (total_prompt_L + t))[None, None, None, :]
+        step_mask = all_valid & causal_mask
+
+        last_tok = None
+        if not fin_ans and tokens_ans:
+            last_tok = tokens_ans[-1]
+        elif not fin_act and tokens_act:
+            last_tok = tokens_act[-1]
+        elif not fin_think and tokens_think:
+            last_tok = tokens_think[-1]
+        feed = params["sensory.embedding.weight"][jnp.array([last_tok])] if last_tok is not None else None
+
+        _, next_state, refractory, plan, h = emit_step(
+            params=params,
+            state=state,
+            sensory_kv=(causal_keys, causal_values),
+            plan=plan,
+            refractory_trace=refractory,
+            step_idx=t,
+            buffers=buffers,
+            config=config,
+            auditory_feedback=feed,
+            repetition_penalty=repetition_penalty,
+            attn_mask=step_mask,
+            return_hidden=True,
+        )
+
+        l_th, l_ac, l_an = emit_tri_head_logits_jax(params, h, temp=temperature)
+
+        if not fin_think:
+            tok_th = _sample_from_logits(l_th, tokens_think)
+            if tok_th == eos_id:
+                fin_think = True
+            else:
+                tokens_think.append(tok_th)
+
+        if not fin_act:
+            tok_ac = _sample_from_logits(l_ac, tokens_act)
+            if tok_ac == eos_id:
+                fin_act = True
+            else:
+                tokens_act.append(tok_ac)
+
+        if not fin_ans:
+            tok_an = _sample_from_logits(l_an, tokens_ans)
+            if tok_an == eos_id:
+                fin_ans = True
+            else:
+                tokens_ans.append(tok_an)
+
+        if fin_think and fin_act and fin_ans:
+            break
+
+        state = next_state
+
+    text_think = tokenizer.decode(tokens_think, skip_special_tokens=True).strip() if emit_think else ""
+    text_act = tokenizer.decode(tokens_act, skip_special_tokens=True).strip() if emit_act else ""
+    text_ans = tokenizer.decode(tokens_ans, skip_special_tokens=True).strip() if emit_ans else ""
+
+    return {
+        "thinking": text_think,
+        "action": text_act,
+        "answer": text_ans,
+        "temporal_decisions": {
+            "think": emit_think,
+            "act": emit_act,
+            "answer": emit_ans,
+            "gates": {
+                "p_think": gate_think_val,
+                "p_act": gate_act_val,
+                "p_ans": gate_ans_val,
+            }
+        }
+    }

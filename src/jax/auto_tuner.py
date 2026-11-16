@@ -159,7 +159,9 @@ def generate_vram_maximizing_candidates(
     elif total_gb >= 12.0:
         # Standard datacenter accelerator: TPU v5e-1 (16GB), T4 (16GB), V100 (16GB), L4 (24GB), RTX 3090/4090 (24GB)
         if is_small_tier:
-            if max_batch_size is not None and max_batch_size <= 64:
+            if seq_len >= 512:
+                base_ladder = [16, 32, 64, 128, 192, 256]
+            elif max_batch_size is not None and max_batch_size <= 64:
                 base_ladder = [16, 32, 64]
             else:
                 base_ladder = [32, 64, 128, 192, 256, 384, 512, 768, 1024]

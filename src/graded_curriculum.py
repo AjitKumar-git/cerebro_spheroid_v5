@@ -39,6 +39,7 @@ Storage Optimization ("Save Training Space"):
 from __future__ import annotations
 
 import glob
+import json
 import math
 import os
 import queue
@@ -91,8 +92,8 @@ class CurriculumScheduleConfig:
     min_lr: float = 0.0
     energy_reg_phase_1_3: float = 0.01
     energy_reg_phase_4: float = 0.05
-    prompt_len: int = 32
-    seq_len: int = 256
+    prompt_len: int = 256
+    seq_len: int = 512
     batch_size: int = 8
     visual_dim: int = 512
     num_visual_patches: int = 16
@@ -201,7 +202,7 @@ class GradedCurriculumStreamer:
         self.close()
 
     def _locate_local_datasets(self) -> Dict[str, List[str]]:
-        """Scans search directories to catalog available parquet files."""
+        """Scans search directories to catalog available parquet, jsonl, and json files."""
         catalog: Dict[str, List[str]] = {
             "basic": [],
             "reasoning": [],
@@ -211,35 +212,65 @@ class GradedCurriculumStreamer:
         }
 
         found_files = []
+        seen_found = set()
         for d in self.search_dirs:
             if os.path.exists(d):
-                found_files.extend(glob.glob(f"{d}/**/*.parquet", recursive=True))
+                for ext in ("*.parquet", "*.jsonl", "*.json"):
+                    for fp in glob.glob(f"{d}/**/{ext}", recursive=True):
+                        real_p = os.path.realpath(fp)
+                        if real_p not in seen_found:
+                            seen_found.add(real_p)
+                            found_files.append(real_p)
 
         for f in found_files:
             fname = os.path.basename(f).lower()
-            if "world_knowledge" in fname or "canonical" in fname or "cosmopedia" in fname or "fineweb" in fname:
+            fpath = f.lower()
+            if "benchmark" in fpath or "cache" in fpath or "tokenizer" in fpath or "config" in fname or "special_tokens" in fname:
+                continue
+            if "diverse_sft" in fname:
+                # Master 25k multi-domain corpus spans all curriculum pillars!
                 catalog["basic"].append(f)
-            elif "openhermes" in fname or "gsm8k" in fname or "finemath" in fname:
                 catalog["reasoning"].append(f)
-            elif "stack" in fname or "python" in fname:
                 catalog["code"].append(f)
-            elif "ultrachat" in fname or "lmsys" in fname or "tool" in fname or "smoltalk" in fname:
+                catalog["workflows"].append(f)
+                catalog["gold"].append(f)
+            elif "world_knowledge" in fname or "canonical" in fname or "cosmopedia" in fname or "fineweb" in fname:
+                catalog["basic"].append(f)
+            elif "openhermes" in fname or "gsm8k" in fname or "finemath" in fname or "math" in fname:
+                catalog["reasoning"].append(f)
+            elif "stack" in fname or "python" in fname or "code" in fname:
+                catalog["code"].append(f)
+            elif "ultrachat" in fname or "lmsys" in fname or "tool" in fname or "smoltalk" in fname or "agent" in fname:
                 catalog["workflows"].append(f)
             elif "cerebro_cognitive" in fname:
                 catalog["gold"].append(f)
+                catalog["reasoning"].append(f)
+            else:
+                catalog["basic"].append(f)
                 catalog["reasoning"].append(f)
 
         return catalog
 
     def _generate_synthetic_basic(self) -> str:
-        """On-the-fly fallback generator for Phase 1 foundational syntax."""
-        subjects = ["The photon", "An electron", "The neural membrane", "A harmonic oscillator", "The protein structure", "A binary tree", "The curvature tensor"]
-        verbs = ["propagates through", "exhibits resonance with", "maintains equilibrium across", "governs the evolution of", "encodes information in", "modulates"]
-        objects = ["the concentric radial boundary.", "the latent state manifold.", "the phase clock cycle.", "orthogonal spherical harmonics.", "the axonal shortcut pathways."]
-        s = self.rng.choice(subjects)
-        v = self.rng.choice(verbs)
-        o = self.rng.choice(objects)
-        return f"{s} {v} {o} Specifically, its spatial gradient remains bounded within contractive limits."
+        """Emergency fallback: returns a diverse cognitive reasoning query without procedural arithmetic or static world trivia traps."""
+        # Try any available local pair first
+        for cat in ("basic", "reasoning", "gold", "workflows"):
+            p = self._next_local_pair(cat)
+            if p is not None:
+                return f"Question: {p[0]}\nAnswer: {p[1]}"
+        # If no local pairs loaded, provide diverse foundational scientific reasoning
+        topics = [
+            ("Explain the concept of entropy in thermodynamics and its relationship to microstates.",
+             "Entropy is a measure of the molecular disorder or randomness within a system. In statistical thermodynamics, Boltzmann formulated entropy as S = k * ln(W), where k is the Boltzmann constant and W represents the number of microscopic configurations (microstates) corresponding to a thermodynamic macrostate. As a system naturally evolves toward equilibrium, spontaneous processes tend to maximize microstates, causing net entropy to increase in accordance with the Second Law of Thermodynamics."),
+            ("Describe the mechanism of action of DNA polymerase during semi-conservative replication.",
+             "DNA polymerase synthesizes new DNA strands by catalyzing the formation of phosphodiester bonds between the 3'-hydroxyl group of the growing strand and the 5'-phosphate group of an incoming deoxynucleotide triphosphate (dNTP). It operates strictly in the 5' to 3' direction, requiring a pre-existing RNA primer synthesized by primase. On the leading strand, synthesis is continuous, while on the lagging strand, discontinuous Okazaki fragments are formed, later joined by DNA ligase."),
+            ("Derive the time complexity of the merge sort algorithm using the master theorem.",
+             "Merge sort divides an array of size n into two halves of size n/2, recursively sorts both halves, and merges them in linear time O(n). The recurrence relation is T(n) = 2T(n/2) + O(n). Using the Master Theorem: a = 2, b = 2, and f(n) = n. Since log_b(a) = log_2(2) = 1, and f(n) = Theta(n^1), we fall under Case 2 of the Master Theorem. Therefore, the overall time complexity of merge sort is Theta(n * log(n)) in best, average, and worst cases."),
+            ("Analyze how transformer self-attention computes contextual representations.",
+             "Self-attention transforms an input sequence of vectors into queries (Q), keys (K), and values (V) via linear projections. The attention weights are calculated via scaled dot-product: Attention(Q, K, V) = softmax(Q * K^T / sqrt(d_k)) * V. This allows every token in the sequence to dynamically attend to every other token based on pairwise relevance, enabling rich parallelized contextual representations without sequential recurrence bottlenecks.")
+        ]
+        q, a = self.rng.choice(topics)
+        return f"Question: {q}\nAnswer: {a}"
 
     def _generate_synthetic_multimodal(self, phase: CurriculumPhase) -> Tuple[str, int, torch.Tensor]:
         """Generates paired perceptual visual patches and multimodal reasoning dialogue."""
@@ -315,20 +346,58 @@ class GradedCurriculumStreamer:
         return self.rng.choice(tool_scenarios)
 
     def _stream_parquet_samples(self, file_path: str, max_samples: Optional[int] = None) -> Iterator[Tuple[str, str]]:
-        """Memory-mapped streaming reader yielding extracted (prompt, response) pairs."""
+        """Streaming reader yielding extracted (prompt, response) pairs from Parquet, JSONL, or JSON."""
         count = 0
-        try:
-            parquet_file = pq.ParquetFile(file_path)
-            for batch in parquet_file.iter_batches(batch_size=512):
-                for row in batch.to_pylist():
-                    q_txt, r_txt = extract_prompt_response_pair(row)
-                    if q_txt and r_txt:
-                        yield q_txt, r_txt
-                        count += 1
-                        if max_samples is not None and count >= max_samples:
-                            return
-        except Exception:
-            return
+        ext = os.path.splitext(file_path)[1].lower()
+
+        if ext == ".parquet":
+            try:
+                parquet_file = pq.ParquetFile(file_path)
+                for batch in parquet_file.iter_batches(batch_size=512):
+                    for row in batch.to_pylist():
+                        q_txt, r_txt = extract_prompt_response_pair(row)
+                        if q_txt and r_txt:
+                            yield q_txt, r_txt
+                            count += 1
+                            if max_samples is not None and count >= max_samples:
+                                return
+            except Exception:
+                return
+
+        elif ext == ".jsonl":
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        try:
+                            row = json.loads(line)
+                            q_txt, r_txt = extract_prompt_response_pair(row)
+                            if q_txt and r_txt:
+                                yield q_txt, r_txt
+                                count += 1
+                                if max_samples is not None and count >= max_samples:
+                                    return
+                        except Exception:
+                            continue
+            except Exception:
+                return
+
+        elif ext == ".json":
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                items = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+                for row in items:
+                    if isinstance(row, dict):
+                        q_txt, r_txt = extract_prompt_response_pair(row)
+                        if q_txt and r_txt:
+                            yield q_txt, r_txt
+                            count += 1
+                            if max_samples is not None and count >= max_samples:
+                                return
+            except Exception:
+                return
 
     def _load_local_pool(self, bucket: str) -> List[Tuple[str, str]]:
         """Loads, shards across DDP ranks, and shuffles all local Parquet pairs for a bucket."""
@@ -379,7 +448,7 @@ class GradedCurriculumStreamer:
             self._online_queues[stream_key] = q
 
             def _producer():
-                max_attempts = 3
+                max_attempts = 10
                 for attempt in range(max_attempts):
                     if self._stop_event.is_set():
                         return
@@ -404,21 +473,22 @@ class GradedCurriculumStreamer:
                     except Exception as exc:
                         err_msg = str(exc).lower()
                         is_rate_limit = "429" in err_msg or "rate limit" in err_msg or "too many requests" in err_msg
+                        wait_t = min(30.0, (2.0 ** attempt) * 2.0 + random.uniform(1.0, 3.0))
                         if is_rate_limit:
                             print(
                                 f"⚠️ [online-stream:{stream_key}:r{self.rank}] "
-                                f"HuggingFace 429 Rate Limit encountered. Switching immediately to resilient local/synthetic curriculum."
+                                f"HuggingFace Rate Limit (429). Backing off {wait_t:.1f}s before retry {attempt + 1}/{max_attempts}..."
                             )
-                            self._online_failed[stream_key] = True
-                            return
-                        print(
-                            f"⚠️ [online-stream:{stream_key}:r{self.rank}] "
-                            f"attempt {attempt + 1}/{max_attempts} failed ({type(exc).__name__}: {exc})"
-                        )
+                        else:
+                            print(
+                                f"⚠️ [online-stream:{stream_key}:r{self.rank}] "
+                                f"attempt {attempt + 1}/{max_attempts} notice: {exc}. Retrying in {wait_t:.1f}s..."
+                            )
                         if attempt + 1 >= max_attempts:
+                            print(f"❌ [online-stream:{stream_key}:r{self.rank}] Max attempts exhausted. Falling back to local curriculum.")
                             self._online_failed[stream_key] = True
                             return
-                        self._stop_event.wait(timeout=min(2.0 ** attempt, 8.0))
+                        self._stop_event.wait(timeout=wait_t)
 
             t = threading.Thread(
                 target=_producer,
@@ -589,12 +659,8 @@ class GradedCurriculumStreamer:
                 if valid_len == 0:
                     tgt = [-100] * T
             else:
-                max_start = len(safe_tokens) - (T + 1)
-                if max_start > 0 and self.rng.random() < 0.25:
-                    start_idx = max_start
-                else:
-                    start_idx = self.rng.randint(0, max(0, max_start))
-                window_tokens = safe_tokens[start_idx : start_idx + T + 1]
+                # Full text intact input: always preserve stimulus prompt from token 0; never chop question front
+                window_tokens = safe_tokens[: T + 1]
                 inp = window_tokens[:T]
                 tgt = window_tokens[1 : T + 1]
 
@@ -679,9 +745,9 @@ class GradedCurriculumStreamer:
 
             records.append((q_ids, r_ids))
 
-        avg_q = max(1, sum(len(q) for q, _ in records) // len(records))
+        max_q = max(1, max(len(q) for q, _ in records))
         avg_r = max(1, sum(len(r) for _, r in records) // len(records))
-        b_idx = select_best_bucket(avg_q, avg_r, active_buckets)
+        b_idx = select_best_bucket(max_q, avg_r, active_buckets)
         bucket_name, bp, bt = active_buckets[b_idx]
 
         batch_prompts = []

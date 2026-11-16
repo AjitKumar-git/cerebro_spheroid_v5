@@ -130,7 +130,7 @@ def parse_args(args_list=None):
     parser.add_argument("--grad-accum", "--grad_accum", dest="grad_accum", type=int, default=1, help="Gradient accumulation micro-steps per optimizer update")
     parser.add_argument("--multi-tpu", "--multi_tpu", dest="multi_tpu", type=str, default="auto", choices=["auto", "local_sgd", "single"], help="Multi-TPU execution mode ('auto'/'local_sgd' uses all TPUs with 1 step per TPU)")
     parser.add_argument("--local-steps", "--local_steps", dest="local_steps", type=int, default=4, help="Sequential local optimizer steps per TPU before pmean parameter merge (default: 4)")
-    parser.add_argument("--seq-len", "--target_len", dest="seq_len", type=int, default=256, help="Target response sequence length (default: 256, transitioning to 512 for reasoning)")
+    parser.add_argument("--seq-len", "--target_len", dest="seq_len", type=int, default=512, help="Target response sequence length (default: 512 for deep reasoning)")
     parser.add_argument("--target-seq-len", "--target_seq_len", dest="target_seq_len", type=int, default=None, help="Target sequence length to transition toward (e.g. 512 or 1024)")
     parser.add_argument("--seq-transition-steps", "--seq_transition_steps", dest="seq_transition_steps", type=int, default=0, help="Steps over which to transition sequence length (0 = immediate transition to target_seq_len)")
     parser.add_argument("--prompt_len", type=int, default=256, help="Prompt context length (used when --elastic_window is disabled, default: 256)")
@@ -235,10 +235,10 @@ def build_data_stream(
     except ImportError:
         pass
 
-    if dataset_source == "local" or not HAS_DATASETS:
-        if dataset_source != "local" and not HAS_DATASETS:
+    if dataset_source in ("local", "pretrain", "offline") or not HAS_DATASETS:
+        if dataset_source not in ("local", "pretrain", "offline") and not HAS_DATASETS:
             print(f"⚠️ [DataStreamer] 'datasets' library not found. Falling back to high-throughput local corpus.")
-        print(f"📦 Initializing background linguistic streaming queue (Local Corpus in data/tokenizer)...")
+        print(f"📦 Initializing background linguistic streaming queue (Local Corpus in data/)...")
         streamer = LinguisticDataStreamer(
             batch_size=batch_size,
             prompt_len=prompt_len,

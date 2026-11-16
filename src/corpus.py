@@ -181,12 +181,24 @@ def small_parquet_pairs(path: str, seed: int = 0, holdout_every: int = 0,
 # --------------------------------------------------------------------------------------------
 
 def _get_hf_token() -> Optional[str]:
-    """Retrieve Hugging Face API token from environment if present."""
-    return (
+    """Retrieve Hugging Face API token from environment or cache if present."""
+    if "HF_HOME" not in os.environ:
+        user_hf = os.path.expanduser("~/.hf_cache")
+        os.makedirs(user_hf, exist_ok=True)
+        os.environ["HF_HOME"] = user_hf
+        os.environ["HF_HUB_CACHE"] = os.path.join(user_hf, "hub")
+    env_token = (
         os.environ.get("HF_TOKEN")
         or os.environ.get("HUGGINGFACE_HUB_TOKEN")
         or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     )
+    if env_token:
+        return env_token
+    try:
+        from huggingface_hub import get_token
+        return get_token()
+    except Exception:
+        return None
 
 
 def cosmopedia_stream(seed: int = 0) -> Iterator[Pair]:
@@ -681,6 +693,64 @@ def extract_strict_act_payload(
     return clean_motor_response(decoded, strict=True)
 
 
+def parse_model_output(text: str) -> Dict[str, Any]:
+    """
+    Parses CerebroSpheroid output following the 3-tier cognitive protocol:
+    1. Thinking           : <think> ... </think> -> Private scratchpad (hidden or collapsible)
+    2. Non-Conversational : <act> ... </act>     -> Coding, Calculator, & Tool actions
+    3. Talking / Answering: Unbounded Plain Text -> Fluid, polite conversational response
+    """
+    raw = str(text or "").strip()
+
+    # 1. Extract <think> ... </think>
+    thinking = ""
+    think_m = re.search(r"<think>(.*?)(?:</think>|$)", raw, re.DOTALL)
+    if think_m:
+        thinking = think_m.group(1).strip()
+
+    # 2. Extract <act> ... </act> non-conversational actions
+    raw_tools = []
+    for m in re.finditer(r"<act>(.*?)(?:</act>|$)", raw, re.DOTALL):
+        raw_tools.append(m.group(1).strip())
+
+    # 3. Extract plain talking/answering text (outside thinking & action blocks)
+    clean_text = re.sub(r"<think>.*?(?:</think>|$)", "", raw, flags=re.DOTALL)
+    clean_text = re.sub(r"<act>.*?(?:</act>|$)", "", clean_text, flags=re.DOTALL)
+
+    # Strip any stray ChatML or turn boundary tokens
+    for stray in ("<|im_end|>", "<|im_start|>", "</s>", "<s>", "<stim>", "</stim>", "</act>", "</think>"):
+        clean_text = clean_text.replace(stray, "")
+    answer = clean_text.strip()
+
+    # 4. Filter & Route Action Blocks (Coding, Calculator, Tools vs Legacy Wrapped Text)
+    tool_calls = []
+    for tc in raw_tools:
+        tc_clean = re.sub(r"<think>.*?(?:</think>|$)", "", tc, flags=re.DOTALL).strip()
+        for stray in ("<|im_end|>", "<|im_start|>", "</s>", "<s>", "<stim>", "</stim>", "</act>", "</think>"):
+            tc_clean = tc_clean.replace(stray, "")
+        tc_clean = tc_clean.strip()
+        if not tc_clean:
+            continue
+
+        # If answer is present outside <act>, everything inside <act> is a valid action!
+        if answer:
+            tool_calls.append(tc_clean)
+        else:
+            # If answer is empty, check if this is a real non-conversational action or legacy wrapped text
+            has_code_or_tool = any(ch in tc_clean for ch in ("=", "(", ")", "[", "]", "{", "}", ":", "+", "*", "/")) or "\n" in tc_clean
+            if has_code_or_tool:
+                tool_calls.append(tc_clean)
+            else:
+                answer = tc_clean
+
+    return {
+        "thinking": thinking,
+        "answer": answer,
+        "tool_calls": tool_calls,
+        "raw": raw,
+    }
+
+
 def encode_no_special(tokenizer, text: str, max_length: Optional[int] = None) -> List[int]:
     """Encode text without prepending/appending BOS/EOS tokens."""
     if hasattr(tokenizer, "encode"):
@@ -711,12 +781,14 @@ def encode_no_special(tokenizer, text: str, max_length: Optional[int] = None) ->
 
 
 def get_bio_token_ids(tokenizer) -> Dict[str, Optional[int]]:
-    """Resolve single-token IDs for <stim>, </stim>, <act>, </act> if defined."""
+    """Resolve single-token IDs for <stim>, </stim>, <act>, </act>, <think>, </think> if defined."""
     tags = {
         "stim": "<stim>",
         "stim_end": "</stim>",
         "act": "<act>",
         "act_end": "</act>",
+        "think": "<think>",
+        "think_end": "</think>",
     }
     result: Dict[str, Optional[int]] = {k: None for k in tags}
     if tokenizer is None or not hasattr(tokenizer, "encode"):
@@ -732,8 +804,8 @@ def get_bio_token_ids(tokenizer) -> Dict[str, Optional[int]]:
     return result
 
 
-def tokenize_pair(tokenizer, prompt: str, answer: str, max_prompt_len: int,
-                  max_answer_tokens: int) -> Tuple[List[int], List[int]]:
+def tokenize_pair(tokenizer, prompt: str, answer: str, max_prompt_len: int = 256,
+                  max_answer_tokens: int = 512) -> Tuple[List[int], List[int]]:
     """Tokenises one record using enclosed biological delimiters ('<stim> ... </stim>' / '<act> ... </act>'), appending EOS."""
     formatted_prompt = format_stimulus_prompt(prompt)
     prompt_ids = encode_no_special(tokenizer, formatted_prompt, max_length=max_prompt_len)

@@ -16,6 +16,9 @@ Core Principles:
 """
 
 from typing import Dict, List, Tuple, Optional, Any, Iterator
+import os
+import re
+import json
 import collections
 import queue
 import random
@@ -23,16 +26,55 @@ import threading
 import time
 import numpy as np
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 from src.corpus import encode_no_special
+
+
+def _normalize_3tier_response(r_txt: str, q_txt: str = "") -> str:
+    """
+    Enforces the 3-Tier Cognitive Output Architecture:
+      1. Thinking           : <think> ... </think> -> Private scratchpad deliberation
+      2. Non-Conversational : <act> ... </act>     -> Coding, Calculator, & Tool actions
+      3. Talking / Answering: Unbounded Plain Text -> Natural human dialogue & explanations
+    """
+    if not r_txt:
+        return ""
+    # Normalize thinking tags across models to canonical <think> ... </think>
+    r_txt = r_txt.replace("<|begin_of_thought|>", "<think>").replace("<|end_of_thought|>", "</think>")
+    r_txt = r_txt.replace("<thought>", "<think>").replace("</thought>", "</think>")
+
+    # 1. Arithmetic & GSM8K derivations ending in '#### <ans>'
+    if "####" in r_txt and "<act>" not in r_txt:
+        parts = r_txt.split("####", 1)
+        deriv = parts[0].strip()
+        ans_str = parts[1].strip()
+        if not deriv.startswith("<think>"):
+            deriv = f"<think>\n{deriv}\n</think>"
+        return f"{deriv}\n<act>\ncalculator: {ans_str}\n</act>\n{ans_str}"
+
+    # 2. Markdown code fences -> Non-conversational Action <act> ... </act>
+    if "<act>" not in r_txt:
+        # Match fenced code block (python, py, bash, sh, json, or untyped)
+        pattern = r"```(?:python|py|bash|sh|json)?\s*\n(.*?)\n```"
+        match = re.search(pattern, r_txt, re.DOTALL)
+        if match:
+            code_content = match.group(1).strip()
+            # Replace code block with <act> ... </act>
+            r_txt = r_txt[:match.start()] + f"<act>\n{code_content}\n</act>" + r_txt[match.end():]
+        elif any(r_txt.strip().startswith(prefix) for prefix in ("def ", "class ", "import ", "from ", "#!/usr/bin/env")):
+            r_txt = f"<act>\n{r_txt.strip()}\n</act>"
+
+    return r_txt
 
 
 def extract_prompt_response_pair(row: Any) -> Tuple[str, str]:
     """Extract `(prompt, response)` strings from HF/Parquet/tuple dataset records."""
     if isinstance(row, (tuple, list)):
         if len(row) == 3:
-            return str(row[1]), str(row[2])
+            return str(row[1]), _normalize_3tier_response(str(row[2]), str(row[1]))
         elif len(row) >= 2:
-            return str(row[0]), str(row[1])
+            return str(row[0]), _normalize_3tier_response(str(row[1]), str(row[0]))
         return "", ""
 
     if isinstance(row, dict):
@@ -41,7 +83,7 @@ def extract_prompt_response_pair(row: Any) -> Tuple[str, str]:
             q_txt = str(row.get("stimulus") or "").strip()
             r_txt = str(row.get("articulation") or "").strip()
             if q_txt and r_txt:
-                return q_txt, r_txt
+                return q_txt, _normalize_3tier_response(r_txt, q_txt)
 
         # 1. OpenHermes / ShareGPT format
         convs = row.get("conversations", [])
@@ -60,7 +102,7 @@ def extract_prompt_response_pair(row: Any) -> Tuple[str, str]:
             if sys_txt and q_txt:
                 q_txt = f"{sys_txt}\n\n{q_txt}"
             if q_txt and r_txt:
-                return str(q_txt), str(r_txt)
+                return str(q_txt), _normalize_3tier_response(str(r_txt), str(q_txt))
 
         # 2. SmolTalk / UltraChat / ChatML format
         msgs = row.get("messages", [])
@@ -79,24 +121,31 @@ def extract_prompt_response_pair(row: Any) -> Tuple[str, str]:
             if sys_txt and q_txt:
                 q_txt = f"{sys_txt}\n\n{q_txt}"
             if q_txt and r_txt:
-                return str(q_txt), str(r_txt)
+                return str(q_txt), _normalize_3tier_response(str(r_txt), str(q_txt))
 
-        # 3. GSM8K / MetaMathQA / Q&A / Cosmopedia format
-        q_txt = row.get("question", row.get("prompt", row.get("input", row.get("query", ""))))
-        r_txt = row.get("answer", row.get("response", row.get("output", row.get("text", ""))))
-        if q_txt and r_txt:
-            return str(q_txt), str(r_txt)
-        if not q_txt and "code" in row:
+        # 3. Frontier Reasoning / Math / CoT / Q&A format
+        q_val = row.get("problem") or row.get("instruction") or row.get("question") or row.get("prompt") or row.get("input") or row.get("query")
+        r_val = row.get("solution") or row.get("completion") or row.get("answer") or row.get("response") or row.get("output") or row.get("text")
+        if q_val and r_val:
+            q_txt = str(q_val).strip()
+            r_txt = str(r_val).strip()
+            # If explicit thought or reasoning trace is separate, enclose in <think> ... </think>
+            th_txt = str(row.get("thought") or row.get("thinking") or row.get("reasoning") or "").strip()
+            if th_txt and "<think>" not in r_txt:
+                r_txt = f"<think>\n{th_txt}\n</think>\n{r_txt}"
+            return q_txt, _normalize_3tier_response(r_txt, q_txt)
+        if not q_val and "code" in row:
             raw_c = str(row["code"]).strip()
-            return "Implement the following Python code:", raw_c
-        if not q_txt and "text" in row:
+            return "Implement the following Python code:", f"<act>\n{raw_c}\n</act>"
+        if not q_val and "text" in row:
             raw_t = str(row["text"]).strip()
             if "\n\n" in raw_t:
                 p, r = raw_t.split("\n\n", 1)
             else:
                 p, r = "Explain and analyze the following topic:", raw_t
-            return p.strip(), r.strip()
-        return str(q_txt), str(r_txt)
+            return p.strip(), _normalize_3tier_response(r.strip(), p.strip())
+        return str(q_val or ""), _normalize_3tier_response(str(r_val or ""), str(q_val or ""))
+    return "", ""
     return "", ""
 
 
@@ -108,15 +157,32 @@ _DEFAULT_DATASET_REVISIONS: Dict[str, str] = {
     "teknium/OpenHermes-2.5": "refs/convert/parquet",
 }
 
+_DEFAULT_DATASET_CONFIGS: Dict[str, str] = {
+    "HuggingFaceTB/cosmopedia-v2": "cosmopedia-v2",
+    "HuggingFaceFW/fineweb-edu": "sample-350BT",
+    "openai/gsm8k": "main",
+    "gsm8k": "main",
+    "HuggingFaceTB/smoltalk": "all",
+    "HuggingFaceTB/finemath": "finemath-4plus",
+    "open-r1/OpenR1-Math-220k": "default",
+}
+
 
 def _get_hf_token() -> Optional[str]:
-    """Retrieve Hugging Face API token from standard environment variables."""
+    """Retrieve Hugging Face API token from environment variables or cache."""
     import os
-    return (
+    env_token = (
         os.environ.get("HF_TOKEN")
         or os.environ.get("HUGGINGFACE_HUB_TOKEN")
         or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     )
+    if env_token:
+        return env_token
+    try:
+        from huggingface_hub import get_token
+        return get_token()
+    except Exception:
+        return None
 
 
 def _open_hf_stream(
@@ -126,57 +192,94 @@ def _open_hf_stream(
     rank: int = 0,
     world_size: int = 1,
     revision: Optional[str] = None,
+    max_retries: int = 6,
 ) -> Iterator[Any]:
-    """Open a HuggingFace streaming dataset with optional multi-rank sharding and auth token."""
+    """Open a HuggingFace streaming dataset with robust token authentication, exponential backoff, and 429 recovery."""
     import os
+    import time
+    import random
 
     # Redirect legacy script-based gsm8k repo to official Parquet dataset to prevent 429 rate limit stalls
     if repo == "gsm8k":
         repo = "openai/gsm8k"
 
+    effective_config = config_name if config_name is not None else _DEFAULT_DATASET_CONFIGS.get(repo)
+
     if "HF_HOME" not in os.environ:
-        default_hub = os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub")
-        default_hf = os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
-        default_cache = os.path.join(os.path.expanduser("~"), ".cache")
-        if (os.path.exists(default_hub) and not os.access(default_hub, os.W_OK)) or \
-           (os.path.exists(default_hf) and not os.access(default_hf, os.W_OK)) or \
-           (not os.access(default_cache, os.W_OK)):
-            os.environ["HF_HOME"] = "/tmp/hf_cache"
-            os.environ["HF_HUB_CACHE"] = "/tmp/hf_cache/hub"
+        user_hf = os.path.expanduser("~/.hf_cache")
+        os.makedirs(user_hf, exist_ok=True)
+        os.environ["HF_HOME"] = user_hf
+        os.environ["HF_HUB_CACHE"] = os.path.join(user_hf, "hub")
 
     from datasets import load_dataset
 
     effective_revision = revision if revision is not None else _DEFAULT_DATASET_REVISIONS.get(repo)
-    kwargs: Dict[str, Any] = {"split": split, "streaming": True}
-    if effective_revision is not None:
-        kwargs["revision"] = effective_revision
 
+    for attempt in range(max_retries):
+        kwargs: Dict[str, Any] = {"split": split, "streaming": True}
+        if effective_revision is not None:
+            kwargs["revision"] = effective_revision
+
+        token = _get_hf_token()
+        if token:
+            kwargs["token"] = token
+            try:
+                from huggingface_hub import login
+                login(token=token, add_to_git_credential=False)
+            except Exception:
+                pass
+
+        try:
+            ds = load_dataset(repo, effective_config, **kwargs) if effective_config else load_dataset(repo, **kwargs)
+            if world_size > 1:
+                try:
+                    from datasets.distributed import split_dataset_by_node
+                    ds = split_dataset_by_node(ds, rank=rank, world_size=world_size)
+                except Exception:
+                    if rank > 0 and hasattr(ds, "skip"):
+                        ds = ds.skip(rank * 256)
+            return iter(ds)
+
+        except TypeError:
+            # Backward compatibility for older datasets library versions lacking token or revision kwargs
+            if "revision" in kwargs:
+                kwargs.pop("revision", None)
+            if "token" in kwargs:
+                kwargs.pop("token", None)
+            try:
+                ds = load_dataset(repo, effective_config, **kwargs) if effective_config else load_dataset(repo, **kwargs)
+                if world_size > 1:
+                    try:
+                        from datasets.distributed import split_dataset_by_node
+                        ds = split_dataset_by_node(ds, rank=rank, world_size=world_size)
+                    except Exception:
+                        if rank > 0 and hasattr(ds, "skip"):
+                            ds = ds.skip(rank * 256)
+                return iter(ds)
+            except Exception as e:
+                err_str = str(e).lower()
+                wait_t = min(30.0, (2.0 ** attempt) + random.uniform(0.5, 2.0))
+                if "429" in err_str or "rate limit" in err_str or "too many requests" in err_str:
+                    print(f"⚠️ [DataStreamer] HuggingFace Rate Limit (429) on {repo}. Backing off {wait_t:.1f}s (retry {attempt+1}/{max_retries})...")
+                else:
+                    print(f"⚠️ [DataStreamer] Dataset stream notice on {repo} ({e}). Retrying in {wait_t:.1f}s...")
+                time.sleep(wait_t)
+
+        except Exception as e:
+            err_str = str(e).lower()
+            wait_t = min(30.0, (2.0 ** attempt) + random.uniform(0.5, 2.0))
+            if "429" in err_str or "rate limit" in err_str or "too many requests" in err_str:
+                print(f"⚠️ [DataStreamer] HuggingFace Rate Limit (429) on {repo}. Backing off {wait_t:.1f}s (retry {attempt+1}/{max_retries})...")
+            else:
+                print(f"⚠️ [DataStreamer] Dataset stream notice on {repo} ({e}). Retrying in {wait_t:.1f}s...")
+            time.sleep(wait_t)
+
+    # Final attempt fallback
+    kwargs = {"split": split, "streaming": True}
     token = _get_hf_token()
     if token:
         kwargs["token"] = token
-
-    try:
-        ds = load_dataset(repo, config_name, **kwargs) if config_name else load_dataset(repo, **kwargs)
-    except TypeError:
-        # Backward compatibility for older datasets library versions lacking token or revision kwargs
-        if "revision" in kwargs:
-            kwargs.pop("revision", None)
-        if "token" in kwargs and TypeError:
-            kwargs.pop("token", None)
-        ds = load_dataset(repo, config_name, **kwargs) if config_name else load_dataset(repo, **kwargs)
-    except Exception as e:
-        err_str = str(e).lower()
-        if "429" in err_str or "rate limit" in err_str or "too many requests" in err_str:
-            print(f"⚠️ [DataStreamer] HuggingFace Rate Limit (429) on {repo}. Recommend setting HF_TOKEN.")
-        raise
-
-    if world_size > 1:
-        try:
-            from datasets.distributed import split_dataset_by_node
-            ds = split_dataset_by_node(ds, rank=rank, world_size=world_size)
-        except Exception:
-            if rank > 0 and hasattr(ds, "skip"):
-                ds = ds.skip(rank * 256)
+    ds = load_dataset(repo, effective_config, **kwargs) if effective_config else load_dataset(repo, **kwargs)
     return iter(ds)
 
 
@@ -198,8 +301,10 @@ def build_online_dataset_iterator(
       - 'consolidation': Final cooling replay mixture.
     """
     source = (dataset_source or "dense_edu").lower()
-    if source in ("sft", "instruction_sft", "chat_sft", "alignment"):
-        source = "sft"
+    if source in ("chat_thinking", "db_thinking", "specialized_trihead", "specialized_sft"):
+        source = "chat_thinking"
+    elif source in ("sft", "instruction_sft", "chat_sft", "alignment", "reasoning_sft", "cot_sft", "think_sft", "r1_sft", "cot", "deepseek_r1", "conversational", "conversational_sft", "layman"):
+        source = "conversational_sft"
     elif source in ("foundation", "auto", "basic", "fineweb_edu"):
         source = "dense_edu"
     elif source in ("reasoning", "frontier", "beat_smollm", "smollm_pass", "frontier_mix", "tri_pillar"):
@@ -211,14 +316,36 @@ def build_online_dataset_iterator(
     elif source in ("autonomous", "autonomous_curriculum", "v5_base", "v5_base_curriculum", "v5_curriculum", "curriculum"):
         source = "autonomous"
 
-    def _next_or_reopen(it: Optional[Iterator[Any]], opener):
-        if it is None:
-            it = opener()
-        try:
-            return next(it), it
-        except StopIteration:
-            it = opener()
-            return next(it), it
+    def _next_or_reopen(it: Optional[Iterator[Any]], opener, max_retries: int = 5):
+        import time, random
+        for attempt in range(max_retries):
+            if it is None:
+                try:
+                    it = opener()
+                except Exception as e:
+                    wait_t = min(30.0, (2.0 ** attempt) + random.uniform(0.5, 2.0))
+                    print(f"⚠️ [HuggingFace Stream] Re-opener error ({e}). Retrying in {wait_t:.1f}s...")
+                    time.sleep(wait_t)
+                    continue
+            try:
+                return next(it), it
+            except StopIteration:
+                try:
+                    it = opener()
+                    return next(it), it
+                except Exception:
+                    it = None
+            except Exception as exc:
+                it = None
+                wait_t = min(30.0, (2.0 ** attempt) + random.uniform(0.5, 2.0))
+                err_str = str(exc).lower()
+                if "429" in err_str or "rate limit" in err_str or "too many requests" in err_str:
+                    print(f"⚠️ [HuggingFace Stream] 429 Rate Limit encountered. Backing off for {wait_t:.1f}s (retry {attempt+1}/{max_retries})...")
+                else:
+                    print(f"⚠️ [HuggingFace Stream] Read interruption ({exc}). Re-establishing connection in {wait_t:.1f}s...")
+                time.sleep(wait_t)
+        it = opener()
+        return next(it), it
 
     def _next_filtered_fineweb(it: Optional[Iterator[Any]], opener, min_score: float = 3.0):
         for _ in range(50):
@@ -447,78 +574,130 @@ def build_online_dataset_iterator(
 
         return _autonomous_gen()
 
-    if source == "sft":
-        # Curated Conversational & Reasoning SFT Mixture:
-        # 30% SmolTalk Everyday + OpenHermes (Conversational & STEM Instruction)
-        # 25% Smol-Magpie-Ultra + Apigen-80k (Deep Multi-Turn Logic & Tool Dispatch)
-        # 20% GSM8K + MetaMathQA (Step-by-Step Mathematical Derivation with ####)
-        # 15% SmolTalk Self-OSS-Instruct (Python Coding & Algorithmic Implementation)
-        # 10% FineWeb-Edu (score >= 4.0) (Knowledge Retention Anchor)
+    if source == "chat_thinking":
+        # 100% Offline Database-Augmented Chat, Reasoning & Action Streamer:
+        # Zero HuggingFace dependence, zero unauthenticated rate limits.
+        # Combines conversational chat, SQL factual queries, calculator, code, and agentic tools.
+        chat_thinking_path = os.path.join(REPO_ROOT, "data", "chat_thinking_sft_15k.jsonl")
+        if not os.path.exists(chat_thinking_path):
+            chat_thinking_path = os.path.join(os.getcwd(), "data", "chat_thinking_sft_15k.jsonl")
+        if not os.path.exists(chat_thinking_path):
+            try:
+                from scripts.build_chat_thinking_dataset import build_chat_thinking_dataset
+                build_chat_thinking_dataset()
+            except Exception as e:
+                print(f"Notice auto-generating chat thinking dataset: {e}")
+
+        def _chat_thinking_gen():
+            import json, os, time, random
+            while True:
+                if os.path.exists(chat_thinking_path):
+                    with open(chat_thinking_path, "r", encoding="utf-8") as f:
+                        lines = [l.strip() for l in f if l.strip()]
+                    random.shuffle(lines)
+                    for line in lines:
+                        try:
+                            item = json.loads(line)
+                            item["_dataset"] = "chat_thinking"
+                            yield item
+                        except Exception:
+                            continue
+                else:
+                    time.sleep(1.0)
+
+        return _chat_thinking_gen()
+
+    if source == "conversational_sft":
+        # Specialized Layman Conversational & Step-by-Step CoT Reasoning Mixture:
+        # Zero unsupervised web crawl, zero raw textbook physics/calculus drift.
+        #   30% SmolTalk everyday-conversations (natural dialogue, greetings, small talk, assistance)
+        #   25% SmolTalk openhermes-100k (broad world knowledge, clear explanations, definitions)
+        #   20% Local Layman Conversational CoT ('what is earth', 'pixle', 'port', capitals, math with <think>)
+        #   15% SmolTalk self-oss-instruct (clean, functional Python coding with step-by-step logic)
+        #   10% GSM8K + Master Diverse Slot QA (elementary arithmetic, word problems, direct factual QA)
         everyday_it: Optional[Iterator[Any]] = None
         openhermes_it: Optional[Iterator[Any]] = None
-        logic_it: Optional[Iterator[Any]] = None
-        tool_it: Optional[Iterator[Any]] = None
-        gsm_it: Optional[Iterator[Any]] = None
-        math_it: Optional[Iterator[Any]] = None
         code_it: Optional[Iterator[Any]] = None
-        know_it: Optional[Iterator[Any]] = None
+        gsm_it: Optional[Iterator[Any]] = None
+        layman_it: Optional[Iterator[Any]] = None
+        diverse_it: Optional[Iterator[Any]] = None
 
-        def _sft_gen():
-            nonlocal everyday_it, openhermes_it, logic_it, tool_it, gsm_it, math_it, code_it, know_it
+        def _open_local_cyclic_jsonl(filepath: str) -> Iterator[Dict[str, Any]]:
+            import json, os, time
+            if not os.path.exists(filepath) and "layman_conversational_cot" in filepath:
+                try:
+                    from scripts.build_layman_sft_dataset import build_layman_dataset
+                    build_layman_dataset()
+                except Exception:
+                    pass
+            while True:
+                if os.path.exists(filepath):
+                    with open(filepath, "r", encoding="utf-8") as f:
+                        for line in f:
+                            l = line.strip()
+                            if l:
+                                try:
+                                    yield json.loads(l)
+                                except Exception:
+                                    continue
+                else:
+                    time.sleep(1.0)
+
+        layman_path = os.path.join(REPO_ROOT, "data", "layman_conversational_cot.jsonl")
+        if not os.path.exists(layman_path):
+            layman_path = os.path.join(os.getcwd(), "data", "layman_conversational_cot.jsonl")
+
+        diverse_path = os.path.join(REPO_ROOT, "data", "diverse_sft_corpus_25k.jsonl")
+        if not os.path.exists(diverse_path):
+            diverse_path = os.path.join(os.getcwd(), "data", "diverse_sft_corpus_25k.jsonl")
+
+        def _conversational_gen():
+            nonlocal everyday_it, openhermes_it, code_it, gsm_it, layman_it, diverse_it
             turn = 0
             while True:
                 mod10 = turn % 10
                 try:
                     if mod10 in (0, 3, 6):
-                        # Conversational & Instruction following (SmolTalk everyday + openhermes)
-                        if (turn // 10) % 2 == 0:
-                            row, everyday_it = _next_or_reopen(
-                                everyday_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "everyday-conversations", rank=rank, world_size=world_size)
-                            )
-                            ds_name = "smoltalk_everyday"
-                        else:
-                            row, openhermes_it = _next_or_reopen(
-                                openhermes_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "openhermes-100k", rank=rank, world_size=world_size)
-                            )
-                            ds_name = "openhermes_100k"
+                        # 30% SmolTalk Everyday Conversations
+                        row, everyday_it = _next_or_reopen(
+                            everyday_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "everyday-conversations", rank=rank, world_size=world_size)
+                        )
+                        ds_name = "smoltalk_everyday"
                         if isinstance(row, dict):
                             row["_dataset"] = ds_name
                         yield row
 
                     elif mod10 in (1, 4):
-                        # Deep Logic & Agentic Tool Dispatch (Magpie Ultra + Apigen)
+                        # 25% SmolTalk OpenHermes 100k (Definitions, World Knowledge & Explanation)
                         if (turn // 10) % 2 == 0:
-                            row, logic_it = _next_or_reopen(
-                                logic_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "smol-magpie-ultra", rank=rank, world_size=world_size)
+                            row, openhermes_it = _next_or_reopen(
+                                openhermes_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "openhermes-100k", rank=rank, world_size=world_size)
+                            )
+                            ds_name = "openhermes_100k"
+                        else:
+                            row, openhermes_it = _next_or_reopen(
+                                openhermes_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "smol-magpie-ultra", rank=rank, world_size=world_size)
                             )
                             ds_name = "smol_magpie_ultra"
-                        else:
-                            row, tool_it = _next_or_reopen(
-                                tool_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "apigen-80k", rank=rank, world_size=world_size)
-                            )
-                            ds_name = "apigen_80k"
                         if isinstance(row, dict):
                             row["_dataset"] = ds_name
                         yield row
 
                     elif mod10 in (2, 7):
-                        # Math Reasoning & Derivation (GSM8K + MetaMathQA)
-                        if (turn // 10) % 2 == 0:
-                            row, gsm_it = _next_or_reopen(
-                                gsm_it, lambda: _open_hf_stream("openai/gsm8k", "main", rank=rank, world_size=world_size)
-                            )
-                            ds_name = "gsm8k"
-                        else:
-                            row, math_it = _next_or_reopen(
-                                math_it, lambda: _open_hf_stream("meta-math/MetaMathQA", rank=rank, world_size=world_size)
-                            )
-                            ds_name = "metamathqa"
+                        # 20% Local Layman Conversational & CoT (earth, pixel, port, capitals, greetings, math with <think>)
+                        if layman_it is None:
+                            layman_it = _open_local_cyclic_jsonl(layman_path)
+                        try:
+                            row = next(layman_it)
+                        except Exception:
+                            layman_it = _open_local_cyclic_jsonl(layman_path)
+                            row = next(layman_it)
                         if isinstance(row, dict):
-                            row["_dataset"] = ds_name
+                            row["_dataset"] = "layman_cot"
                         yield row
 
                     elif mod10 in (5, 8):
-                        # Python Software & Algorithm Synthesis (Self-OSS-Instruct)
+                        # 15% Python Software & Algorithm Synthesis (Self-OSS-Instruct)
                         row, code_it = _next_or_reopen(
                             code_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct", rank=rank, world_size=world_size)
                         )
@@ -527,19 +706,30 @@ def build_online_dataset_iterator(
                         yield row
 
                     else:
-                        # Knowledge Retention Anchor (FineWeb-Edu score >= 3.0) -> Prevents catastrophic forgetting!
-                        row, know_it = _next_filtered_fineweb(
-                            know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size), min_score=3.0
-                        )
+                        # 10% GSM8K Arithmetic Reasoning & Master Diverse Slot QA
+                        if os.path.exists(diverse_path) and (turn // 10) % 2 == 0:
+                            if diverse_it is None:
+                                diverse_it = _open_local_cyclic_jsonl(diverse_path)
+                            try:
+                                row = next(diverse_it)
+                            except Exception:
+                                diverse_it = _open_local_cyclic_jsonl(diverse_path)
+                                row = next(diverse_it)
+                            ds_name = "master_diverse_slot"
+                        else:
+                            row, gsm_it = _next_or_reopen(
+                                gsm_it, lambda: _open_hf_stream("openai/gsm8k", "main", rank=rank, world_size=world_size)
+                            )
+                            ds_name = "gsm8k_cot"
                         if isinstance(row, dict):
-                            row["_dataset"] = "fineweb_edu_anchor"
+                            row["_dataset"] = ds_name
                         yield row
 
                 except Exception:
                     time.sleep(0.5)
                 turn += 1
 
-        return _sft_gen()
+        return _conversational_gen()
 
     if source == "dense_edu":
         cosmo_it: Optional[Iterator[Any]] = None
@@ -763,29 +953,27 @@ def sample_window(
 
 
 def get_default_elastic_buckets(total_window: int = 1024) -> List[Tuple[str, int, int]]:
-    """Returns high-density complementary sliding window buckets avoiding extreme padding traps."""
+    """Returns high-density complementary sliding window buckets preserving intact prompts and deep reasoning trajectories."""
     assert total_window >= 256, "total_window must be at least 256 tokens"
     if total_window >= 1024:
         return [
-            ("short_cot", 256, 256),
-            ("standard_cot", 256, 384),
-            ("balanced", 384, 384),
-            ("deep_reasoning", 256, 512),
-            ("long_context", 768, 256),
+            ("standard_cot", 256, 512),
+            ("deep_reasoning", 256, 768),
+            ("balanced", 384, 512),
+            ("long_prompt", 512, 512),
         ]
     elif total_window >= 768:
         return [
-            ("short_cot", 128, 256),
-            ("standard_cot", 256, 256),
-            ("deep_reasoning", 256, 512),
-            ("long_context", 512, 256),
+            ("short_prompt_deep_cot", 128, 512),
+            ("standard_cot", 256, 512),
+            ("balanced", 256, 384),
+            ("long_prompt", 384, 384),
         ]
     elif total_window >= 512:
         return [
-            ("short_cot", 128, 128),
-            ("standard_cot", 128, 256),
+            ("standard_cot", 128, 384),
             ("balanced", 256, 256),
-            ("long_context", 384, 128),
+            ("deep_reasoning", 128, 384),
         ]
     else:
         half = total_window // 2
@@ -793,8 +981,11 @@ def get_default_elastic_buckets(total_window: int = 1024) -> List[Tuple[str, int
 
 
 def select_best_bucket(p_len: int, t_len: int, buckets: List[Tuple[str, int, int]]) -> int:
-    """Selects the bucket that minimizes wasted padding while preserving target reasoning tokens."""
-    best_idx = min(2, len(buckets) - 1)
+    """
+    Selects the bucket that minimizes wasted padding while strictly preserving full-text prompt intactness.
+    Prompt truncation carries a massive penalty (50,000) so a bucket accommodating the full question is always prioritized.
+    """
+    best_idx = min(1, len(buckets) - 1)
     min_penalty = float("inf")
 
     for idx, (_, bp, bt) in enumerate(buckets):
@@ -802,11 +993,11 @@ def select_best_bucket(p_len: int, t_len: int, buckets: List[Tuple[str, int, int
             # Fits completely: penalty is wasted padding
             penalty = (bp - p_len) + (bt - t_len)
         elif p_len <= bp:
-            # Fits prompt, mild target truncation
+            # Fits prompt completely, target has mild truncation: penalize target truncation
             penalty = (bp - p_len) + (t_len - bt) * 3
         else:
-            # Prompt exceeds bucket: penalize both prompt and target truncation
-            penalty = (p_len - bp) * 5 + max(0, t_len - bt) * 3
+            # Prompt exceeds bucket: massive penalty! Never truncate the prompt if another bucket fits it!
+            penalty = 50000 + (p_len - bp) * 100 + max(0, t_len - bt) * 3
 
         if penalty < min_penalty:
             min_penalty = penalty
@@ -947,16 +1138,24 @@ class ElasticBucketBatcher:
 
                 ds_name = row.get("_dataset", "corpus") if isinstance(row, dict) else "corpus"
 
-                # Format with enclosed biological delimiters: <stim> ... </stim> and <act> ... </act>
+                # Biological Sensory Input Delimiters: <stim> ... </stim>
                 try:
-                    from src.corpus import format_stimulus_prompt, format_motor_response
+                    from src.corpus import format_stimulus_prompt
                     q_txt = format_stimulus_prompt(q_txt)
-                    r_txt = format_motor_response(r_txt)
                 except Exception:
                     if not q_txt.startswith("<stim>"):
                         q_txt = f"<stim> {q_txt} </stim>"
-                    if not r_txt.startswith("<act>"):
-                        r_txt = f"<act> {r_txt} </act>"
+
+                # 3-Tier Cognitive Formatting for Response:
+                # 1. If response already contains <act> or <think>, preserve exact structured boundaries.
+                # 2. Non-conversational output: Coding, Calculator, Tools are enclosed in <act> ... </act>.
+                # 3. Conversational dialogue: Natural fluid plain text outside <act>.
+                r_txt = _normalize_3tier_response(r_txt, q_txt)
+                if "<act>" not in r_txt:
+                    if any(kw in ds_name.lower() for kw in ("code", "python", "self_oss")):
+                        r_txt = f"<act>\n{r_txt.strip()}\n</act>"
+                    elif "calculator" in ds_name.lower():
+                        r_txt = f"<act>\ncalculator: {r_txt.strip()}\n</act>"
                 raw_pairs.append((q_txt, r_txt, ds_name))
 
             if not raw_pairs and stream_ended:
@@ -1097,14 +1296,11 @@ def build_canonical_eval_split(
     from src.corpus import format_stimulus_prompt, format_motor_response
 
     domain_configs = [
-        ("Science (FineWeb-Edu >= 3)", lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT")),
-        ("Textbooks (Cosmopedia-v2)", lambda: _open_hf_stream("HuggingFaceTB/cosmopedia-v2", "cosmopedia-v2")),
-        ("Math Proofs (MetaMathQA)", lambda: _open_hf_stream("meta-math/MetaMathQA")),
-        ("Math-CoT (GSM8K Test)", lambda: _open_hf_stream("openai/gsm8k", "main", split="test")),
+        ("Commonsense Dialogue (SmolTalk)", lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "everyday-conversations")),
+        ("World Knowledge (Hermes)", lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "openhermes-100k")),
         ("Python Code (Self-OSS)", lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct")),
-        ("Commonsense (SmolTalk)", lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "everyday-conversations")),
-        ("Multi-Turn (Magpie Ultra)", lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "smol-magpie-ultra")),
-        ("STEM & Reasoning (Hermes)", lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "openhermes-100k")),
+        ("Math-CoT (GSM8K Test)", lambda: _open_hf_stream("openai/gsm8k", "main", split="test")),
+        ("Multi-Turn Logic (Magpie Ultra)", lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "smol-magpie-ultra")),
     ]
 
     eval_batches = []
@@ -1143,7 +1339,9 @@ def build_canonical_eval_split(
 
         for q_txt, r_txt in rows[:batch_size]:
             q_fmt = format_stimulus_prompt(q_txt)
-            r_fmt = format_motor_response(r_txt)
+            r_fmt = r_txt.strip()
+            if "<act>" not in r_fmt and any(kw in name.lower() for kw in ("code", "python")):
+                r_fmt = f"<act>\n{r_fmt}\n</act>"
 
             if hasattr(tokenizer, "encode"):
                 q_ids = encode_no_special(tokenizer, q_fmt, max_length=prompt_len)

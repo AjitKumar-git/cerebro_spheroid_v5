@@ -1,0 +1,8 @@
+{
+  "MMLU": 12.5,
+  "ARC_Challenge": 25.0,
+  "HellaSwag": 0.0,
+  "GSM8K": 0.0,
+  "HumanEval": 0.0,
+  "Composite_Score": 7.5
+}

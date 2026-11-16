@@ -142,6 +142,9 @@ class _CerebroDDPModule(nn.Module):
         compute_action: bool = False,
         persona_id: Optional[int] = None,
         deliberation_mode: str = "scheduled",
+        use_anchor_loss: bool = False,
+        anchor_weight: float = 3.5,
+        target_weights: Optional[torch.Tensor] = None,
     ):
         ce_loss, logits = self.model(
             input_ids,
@@ -153,6 +156,9 @@ class _CerebroDDPModule(nn.Module):
             perceptual_inputs=perceptual_inputs,
             persona_id=persona_id,
             deliberation_mode=deliberation_mode,
+            use_anchor_loss=use_anchor_loss,
+            anchor_weight=anchor_weight,
+            target_weights=target_weights,
         )
         action_logits = None
         if compute_action:
@@ -168,8 +174,8 @@ def parse_args(args_list: Optional[Sequence[str]] = None):
     parser.add_argument("--batch-size", type=int, default=8, help="Per-GPU micro-batch size (default: 8)")
     parser.add_argument("--grad-accum", type=int, default=None, help="Gradient accumulation steps (default: auto-computed to hit --target-batch-size)")
     parser.add_argument("--target-batch-size", "--prompts-per-step", dest="target_batch_size", type=int, default=64, help="Global prompts per optimizer step across all GPUs (default: 64, matching TPU)")
-    parser.add_argument("--prompt-len", type=int, default=32, help="Prompt context length in TPU-parity static mode (default: 32)")
-    parser.add_argument("--seq-len", type=int, default=256, help="Target sequence length in TPU-parity static mode (default: 256)")
+    parser.add_argument("--prompt-len", type=int, default=256, help="Prompt context length in TPU-parity static mode (default: 256)")
+    parser.add_argument("--seq-len", type=int, default=512, help="Target sequence length in TPU-parity static mode (default: 512)")
     parser.add_argument("--target-seq-len", "--target_seq_len", dest="target_seq_len", type=int, default=None, help="Target sequence length to transition toward (e.g. 512 or 1024)")
     parser.add_argument("--seq-transition-steps", "--seq_transition_steps", dest="seq_transition_steps", type=int, default=0, help="Steps over which to transition sequence length (0 = immediate transition to target_seq_len)")
     parser.add_argument("--deliberation-mode", "--deliberation_mode", dest="deliberation_mode", type=str, default="teacher_forcing", choices=["teacher_forcing", "scheduled", "pitfall_recovery", "internal", "interleaved", "dual_pass", "predictive_coding"], help="Deliberation feedback mode: 'teacher_forcing' uses pure ground truth (peak throughput); 'scheduled' anneals sampling_p; 'interleaved' alternates deliberation and teacher forcing; 'dual_pass' runs twin resonance passes; 'predictive_coding' trains predictive state innovation; 'pitfall_recovery' trains error recovery")
@@ -190,8 +196,8 @@ def parse_args(args_list: Optional[Sequence[str]] = None):
     parser.add_argument("--cloud-sync", action="store_true", help="Enable bi-directional checkpoint sync with bioflo.in")
     parser.add_argument("--cloud-sync-interval", type=int, default=100, help="Steps between background cloud sync uploads")
     parser.add_argument("--offline", action="store_true", help="Force offline mode using local datasets & cache")
-    parser.add_argument("--elastic-window", action=argparse.BooleanOptionalAction, default=False, help="Enable multi-bucket elastic sliding window instead of static TPU (32, 256) shape")
-    parser.add_argument("--total-window", type=int, default=288, help="Total sequence budget (prompt + response) for elastic window")
+    parser.add_argument("--elastic-window", action=argparse.BooleanOptionalAction, default=False, help="Enable multi-bucket elastic sliding window instead of static TPU (256, 512) shape")
+    parser.add_argument("--total-window", type=int, default=768, help="Total sequence budget (prompt + response) for elastic window")
     parser.add_argument("--tail-prob", type=float, default=0.25, help="V4 tail probability for EOS representation in window sampling")
     parser.add_argument("--num-mtp-heads", "--num_mtp_heads", dest="num_mtp_heads", type=int, default=1, choices=[1, 2, 3, 4], help="Multi-Token Prediction heads (1: standard single-token emission; 2 or 3: speculative decoding & future-token predictive training)")
     parser.add_argument("--persona-id", "--persona_id", dest="persona_id", type=int, default=None, choices=[0, 1, 2, 3], help="Cognitive Persona Steering basis (None: unbiased representation; 0: Reasoner, 1: Explorer, 2: Concise, 3: Verifier)")
@@ -202,7 +208,9 @@ def parse_args(args_list: Optional[Sequence[str]] = None):
     parser.add_argument("--model-preset", type=str, default="v5_small", choices=["v5_small", "v5_compact", "v5_base"], help="Model preset architecture tier (v5_small: 101M, v5_compact: 244M, v5_base: 617M)")
     parser.add_argument("--mix", type=str, default="auto", choices=["auto", "foundation", "reasoning", "code", "agentic", "consolidation"], help="Curriculum data mixture selection")
     parser.add_argument("--amp-dtype", "--precision", dest="amp_dtype", type=str, default="auto", choices=["auto", "float16", "fp16", "bfloat16", "bf16", "float32", "fp32"], help="Mixed precision dtype: 'auto' (native BF16 on Ampere+, FP16 on Turing/T4), or explicitly 'float16' / 'bfloat16' / 'float32'")
-    parser.add_argument("--optimizer", type=str, default="spheroid", choices=["spheroid", "adafactor", "adamw"], help="Optimizer to use (default: custom SpheroidOptimizer with Polar Newton-Schulz & spectral clamp)")
+    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "spheroid", "adafactor"], help="Optimizer to use (default: decoupled AdamW, options: spheroid, adafactor)")
+    parser.add_argument("--enable-aalw", action=argparse.BooleanOptionalAction, default=True, help="Enable Answer-Anchor Loss Weighting (3.5x penalty on final answer/reasoning tokens)")
+    parser.add_argument("--anchor-weight", type=float, default=3.5, help="Loss multiplier for anchor and target completion tokens (default: 3.5)")
     parser.add_argument("--from-scratch", "--from_scratch", dest="from_scratch", action="store_true", default=False, help="Start clean from Step 0 without restoring local/cloud checkpoints")
     parser.add_argument("--max-hours", type=float, default=None, help="Wall-clock budget in hours for clean checkpoint save before timeout")
     parser.add_argument("--seed", type=int, default=42, help="Base PRNG seed (offset per DDP rank for data streaming)")
@@ -397,7 +405,7 @@ def _run_training(
             print(f"\n🔄 [Sequence Transition] Advancing target sequence length from {args.seq_len} -> {args.target_seq_len} tokens for deep reasoning!")
         args.seq_len = args.target_seq_len
 
-    if args.total_window == 288 and not args.elastic_window and (args.seq_len != 256 or args.prompt_len != 32):
+    if args.total_window in (288, 768) and not args.elastic_window and (args.seq_len != 512 or args.prompt_len != 256):
         args.total_window = args.prompt_len + args.seq_len
 
     # Resolve effective grad_accum for global prompt/token parity with TPU (64 prompts/step)
@@ -809,6 +817,8 @@ def _run_training(
                             compute_action=compute_action,
                             persona_id=args.persona_id,
                             deliberation_mode=args.deliberation_mode,
+                            use_anchor_loss=getattr(args, "enable_aalw", True),
+                            anchor_weight=getattr(args, "anchor_weight", 3.5),
                         )
                         if compute_action and action_logits is not None:
                             act_loss = action_loss_fn(action_logits, action_labels)

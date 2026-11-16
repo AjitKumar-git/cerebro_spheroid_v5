@@ -1,0 +1,21 @@
+name,three_letter_code,one_letter_code,molecular_weight,polarity,side_chain_charge
+Alanine,Ala,A,89.09,Nonpolar,Neutral
+Arginine,Arg,R,174.2,Basic polar,Positive
+Asparagine,Asn,N,132.12,Polar,Neutral
+Aspartic acid,Asp,D,133.1,Acidic polar,Negative
+Cysteine,Cys,C,121.16,Nonpolar,Neutral
+Glutamic acid,Glu,E,147.13,Acidic polar,Negative
+Glutamine,Gln,Q,146.15,Polar,Neutral
+Glycine,Gly,G,75.07,Nonpolar,Neutral
+Histidine,His,H,155.16,Basic polar,Positive
+Isoleucine,Ile,I,131.18,Nonpolar,Neutral
+Leucine,Leu,L,131.18,Nonpolar,Neutral
+Lysine,Lys,K,146.19,Basic polar,Positive
+Methionine,Met,M,149.21,Nonpolar,Neutral
+Phenylalanine,Phe,F,165.19,Nonpolar,Neutral
+Proline,Pro,P,115.13,Nonpolar,Neutral
+Serine,Ser,S,105.09,Polar,Neutral
+Threonine,Thr,T,119.12,Polar,Neutral
+Tryptophan,Trp,W,204.23,Nonpolar,Neutral
+Tyrosine,Tyr,Y,181.19,Polar,Neutral
+Valine,Val,V,117.15,Nonpolar,Neutral

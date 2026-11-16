@@ -102,17 +102,16 @@ def load_arc_dataset(split_name: str = "ARC-Challenge", limit: Optional[int] = 5
     """Loads ARC from allenai/ai2_arc test split."""
     cache_tag = f"all" if limit is None or limit <= 0 else str(limit)
     cache_file = os.path.join(LOCAL_CACHE_DIR, f"{split_name.lower()}_{cache_tag}.json")
+    all_cache_file = os.path.join(LOCAL_CACHE_DIR, f"{split_name.lower()}_all.json")
     if os.path.exists(cache_file):
         try:
             with open(cache_file, "r") as f:
                 return json.load(f)
         except Exception:
             pass
-
-    all_file = os.path.join(LOCAL_CACHE_DIR, f"{split_name.lower()}_all.json")
-    if os.path.exists(all_file):
+    elif os.path.exists(all_cache_file):
         try:
-            with open(all_file, "r") as f:
+            with open(all_cache_file, "r") as f:
                 items = json.load(f)
                 return items[:limit] if limit and limit > 0 else items
         except Exception:
@@ -152,17 +151,16 @@ def load_hellaswag_dataset(limit: Optional[int] = 100) -> List[Dict[str, Any]]:
     """Loads HellaSwag from Rowan/hellaswag validation split."""
     cache_tag = f"all" if limit is None or limit <= 0 else str(limit)
     cache_file = os.path.join(LOCAL_CACHE_DIR, f"hellaswag_{cache_tag}.json")
+    all_cache_file = os.path.join(LOCAL_CACHE_DIR, "hellaswag_all.json")
     if os.path.exists(cache_file):
         try:
             with open(cache_file, "r") as f:
                 return json.load(f)
         except Exception:
             pass
-
-    all_file = os.path.join(LOCAL_CACHE_DIR, "hellaswag_all.json")
-    if os.path.exists(all_file):
+    elif os.path.exists(all_cache_file):
         try:
-            with open(all_file, "r") as f:
+            with open(all_cache_file, "r") as f:
                 items = json.load(f)
                 return items[:limit] if limit and limit > 0 else items
         except Exception:
@@ -198,17 +196,16 @@ def load_mmlu_dataset(limit: Optional[int] = 100) -> List[Dict[str, Any]]:
     """Loads MMLU across all subjects from cais/mmlu test split."""
     cache_tag = f"all" if limit is None or limit <= 0 else str(limit)
     cache_file = os.path.join(LOCAL_CACHE_DIR, f"mmlu_{cache_tag}.json")
+    all_cache_file = os.path.join(LOCAL_CACHE_DIR, "mmlu_all.json")
     if os.path.exists(cache_file):
         try:
             with open(cache_file, "r") as f:
                 return json.load(f)
         except Exception:
             pass
-
-    all_file = os.path.join(LOCAL_CACHE_DIR, "mmlu_all.json")
-    if os.path.exists(all_file):
+    elif os.path.exists(all_cache_file):
         try:
-            with open(all_file, "r") as f:
+            with open(all_cache_file, "r") as f:
                 items = json.load(f)
                 return items[:limit] if limit and limit > 0 else items
         except Exception:
@@ -243,17 +240,16 @@ def load_winogrande_dataset(limit: Optional[int] = 50) -> List[Dict[str, Any]]:
     """Loads Winogrande from allenai/winogrande validation split."""
     cache_tag = f"all" if limit is None or limit <= 0 else str(limit)
     cache_file = os.path.join(LOCAL_CACHE_DIR, f"winogrande_{cache_tag}.json")
+    all_cache_file = os.path.join(LOCAL_CACHE_DIR, "winogrande_all.json")
     if os.path.exists(cache_file):
         try:
             with open(cache_file, "r") as f:
                 return json.load(f)
         except Exception:
             pass
-
-    all_file = os.path.join(LOCAL_CACHE_DIR, "winogrande_all.json")
-    if os.path.exists(all_file):
+    elif os.path.exists(all_cache_file):
         try:
-            with open(all_file, "r") as f:
+            with open(all_cache_file, "r") as f:
                 items = json.load(f)
                 return items[:limit] if limit and limit > 0 else items
         except Exception:
@@ -288,17 +284,16 @@ def load_openbookqa_dataset(limit: Optional[int] = 50) -> List[Dict[str, Any]]:
     """Loads OpenBookQA from allenai/openbookqa test split."""
     cache_tag = f"all" if limit is None or limit <= 0 else str(limit)
     cache_file = os.path.join(LOCAL_CACHE_DIR, f"openbookqa_{cache_tag}.json")
+    all_cache_file = os.path.join(LOCAL_CACHE_DIR, "openbookqa_all.json")
     if os.path.exists(cache_file):
         try:
             with open(cache_file, "r") as f:
                 return json.load(f)
         except Exception:
             pass
-
-    all_file = os.path.join(LOCAL_CACHE_DIR, "openbookqa_all.json")
-    if os.path.exists(all_file):
+    elif os.path.exists(all_cache_file):
         try:
-            with open(all_file, "r") as f:
+            with open(all_cache_file, "r") as f:
                 items = json.load(f)
                 return items[:limit] if limit and limit > 0 else items
         except Exception:
@@ -335,17 +330,16 @@ def load_gsm8k_dataset(limit: Optional[int] = 25) -> List[Dict[str, Any]]:
     """Loads GSM8K from openai/gsm8k test split."""
     cache_tag = f"all" if limit is None or limit <= 0 else str(limit)
     cache_file = os.path.join(LOCAL_CACHE_DIR, f"gsm8k_{cache_tag}.json")
+    all_cache_file = os.path.join(LOCAL_CACHE_DIR, "gsm8k_all.json")
     if os.path.exists(cache_file):
         try:
             with open(cache_file, "r") as f:
                 return json.load(f)
         except Exception:
             pass
-
-    all_file = os.path.join(LOCAL_CACHE_DIR, "gsm8k_all.json")
-    if os.path.exists(all_file):
+    elif os.path.exists(all_cache_file):
         try:
-            with open(all_file, "r") as f:
+            with open(all_cache_file, "r") as f:
                 items = json.load(f)
                 return items[:limit] if limit and limit > 0 else items
         except Exception:

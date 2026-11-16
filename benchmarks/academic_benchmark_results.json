@@ -1,0 +1,161 @@
+{
+  "metadata": {
+    "checkpoint": "v5_small_sft_factual_calibrated.pt",
+    "step": 200,
+    "loss": 1.278980016708374,
+    "protocol": "stim_act",
+    "timestamp": "2026-11-16T06:29:13Z",
+    "device": "cuda"
+  },
+  "summary": {
+    "arc_challenge": {
+      "acc": 0.0,
+      "acc_norm": 0.0,
+      "stderr": 0.0,
+      "n": 2,
+      "time_sec": 4.838561773300171
+    },
+    "arc_easy": {
+      "acc": 50.0,
+      "acc_norm": 0.0,
+      "stderr": 0.0,
+      "n": 2,
+      "time_sec": 0.07191038131713867
+    },
+    "hellaswag": {
+      "acc": 0.0,
+      "acc_norm": 0.0,
+      "stderr": 0.0,
+      "n": 2,
+      "time_sec": 0.06618523597717285
+    },
+    "mmlu": {
+      "acc": 0.0,
+      "acc_norm": 0.0,
+      "stderr": 0.0,
+      "n": 2,
+      "time_sec": 0.07357168197631836
+    },
+    "winogrande": {
+      "acc": 50.0,
+      "acc_norm": 50.0,
+      "stderr": 35.35533905932738,
+      "n": 2,
+      "time_sec": 2.435560703277588
+    },
+    "openbookqa": {
+      "acc": 0.0,
+      "acc_norm": 0.0,
+      "stderr": 0.0,
+      "n": 2,
+      "time_sec": 0.08022546768188477
+    },
+    "gsm8k": {
+      "acc": 0.0,
+      "acc_norm": 0.0,
+      "stderr": 0.0,
+      "n": 2,
+      "time_sec": 0.41651368141174316
+    }
+  },
+  "details": {
+    "arc_challenge": [
+      {
+        "q": "An astronomer observes that a planet rotates faster after a ",
+        "target": "C",
+        "pred": "A",
+        "correct": false
+      },
+      {
+        "q": "A group of engineers wanted to know how different building d",
+        "target": "B",
+        "pred": "D",
+        "correct": false
+      }
+    ],
+    "arc_easy": [
+      {
+        "q": "Which statement best explains why photosynthesis is the foun",
+        "target": "A",
+        "pred": "C",
+        "correct": false
+      },
+      {
+        "q": "Which piece of safety equipment is used to keep mold spores ",
+        "target": "B",
+        "pred": "A",
+        "correct": false
+      }
+    ],
+    "hellaswag": [
+      {
+        "ctx": "A man is sitting on a roof. he",
+        "target": 3,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "ctx": "A lady walks to a barbell. She bends down and grabs the pole",
+        "target": 3,
+        "pred": 1,
+        "correct": false
+      }
+    ],
+    "mmlu": [
+      {
+        "q": "Find the degree for the given field extension Q(sqrt(2), sqr",
+        "target": 1,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "q": "Let p = (1, 2, 5, 4)(2, 3) in S_5 . Find the index of <p> in",
+        "target": 2,
+        "pred": 1,
+        "correct": false
+      }
+    ],
+    "winogrande": [
+      {
+        "s": "Sarah was a much better surgeon than Maria so _ always got t",
+        "target": 1,
+        "pred": 1,
+        "correct": true
+      },
+      {
+        "s": "Sarah was a much better surgeon than Maria so _ always got t",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      }
+    ],
+    "openbookqa": [
+      {
+        "q": "A person wants to start saving money so that they can afford",
+        "target": 1,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "q": "There is most likely going to be fog around:",
+        "target": 0,
+        "pred": 1,
+        "correct": false
+      }
+    ],
+    "gsm8k": [
+      {
+        "q": "Janet\u2019s ducks lay 16 eggs per day. She eats three for breakf",
+        "target": "18",
+        "pred": null,
+        "correct": false
+      },
+      {
+        "q": "A robe takes 2 bolts of blue fiber and half that much white ",
+        "target": "3",
+        "pred": null,
+        "correct": false
+      }
+    ]
+  }
+}

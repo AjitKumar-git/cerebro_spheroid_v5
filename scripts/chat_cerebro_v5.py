@@ -75,7 +75,8 @@ class CerebroChatSession:
         temperature: float = 0.6,
         top_p: float = 0.9,
         repetition_penalty: float = 1.25,
-        max_new_tokens: int = 64,
+        max_new_tokens: int = 256,
+        show_thinking: bool = True,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -85,55 +86,135 @@ class CerebroChatSession:
         self.top_p = top_p
         self.repetition_penalty = repetition_penalty
         self.max_new_tokens = max_new_tokens
+        self.show_thinking = show_thinking
+        self.tri_head_mode = True
         self.history: List[Dict[str, str]] = []
 
     def reset(self):
         self.history.clear()
 
-    def generate_reply(self, user_text: str) -> str:
-        """Processes user input, runs subconscious deliberation, and emits response."""
-        # Build prompt context with conversational framing
-        conversation_context = ""
-        for turn in self.history[-3:]:  # Keep up to 3 previous turns in memory
-            conversation_context += f"User: {turn['user']}\nAssistant: {turn['bot']}\n"
-        conversation_context += f"User: {user_text}\nAssistant:"
-
-        formatted_stim = format_stimulus_prompt(conversation_context) + " <act> "
-        tokens = encode_no_special(self.tokenizer, formatted_stim)
-        p_tensor = torch.tensor([tokens], dtype=torch.long, device=self.device)
-
-        orig_cycles = self.model.config.thinking_cycles
-        self.model.config.thinking_cycles = self.thinking_cycles
-
+    def generate_tri_reply(self, user_text: str):
+        """Generates all three cognitive tiers simultaneously in parallel using the Three Heads."""
         t0 = time.time()
-        stop_ids = [self.tokenizer.eos_token_id] if getattr(self.tokenizer, "eos_token_id", None) else []
         with torch.no_grad():
-            out_ids = self.model.generate(
-                p_tensor,
+            res = self.model.generate_tri_stream(
+                prompt=user_text,
+                tokenizer=self.tokenizer,
                 max_new_tokens=self.max_new_tokens,
                 temperature=self.temperature,
+                top_k=40,
                 top_p=self.top_p,
                 repetition_penalty=self.repetition_penalty,
-                stop_token_ids=stop_ids,
+                device=self.device,
             )
         elapsed = time.time() - t0
-        self.model.config.thinking_cycles = orig_cycles
+        all_text = res.get("thinking", "") + res.get("action", "") + res.get("answer", "")
+        tok_count = max(1, len(self.tokenizer.encode(all_text, add_special_tokens=False)))
+        speed = tok_count / max(elapsed, 1e-4)
 
-        gen_tokens = out_ids[0].tolist()
-        num_generated = len(gen_tokens)
-        speed = num_generated / max(elapsed, 1e-4)
+        self.history.append({"user": user_text, "bot": res["answer"]})
+        parsed = {
+            "thinking": res["thinking"],
+            "tool_calls": [res["action"]] if res["action"] else [],
+            "answer": res["answer"],
+            "temporal_decisions": res.get("temporal_decisions", {}),
+            "raw": f"<think>\n{res['thinking']}\n</think>\n<act>\n{res['action']}\n</act>\n{res['answer']}",
+        }
 
-        raw_text = self.tokenizer.decode(gen_tokens, skip_special_tokens=False)
-        clean_text = clean_motor_response(raw_text)
+        # Sensory Afference ReAct Loop: Ground Answer in Tool Observation
+        if res.get("action"):
+            from src.tools.tool_dispatcher import execute_action
+            act = res["action"]
+            obs = execute_action(act)
+            if obs and not obs.startswith("[Tool Error"):
+                parsed["tool_results"] = [obs]
+                # If answer is missing or truncated, ground it in observation
+                if not res.get("answer") or len(res.get("answer", "").strip()) < 3:
+                    afferent_prompt = (
+                        f"{user_text}\n"
+                        f"<think>\n{res.get('thinking', '')}\n</think>\n"
+                        f"<act>\n{act}\n</act>\n"
+                        f"Observation: {obs}\n"
+                    )
+                    with torch.no_grad():
+                        grounded = self.model.generate_text(
+                            prompt=afferent_prompt,
+                            tokenizer=self.tokenizer,
+                            max_new_tokens=self.max_new_tokens,
+                            temperature=self.temperature,
+                            device=self.device,
+                            return_parsed=True,
+                        )
+                        grounded_ans = grounded.get("answer") or grounded.get("raw") or ""
+                        if grounded_ans:
+                            parsed["answer"] = grounded_ans
+        return parsed, elapsed, speed, tok_count
 
-        # Fallback if clean response was emptied by delimiter strip
-        if not clean_text:
-            clean_text = raw_text.replace("<act>", "").replace("</act>", "").replace("</s>", "").strip()
+    def generate_reply(self, user_text: str):
+        """Processes user input, runs subconscious deliberation, and emits parsed response."""
+        t0 = time.time()
+        with torch.no_grad():
+            parsed = self.model.generate_text(
+                prompt=user_text,
+                tokenizer=self.tokenizer,
+                max_new_tokens=self.max_new_tokens,
+                temperature=self.temperature,
+                top_k=5,
+                top_p=self.top_p,
+                repetition_penalty=self.repetition_penalty,
+                thinking_cycles=self.thinking_cycles,
+                device=self.device,
+                strict_act=False,
+                return_parsed=True,
+            )
 
-        # Update conversational memory
-        self.history.append({"user": user_text, "bot": clean_text})
+        # Sensory Afference ReAct Loop: Execute Action and Ground Answer
+        if parsed.get("tool_calls"):
+            from src.tools.tool_dispatcher import execute_action
+            tool_results = []
+            for act in parsed["tool_calls"]:
+                tool_res = execute_action(act)
+                if tool_res and not tool_res.startswith("[Tool Error"):
+                    tool_results.append(tool_res)
 
-        return clean_text, elapsed, speed, num_generated
+            if tool_results:
+                parsed["tool_results"] = tool_results
+                # If answer is truncated or missing after </act>, articulate grounded answer
+                if not parsed.get("answer") or len(parsed.get("answer", "").strip()) < 3:
+                    afferent_prompt = (
+                        f"{user_text}\n"
+                        f"<think>\n{parsed.get('thinking', '')}\n</think>\n"
+                        f"<act>\n{parsed['tool_calls'][0]}\n</act>\n"
+                        f"Observation: {tool_results[0]}\n"
+                    )
+                    with torch.no_grad():
+                        grounded = self.model.generate_text(
+                            prompt=afferent_prompt,
+                            tokenizer=self.tokenizer,
+                            max_new_tokens=self.max_new_tokens,
+                            temperature=self.temperature,
+                            top_k=5,
+                            top_p=self.top_p,
+                            repetition_penalty=self.repetition_penalty,
+                            thinking_cycles=1,
+                            device=self.device,
+                            strict_act=False,
+                            return_parsed=True,
+                        )
+                        grounded_ans = grounded.get("answer") or grounded.get("raw") or ""
+                        if grounded_ans:
+                            parsed["answer"] = grounded_ans
+
+        elapsed = time.time() - t0
+        raw_text = parsed.get("raw", "")
+        tok_count = max(1, len(self.tokenizer.encode(raw_text, add_special_tokens=False)))
+        speed = tok_count / max(elapsed, 1e-4)
+
+        # Update conversational memory with clean answer
+        answer = parsed.get("answer") or raw_text
+        self.history.append({"user": user_text, "bot": answer})
+
+        return parsed, elapsed, speed, tok_count
 
 
 def interactive_chat_loop(checkpoint_path: str, thinking_cycles: int = 4, temperature: float = 0.6):
@@ -159,6 +240,8 @@ def interactive_chat_loop(checkpoint_path: str, thinking_cycles: int = 4, temper
     print(f"  • Hardware Device    : {device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
     print("-" * 80)
     print("Commands:")
+    print("  /think [on|off]: Toggle deliberation scratchpad (<think>) display")
+    print("  /tri [on|off]  : Toggle simultaneous 3-Head parallel generation")
     print("  /cycles <1-8>  : Adjust subconscious thinking passes")
     print("  /temp <0.1-1.0>: Adjust sampling temperature")
     print("  /tokens <len>  : Adjust maximum output tokens")
@@ -175,6 +258,36 @@ def interactive_chat_loop(checkpoint_path: str, thinking_cycles: int = 4, temper
             if user_input.lower() in ("exit", "quit", "/exit", "/quit"):
                 print("👋 Ending session. Exiting CerebroSpheroid V5...")
                 break
+
+            if user_input.startswith("/think"):
+                parts = user_input.split()
+                if len(parts) > 1:
+                    arg = parts[1].lower()
+                    if arg.isdigit():
+                        session.thinking_cycles = max(1, min(16, int(arg)))
+                        session.show_thinking = True
+                        print(f"⚙️ Deliberation scratchpad visibility: ENABLED | Thinking passes set to: {session.thinking_cycles} cycles/token")
+                    elif arg in ("on", "true", "1", "show"):
+                        session.show_thinking = True
+                        print(f"⚙️ Deliberation scratchpad visibility: ENABLED (Visible)")
+                    elif arg in ("off", "false", "0", "hide"):
+                        session.show_thinking = False
+                        print(f"⚙️ Deliberation scratchpad visibility: HIDDEN (Private scratchpad)")
+                else:
+                    session.show_thinking = not session.show_thinking
+                    status_str = "ENABLED (Visible)" if session.show_thinking else "HIDDEN (Private scratchpad)"
+                    print(f"⚙️ Deliberation scratchpad visibility: {status_str}")
+                continue
+
+            if user_input.startswith("/tri"):
+                parts = user_input.split()
+                if len(parts) > 1 and parts[1].lower() in ("off", "false", "0"):
+                    session.tri_head_mode = False
+                    print("⚙️ Simultaneous 3-Head Parallel Generation: DISABLED (Sequential Single-Stream)")
+                else:
+                    session.tri_head_mode = True
+                    print("⚙️ Simultaneous 3-Head Parallel Generation: ENABLED (Simultaneous Thinking, Action & Talking)")
+                continue
 
             if user_input.startswith("/cycles"):
                 parts = user_input.split()
@@ -205,10 +318,81 @@ def interactive_chat_loop(checkpoint_path: str, thinking_cycles: int = 4, temper
                 print("🧹 Conversational memory reset.")
                 continue
 
-            reply, elapsed_sec, tok_speed, num_toks = session.generate_reply(user_input)
+            if getattr(session, "tri_head_mode", False):
+                parsed, elapsed_sec, tok_speed, num_toks = session.generate_tri_reply(user_input)
+            else:
+                parsed, elapsed_sec, tok_speed, num_toks = session.generate_reply(user_input)
 
-            print(f"\n🧠 CerebroSpheroid V5 > {reply}")
+            # 1. Deliberation Scratchpad (<think>)
+            if session.show_thinking and parsed.get("thinking"):
+                print(f"\n┌─ 💭 Deliberation Scratchpad (<think>) {'─' * 39}")
+                for line in parsed["thinking"].splitlines():
+                    print(f"│  {line}")
+                print(f"└{'─' * 79}")
+
+            # 2. Non-Conversational Action Execution (<act>: Coding, Calculator, SQL, Tools, Diagrams)
+            act_category = "Action"
+            if parsed.get("tool_calls"):
+                for act in parsed["tool_calls"]:
+                    act_lower = act.lower().strip()
+                    if any(act_lower.startswith(p) for p in ("calculator:", "calc:", "math:")):
+                        title = "Calculator Action (<act>)"
+                        act_category = "Calculator"
+                    elif act_lower.startswith("sql:") or any(act_lower.startswith(p) for p in ("select ", "insert ", "update ", "delete ")):
+                        title = "SQL Query (<act>)"
+                        act_category = "SQL"
+                    elif any(act_lower.startswith(p) for p in ("tool:", "call:", "function:")) or (act.strip().startswith("{") and "tool" in act.lower()):
+                        title = "Tool Invocation (<act>)"
+                        act_category = "Tool Call"
+                    elif any(act_lower.startswith(p) for p in ("mermaid:", "graph ", "flowchart ", "sequencediagram", "plot:")):
+                        title = "Diagram & Visual Plot (<act>)"
+                        act_category = "Diagram/Plot"
+                    elif act_lower.startswith("regex:") or "re.search" in act_lower or "re.findall" in act_lower:
+                        title = "Regular Expression (<act>)"
+                        act_category = "Regex"
+                    elif any(act_lower.startswith(p) for p in ("test:", "assert ")):
+                        title = "Unit Test Assertion (<act>)"
+                        act_category = "Unit Test"
+                    elif any(act_lower.startswith(p) for p in ("datetime:", "time:", "clock:")):
+                        title = "Datetime Service (<act>)"
+                        act_category = "Datetime"
+                    elif any(act_lower.startswith(p) for p in ("bash:", "sh:", "cmd:")):
+                        title = "System Shell (<act>)"
+                        act_category = "Shell"
+                    elif any(act.strip().startswith(p) for p in ("def ", "class ", "import ", "from ", "```", "return ", "print(", "for ", "while ", "# ")) or ("\ndef " in act or "\nclass " in act or "=" in act):
+                        title = "Code Synthesis (<act>)"
+                        act_category = "Code"
+                    else:
+                        title = "Action Execution (<act>)"
+                        act_category = "Action"
+                    dash_count = max(5, 74 - len(title))
+                    print(f"\n┌─ ⚡ {title} {'─' * dash_count}")
+                    for line in act.splitlines():
+                        print(f"│  {line}")
+                    from src.tools.tool_dispatcher import execute_action
+                    cached_results = parsed.get("tool_results") or []
+                    tool_res = cached_results[0] if cached_results else execute_action(act)
+                    if tool_res and tool_res != act and not tool_res.startswith("[Tool Error"):
+                        print(f"│  ↳ 🔬 Result: {tool_res}")
+                    print(f"└{'─' * 79}")
+
+            # 3. Main plain-text response (unbounded to EOS)
+            answer = parsed.get("answer") or parsed.get("raw") or "..."
+            print(f"\n🧠 CerebroSpheroid V5 > {answer}")
             print(f"   ⏱️  {elapsed_sec*1000:.1f}ms | {tok_speed:.1f} tok/s | {num_toks} tokens | {session.thinking_cycles} thinking cycles")
+
+            # 4. Temporal Gating Route Display
+            temporal_info = parsed.get("temporal_decisions", {})
+            if temporal_info:
+                th_ok = temporal_info.get("think", False)
+                ac_ok = temporal_info.get("act", False)
+                an_ok = temporal_info.get("answer", True)
+
+                th_str = "✓" if th_ok else "✗ (Suppressed)"
+                ac_str = f"✓ ({act_category})" if (ac_ok and parsed.get("tool_calls")) else ("✓" if ac_ok else "✗ (Suppressed)")
+                an_str = "✓" if an_ok else "✗ (Suppressed)"
+
+                print(f"   🛣️  Temporal Route   : [Think: {th_str} | Act: {ac_str} | Answer: {an_str}]")
 
         except (KeyboardInterrupt, EOFError):
             print("\n👋 Session interrupted. Goodbye!")
@@ -217,7 +401,9 @@ def interactive_chat_loop(checkpoint_path: str, thinking_cycles: int = 4, temper
 
 def main():
     parser = argparse.ArgumentParser(description="Chat with CerebroSpheroid V5 Small.")
-    default_ckpt = os.path.join(REPO_ROOT, "checkpoints", "v5_small_sft_best.pt")
+    default_ckpt = os.path.join(REPO_ROOT, "checkpoints", "v5_small_sft_master_diverse.pt")
+    if not os.path.exists(default_ckpt):
+        default_ckpt = os.path.join(REPO_ROOT, "checkpoints", "v5_small_sft_best.pt")
     if not os.path.exists(default_ckpt):
         default_ckpt = os.path.join(REPO_ROOT, "checkpoints", "v5_small_sft_step50k.pt")
     if not os.path.exists(default_ckpt):

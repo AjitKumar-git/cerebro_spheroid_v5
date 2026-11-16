@@ -1,0 +1,34 @@
+{
+  "checkpoint": "v5_small_sft_master_diverse.pt",
+  "step": 2500,
+  "loss": 0.45861242758110166,
+  "eval_loss": 0.0,
+  "pillars": {
+    "conversational_chat": {
+      "score": 100.0,
+      "passed": 20,
+      "total": 20
+    },
+    "thinking_depth": {
+      "score": 100.0,
+      "passed": 20,
+      "total": 20
+    },
+    "action_formatting": {
+      "score": 70.0,
+      "passed": 14,
+      "total": 20
+    },
+    "database_sql_retrieval": {
+      "score": 100.0,
+      "passed": 20,
+      "total": 20
+    },
+    "temporal_gating": {
+      "score": 85.0,
+      "passed": 17,
+      "total": 20
+    }
+  },
+  "composite_score": 91.0
+}

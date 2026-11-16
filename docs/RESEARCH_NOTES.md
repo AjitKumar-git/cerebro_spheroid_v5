@@ -377,3 +377,47 @@ Attention heads: 9 (Query), 3 (KV, GQA 3:1)
    - **Lyapunov Stability Clamp** ($\lambda \le 0.10$) ensures the manifold remains mathematically non-chaotic.
    - **Laminar Differentiation Checks** ($R_{\text{eff}}$) prevent representation collapse.
    - **Deterministic Circuit Breakers** (`Scale-Up: GRANTED / HALT`) guarantee that scaling compute is only permitted when the system operates within bounded, homeostatic limits.
+
+---
+
+## 12. Training the Thinking Level: Adaptive Deliberation & PonderNet Halting
+
+**Date:** November 16, 2026  
+**Reference Document:** [`docs/THINKING_LEVEL_TRAINING.md`](file:///home/ajit/Documents/Startup/Active_Development/cerebro_spheroid_v5/docs/THINKING_LEVEL_TRAINING.md)
+
+### 12.1 The Deliberation Objective
+In CerebroSpheroid V5, pre-emission thinking occurs within the 24 concentric shells of the volumetric core across cycles $c \in [1, C_{\text{max}}]$ before motor decoding. Unlike feedforward Transformers which execute constant compute per token, CerebroSpheroid supports dynamic test-time compute scaling.
+
+### 12.2 The 4 Pillars for Fine-Tuning the Thinking Level
+1. **PonderNet Probabilistic Halting**: Formulate halting as exit distribution $p_c = \lambda_c \prod_{j=1}^{c-1} (1 - \lambda_j)$ and minimize expected task loss $\sum p_c \mathcal{L}_{\text{task}}(S_c)$ regularized against a Geometric compute prior $\mathcal{P}_{\text{geom}}(\lambda_{\text{prior}})$.
+2. **Stochastic Cycle Jitter Curriculum**: Train across variable cycles $C \sim \text{Categorical}(\{1, 2, 4, 6, 8\})$ to prevent motor decoder manifold collapse to $S_4$.
+3. **Latent Attractor Energy Relaxation**: Add Lyapunov velocity penalty $\frac{1}{C-1} \sum \|S_c - S_{c-1}\|^2$ to stabilize recurrent dynamics.
+4. **Test-Time Compute RL (PPO/GRPO)**: Reward answer correctness penalized by cycle count $\beta \cdot C_{\text{halt}}$.
+
+---
+
+## 13. Unified 3-Tier Cognitive Output Protocol: Thinking, Talking, and Action
+
+**Date:** November 16, 2026  
+**Implementation Modules:** [`src/spheroid_v5.py`](file:///home/ajit/Documents/Startup/Active_Development/cerebro_spheroid_v5/src/spheroid_v5.py), [`src/corpus.py`](file:///home/ajit/Documents/Startup/Active_Development/cerebro_spheroid_v5/src/corpus.py), [`scripts/chat_cerebro_v5.py`](file:///home/ajit/Documents/Startup/Active_Development/cerebro_spheroid_v5/scripts/chat_cerebro_v5.py)
+
+### 13.1 Protocol Specification Matrix
+
+| Action Type | Structure | Rationale & Architectural Mechanics |
+| :--- | :--- | :--- |
+| **Thinking** | `<think> ... </think>` | **Private Deliberation Scratchpad:** Encloses chain-of-thought, problem breakdown, and working hypotheses. Renders as a collapsible or hidden drawer in consumer UIs; excluded from evaluation answer parsing. |
+| **Talking / Answering** | **Unbounded (Plain text to EOS)** | **Zero-Overhead Fluid Streaming:** Emits conversational speech directly without artificial enclosing tags. Eliminates the premature `<act_end>` collapse (`[33, 34]`), prevents boundary truncation bugs, and matches native frontier LLM streaming. |
+| **Tool / Agent Execution** | `<act> ... </act>` | **Explicit Parser Execution Boundary:** Reserved strictly for external tool invocations, shell commands, calculator calls, and structured agent actions. Yields an unambiguous delimiter for host execution hooks. |
+
+### 13.2 Key Architectural Benefits
+
+1. **Elimination of the Premature `<act_end>` Collapse:**
+   Previously, wrapping trivial conversational responses (e.g. `"night"`, `"Paris"`) in `<act> ... </act>` trained the model to place high transition mass on token 34 (`</act>`) immediately after token 33 (`<act>`), resulting in empty string extractions. Unbounded plain text answering allows conversational answers to stream freely to EOS (`token 2`).
+
+2. **Parser Decoupling:**
+   The regex parser in `parse_model_output()` neatly segregates `thinking`, `answer`, and `tool_calls`. Client applications can route `<act>` payloads directly to sandboxed tool runners while streaming conversational text directly to the user.
+
+3. **Frontier Alignment Parity:**
+   This scheme aligns CerebroSpheroid with state-of-the-art reasoning architectures (such as DeepSeek-R1 and Qwen-2.5-Math) while preserving biomimetic sensory-motor separation in the underlying volumetric spheroid core.
+
+

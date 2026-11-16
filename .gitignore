@@ -17,6 +17,11 @@ checkpoints/
 # Heavy data directories and caches
 data/*
 !data/cerebro_cognitive_8k/
+!data/factual_tables/
+!data/factual_tables/**
+!data/tokenizer/
+!data/tokenizer/**
+!data/chat_thinking_sft_15k.jsonl
 archive/
 .hf_cache/
 .kaggle_output/
@@ -49,3 +54,8 @@ TRC_APPLICATION.md
 *Application*
 private/
 backup/
+
+# Local run artifacts
+loss_history*.json
+loss_trajectory*.png
+metrics/

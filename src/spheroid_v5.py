@@ -711,6 +711,18 @@ class PremotorMotorDecoderV5(nn.Module):
             self.motor_swiglu = SwiGLU(fused_dim, hidden_features=surface_dim * 2, out_features=surface_dim)
             self.norm_mid = RMSNorm(surface_dim)
             self.affine_scale = nn.Parameter(torch.ones(surface_dim))
+            # Tri-Head Affine Scales for Simultaneous Multi-Head Output:
+            # 1. affine_think  : Cognitive Deliberation & Scratchpad (<think>)
+            # 2. affine_act    : Non-Conversational Actions (Code, Calculator, Tools) (<act>)
+            # 3. affine_answer : Conversational Speech & Dialogue (Plain Text)
+            self.affine_think = nn.Parameter(torch.ones(surface_dim))
+            self.affine_act = nn.Parameter(torch.ones(surface_dim))
+            self.affine_answer = nn.Parameter(torch.ones(surface_dim))
+            # Temporal Output Router: dynamically decides whether to activate Think, Act, Answer
+            self.temporal_router = nn.Linear(surface_dim, 3, bias=True)
+            with torch.no_grad():
+                self.temporal_router.weight.zero_()
+                self.temporal_router.bias.copy_(torch.tensor([0.5, -0.8, 1.0]))
             self.head = None
             self.efference_proj = nn.Linear(surface_dim, surface_dim, bias=False)
             plan_in_dim = surface_dim * 2
@@ -721,6 +733,9 @@ class PremotorMotorDecoderV5(nn.Module):
             self.norm_mid = RMSNorm(surface_dim * 2)
             self.head = nn.Linear(surface_dim * 2, vocab_size, bias=False)
             self.affine_scale = None
+            self.affine_think = None
+            self.affine_act = None
+            self.affine_answer = None
             self.efference_proj = nn.Linear(surface_dim * 2, surface_dim, bias=False)
             plan_in_dim = surface_dim * 3
 
@@ -1006,6 +1021,66 @@ class PremotorMotorDecoderV5(nn.Module):
         if return_hidden:
             return adapted_logits, efference, next_trace, next_plan, h
         return adapted_logits, efference, next_trace, next_plan
+
+    def emit_tri_head_logits(
+        self,
+        h: torch.Tensor,
+        tied_embedding_weight: torch.Tensor,
+        temp: Optional[float] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Simultaneously computes vocabulary logits across all three cognitive tiers:
+          1. logits_think : Deliberation / Reasoning scratchpad (<think>)
+          2. logits_act   : Non-conversational actions (Coding, Calculator, Tools) (<act>)
+          3. logits_answer: Conversational dialogue / Response (Plain Text)
+        """
+        tau = temp if temp is not None else float(torch.clamp(self.temperature_scale, 0.1, 5.0).item())
+        if self.use_tied_embeddings:
+            aff_th = self.affine_think if self.affine_think is not None else self.affine_scale
+            aff_ac = self.affine_act if self.affine_act is not None else self.affine_scale
+            aff_an = self.affine_answer if self.affine_answer is not None else self.affine_scale
+
+            h_think = (h * aff_th.to(h.dtype)) / tau
+            h_act = (h * aff_ac.to(h.dtype)) / tau
+            h_answer = (h * aff_an.to(h.dtype)) / tau
+
+            logits_think = F.linear(h_think, tied_embedding_weight.to(h.dtype))
+            logits_act = F.linear(h_act, tied_embedding_weight.to(h.dtype))
+            logits_answer = F.linear(h_answer, tied_embedding_weight.to(h.dtype))
+        else:
+            logits_think = self.head(h) / tau
+            logits_act = self.head(h) / tau
+            logits_answer = self.head(h) / tau
+        return logits_think, logits_act, logits_answer
+
+    def compute_temporal_gates(
+        self,
+        h: torch.Tensor,
+        action_trigger: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Computes dynamic temporal emission probabilities for the three heads:
+          1. gate_think  : Deliberation / Reasoning scratchpad (<think>)
+          2. gate_act    : Non-conversational Action (Code, Calculator, Tools) (<act>)
+          3. gate_answer : Conversational Speech / Response (Plain Text)
+        Returns:
+          (gate_think, gate_act, gate_answer) as probabilities in [0.0, 1.0]
+        """
+        if self.temporal_router is None:
+            return torch.tensor([0.8], device=h.device), torch.tensor([0.2], device=h.device), torch.tensor([0.95], device=h.device)
+
+        h_feat = h if h.ndim == 2 else h.view(-1, self.surface_dim)
+        router_logits = self.temporal_router(h_feat)  # [B, 3]
+
+        if action_trigger is True:
+            # Boost action gate if prompt explicitly requests machine execution
+            router_logits = router_logits + torch.tensor([0.0, 3.0, 0.0], device=h.device, dtype=h.dtype)
+        elif action_trigger is False:
+            # Suppress action gate if prompt is purely conversational small talk
+            router_logits = router_logits - torch.tensor([0.0, 4.0, 0.0], device=h.device, dtype=h.dtype)
+
+        gates = torch.sigmoid(router_logits)
+        return gates[:, 0], gates[:, 1], gates[:, 2]
 
     def forward_sequence(
         self,
@@ -2066,18 +2141,26 @@ class CerebroSpheroidV5(nn.Module):
         repetition_penalty: float = 1.25,
         thinking_cycles: Optional[int] = None,
         device: Optional[torch.device] = None,
-        strict_act: bool = True,
+        strict_act: bool = False,
+        seed_token_id: Optional[int] = None,
+        return_parsed: bool = False,
         images: Optional[torch.Tensor] = None,
         audio: Optional[torch.Tensor] = None,
         perceptual_inputs: Optional[torch.Tensor] = None,
-    ) -> str:
-        """Convenience method for generating text from a prompt string with strict <act> ... </act> payload extraction."""
+    ) -> Union[str, Dict[str, Any]]:
+        """
+        Generates text using the 3-tier cognitive output protocol:
+          1. Thinking   : <think> ... </think> -> Private scratchpad (hidden or collapsed)
+          2. Talking    : Unbounded plain text to EOS -> Fluid zero-overhead answering
+          3. Tool Action: <act> ... </act> -> Structured external tool execution boundary
+        """
         from src.corpus import (
             format_stimulus_prompt,
             clean_motor_response,
             encode_no_special,
             get_bio_token_ids,
             extract_strict_act_payload,
+            parse_model_output,
         )
 
         dev = device if device is not None else next(self.parameters()).device
@@ -2089,9 +2172,16 @@ class CerebroSpheroidV5(nn.Module):
         bio_ids = get_bio_token_ids(tokenizer)
         raw_eos = getattr(tokenizer, "eos_token_id", 2)
         eos_id = int(raw_eos) if raw_eos is not None else 2
-        seed_id = bio_ids.get("act")
+        seed_id = seed_token_id  # Unbiased generation: do not force <act> by default
 
-        # Pillar 5: Dynamic Stopping Criteria & Prompt-Type Aware Decoding
+        # Dynamic Stopping Criteria: EOS, tool-end </act>, and stimulus restart </stim>
+        stop_list = [eos_id]
+        if bio_ids.get("act_end") is not None:
+            stop_list.append(bio_ids.get("act_end"))
+        if bio_ids.get("stim") is not None:
+            stop_list.append(bio_ids.get("stim"))
+
+        # Slot query single-token optimization
         slot_keywords = (
             "analogy",
             "::",
@@ -2107,8 +2197,6 @@ class CerebroSpheroidV5(nn.Module):
             "define ",
         )
         is_slot_query = any(kw in prompt.lower() for kw in slot_keywords)
-
-        stop_list = list(t for t in (eos_id, bio_ids.get("act_end")) if t is not None)
         if is_slot_query:
             try:
                 nl_tokens = encode_no_special(tokenizer, "\n")
@@ -2119,7 +2207,7 @@ class CerebroSpheroidV5(nn.Module):
                 pass
             max_new_tokens = min(max_new_tokens, 48)
 
-        stop_ids = tuple(stop_list)
+        stop_ids = tuple(s for s in stop_list if s is not None)
 
         out_ids = self.generate(
             tok_tensor,
@@ -2137,14 +2225,187 @@ class CerebroSpheroidV5(nn.Module):
             perceptual_inputs=perceptual_inputs,
         )
         seq = out_ids[0].tolist()
+
         if strict_act:
             return extract_strict_act_payload(seq, tokenizer)
+
         for idx_tok, tid in enumerate(seq):
-            if tid in stop_ids and tid != seed_id:
+            if tid in stop_ids and (seed_id is None or tid != seed_id):
                 seq = seq[:idx_tok]
                 break
-        decoded = tokenizer.decode(seq, skip_special_tokens=True)
-        return clean_motor_response(decoded)
+
+        decoded = tokenizer.decode(seq, skip_special_tokens=False)
+        # Check text-level stops: ChatML <|im_end|>, </stim>, </s>
+        for stop_str in ("<|im_end|>", "</stim>", "</s>"):
+            if stop_str in decoded:
+                decoded = decoded.split(stop_str)[0]
+
+        parsed = parse_model_output(decoded)
+        if return_parsed:
+            return parsed
+
+        return parsed["answer"] if parsed["answer"] else (parsed["thinking"] if parsed["thinking"] else clean_motor_response(decoded))
+
+    @torch.no_grad()
+    def generate_tri_stream(
+        self,
+        prompt: str,
+        tokenizer: Any,
+        max_new_tokens: int = 128,
+        temperature: float = 0.6,
+        top_k: int = 40,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.15,
+        device: Optional[torch.device] = None,
+    ) -> Dict[str, str]:
+        """
+        Simultaneous Tri-Head Cognitive Emission:
+        Emits all 3 streams simultaneously from the shared manifold hidden state:
+          - Head 1 (Think)  : Emits cognitive reasoning scratchpad (<think>)
+          - Head 2 (Act)    : Emits non-conversational code / calculator / tool actions (<act>)
+          - Head 3 (Answer) : Emits natural conversational answer (Plain Text)
+        """
+        from src.corpus import format_stimulus_prompt, encode_no_special
+
+        dev = device if device is not None else next(self.parameters()).device
+        formatted_prompt = format_stimulus_prompt(prompt)
+        raw_ids = encode_no_special(tokenizer, formatted_prompt)
+        input_ids = [t % self.config.vocab_size for t in raw_ids] or [getattr(tokenizer, "bos_token_id", 1) or 1]
+        prompt_ids = torch.tensor([input_ids], dtype=torch.long, device=dev)
+        B = prompt_ids.shape[0]
+
+        # Check prompt semantics for action triggers (coding, calculator, bash, sql, tools)
+        p_lower = prompt.lower()
+        has_action_trigger = any(kw in p_lower for kw in (
+            "python", "code", "script", "function", "def ", "calculate", "solve", "+", "-", "*", "/",
+            "sqrt", "sql", "select ", "tool", "bash", "grep", "curl", "regex", "test", "assert", "datetime", "mermaid"
+        ))
+        is_pure_conversation = any(p_lower.strip().startswith(kw) for kw in ("hi", "hello", "hey", "good morning", "good evening", "how are you", "who are you", "what is earth", "why is the sky", "what is a pixel", "what is a computer port")) and not has_action_trigger
+        action_intent = True if has_action_trigger else (False if is_pure_conversation else None)
+
+        # 1. Sensory encoding & deliberation
+        sensory_flux, sensory_kv = self.sensory_dnn(prompt_ids)
+        prompt_mask_b = prompt_ids != 0
+        prompt_mask = prompt_mask_b.float()
+        safe_mask = torch.where(prompt_mask.sum(dim=1, keepdim=True) > 0, prompt_mask, torch.ones_like(prompt_mask))
+        prompt_valid_mask = safe_mask.bool()
+        prompt_centroid = self._recency_weighted_pool(sensory_flux, safe_mask)
+
+        # Autonomous Temporal Decision: the model dynamically decides which heads emit
+        g_th, g_ac, g_an = self.motor_decoder.compute_temporal_gates(prompt_centroid, action_trigger=action_intent)
+        gate_think_val = float(g_th[0].item())
+        gate_act_val = float(g_ac[0].item())
+        gate_ans_val = float(g_an[0].item())
+
+        emit_think = gate_think_val >= 0.35
+        emit_act = gate_act_val >= 0.45
+        emit_ans = gate_ans_val >= 0.35
+
+        subcortical = torch.zeros(B, self.config.num_shells - 1, self.config.surface_dim, device=dev, dtype=prompt_centroid.dtype)
+        state = torch.cat([subcortical, prompt_centroid.unsqueeze(1)], dim=1)
+
+        cycles = self.config.thinking_cycles
+        for _ in range(cycles):
+            state = self.volumetric_core.deliberate_step(state)
+
+        plan = self.motor_decoder.init_plan(B, dev) if self.config.use_plan else None
+        refractory = torch.zeros(B, self.config.vocab_size, device=dev, dtype=state.dtype)
+        tied_w = self.sensory_dnn.embedding.weight
+
+        eos_id = getattr(tokenizer, "eos_token_id", 2) or 2
+        tokens_think, tokens_act, tokens_ans = [], [], []
+        fin_think = not emit_think
+        fin_act = not emit_act
+        fin_ans = not emit_ans
+
+        def _sample_from_logits(lg: torch.Tensor, prev_toks: List[int]) -> int:
+            lg = lg.clone().squeeze(0)
+            if prev_toks:
+                for pt in set(prev_toks):
+                    if lg[pt] > 0:
+                        lg[pt] /= repetition_penalty
+                    else:
+                        lg[pt] *= repetition_penalty
+            lg = lg / max(temperature, 1e-4)
+            if top_k > 0:
+                v, _ = torch.topk(lg, min(top_k, lg.size(-1)))
+                lg[lg < v[-1]] = -float("Inf")
+            probs = F.softmax(lg, dim=-1)
+            return int(torch.multinomial(probs, num_samples=1).item())
+
+        for t in range(max_new_tokens):
+            last_tok = None
+            if not fin_ans and tokens_ans:
+                last_tok = tokens_ans[-1]
+            elif not fin_act and tokens_act:
+                last_tok = tokens_act[-1]
+            elif not fin_think and tokens_think:
+                last_tok = tokens_think[-1]
+            feed = self.sensory_dnn.embedding(torch.tensor([[last_tok]], device=dev)).squeeze(1) if last_tok is not None else None
+
+            _, efference, refractory, plan, h = self.motor_decoder(
+                state=state,
+                sensory_kv=sensory_kv,
+                tied_embedding_weight=tied_w,
+                plan=plan,
+                refractory_trace=refractory,
+                step_idx=t,
+                auditory_feedback=feed,
+                repetition_penalty=repetition_penalty,
+                prompt_valid_mask=prompt_valid_mask,
+                return_hidden=True,
+            )
+
+            # Tri-Head Simultaneous Emission
+            l_th, l_ac, l_an = self.motor_decoder.emit_tri_head_logits(h, tied_w, temp=temperature)
+
+            if not fin_think:
+                tok_th = _sample_from_logits(l_th, tokens_think)
+                if tok_th == eos_id:
+                    fin_think = True
+                else:
+                    tokens_think.append(tok_th)
+
+            if not fin_act:
+                tok_ac = _sample_from_logits(l_ac, tokens_act)
+                if tok_ac == eos_id:
+                    fin_act = True
+                else:
+                    tokens_act.append(tok_ac)
+
+            if not fin_ans:
+                tok_an = _sample_from_logits(l_an, tokens_ans)
+                if tok_an == eos_id:
+                    fin_ans = True
+                else:
+                    tokens_ans.append(tok_an)
+
+            if fin_think and fin_act and fin_ans:
+                break
+
+            # Advance state manifold
+            state = self.volumetric_core.step_efference_fast(state, efference)
+
+        # Decode all 3 simultaneous streams
+        text_think = tokenizer.decode(tokens_think, skip_special_tokens=True).strip() if emit_think else ""
+        text_act = tokenizer.decode(tokens_act, skip_special_tokens=True).strip() if emit_act else ""
+        text_ans = tokenizer.decode(tokens_ans, skip_special_tokens=True).strip() if emit_ans else ""
+
+        return {
+            "thinking": text_think,
+            "action": text_act,
+            "answer": text_ans,
+            "temporal_decisions": {
+                "think": emit_think,
+                "act": emit_act,
+                "answer": emit_ans,
+                "gates": {
+                    "p_think": gate_think_val,
+                    "p_act": gate_act_val,
+                    "p_ans": gate_ans_val,
+                }
+            }
+        }
 
 
 def build_spheroid_v5(preset: str = "v5_compact", **kwargs) -> CerebroSpheroidV5:
@@ -2354,6 +2615,12 @@ def _adapt_jax_state_to_torch(raw_state: Dict[str, Any], target_sd: Dict[str, to
     if "volumetric_core.radial_up_out.weight" not in mapped and "volumetric_core.radial_up.weight" in mapped:
         mapped["volumetric_core.radial_up_out.weight"] = mapped["volumetric_core.radial_up.weight"].clone()
 
+    if "motor_decoder.affine_scale" in mapped:
+        base_affine = mapped["motor_decoder.affine_scale"]
+        for tri_k in ("motor_decoder.affine_think", "motor_decoder.affine_act", "motor_decoder.affine_answer"):
+            if tri_k not in mapped:
+                mapped[tri_k] = base_affine.clone()
+
     return mapped
 
 
@@ -2370,6 +2637,12 @@ def load_v5_checkpoint_into_torch(
 
     if "volumetric_core.radial_up_out.weight" not in adapted and "volumetric_core.radial_up.weight" in adapted:
         adapted["volumetric_core.radial_up_out.weight"] = adapted["volumetric_core.radial_up.weight"].clone()
+
+    if "motor_decoder.affine_scale" in adapted:
+        base_affine = adapted["motor_decoder.affine_scale"]
+        for tri_k in ("motor_decoder.affine_think", "motor_decoder.affine_act", "motor_decoder.affine_answer"):
+            if tri_k not in adapted and tri_k in target_sd:
+                adapted[tri_k] = base_affine.clone()
 
     filtered: Dict[str, torch.Tensor] = {}
     skipped: List[str] = []

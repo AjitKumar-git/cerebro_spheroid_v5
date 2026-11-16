@@ -1,0 +1,82 @@
+[
+  {
+    "label": "Step 900k (Base Final)",
+    "step": 900000,
+    "loss": 2.3939766883850098,
+    "total_params": 101957079,
+    "agi_score": 3.73,
+    "safety_classification": "DORMANT / SUB-CRITICAL (EARLY PRETRAINING - NO AGI TRAITS)",
+    "laminar_protobrain_score": 46.89,
+    "effective_manifold_rank": 11.43,
+    "connectome_score": 80.49,
+    "proprioceptive_autonomy": 100.0,
+    "spectral_radius": 0.926,
+    "lyapunov_lambda": 1.3291,
+    "overall_option_accuracy": 42.857142857142854,
+    "deliberation_gain_4cyc": -27.297031368528096,
+    "deliberation_gain_8cyc": -8.135643584387642,
+    "category_summaries": [
+      {
+        "category": "Pillar 1: Deductive Syllogisms",
+        "mean_loss": 50.60321807861328,
+        "accuracy": 0.0
+      },
+      {
+        "category": "Pillar 2: Transitive Reasoning",
+        "mean_loss": 31.8807430267334,
+        "accuracy": 50.0
+      },
+      {
+        "category": "Pillar 3: Counterfactual Physics",
+        "mean_loss": 38.28287315368652,
+        "accuracy": 50.0
+      },
+      {
+        "category": "Pillar 4: Multi-Step Arithmetic",
+        "mean_loss": 16.017332553863525,
+        "accuracy": 100.0
+      },
+      {
+        "category": "Pillar 5: Biochemical Mechanisms",
+        "mean_loss": 29.791007041931152,
+        "accuracy": 50.0
+      },
+      {
+        "category": "Pillar 6: Spatial Symmetry & Invariance",
+        "mean_loss": 25.159957885742188,
+        "accuracy": 100.0
+      },
+      {
+        "category": "Pillar 7: Scientific Reasoning (OpenHermes/ARC)",
+        "mean_loss": 51.86475118001302,
+        "accuracy": 0.0
+      }
+    ],
+    "generations": [
+      {
+        "prompt": "The reason why the sky is blue during the daytime is",
+        "raw": "<act>The answer is not months. 0,5).</act></s>",
+        "clean": "The answer is not months. 0,5).",
+        "protocol_compliant": true
+      },
+      {
+        "prompt": "What is 15 + 27? Answer:",
+        "raw": "<act>To determine the value of x, where n ispper rank. Subst surepressatime. To determine the value of x,",
+        "clean": "To determine the value of x, where n ispper rank. Subst surepressatime. To determine the value of x,",
+        "protocol_compliant": true
+      },
+      {
+        "prompt": "In thermodynamics, the second law states that",
+        "raw": "<act>In mathematics, Cckets and traversal represent centuries-oldestoretic values refer to a mathematical function that can be solved using calculus",
+        "clean": "In mathematics, Cckets and traversal represent centuries-oldestoretic values refer to a mathematical function that can be solved using calculus",
+        "protocol_compliant": true
+      },
+      {
+        "prompt": "def is_even(n: int) -> bool:",
+        "raw": "<act>To determine if n is m(0), 0 otherwise prime n! Now let's try traversing the first few values of",
+        "clean": "To determine if n is m(0), 0 otherwise prime n! Now let's try traversing the first few values of",
+        "protocol_compliant": true
+      }
+    ]
+  }
+]

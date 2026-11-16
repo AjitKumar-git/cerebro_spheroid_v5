@@ -14,6 +14,7 @@ operate at maximum sustained tok/s without I/O or tokenization stalls.
 from __future__ import annotations
 
 import glob
+import json
 import os
 import queue
 import random
@@ -125,8 +126,11 @@ class LinguisticDataStreamer:
         if not os.path.exists(self.data_dir):
             return
 
+        # 1. Parquet files
         parquet_files = glob.glob(os.path.join(self.data_dir, "**", "*.parquet"), recursive=True)
         for pf in parquet_files:
+            if "benchmark" in pf.lower() or "cache" in pf.lower() or "tokenizer" in pf.lower():
+                continue
             if HAS_PYARROW:
                 try:
                     table = pq.read_table(pf)
@@ -145,9 +149,13 @@ class LinguisticDataStreamer:
                         for t in texts:
                             t_str = str(t).strip()
                             if len(t_str) > 20:
-                                parts = t_str.split("\n\n", 1) if "\n\n" in t_str else (t_str[:60], t_str[60:])
-                                p = format_stimulus_prompt(parts[0])
-                                r = format_motor_response(parts[1] if len(parts) > 1 else parts[0])
+                                if "\n\n" in t_str:
+                                    parts = t_str.split("\n\n", 1)
+                                    p = format_stimulus_prompt(parts[0])
+                                    r = format_motor_response(parts[1])
+                                else:
+                                    p = format_stimulus_prompt("Explain and analyze the following text:")
+                                    r = format_motor_response(t_str)
                                 self.pairs_corpus.append((p, r))
                     else:
                         for col in cols:
@@ -155,30 +163,81 @@ class LinguisticDataStreamer:
                                 for x in table[col].to_pylist():
                                     s_val = str(x).strip()
                                     if len(s_val) > 20:
-                                        p = format_stimulus_prompt(s_val[:60])
-                                        r = format_motor_response(s_val[60:] if len(s_val) > 60 else s_val)
+                                        p = format_stimulus_prompt("Analyze the following subject:")
+                                        r = format_motor_response(s_val)
                                         self.pairs_corpus.append((p, r))
                                 break
                 except Exception:
                     pass
 
+        # 2. JSONL files (e.g. diverse_sft_corpus_25k.jsonl, reasoning, science, math)
+        jsonl_files = glob.glob(os.path.join(self.data_dir, "**", "*.jsonl"), recursive=True)
+        for jf in jsonl_files:
+            if "benchmark" in jf.lower() or "cache" in jf.lower() or "tokenizer" in jf.lower():
+                continue
+            try:
+                with open(jf, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        try:
+                            obj = json.loads(line)
+                            p_val = obj.get("prompt") or obj.get("question") or obj.get("input") or obj.get("stimulus")
+                            r_val = obj.get("response") or obj.get("answer") or obj.get("output") or obj.get("articulation")
+                            if p_val and r_val:
+                                p_str = str(p_val).strip()
+                                r_str = str(r_val).strip()
+                                if len(p_str) > 2 and len(r_str) > 1:
+                                    p = format_stimulus_prompt(p_str)
+                                    r = format_motor_response(r_str)
+                                    self.pairs_corpus.append((p, r))
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+        # 3. JSON files (e.g. cerebro_cognitive_8k/*.json)
+        json_files = glob.glob(os.path.join(self.data_dir, "**", "*.json"), recursive=True)
+        for jf in json_files:
+            if "benchmark" in jf or "config" in jf or "tokenizer" in jf:
+                continue
+            try:
+                with open(jf, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                items = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+                for item in items:
+                    if isinstance(item, dict):
+                        p_val = item.get("prompt") or item.get("question") or item.get("input") or item.get("stimulus")
+                        r_val = item.get("response") or item.get("answer") or item.get("output") or item.get("articulation")
+                        if p_val and r_val:
+                            p_str = str(p_val).strip()
+                            r_str = str(r_val).strip()
+                            if len(p_str) > 2 and len(r_str) > 1:
+                                p = format_stimulus_prompt(p_str)
+                                r = format_motor_response(r_str)
+                                self.pairs_corpus.append((p, r))
+            except Exception:
+                pass
+
         if self.pairs_corpus:
-            print(f"📚 [DataStreamer] Loaded {len(self.pairs_corpus):,} local Strategy A (<stim>/<act>) pairs for pretraining!")
+            print(f"📚 [DataStreamer] Loaded {len(self.pairs_corpus):,} local multi-domain Strategy A (<stim>/<act>) pairs for pretraining!")
 
     def _generate_synthetic_prose(self) -> Tuple[str, str]:
-        """Generates realistic structured linguistic sentences formatted with Strategy A bio-tokens."""
-        subjects = ["The algorithm", "A cognitive model", "The system", "Deep neural computation", "The researcher", "An autonomous agent", "Quantum mechanics", "The biological cortex", "The mathematical theorem"]
-        verbs = ["demonstrates", "establishes", "calculates", "optimizes", "processes", "formulates", "evaluates", "simulates", "enhances"]
-        objects = ["high dimensional representations", "recurrent manifold attractors", "efficient linguistic patterns", "contractive spectral boundaries", "multimodal information flux", "complex reasoning chains", "optimal policy trajectories"]
-        connectives = ["because it minimizes empirical loss", "while preserving structural invariants", "and discovers underlying latent geometry", "thereby establishing robust convergence", "under bounded energy dissipation"]
-
-        sentences = []
-        for _ in range(8):
-            s = f"{random.choice(subjects)} {random.choice(verbs)} {random.choice(objects)} {random.choice(connectives)}. "
-            sentences.append(s)
-        p = format_stimulus_prompt("Synthesize the core principle of cognitive manifold computation:")
-        r = format_motor_response("".join(sentences))
-        return (p, r)
+        """Emergency fallback: diverse cognitive reasoning questions without procedural arithmetic or static world trivia traps."""
+        topics = [
+            ("Explain the concept of entropy in thermodynamics and its relationship to microstates.",
+             "Entropy is a measure of the molecular disorder or randomness within a system. In statistical thermodynamics, Boltzmann formulated entropy as S = k * ln(W), where k is the Boltzmann constant and W represents the number of microscopic configurations (microstates) corresponding to a thermodynamic macrostate. As a system naturally evolves toward equilibrium, spontaneous processes tend to maximize microstates, causing net entropy to increase in accordance with the Second Law of Thermodynamics."),
+            ("Describe the mechanism of action of DNA polymerase during semi-conservative replication.",
+             "DNA polymerase synthesizes new DNA strands by catalyzing the formation of phosphodiester bonds between the 3'-hydroxyl group of the growing strand and the 5'-phosphate group of an incoming deoxynucleotide triphosphate (dNTP). It operates strictly in the 5' to 3' direction, requiring a pre-existing RNA primer synthesized by primase. On the leading strand, synthesis is continuous, while on the lagging strand, discontinuous Okazaki fragments are formed, later joined by DNA ligase."),
+            ("Derive the time complexity of the merge sort algorithm using the master theorem.",
+             "Merge sort divides an array of size n into two halves of size n/2, recursively sorts both halves, and merges them in linear time O(n). The recurrence relation is T(n) = 2T(n/2) + O(n). Using the Master Theorem: a = 2, b = 2, and f(n) = n. Since log_b(a) = log_2(2) = 1, and f(n) = Theta(n^1), we fall under Case 2 of the Master Theorem. Therefore, the overall time complexity of merge sort is Theta(n * log(n)) in best, average, and worst cases."),
+            ("Analyze how transformer self-attention computes contextual representations.",
+             "Self-attention transforms an input sequence of vectors into queries (Q), keys (K), and values (V) via linear projections. The attention weights are calculated via scaled dot-product: Attention(Q, K, V) = softmax(Q * K^T / sqrt(d_k)) * V. This allows every token in the sequence to dynamically attend to every other token based on pairwise relevance, enabling rich parallelized contextual representations without sequential recurrence bottlenecks."),
+            ("What does `bool([0])` evaluate to in Python?", "In Python, `bool([0])` evaluates to `True` because any non-empty list has truth value True regardless of its element values."),
+            ("Write a Python function to check if a number is even.", "def is_even(n: int) -> bool:\n    return n % 2 == 0")
+        ]
+        q, a = random.choice(topics)
+        return format_stimulus_prompt(q), format_motor_response(a)
 
     def _worker_loop(self):
         """Continuous background prefetch loop packing Strategy A batches into queue."""
