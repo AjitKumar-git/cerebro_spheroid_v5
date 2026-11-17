@@ -562,7 +562,11 @@ def main(args=None):
                 restored_ema = ckpt.get("ema_loss", ckpt.get("loss", ckpt.get("eval_loss", None)))
                 if restored_ema is not None and math.isfinite(float(restored_ema)) and float(restored_ema) > 0.0:
                     initial_ema_loss = float(restored_ema)
-                restored = adapt_and_load_checkpoint_weights(ckpt, params, target_dtype, config, buffers=buffers)
+                adapt_res = adapt_and_load_checkpoint_weights(ckpt, params, target_dtype, config, buffers=buffers)
+                if isinstance(adapt_res, tuple):
+                    restored, buffers = adapt_res
+                else:
+                    restored = adapt_res
                 ema_info = f" (EMA: {initial_ema_loss:.4f})" if initial_ema_loss is not None else ""
                 print(f"✓ Resumed from {os.path.basename(discovered_ckpt)} at Step {start_step:,} (Loss: {best_eval_loss:.4f}{ema_info})")
                 if restored == len(params):

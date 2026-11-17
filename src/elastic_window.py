@@ -323,6 +323,9 @@ def build_online_dataset_iterator(
                 try:
                     it = opener()
                 except Exception as e:
+                    err_s = str(e).lower()
+                    if "no (supported) data files" in err_s or "dataset not found" in err_s or "does not exist" in err_s:
+                        raise e
                     wait_t = min(30.0, (2.0 ** attempt) + random.uniform(0.5, 2.0))
                     print(f"⚠️ [HuggingFace Stream] Re-opener error ({e}). Retrying in {wait_t:.1f}s...")
                     time.sleep(wait_t)

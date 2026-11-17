@@ -536,7 +536,7 @@ def emit_step(
     B, K, D = state.shape
     st_dtype = state.dtype
     core = state[:, 0, :]
-    if K > 16 and encephalization_alpha < 1.0 - 1e-6:
+    if K > 16:
         surface = (1.0 - encephalization_alpha) * state[:, 15, :] + encephalization_alpha * state[:, -1, :]
     else:
         surface = state[:, -1, :]
@@ -1011,7 +1011,7 @@ def training_rollout(
 
     if is_pure_tf:
         T = int(target_len)
-        if num_shells > 16 and encephalization_alpha < 1.0 - 1e-6:
+        if num_shells > 16:
             surface = (1.0 - encephalization_alpha) * state[:, 15, :] + encephalization_alpha * state[:, -1, :]
         else:
             surface = state[:, -1, :]
