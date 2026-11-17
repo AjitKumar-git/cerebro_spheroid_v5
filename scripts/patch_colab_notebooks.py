@@ -16,6 +16,11 @@ def patch_training_notebook(file_path: str):
     with open(file_path, "r", encoding="utf-8") as f:
         nb = json.load(f)
 
+    # Simplified notebooks already have clean consolidated 7-cell architecture
+    if len(nb.get("cells", [])) <= 10:
+        print(f"✅ Verified simplified notebook: {file_path}")
+        return
+
     # 1. Update Step 3 Markdown (Cell 5)
     nb["cells"][5]["source"] = [
         "## Step 3: Install Dependencies, Authenticate Hugging Face & Synchronize Repository\n",
