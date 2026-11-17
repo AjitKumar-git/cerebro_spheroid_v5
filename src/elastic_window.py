@@ -355,6 +355,30 @@ def build_online_dataset_iterator(
                 return row, it
         return row, it
 
+    if "/" in dataset_source:
+        repo_id = dataset_source
+        custom_it: Optional[Iterator[Any]] = None
+
+        def _open_custom_stream():
+            from datasets import load_dataset
+            print(f"🌐 Connecting online stream to custom Hugging Face repo: {repo_id}...")
+            return iter(load_dataset(repo_id, split="train", streaming=True))
+
+        while True:
+            row, custom_it = _next_or_reopen(custom_it, _open_custom_stream)
+            prompt = str(row.get("prompt", "") or "").strip()
+            text = str(row.get("text", "") or "").strip()
+            answer = str(row.get("answer", "") or "").strip()
+            toks = row.get("tokens")
+            weights = row.get("target_weights")
+            yield {
+                "prompt": prompt,
+                "text": text if text else answer,
+                "answer": answer if answer else text,
+                "tokens": toks,
+                "target_weights": weights,
+            }
+
     if source == "autonomous":
         # 4-Phase Developmental Autonomous Curriculum for V5 Base / 200B Campaign
         # Phase 1 (0 -> 15%): Foundation World Knowledge & Educational Prose (60% FineWeb-Edu >= 3, 15% Cosmo, 10% Everyday, 10% Math, 5% Code)

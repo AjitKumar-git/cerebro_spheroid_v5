@@ -215,6 +215,7 @@ def parse_args(args_list=None):
     parser.add_argument("--teacher_digest", "--teacher-digest", dest="teacher_digest", type=str, default="none", choices=["online", "heuristic", "none"], help="Enable Teacher Digestion & Dynamic Next-Token Loss Weighting (default: none)")
     parser.add_argument("--teacher_model", "--teacher-model", dest="teacher_model", type=str, default="Qwen/Qwen2.5-1.5B-Instruct", help="HuggingFace teacher model for digestion")
     parser.add_argument("--teacher_scale", "--teacher-scale", dest="teacher_scale", type=float, default=1.5, help="Scaling factor alpha for dynamic next-token weights")
+    parser.add_argument("--encephalization_warmup_steps", "--encephalization-warmup-steps", dest="encephalization_warmup_steps", type=int, default=1000, help="Steps to smoothly transition motor surface readout from core to outer mantle")
 
     return parser.parse_args(args_list)
 
@@ -562,7 +563,7 @@ def main(args=None):
                 restored_ema = ckpt.get("ema_loss", ckpt.get("loss", ckpt.get("eval_loss", None)))
                 if restored_ema is not None and math.isfinite(float(restored_ema)) and float(restored_ema) > 0.0:
                     initial_ema_loss = float(restored_ema)
-                restored = adapt_and_load_checkpoint_weights(ckpt, params, target_dtype, config)
+                restored = adapt_and_load_checkpoint_weights(ckpt, params, target_dtype, config, buffers=buffers)
                 ema_info = f" (EMA: {initial_ema_loss:.4f})" if initial_ema_loss is not None else ""
                 print(f"✓ Resumed from {os.path.basename(discovered_ckpt)} at Step {start_step:,} (Loss: {best_eval_loss:.4f}{ema_info})")
                 if restored == len(params):
@@ -684,8 +685,14 @@ def main(args=None):
             ) if param_masks is not None else (None, apply_opt_step_anneal)
             apply_opt_step = apply_opt_step_anneal
 
-            def train_step_fn(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens=None, sampling_p=1.0):
-                loss_val, grads = compute_grad_step(p, q_batch, r_batch, feedback_tokens=feedback_tokens, sampling_p=sampling_p, deliberation_mode=args.deliberation_mode)
+            def train_step_fn(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens=None, sampling_p=1.0, encephalization_alpha=1.0):
+                loss_val, grads = compute_grad_step(
+                    p, q_batch, r_batch,
+                    feedback_tokens=feedback_tokens,
+                    sampling_p=sampling_p,
+                    deliberation_mode=args.deliberation_mode,
+                    encephalization_alpha=encephalization_alpha,
+                )
                 new_p, new_opt_s = apply_opt_step(p, opt_s, grads, cur_lr)
                 return new_p, new_opt_s, loss_val
 
@@ -700,7 +707,7 @@ def main(args=None):
         compute_grad_step, apply_opt_step = None, None
 
         @partial(jax.jit, static_argnames=("pure_tf", "deliberation_mode"))
-        def _train_step_adamw_jit(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens, sampling_p, pure_tf: bool, deliberation_mode: str):
+        def _train_step_adamw_jit(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens, sampling_p, pure_tf: bool, deliberation_mode: str, encephalization_alpha: float = 1.0):
             def loss_fn(param_dict):
                 return training_rollout(
                     params=param_dict,
@@ -717,16 +724,17 @@ def main(args=None):
                     remat=remat_choice,
                     pure_teacher_forcing=pure_tf,
                     deliberation_mode=deliberation_mode,
+                    encephalization_alpha=encephalization_alpha,
                 )
             loss_val, grads = jax.value_and_grad(loss_fn)(p)
             updates, next_opt_s = optimizer.update(grads, opt_s, p)
             next_p = optax.apply_updates(p, updates)
             return next_p, next_opt_s, loss_val
 
-        def train_step_fn(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens=None, sampling_p=1.0):
+        def train_step_fn(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens=None, sampling_p=1.0, encephalization_alpha=1.0):
             pure_tf = (args.deliberation_mode in ("teacher_forcing", "pure_tf")) and (not isinstance(sampling_p, jax.Array)) and (float(sampling_p) >= 1.0)
             return _train_step_adamw_jit(
-                p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens, sampling_p, pure_tf, args.deliberation_mode
+                p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens, sampling_p, pure_tf, args.deliberation_mode, encephalization_alpha
             )
 
     # 7. Multi-Stream Ingestion & Prefetching
@@ -858,7 +866,7 @@ def main(args=None):
             print(f"⚠️ Fallback validation setup notice: {e_inner}")
 
     @jax.jit
-    def eval_step_loss(p, q_b, r_b, fb_b=None):
+    def eval_step_loss(p, q_b, r_b, fb_b=None, enc_alpha: float = 1.0):
         return training_rollout(
             params=p,
             prompts=q_b,
@@ -871,6 +879,7 @@ def main(args=None):
             targets=r_b,
             remat=False,
             pure_teacher_forcing=True,
+            encephalization_alpha=enc_alpha,
         )
 
     # 10. Learning Rate & Scheduled Sampling Schedules
@@ -1020,6 +1029,13 @@ def main(args=None):
                 cur_lr = cur_lr * (1.0 - 0.4 * alpha_gov)
 
             # Training Step
+            # Progressive Encephalization Warmup Alpha
+            enc_warmup = max(1, getattr(args, "encephalization_warmup_steps", 1000))
+            if config.num_shells > 16 and (step - start_step) < enc_warmup:
+                enc_alpha = float(min(1.0, max(0.0, (step - start_step) / float(enc_warmup))))
+            else:
+                enc_alpha = 1.0
+
             # Cyclical Core Freeze & Consolidation Anneal Schedule
             is_anneal = False
             if getattr(args, "freeze_core", False):
@@ -1051,7 +1067,7 @@ def main(args=None):
                 for _ in range(grad_accum):
                     prompt_b, target_b, feedback_b = _next_batch()
                     g_loss, micro_grads = compute_grad_step(
-                        params, prompt_b, target_b, feedback_tokens=feedback_b, sampling_p=cur_sampling_p, deliberation_mode=args.deliberation_mode
+                        params, prompt_b, target_b, feedback_tokens=feedback_b, sampling_p=cur_sampling_p, deliberation_mode=args.deliberation_mode, encephalization_alpha=enc_alpha
                     )
                     acc_grads = (
                         micro_grads
@@ -1075,6 +1091,7 @@ def main(args=None):
                     cur_lr,
                     feedback_tokens=feedback_b,
                     sampling_p=cur_sampling_p,
+                    encephalization_alpha=enc_alpha,
                 )
                 step_tokens = prompt_b.shape[0] * (prompt_b.shape[1] + target_b.shape[1])
 
@@ -1129,7 +1146,7 @@ def main(args=None):
             crossed_eval = bool(eval_batches) and ((step // max(1, args.eval_interval)) > (prev_step // max(1, args.eval_interval)))
             if crossed_eval:
                 eval_p = jax.device_put(_get_host_params(), devices[0]) if use_multi_tpu_local_sgd else params
-                val_losses = [float(eval_step_loss(eval_p, vp, vt, vfb)) for vp, vt, vfb in eval_batches]
+                val_losses = [float(eval_step_loss(eval_p, vp, vt, vfb, enc_alpha=enc_alpha)) for vp, vt, vfb in eval_batches]
                 eval_loss = float(np.mean(val_losses)) if val_losses else float("inf")
                 last_eval_loss = eval_loss
                 eval_ppl = math.exp(min(eval_loss, 20.0))

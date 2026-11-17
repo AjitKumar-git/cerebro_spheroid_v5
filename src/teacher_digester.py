@@ -140,23 +140,37 @@ class QwenTeacherDigester:
             outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
             logits = outputs.logits[:, :-1, :]  # [B, T-1, V]
             targets = input_ids[:, 1:]          # [B, T-1]
+            del outputs
 
             B, T_minus_1, V = logits.shape
 
-            # 1. Per-token Surprisal (Cross-Entropy)
-            surprisal = F.cross_entropy(
-                logits.reshape(B * T_minus_1, V).float(),
-                targets.reshape(B * T_minus_1),
-                reduction="none",
-            ).reshape(B, T_minus_1)
+            # 1. Chunked Surprisal (Cross-Entropy) to minimize peak VRAM footprint
+            surprisal_chunks = []
+            chunk_size = 128
+            for c_logits, c_targets in zip(logits.split(chunk_size, dim=1), targets.split(chunk_size, dim=1)):
+                c_b, c_t, _ = c_logits.shape
+                s_c = F.cross_entropy(
+                    c_logits.reshape(c_b * c_t, V).float(),
+                    c_targets.reshape(c_b * c_t),
+                    reduction="none",
+                ).reshape(c_b, c_t)
+                surprisal_chunks.append(s_c)
+            surprisal = torch.cat(surprisal_chunks, dim=1)
 
-            # 2. Predictive Entropy (high entropy = semantic decision point)
-            probs = F.softmax(logits.float(), dim=-1)
-            log_probs = F.log_softmax(logits.float(), dim=-1)
-            entropy = -(probs * log_probs).sum(dim=-1)
+            # 2. Predictive Entropy (memory-efficient chunking)
+            if self.beta > 0.0:
+                entropy_chunks = []
+                for c_logits in logits.split(chunk_size, dim=1):
+                    p_c = F.softmax(c_logits.float(), dim=-1)
+                    log_p_c = F.log_softmax(c_logits.float(), dim=-1)
+                    h_c = -(p_c * log_p_c).sum(dim=-1)
+                    entropy_chunks.append(h_c)
+                entropy = torch.cat(entropy_chunks, dim=1)
+                density = surprisal + self.beta * entropy
+            else:
+                density = surprisal
 
-            # 3. Composite Information Density
-            density = surprisal + self.beta * entropy
+            del logits
 
             # 4. Standardized Bounded Dynamic Weights
             mean_d = density.mean(dim=-1, keepdim=True)
@@ -211,6 +225,8 @@ class QwenTeacherDigester:
 
         # 2. Compute Qwen next-token weights
         q_weights = self.compute_teacher_token_weights(q_input_ids)[0].cpu().numpy()
+        del q_enc
+        del q_input_ids
 
         # 3. Construct Character-Level Importance Array
         char_weights = np.ones(len(text), dtype=np.float32)
@@ -337,3 +353,10 @@ def create_digester(
             w_max=w_max,
             lazy_load=True,
         )
+
+
+def load_spheroid_tokenizer(tokenizer_dir: str = "data/tokenizer"):
+    """Convenience helper to load the Spheroid SentencePiece tokenizer."""
+    from src.corpus import build_tokenizer
+    return build_tokenizer(tokenizer_dir)
+

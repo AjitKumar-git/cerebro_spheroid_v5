@@ -240,25 +240,69 @@ class PretrainingTokenStream:
         self.digester = digester
         self.buffer: List[int] = []
         self.weight_buffer: List[float] = []
+        self.precomputed_samples: List[Tuple[List[int], List[float]]] = []
+        self.texts: List[str] = []
+        self.streaming_ds = None
+        self.streaming_iter = None
 
         print(f"📦 Initializing Pretraining Token Stream from: {parquet_path}")
-        if self.digester is not None:
-            print(f"  🧠 Teacher Digestion ACTIVE: Dynamic Next-Token Weighting enabled")
-        if os.path.exists(parquet_path):
+
+        # 1. Check if HuggingFace Dataset Identifier (e.g. "AjitKumar-Bio/cosmopedia-v2-digested")
+        if ("/" in parquet_path and not os.path.exists(parquet_path)):
+            try:
+                from datasets import load_dataset
+                print(f"  🌐 Connecting streaming dataset from HuggingFace Hub: {parquet_path}...")
+                try:
+                    self.streaming_ds = load_dataset(parquet_path, split="train", streaming=True)
+                    self.streaming_iter = iter(self.streaming_ds)
+                    print(f"  ✓ Connected direct streaming pipeline from HuggingFace Hub ({parquet_path})")
+                except Exception as stream_err:
+                    print(f"  ℹ️ Streaming mode fallback ({stream_err}), loading static split...")
+                    ds = load_dataset(parquet_path)
+                    split_name = "train" if "train" in ds else list(ds.keys())[0]
+                    for row in ds[split_name]:
+                        toks = [int(t) for t in row.get("tokens", [])]
+                        weights = [float(w) for w in row.get("target_weights", [1.0] * len(toks))]
+                        if len(toks) > 10:
+                            self.precomputed_samples.append((toks, weights))
+                    random.shuffle(self.precomputed_samples)
+                    print(f"  ✓ Loaded {len(self.precomputed_samples):,} precomputed digested samples from HuggingFace Hub.")
+            except Exception as e:
+                print(f"  ⚠️ Could not load HuggingFace dataset ({e}). Falling back to local/synthetic.")
+
+        # 2. Check if local file exists
+        elif os.path.exists(parquet_path):
             df = pd.read_parquet(parquet_path)
-            self.texts = []
-            for _, r in df.iterrows():
-                p = str(r.get("prompt", "")).strip()
-                a = str(r.get("answer", "")).strip()
-                t = str(r.get("thinking", "")).strip()
-                combined = f"{p}\n{t}\n{a}".strip() if t else f"{p}\n{a}".strip()
-                if len(combined) > 20:
-                    self.texts.append(combined)
-            random.shuffle(self.texts)
-            print(f"  ✓ Loaded {len(self.texts):,} pretraining documents.")
-        else:
-            print("  ⚠️ Parquet not found. Generating synthetic continuous pretraining stream.")
+            if "tokens" in df.columns and "target_weights" in df.columns:
+                print(f"  ⚡ Found precomputed 'tokens' and 'target_weights' columns in {parquet_path}!")
+                for _, r in df.iterrows():
+                    toks = [int(t) for t in r["tokens"]]
+                    weights = [float(w) for w in r["target_weights"]]
+                    if len(toks) > 10:
+                        self.precomputed_samples.append((toks, weights))
+                random.shuffle(self.precomputed_samples)
+                print(f"  ✓ Loaded {len(self.precomputed_samples):,} precomputed digested samples.")
+            else:
+                for _, r in df.iterrows():
+                    p = str(r.get("prompt", "")).strip()
+                    a = str(r.get("answer", "")).strip()
+                    t = str(r.get("thinking", "")).strip()
+                    combined = f"{p}\n{t}\n{a}".strip() if t else f"{p}\n{a}".strip()
+                    if len(combined) > 20:
+                        self.texts.append(combined)
+                random.shuffle(self.texts)
+                print(f"  ✓ Loaded {len(self.texts):,} pretraining raw text documents.")
+
+        if not self.streaming_iter and not self.precomputed_samples and not self.texts:
+            print("  ⚠️ No data loaded. Generating synthetic continuous pretraining stream.")
             self.texts = self._generate_synthetic_corpus()
+
+        if self.streaming_iter is not None:
+            print(f"  🧠 Direct Streaming Digested Stream ACTIVE: Infinite-scale zero-overhead dynamic loss weighting")
+        elif self.precomputed_samples:
+            print(f"  🧠 Direct Digested Stream ACTIVE: Zero-overhead dynamic loss weighting")
+        elif self.digester is not None:
+            print(f"  🧠 Teacher Digestion ACTIVE: On-the-fly Dynamic Next-Token Weighting enabled")
 
         self.text_idx = 0
 
@@ -275,21 +319,41 @@ class PretrainingTokenStream:
     def get_batch(self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         needed_tokens = self.batch_size * (self.seq_len + 1)
         while len(self.buffer) < needed_tokens:
-            doc = self.texts[self.text_idx % len(self.texts)]
-            self.text_idx += 1
-
-            if self.digester is not None:
+            if self.streaming_iter is not None:
                 try:
-                    toks, weights = self.digester.digest_text(doc, self.tokenizer)
+                    row = next(self.streaming_iter)
+                except StopIteration:
+                    self.streaming_iter = iter(self.streaming_ds)
+                    row = next(self.streaming_iter)
+                toks = [int(t) for t in row.get("tokens", [])]
+                weights = [float(w) for w in row.get("target_weights", [1.0] * len(toks))]
+                if len(toks) > 5:
                     toks = list(toks) + [2]  # EOS
                     weights = list(weights) + [1.0]  # EOS weight
-                except Exception as e:
-                    # Robust fallback if teacher digestion encounters rare formatting anomaly
-                    toks = self.tokenizer.encode(doc, add_special_tokens=False) + [2]
-                    weights = [1.0] * len(toks)
+                    self.buffer.extend(toks)
+                    self.weight_buffer.extend(weights)
+                continue
+            elif self.precomputed_samples:
+                sample_toks, sample_weights = self.precomputed_samples[self.text_idx % len(self.precomputed_samples)]
+                self.text_idx += 1
+                toks = list(sample_toks) + [2]  # EOS
+                weights = list(sample_weights) + [1.0]  # EOS weight
             else:
-                toks = self.tokenizer.encode(doc, add_special_tokens=False) + [2]  # EOS
-                weights = [1.0] * len(toks)
+                doc = self.texts[self.text_idx % len(self.texts)]
+                self.text_idx += 1
+
+                if self.digester is not None:
+                    try:
+                        toks, weights = self.digester.digest_text(doc, self.tokenizer)
+                        toks = list(toks) + [2]  # EOS
+                        weights = list(weights) + [1.0]  # EOS weight
+                    except Exception as e:
+                        # Robust fallback if teacher digestion encounters rare formatting anomaly
+                        toks = self.tokenizer.encode(doc, add_special_tokens=False) + [2]
+                        weights = [1.0] * len(toks)
+                else:
+                    toks = self.tokenizer.encode(doc, add_special_tokens=False) + [2]  # EOS
+                    weights = [1.0] * len(toks)
 
             self.buffer.extend(toks)
             self.weight_buffer.extend(weights)
