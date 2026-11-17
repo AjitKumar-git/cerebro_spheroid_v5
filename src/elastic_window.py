@@ -1276,15 +1276,34 @@ class PrefetchedBatcher:
         self.worker_thread.start()
 
     def _producer_loop(self):
+        consecutive_errors = 0
         while not self.stop_event.is_set():
             try:
                 batch = self.batcher.next_batch()
-                self.queue.put(batch)
-            except Exception:
-                break
+                if batch is not None:
+                    # Block with timeout to check stop_event periodically
+                    while not self.stop_event.is_set():
+                        try:
+                            self.queue.put(batch, timeout=1.0)
+                            consecutive_errors = 0
+                            break
+                        except queue.Full:
+                            continue
+            except Exception as e:
+                consecutive_errors += 1
+                if self.stop_event.is_set():
+                    break
+                wait_s = min(10.0, 0.5 * (2 ** min(consecutive_errors, 5)))
+                time.sleep(wait_s)
 
-    def next_batch(self):
-        return self.queue.get()
+    def next_batch(self, timeout: float = 60.0):
+        while not self.stop_event.is_set():
+            try:
+                return self.queue.get(timeout=timeout)
+            except queue.Empty:
+                if self.stop_event.is_set():
+                    break
+        return None
 
     def get_batch(self):
         return self.next_batch()
