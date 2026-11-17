@@ -149,7 +149,7 @@ def parse_args(args_list=None):
     parser.add_argument("--repetition_penalty", type=float, default=1.25, help="Two-tier refractory repetition penalty multiplier")
 
     # Model & Precision
-    parser.add_argument("--preset", type=str, default="auto", choices=["auto", "v5_small", "v5_compact", "v5_base", "v5_test", "tpu_v5e_1", "tpu_v6e_1", "tpu_v6e"], help="Model preset (default: auto -> auto-detects tpu_v6e_1 / tpu_v5e_1)")
+    parser.add_argument("--preset", type=str, default="auto", choices=["auto", "v5_small", "v5_compact_32shells", "v5_compact", "v5_base", "v5_test", "tpu_v5e_1", "tpu_v6e_1", "tpu_v6e"], help="Model preset (default: auto -> auto-detects tpu_v6e_1 / tpu_v5e_1)")
     parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bf16", "fp16", "fp32"], help="Matrix execution precision ('auto' selects bf16 on TPU)")
     parser.add_argument("--remat", type=str, default="true", choices=["true", "false", "auto"], help="Activation remat scan to minimize HBM footprint (default: true)")
     parser.add_argument("--auto-tune", action="store_true", default=False, help="Micro-benchmark candidate batch sizes at startup to maximize steps/s, tok/s, and HBM/VRAM utilization")
@@ -184,8 +184,7 @@ def parse_args(args_list=None):
 
     # Data Source & Tokenizer
     parser.add_argument("--dataset_source", "--dataset-source", dest="dataset_source", type=str, default="autonomous",
-                        choices=["autonomous", "v5_base", "reasoning_anneal", "dense_edu", "local", "conversation_sft", "balanced_mix", "tri_pillar", "fineweb_edu", "openhermes", "consolidation"],
-                        help="Data stream: 'autonomous' (4-phase developmental curriculum for v5_base), 'reasoning_anneal' (1:1:1 Tri-Pillar), 'dense_edu', 'conversation_sft', 'consolidation'")
+                        help="Data stream: 'autonomous', custom Hugging Face repo (e.g. 'AjitKumar-Bio/cosmopedia-v2-digested'), 'reasoning_anneal', 'dense_edu', 'conversation_sft', 'consolidation'")
     parser.add_argument("--tokenizer_name", type=str, default="llama", help="Tokenizer model name or path (default: 'llama' -> data/tokenizer)")
 
     # Checkpoint & Cloud Sync

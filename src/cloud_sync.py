@@ -44,6 +44,20 @@ DEFAULT_URL = os.environ.get("BIOFLO_SYNC_URL", "https://bioflo.in/api/cerebro/s
 DEFAULT_TOKEN = os.environ.get("BIOFLO_SYNC_TOKEN", "CerebroSpheroid_Sync_Secure_2026")
 TPU_PRESET_ALIASES = ("tpu_v5e_1", "tpu_v6e_1", "tpu_v6e", "tpu", "v5_tpu")
 
+
+def normalize_model_name(model: Optional[str]) -> Optional[str]:
+    """Normalizes model preset names into canonical bioflo.in tiers (v5_small, v5_compact, v5_base)."""
+    if not model:
+        return model
+    m = str(model).strip()
+    if m in TPU_PRESET_ALIASES:
+        return "v5_small"
+    if "compact" in m:
+        return "v5_compact"
+    if "base" in m:
+        return "v5_base"
+    return m
+
 _IN_FLIGHT_UPLOADS: Dict[str, int] = {}
 _IN_FLIGHT_UPLOAD_TIMES: Dict[str, float] = {}
 _LAST_BEST_UPLOAD_TIME: float = 0.0
@@ -79,12 +93,9 @@ def check_remote_manifest(
     token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Queries bioflo.in to retrieve checkpoint status, step numbers, and loss metrics for model tier."""
-    if model in TPU_PRESET_ALIASES:
-        model = "v5_small"
+    model = normalize_model_name(model)
     sync_url = url or DEFAULT_URL
     sync_token = token or DEFAULT_TOKEN
-    if model in TPU_PRESET_ALIASES:
-        model = "v5_small"
 
     req_url = f"{sync_url}?action=status"
     if model:
@@ -111,7 +122,7 @@ def select_highest_step_slot(
     Pick whichever bioflo.in slot (named model vs root fallback) holds the highest step.
     Returns (slot_model_arg, step, loss).
     """
-    norm_model = "v5_small" if model in TPU_PRESET_ALIASES else model
+    norm_model = normalize_model_name(model)
     manifest = (manifest_resp or {}).get("manifest") or {}
     models_block = (manifest_resp or {}).get("models") or {}
 
@@ -173,8 +184,7 @@ def pull_checkpoint(
     """
     sync_url = url or DEFAULT_URL
     sync_token = token or DEFAULT_TOKEN
-    if model in TPU_PRESET_ALIASES:
-        model = "v5_small"
+    model = normalize_model_name(model)
 
     os.makedirs(os.path.dirname(os.path.abspath(local_dest)), exist_ok=True)
     download_url = f"{sync_url}?action=download&type={target_type}"
@@ -350,6 +360,7 @@ def push_checkpoint(
     # Ensure any float32 tensors are converted to bfloat16 before chunking and uploading
     _ensure_bfloat16_checkpoint(file_path)
 
+    model = normalize_model_name(model)
     slot_key = f"{model}_{target_type}" if model else target_type
 
     global _IN_FLIGHT_UPLOADS, _IN_FLIGHT_UPLOAD_TIMES, _LAST_BEST_UPLOAD_TIME
@@ -372,8 +383,7 @@ def push_checkpoint(
 
     sync_url = url or DEFAULT_URL
     sync_token = token or DEFAULT_TOKEN
-    if model in TPU_PRESET_ALIASES:
-        model = "v5_small"
+    model = normalize_model_name(model)
     node_name = source_node or detect_source_environment()
 
     file_size = os.path.getsize(file_path)
@@ -499,8 +509,7 @@ def notify_training_start(
     """Notifies the central hub on bioflo.in that training has started."""
     sync_url = url or DEFAULT_URL
     sync_token = token or DEFAULT_TOKEN
-    if model in TPU_PRESET_ALIASES:
-        model = "v5_small"
+    model = normalize_model_name(model)
     node_name = source_node or detect_source_environment()
     model_name = model or "v5_small"
     msg = message or f"🚀 CerebroSpheroid {model_name} training active on {node_name}"
