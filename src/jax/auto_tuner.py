@@ -138,7 +138,7 @@ def generate_vram_maximizing_candidates(
     to its optimal capacity (~85-92% HBM on TPU / VRAM on GPU) without leaving free memory on the table.
     """
     is_small_tier = preset in ("v5_small", "tpu_v5e_1", "tpu_v6e_1", "tpu_v6e", "v5_test")
-    is_compact_tier = preset == "v5_compact"
+    is_compact_tier = ("compact" in preset) or (preset == "v5_compact")
 
     if total_gb >= 64.0:
         # Ultra-capacity accelerator: TPU v5p (95GB), H100/H200 (80GB/141GB), B200 (192GB)
@@ -166,7 +166,10 @@ def generate_vram_maximizing_candidates(
             else:
                 base_ladder = [32, 64, 128, 192, 256, 384, 512, 768, 1024]
         elif is_compact_tier:
-            base_ladder = [16, 32, 64, 96, 128, 192, 256, 384]
+            if seq_len >= 512:
+                base_ladder = [8, 16, 32, 64, 96, 128]
+            else:
+                base_ladder = [8, 16, 32, 64, 96, 128, 192, 256, 384]
         elif preset == "v5_test":
             base_ladder = [8, 16, 32, 64]
         else:  # v5_base
@@ -217,22 +220,23 @@ def _score_benchmark_result(res: Dict[str, Any], tune_objective: str = "balanced
 
 def load_local_hardware_config(preset: str, device_signature: str) -> Optional[Dict[str, Any]]:
     """Loads cached configuration from local filesystem if present."""
-    norm_preset = "v5_small" if preset in ("tpu_v5e_1", "tpu_v6e_1", "tpu_v6e", "tpu", "v5_tpu") else preset
-    for path in [LOCAL_CONFIG_PATH, os.path.join("configs", "hardware_configs.json"), os.path.join("checkpoints", "hardware_configs.json")]:
-        try:
-            if os.path.exists(path) and os.path.getsize(path) > 2:
-                with open(path, "r") as f:
-                    data = json.load(f)
-                    if norm_preset in data and device_signature in data[norm_preset]:
-                        return data[norm_preset][device_signature]
-        except Exception:
-            pass
+    norm_preset = "v5_small" if preset in ("tpu_v5e_1", "tpu_v6e_1", "tpu_v6e", "tpu", "v5_tpu") else ("v5_compact" if "compact" in preset else preset)
+    for p_key in [preset, norm_preset]:
+        for path in [LOCAL_CONFIG_PATH, os.path.join("configs", "hardware_configs.json"), os.path.join("checkpoints", "hardware_configs.json")]:
+            try:
+                if os.path.exists(path) and os.path.getsize(path) > 2:
+                    with open(path, "r") as f:
+                        data = json.load(f)
+                        if p_key in data and device_signature in data[p_key]:
+                            return data[p_key][device_signature]
+            except Exception:
+                pass
     return None
 
 
 def save_local_hardware_config(preset: str, device_signature: str, config: Dict[str, Any]) -> None:
     """Saves verified configuration to local filesystem."""
-    norm_preset = "v5_small" if preset in ("tpu_v5e_1", "tpu_v6e_1", "tpu_v6e", "tpu", "v5_tpu") else preset
+    norm_preset = "v5_small" if preset in ("tpu_v5e_1", "tpu_v6e_1", "tpu_v6e", "tpu", "v5_tpu") else ("v5_compact" if "compact" in preset else preset)
     os.makedirs(os.path.dirname(os.path.abspath(LOCAL_CONFIG_PATH)), exist_ok=True)
     data = {}
     if os.path.exists(LOCAL_CONFIG_PATH) and os.path.getsize(LOCAL_CONFIG_PATH) > 2:
@@ -242,9 +246,10 @@ def save_local_hardware_config(preset: str, device_signature: str, config: Dict[
         except Exception:
             data = {}
 
-    if norm_preset not in data:
-        data[norm_preset] = {}
-    data[norm_preset][device_signature] = config
+    for p_key in set([preset, norm_preset]):
+        if p_key not in data:
+            data[p_key] = {}
+        data[p_key][device_signature] = config
 
     try:
         with open(LOCAL_CONFIG_PATH, "w") as f:

@@ -553,7 +553,7 @@ def fetch_remote_hardware_config(
     """Retrieves cached optimal batch size, remat, and throughput config for hardware from bioflo.in."""
     sync_url = url or DEFAULT_URL
     sync_token = token or DEFAULT_TOKEN
-    clean_model = "v5_small" if model in TPU_PRESET_ALIASES else model
+    clean_model = normalize_model_name(model) or model
 
     req_url = f"{sync_url}?action=get_config&model={clean_model}&device={urllib.parse.quote(device_signature)}"
     req = urllib.request.Request(
@@ -581,7 +581,7 @@ def push_remote_hardware_config(
     """Uploads benchmarked optimal hyperparameters to bioflo.in for zero-delay reuse."""
     sync_url = url or DEFAULT_URL
     sync_token = token or DEFAULT_TOKEN
-    clean_model = "v5_small" if model in TPU_PRESET_ALIASES else model
+    clean_model = normalize_model_name(model) or model
     source = source_node or detect_source_environment()
 
     payload = {
@@ -627,7 +627,7 @@ def push_remote_loss_history(
     """Uploads/syncs loss records over time to bioflo.in website data repository."""
     sync_url = url or DEFAULT_URL
     sync_token = token or DEFAULT_TOKEN
-    clean_model = "v5_small" if model in TPU_PRESET_ALIASES else model
+    clean_model = normalize_model_name(model) or model
 
     serialized = []
     for r in records:
@@ -670,7 +670,7 @@ def fetch_remote_loss_history(
     """Retrieves recorded training loss progression over time from bioflo.in website data repository."""
     sync_url = url or DEFAULT_URL
     sync_token = token or DEFAULT_TOKEN
-    clean_model = "v5_small" if model in TPU_PRESET_ALIASES else model
+    clean_model = normalize_model_name(model) or model
 
     req_url = f"{sync_url}?action=get_loss_history&model={clean_model}"
     req = urllib.request.Request(
@@ -702,7 +702,7 @@ def push_remote_token_tracker(
     """
     Pushes real-time token ingestion counters and per-dataset breakdowns to bioflo.in.
     """
-    clean_model = "v5_small" if model in TPU_PRESET_ALIASES else model
+    clean_model = normalize_model_name(model) or model
     sync_url = url or DEFAULT_URL
     sync_token = token or DEFAULT_TOKEN
 
@@ -747,7 +747,7 @@ def fetch_remote_token_tracker(
     """
     Retrieves current token ingestion metrics and per-dataset counts from bioflo.in.
     """
-    clean_model = "v5_small" if model in TPU_PRESET_ALIASES else model
+    clean_model = normalize_model_name(model) or model
     sync_url = url or DEFAULT_URL
     sync_token = token or DEFAULT_TOKEN
 
