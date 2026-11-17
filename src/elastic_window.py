@@ -350,11 +350,25 @@ def build_online_dataset_iterator(
         it = opener()
         return next(it), it
 
+    def _is_valid_doc(text: str, min_chars: int = 150, max_chars: int = 14000) -> bool:
+        if not text or not isinstance(text, str):
+            return False
+        s = text.strip()
+        if len(s) < min_chars or len(s) > max_chars:
+            return False
+        # Filter excessive repetition
+        if len(s) > 400:
+            words = s.split()
+            if len(words) > 30 and (len(set(words[:50])) / 50.0 < 0.35):
+                return False
+        return True
+
     def _next_filtered_fineweb(it: Optional[Iterator[Any]], opener, min_score: float = 3.0):
         for _ in range(50):
             row, it = _next_or_reopen(it, opener)
             score = float(row.get("score", 0.0) or row.get("educational_score", 0.0) or row.get("int_score", 0.0))
-            if score >= min_score:
+            text = str(row.get("text", "") or "")
+            if score >= min_score and _is_valid_doc(text, min_chars=150):
                 return row, it
         return row, it
 
@@ -387,11 +401,15 @@ def build_online_dataset_iterator(
         return _custom_gen()
 
     if source == "autonomous":
-        # 4-Phase Developmental Autonomous Curriculum for V5 Base / 200B Campaign
-        # Phase 1 (0 -> 15%): Foundation World Knowledge & Educational Prose (60% FineWeb-Edu >= 3, 15% Cosmo, 10% Everyday, 10% Math, 5% Code)
-        # Phase 2 (15% -> 50%): Broadening & Algorithmic Grounding (35% FineWeb-Edu >= 3, 25% Everyday, 20% Code, 20% Math)
-        # Phase 3 (50% -> 85%): Balanced Tri-Pillar Reasoning (33.3% Science, 33.3% Commonsense & Logic, 33.3% Math-CoT & Code)
-        # Phase 4 (85% -> 100%): Annealing Basin & Boundary Consolidation (30% FineWeb-Edu >= 3, 30% FineMath/MetaMath, 20% Code, 20% Magpie)
+        # Refined 4-Phase Developmental Autonomous Curriculum for CerebroSpheroid V5
+        # Phase 1 (0 -> 15%): World Knowledge, Educational Literacy & Imprinting
+        #   (40% FineWeb-Edu >= 3.0, 25% Cosmopedia v2 Digested, 15% Math/GSM8K, 10% Python Code, 10% Everyday Commonsense)
+        # Phase 2 (15% -> 50%): Broadening, Commonsense Expansion & Algorithmic Grounding
+        #   (30% FineWeb-Edu >= 3.5, 20% Cosmopedia v2 Digested, 25% Math Proofs & CoT, 25% Indented Python)
+        # Phase 3 (50% -> 85%): Balanced Tri-Pillar Reasoning & Deep Deliberation
+        #   (33.3% Science/STEM >= 4.0, 33.3% Multi-Turn Logic/Magpie, 33.3% Math-CoT & Algorithmic Code)
+        # Phase 4 (85% -> 100%): Annealing Basin, Proof Consolidation & 3-Tier Cognitive Alignment
+        #   (30% Verified GSM8K & MetaMath, 30% FineWeb-Edu >= 4.0, 20% Python Code, 20% Magpie Ultra / 3-Tier SFT)
         know_it: Optional[Iterator[Any]] = None
         cosmo_it: Optional[Iterator[Any]] = None
         everyday_it: Optional[Iterator[Any]] = None
@@ -403,15 +421,50 @@ def build_online_dataset_iterator(
         math_it: Optional[Iterator[Any]] = None
         finemath_it: Optional[Iterator[Any]] = None
 
+        # Load emergency offline backup reserve to prevent worker starvation during network drops
+        emergency_offline_pool: List[Dict[str, Any]] = []
+        try:
+            local_train_p = os.path.join(REPO_ROOT, "data", "cerebro_v5_custom_dataset", "train.parquet")
+            if os.path.exists(local_train_p):
+                import pyarrow.parquet as pq
+                tbl = pq.read_table(local_train_p)
+                prompts = tbl["prompt"].to_pylist()
+                answers = tbl["answer"].to_pylist()
+                for p_txt, a_txt in zip(prompts[:1000], answers[:1000]):
+                    if p_txt and a_txt:
+                        emergency_offline_pool.append({
+                            "prompt": p_txt,
+                            "text": a_txt,
+                            "answer": a_txt,
+                            "_dataset": "offline_emergency_reserve",
+                        })
+        except Exception:
+            pass
+
+        def _open_cosmo_stream():
+            candidate_streams = [
+                ("AjitKumar-Bio/cosmopedia-v2-digested", None),
+                ("AjitKumar-Bio/cerebro-spheroid-v5-digested-pretrain", None),
+                ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2"),
+                ("HuggingFaceTB/cosmopedia-v2", "cosmopedia-v2"),
+            ]
+            for c_repo, c_cfg in candidate_streams:
+                try:
+                    return _open_hf_stream(c_repo, c_cfg, rank=rank, world_size=world_size)
+                except Exception:
+                    continue
+            return _open_hf_stream("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", rank=rank, world_size=world_size)
+
         def _get_step_val() -> int:
+            val = 0
             if callable(step_getter):
                 try:
-                    return int(step_getter())
+                    val = int(step_getter())
                 except Exception:
-                    return 0
+                    val = 0
             elif isinstance(step_getter, (int, float)):
-                return int(step_getter)
-            return 0
+                val = int(step_getter)
+            return val
 
         def _autonomous_gen():
             nonlocal know_it, cosmo_it, everyday_it, openhermes_it, logic_it, code_it, pycode_it, gsm_it, math_it, finemath_it
@@ -423,32 +476,40 @@ def build_online_dataset_iterator(
                 return item
 
             while True:
-                cur_step = _get_step_val()
-                tau = float(cur_step) / float(max(1, total_steps))
+                raw_step = _get_step_val()
+                # If external step counter is not advancing or unset, progress via internal turn count
+                effective_step = raw_step if raw_step > 0 else turn
+                tau = float(effective_step) / float(max(1, total_steps))
 
                 try:
                     if tau < 0.15:
-                        # Phase 1: Foundation & World Knowledge Imprinting (Cycle mod 10)
-                        # 60% FineWeb-Edu (score >= 3.0), 15% Cosmopedia, 10% Everyday Commonsense, 10% Math, 5% Code
+                        # Phase 1: Foundation & Cognitive Imprinting (Cycle mod 10)
+                        # 40% FineWeb-Edu >= 3.0, 25% Cosmopedia v2 Digested, 15% Math, 10% Python Code, 10% Everyday Commonsense
                         mod10 = turn % 10
-                        if mod10 in (0, 2, 4, 6, 8):
+                        if mod10 in (0, 2, 4, 6):
                             row, know_it = _next_filtered_fineweb(
                                 know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size), min_score=3.0
                             )
                             yield _tag_yield(row, "fineweb_edu")
                         elif mod10 in (1, 5):
-                            row, cosmo_it = _next_or_reopen(
-                                cosmo_it, lambda: _open_hf_stream("HuggingFaceTB/cosmopedia-v2", "cosmopedia-v2", rank=rank, world_size=world_size)
-                            )
+                            row, cosmo_it = _next_or_reopen(cosmo_it, _open_cosmo_stream)
                             p = (row.get("prompt") or "Explain the concept:").strip()
-                            r = (row.get("text") or "").strip()
-                            yield _tag_yield({"conversations": [{"from": "human", "value": p}, {"from": "gpt", "value": r}]}, "cosmopedia")
+                            r = (row.get("text") or row.get("answer") or "").strip()
+                            item = {
+                                "prompt": p,
+                                "text": r,
+                                "answer": r,
+                                "tokens": row.get("tokens"),
+                                "target_weights": row.get("target_weights"),
+                                "conversations": [{"from": "human", "value": p}, {"from": "gpt", "value": r}],
+                            }
+                            yield _tag_yield(item, "cosmopedia_digested" if row.get("target_weights") else "cosmopedia")
                         elif mod10 == 3:
                             row, everyday_it = _next_or_reopen(
                                 everyday_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "everyday-conversations", rank=rank, world_size=world_size)
                             )
                             yield _tag_yield(row, "smoltalk")
-                        elif mod10 == 7:
+                        elif mod10 in (7, 9):
                             if (turn // 10) % 2 == 0:
                                 row, finemath_it = _next_or_reopen(
                                     finemath_it, lambda: _open_hf_stream("HuggingFaceTB/finemath", "finemath-4plus", rank=rank, world_size=world_size)
@@ -471,18 +532,26 @@ def build_online_dataset_iterator(
 
                     elif tau < 0.50:
                         # Phase 2: Broadening, Commonsense Expansion & Algorithmic Grounding (Cycle mod 10)
-                        # 35% FineWeb-Edu (score >= 3.0), 25% Everyday Commonsense, 20% Python Code, 20% Math Proofs
+                        # 30% FineWeb-Edu >= 3.5, 20% Cosmopedia v2 Digested, 25% Math Proofs & CoT, 25% Indented Python
                         mod10 = turn % 10
                         if mod10 in (0, 3, 6):
                             row, know_it = _next_filtered_fineweb(
-                                know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size), min_score=3.0
+                                know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size), min_score=3.5
                             )
                             yield _tag_yield(row, "fineweb_edu")
-                        elif mod10 in (1, 5, 8):
-                            row, everyday_it = _next_or_reopen(
-                                everyday_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "everyday-conversations", rank=rank, world_size=world_size)
-                            )
-                            yield _tag_yield(row, "smoltalk")
+                        elif mod10 in (1, 5):
+                            row, cosmo_it = _next_or_reopen(cosmo_it, _open_cosmo_stream)
+                            p = (row.get("prompt") or "Explain the concept:").strip()
+                            r = (row.get("text") or row.get("answer") or "").strip()
+                            item = {
+                                "prompt": p,
+                                "text": r,
+                                "answer": r,
+                                "tokens": row.get("tokens"),
+                                "target_weights": row.get("target_weights"),
+                                "conversations": [{"from": "human", "value": p}, {"from": "gpt", "value": r}],
+                            }
+                            yield _tag_yield(item, "cosmopedia_digested" if row.get("target_weights") else "cosmopedia")
                         elif mod10 in (2, 7):
                             if (turn // 10) % 2 == 0:
                                 row, pycode_it = _next_or_reopen(
@@ -511,11 +580,11 @@ def build_online_dataset_iterator(
 
                     elif tau < 0.85:
                         # Phase 3: Deep Deliberation & 1:1:1 Tri-Pillar Reasoning (Cycle mod 6)
-                        # 33.3% Science Anchor (score >= 3.0), 33.3% Commonsense & Multi-Turn Logic, 33.3% Math-CoT & Indented Code
+                        # 33.3% STEM Science >= 4.0, 33.3% Multi-Turn Logic & Commonsense, 33.3% Math-CoT & Indented Code
                         mod6 = turn % 6
                         if mod6 in (0, 3):
                             row, know_it = _next_filtered_fineweb(
-                                know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size), min_score=3.0
+                                know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size), min_score=4.0
                             )
                             yield _tag_yield(row, "fineweb_edu")
                         elif mod6 == 1:
@@ -560,12 +629,12 @@ def build_online_dataset_iterator(
                             yield _tag_yield(row, "smoltalk")
 
                     else:
-                        # Phase 4: Annealing Basin & Boundary Consolidation (Cycle mod 10)
-                        # 30% FineWeb-Edu (score >= 3.0), 30% Verified GSM8K/FineMath/MetaMath, 20% Indented Code, 20% Magpie Ultra Logic
+                        # Phase 4: Annealing Basin, Proof Consolidation & 3-Tier Cognitive Alignment (Cycle mod 10)
+                        # 30% Verified GSM8K/FineMath/MetaMath, 30% FineWeb-Edu >= 4.0, 20% Indented Code with Tests, 20% Magpie Ultra Logic
                         mod10 = turn % 10
                         if mod10 in (0, 3, 6):
                             row, know_it = _next_filtered_fineweb(
-                                know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size), min_score=3.0
+                                know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size), min_score=4.0
                             )
                             yield _tag_yield(row, "fineweb_edu")
                         elif mod10 in (1, 4, 7):
@@ -599,8 +668,14 @@ def build_online_dataset_iterator(
                             )
                             yield _tag_yield(row, "smoltalk")
 
-                except Exception:
-                    time.sleep(0.5)
+                except Exception as stream_exc:
+                    # If online streams fail, immediately draw from local emergency reserve pool without stalling
+                    if emergency_offline_pool:
+                        import random
+                        fallback_sample = random.choice(emergency_offline_pool)
+                        yield fallback_sample
+                    else:
+                        time.sleep(0.5)
                 turn += 1
 
         return _autonomous_gen()

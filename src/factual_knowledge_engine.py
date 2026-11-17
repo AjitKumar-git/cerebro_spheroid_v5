@@ -732,7 +732,11 @@ class FactualKnowledgeEngine:
 
             # Format strictly according to target thinking level
             if target_level == 0:
-                final_out = ans if random.random() < 0.6 else short_ans
+                if random.random() < 0.85:
+                    final_out = ans
+                else:
+                    p = f"{p} (Answer concisely in a few words)"
+                    final_out = short_ans
                 action_call = None
                 th_body = ""
             elif target_level == 1:

@@ -700,8 +700,12 @@ def build_direct_slot_samples(num_samples: int = 4000) -> List[Dict[str, Any]]:
         tmpl = random.choice(templates)
         q_casual = q.lower().rstrip("?").strip()
         p = tmpl.format(q=q, q_casual=q_casual)
-        # Alternate between full sentence and concise slot answer
-        ans = full_ans if random.random() < 0.5 else short_ans
+        # Alternate between full sentence and concise slot answer with clear instruction
+        if random.random() < 0.85:
+            ans = full_ans
+        else:
+            p = f"{p} (Answer concisely in a few words)"
+            ans = short_ans
 
         samples.append({
             "category": "direct_slot_conversational",
@@ -860,6 +864,22 @@ def build_cerebro_v5_custom_dataset() -> Dict[str, Any]:
 
     export_parquet(train_set, train_parquet)
     export_parquet(val_set, val_parquet)
+
+    # Also export canonical train.parquet and validation.parquet for default pretraining/SFT
+    canonical_train_p = os.path.join(OUTPUT_DIR, "train.parquet")
+    canonical_val_p = os.path.join(OUTPUT_DIR, "validation.parquet")
+    canonical_train_j = os.path.join(OUTPUT_DIR, "train.jsonl")
+    canonical_val_j = os.path.join(OUTPUT_DIR, "validation.jsonl")
+
+    export_parquet(train_set, canonical_train_p)
+    export_parquet(val_set, canonical_val_p)
+
+    with open(canonical_train_j, "w", encoding="utf-8") as f:
+        for item in train_set:
+            f.write(json.dumps(item) + "\n")
+    with open(canonical_val_j, "w", encoding="utf-8") as f:
+        for item in val_set:
+            f.write(json.dumps(item) + "\n")
 
     # 3. Export Manifest
     avg_p_len = sum(token_len_prompt) / len(token_len_prompt)
