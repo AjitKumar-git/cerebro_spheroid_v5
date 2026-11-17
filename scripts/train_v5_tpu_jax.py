@@ -289,7 +289,40 @@ def build_data_stream(
         return None, prefetched
 
     except Exception as e:
-        print(f"⚠️ [DataStreamer] Online dataset initialization failed: {e}. Falling back to local corpus.")
+        if dataset_source != "autonomous":
+            print(
+                f"⚠️ [DataStreamer] Online dataset '{dataset_source}' initialization failed: {e}.\n"
+                f"   🌐 Automatically falling back to canonical 'autonomous' foundational curriculum (FineWeb-Edu + Cosmopedia-v2 + Math + Code)..."
+            )
+            try:
+                raw_iter = build_online_dataset_iterator(
+                    dataset_source="autonomous",
+                    step_getter=step_getter,
+                    total_steps=total_steps,
+                )
+                first_row = next(raw_iter)
+                data_iter = itertools.chain([first_row], raw_iter)
+
+                if use_elastic_window:
+                    buckets = get_default_elastic_buckets(total_window)
+                    batcher = ElasticBucketBatcher(
+                        tokenizer, data_iter, batch_size=batch_size, total_window=total_window, buckets=buckets, framework="numpy", return_feedback=True
+                    )
+                else:
+                    buckets = [("static", prompt_len, target_len)]
+                    batcher = ElasticBucketBatcher(
+                        tokenizer, data_iter, batch_size=batch_size, total_window=prompt_len + target_len, buckets=buckets, framework="numpy", return_feedback=True
+                    )
+
+                q_depth = max(16, int(prefetch_queue_size))
+                prefetched = PrefetchedBatcher(batcher, queue_size=q_depth)
+                print(f"⚡ Background Asynchronous Batch Prefetcher Active for 'autonomous' (Queue Depth: {q_depth} batches)")
+                return None, prefetched
+            except Exception as e_auto:
+                print(f"⚠️ [DataStreamer] 'autonomous' curriculum initialization failed: {e_auto}. Falling back to local corpus.")
+        else:
+            print(f"⚠️ [DataStreamer] Online dataset initialization failed: {e}. Falling back to local corpus.")
+
         streamer = LinguisticDataStreamer(
             batch_size=batch_size,
             prompt_len=prompt_len,
@@ -485,37 +518,40 @@ def main(args=None):
                     slot_model, remote_step, remote_loss = select_highest_step_slot(
                         remote_manifest, sync_model_name, args.resume_target
                     )
-                    # Safety Override: If 'best' was requested but 'latest' is significantly ahead,
-                    # prevent accidental regression (e.g. starting back at 586k when 666k is available)
-                    if args.resume_target == "best":
-                        _, latest_step, _ = select_highest_step_slot(
-                            remote_manifest, sync_model_name, "latest"
-                        )
-                        if latest_step > remote_step + 5000:
-                            print(
-                                f"🛡️ [SAFETY OVERRIDE] 'best.pt' (Step {remote_step:,}) is >5,000 steps behind 'latest.pt' (Step {latest_step:,})!\n"
-                                f"   Automatically switching resumption to 'latest.pt' to prevent step regression."
-                            )
-                            args.resume_target = "latest"
-                            slot_model, remote_step, remote_loss = select_highest_step_slot(
+                    if remote_step > 0:
+                        # Safety Override: If 'best' was requested but 'latest' is significantly ahead,
+                        # prevent accidental regression (e.g. starting back at 586k when 666k is available)
+                        if args.resume_target == "best":
+                            _, latest_step, _ = select_highest_step_slot(
                                 remote_manifest, sync_model_name, "latest"
                             )
+                            if latest_step > remote_step + 5000:
+                                print(
+                                    f"🛡️ [SAFETY OVERRIDE] 'best.pt' (Step {remote_step:,}) is >5,000 steps behind 'latest.pt' (Step {latest_step:,})!\n"
+                                    f"   Automatically switching resumption to 'latest.pt' to prevent step regression."
+                                )
+                                args.resume_target = "latest"
+                                slot_model, remote_step, remote_loss = select_highest_step_slot(
+                                    remote_manifest, sync_model_name, "latest"
+                                )
 
-                    print(
-                        f"🔎 [cloud_sync] Selected remote slot model={slot_model or 'root'} "
-                        f"(Step {remote_step:,}, Loss {remote_loss:.4f}) for {args.resume_target}.pt"
-                    )
-                    target_dest = os.path.join(args.checkpoint_dir, f"{args.preset}_{args.resume_target}.pt")
-                    pulled_ok = pull_checkpoint(
-                        target_dest,
-                        target_type=args.resume_target,
-                        model=slot_model,
-                        url=args.cloud_url,
-                        token=args.cloud_token,
-                    )
-                    if pulled_ok and os.path.exists(target_dest):
-                        local_latest = target_dest
-                        print(f"✓ Restored latest checkpoint from cloud hub: {target_dest}")
+                        print(
+                            f"🔎 [cloud_sync] Selected remote slot model={slot_model or 'root'} "
+                            f"(Step {remote_step:,}, Loss {remote_loss:.4f}) for {args.resume_target}.pt"
+                        )
+                        target_dest = os.path.join(args.checkpoint_dir, f"{args.preset}_{args.resume_target}.pt")
+                        pulled_ok = pull_checkpoint(
+                            target_dest,
+                            target_type=args.resume_target,
+                            model=slot_model,
+                            url=args.cloud_url,
+                            token=args.cloud_token,
+                        )
+                        if pulled_ok and os.path.exists(target_dest):
+                            local_latest = target_dest
+                            print(f"✓ Restored latest checkpoint from cloud hub: {target_dest}")
+                    else:
+                        print(f"ℹ️ [cloud_sync] No existing checkpoint on bioflo.in for {args.preset} (Step 0). Ready for foundation seeding.")
             except Exception as e:
                 print(f"⚠️ [cloud_sync] Notice: {e}")
 
@@ -538,10 +574,29 @@ def main(args=None):
                 if p and os.path.exists(p):
                     discovered_ckpt = p
                     break
+
+            # If explicit foundation checkpoint not found locally, pull it from bioflo.in
+            if not discovered_ckpt and args.cloud_sync:
+                c_str = str(candidate_init).lower()
+                pull_model = "v5_small" if ("v5_small" in c_str or "step920" in c_str or "step900" in c_str or "foundation" in c_str) else None
+                dest_file = candidate_init if candidate_init.endswith(".pt") else f"{candidate_init}.pt"
+                dest_path = os.path.join(args.checkpoint_dir, dest_file)
+                print(f"🔄 [cloud_sync] Explicit foundation checkpoint '{candidate_init}' requested. Pulling model='{pull_model or 'v5_small'}' from bioflo.in...")
+                pulled_ok = pull_checkpoint(
+                    dest_path,
+                    target_type="latest",
+                    model=pull_model or "v5_small",
+                    url=args.cloud_url,
+                    token=args.cloud_token,
+                )
+                if pulled_ok and os.path.exists(dest_path):
+                    discovered_ckpt = dest_path
+                    print(f"✓ Restored foundation checkpoint from cloud hub: {dest_path}")
+
             if discovered_ckpt:
                 print(f"📦 Loading base model weights from explicit checkpoint: {discovered_ckpt}")
             else:
-                print(f"⚠️ Explicit checkpoint '{candidate_init}' not found locally. Searching default checkpoint paths...")
+                print(f"⚠️ Explicit checkpoint '{candidate_init}' not found locally or on cloud hub. Searching default checkpoint paths...")
 
         if not discovered_ckpt:
             if not os.path.exists(local_latest) and os.path.exists(fallback_latest):

@@ -247,6 +247,14 @@ def adapt_and_load_checkpoint_weights(
                 target_params[tri_k] = base_affine
                 restored_keys.add(tri_k)
 
+    # Temporal Router transferability: canonical zero weight and [0.5, -0.8, 1.0] bias initialization
+    if "motor.temporal_router.weight" in target_params and "motor.temporal_router.weight" not in restored_keys:
+        target_params["motor.temporal_router.weight"] = jnp.zeros_like(target_params["motor.temporal_router.weight"])
+        restored_keys.add("motor.temporal_router.weight")
+    if "motor.temporal_router.bias" in target_params and "motor.temporal_router.bias" not in restored_keys:
+        target_params["motor.temporal_router.bias"] = jnp.array([0.5, -0.8, 1.0], dtype=target_params["motor.temporal_router.bias"].dtype)
+        restored_keys.add("motor.temporal_router.bias")
+
     # 4. Progressive Cortical Expansion: Preserve tract wiring and apply Net2Net zero-regression init
     updated_buffers = buffers
     if buffers is not None and "core.src_indices" in raw_state and "core.dst_indices" in raw_state:

@@ -127,17 +127,26 @@ def select_highest_step_slot(
     models_block = (manifest_resp or {}).get("models") or {}
 
     candidates = []
-    if norm_model:
-        named_entry = manifest.get(f"{norm_model}_{target_type}")
-        if not named_entry and norm_model in models_block:
-            named_entry = models_block[norm_model].get(f"{target_type}_manifest")
-        if isinstance(named_entry, dict):
-            candidates.append((norm_model, int(named_entry.get("step", 0)), float(named_entry.get("loss", float("inf")))))
+    lookup_models = [norm_model] if norm_model else []
+    if norm_model and "compact" in norm_model and norm_model != "v5_compact":
+        lookup_models.append("v5_compact")
+    elif norm_model and "base" in norm_model and norm_model != "v5_base":
+        lookup_models.append("v5_base")
 
-    root_entry = manifest.get(target_type)
-    if isinstance(root_entry, dict):
-        root_model = root_entry.get("model") or None
-        candidates.append((root_model, int(root_entry.get("step", 0)), float(root_entry.get("loss", float("inf")))))
+    for m in lookup_models:
+        named_entry = manifest.get(f"{m}_{target_type}")
+        if not named_entry and m in models_block:
+            named_entry = models_block[m].get(f"{target_type}_manifest")
+        if isinstance(named_entry, dict) and int(named_entry.get("step", 0)) > 0:
+            candidates.append((m, int(named_entry.get("step", 0)), float(named_entry.get("loss", float("inf")))))
+
+    # Root slot fallback is strictly for v5_small or unassigned root models, never for compact/base tiers
+    allow_root = (norm_model is None or norm_model in ("v5_small", "root", "") or norm_model in TPU_PRESET_ALIASES)
+    if allow_root:
+        root_entry = manifest.get(target_type)
+        if isinstance(root_entry, dict) and int(root_entry.get("step", 0)) > 0:
+            root_model = root_entry.get("model") or None
+            candidates.append((root_model, int(root_entry.get("step", 0)), float(root_entry.get("loss", float("inf")))))
 
     if not candidates:
         return norm_model, 0, float("inf")
