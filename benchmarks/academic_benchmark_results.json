@@ -1,26 +1,26 @@
 {
   "metadata": {
-    "checkpoint": "v5_small_latest_step920k.pt",
-    "step": 920500,
-    "loss": 2.6085169315338135,
-    "protocol": "raw",
-    "timestamp": "2026-11-17T14:50:09Z",
+    "checkpoint": "v5_small_repaired_sft_400steps.pt",
+    "step": 400,
+    "loss": 3.8665199279785156,
+    "protocol": "stim_act",
+    "timestamp": "2026-11-17T15:57:03Z",
     "device": "cuda"
   },
   "summary": {
     "arc_challenge": {
-      "acc": 0.0,
-      "acc_norm": 30.0,
-      "stderr": 14.491376746189438,
-      "n": 10,
-      "time_sec": 19.95926523208618
+      "acc": 20.0,
+      "acc_norm": 20.0,
+      "stderr": 8.944271909999161,
+      "n": 20,
+      "time_sec": 12.266141414642334
     },
     "hellaswag": {
-      "acc": 30.0,
-      "acc_norm": 30.0,
-      "stderr": 14.491376746189438,
-      "n": 10,
-      "time_sec": 0.36902379989624023
+      "acc": 20.0,
+      "acc_norm": 25.0,
+      "stderr": 9.682458365518542,
+      "n": 20,
+      "time_sec": 0.7301995754241943
     }
   },
   "details": {
@@ -28,8 +28,8 @@
       {
         "q": "An astronomer observes that a planet rotates faster after a ",
         "target": "C",
-        "pred": "C",
-        "correct": true
+        "pred": "A",
+        "correct": false
       },
       {
         "q": "A group of engineers wanted to know how different building d",
@@ -52,13 +52,13 @@
       {
         "q": "An astronaut drops a 1.0 kg object and a 5.0 kg object on th",
         "target": "D",
-        "pred": "C",
-        "correct": false
+        "pred": "D",
+        "correct": true
       },
       {
         "q": "Devil facial tumor disease (DFTD) is a disease that is decim",
         "target": "B",
-        "pred": "C",
+        "pred": "D",
         "correct": false
       },
       {
@@ -84,13 +84,73 @@
         "target": "A",
         "pred": "C",
         "correct": false
+      },
+      {
+        "q": "According to cell classification, prokaryotic cells are sepa",
+        "target": "B",
+        "pred": "C",
+        "correct": false
+      },
+      {
+        "q": "Which statement best describes the effect of the Sun on the ",
+        "target": "A",
+        "pred": "C",
+        "correct": false
+      },
+      {
+        "q": "The morning temperature in a city is 41\u00b0F. If a sunny, mild ",
+        "target": "C",
+        "pred": "C",
+        "correct": true
+      },
+      {
+        "q": "A class plans an investigation to see which brand of light b",
+        "target": "C",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "Which of these gases is the most abundant greenhouse gas in ",
+        "target": "C",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "At which temperature does water freeze?",
+        "target": "A",
+        "pred": "C",
+        "correct": false
+      },
+      {
+        "q": "Fossil bones and teeth of dinosaurs have been researched for",
+        "target": "C",
+        "pred": "B",
+        "correct": false
+      },
+      {
+        "q": "Molly was making iced tea by putting tea bags in boiling wat",
+        "target": "B",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "Logging companies cut trees in a forest and send the trees t",
+        "target": "A",
+        "pred": "C",
+        "correct": false
+      },
+      {
+        "q": "It was once thought that living organisms could come from no",
+        "target": "C",
+        "pred": "D",
+        "correct": false
       }
     ],
     "hellaswag": [
       {
         "ctx": "A man is sitting on a roof. he",
         "target": 3,
-        "pred": 1,
+        "pred": 2,
         "correct": false
       },
       {
@@ -102,19 +162,19 @@
       {
         "ctx": "Two women in a child are shown in a canoe while a man pulls ",
         "target": 2,
-        "pred": 2,
-        "correct": true
+        "pred": 1,
+        "correct": false
       },
       {
         "ctx": "A boy is running down a track. the boy",
         "target": 2,
-        "pred": 0,
-        "correct": false
+        "pred": 2,
+        "correct": true
       },
       {
         "ctx": "The boy lifts his body above the height of a pole. The boy l",
         "target": 1,
-        "pred": 2,
+        "pred": 3,
         "correct": false
       },
       {
@@ -126,8 +186,8 @@
       {
         "ctx": "A man is standing in front of a camera. He starts playing a ",
         "target": 2,
-        "pred": 2,
-        "correct": true
+        "pred": 3,
+        "correct": false
       },
       {
         "ctx": "A cartoon animation video is shown with people wandering aro",
@@ -138,11 +198,71 @@
       {
         "ctx": "A man is holding a pocket knife while sitting on some rocks ",
         "target": 1,
-        "pred": 1,
-        "correct": true
+        "pred": 2,
+        "correct": false
       },
       {
         "ctx": "Then he takes a small stone from the flowing river and smash",
+        "target": 1,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "ctx": "Then he takes a piece of bark and rubs the powered stone pie",
+        "target": 3,
+        "pred": 3,
+        "correct": true
+      },
+      {
+        "ctx": "The stone particles stick to the wet piece of wood. He then ",
+        "target": 3,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "ctx": "He then takes the knife and sharpens it against the wood pie",
+        "target": 2,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "ctx": "He then notices a little black and green poisonous frog sitt",
+        "target": 2,
+        "pred": 2,
+        "correct": true
+      },
+      {
+        "ctx": "A person is playing bagpipes out in a park. A man and two bo",
+        "target": 0,
+        "pred": 3,
+        "correct": false
+      },
+      {
+        "ctx": "Two people are seen passing a ball back and fourth in a pool",
+        "target": 3,
+        "pred": 3,
+        "correct": true
+      },
+      {
+        "ctx": "A woman is sitting at a table in a fast food restaurant whil",
+        "target": 2,
+        "pred": 1,
+        "correct": false
+      },
+      {
+        "ctx": "A group of cheerleaders run onto a stage before a cheering a",
+        "target": 0,
+        "pred": 0,
+        "correct": true
+      },
+      {
+        "ctx": "A group of cheerleaders run onto a stage before a cheering a",
+        "target": 1,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "ctx": "They get into formation, then begin dancing and flipping as ",
         "target": 1,
         "pred": 2,
         "correct": false

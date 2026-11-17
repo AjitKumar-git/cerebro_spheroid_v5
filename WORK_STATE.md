@@ -1,15 +1,15 @@
 # Agent Work State & Activity Tracker
 
-> **Status**: 🟡 `IN_PROGRESS` | **Last Updated**: `2026-11-17T21:12:01.806940+05:30` | **Session**: `734a32d4-30f9-4fa4-b9c2-5336e0f58c27`
+> **Status**: 🟢 `COMPLETED` | **Last Updated**: `2026-11-17T21:13:02.930258+05:30` | **Session**: `734a32d4-30f9-4fa4-b9c2-5336e0f58c27`
 
 ## Current / Active Objective
-**Goal**: make a dataset sppecifically to eliminate sycophancy
+**Goal**: upload to my hf also check if cosmopedia_digested is present there
 
-- **Phase**: `executing`
-- **Current Task**: Executed run_command: Verify published files on HF
+- **Phase**: `completed`
+- **Current Task**: Idle / Awaiting next request
 
 ## Summary of Completed Work
-We have built and compiled a dedicated **Anti-Sycophancy & Truth Resistance Dataset**:
+The dataset has been converted to Parquet and published with full Hugging Face Dataset Viewer support:
 
 ## Modified Files
 - [`scripts/run_weight_transfer_experiment.py`](scripts/run_weight_transfer_experiment.py)
@@ -79,6 +79,7 @@ We have built and compiled a dedicated **Anti-Sycophancy & Truth Resistance Data
 ## Recent Actions (Last 10)
 | Time | Tool | Details |
 | :--- | :--- | :--- |
+| `21:12:40` | `run_command` | Commit upload script |
 | `21:12:01` | `run_command` | Verify published files on HF |
 | `21:11:43` | `manage_task` | manage_task |
 | `21:11:30` | `run_command` | Upload anti-sycophancy dataset to Hugging Face |
@@ -88,7 +89,6 @@ We have built and compiled a dedicated **Anti-Sycophancy & Truth Resistance Data
 | `21:10:29` | `run_command` | Inspect dataframe of anti-sycophancy dataset |
 | `21:10:17` | `run_command` | Check local cosmopedia digested shards |
 | `21:10:10` | `run_command` | List files in digested datasets |
-| `21:10:02` | `run_command` | List all datasets by AjitKumar-Bio |
 
 ---
 *This file is automatically maintained by `auto-work-tracker`. Other agents can parse `.agents/work_state.json` or inspect this file directly to resume or review progress.*

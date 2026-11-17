@@ -130,97 +130,168 @@ def build_direct_slot_qa_corpus() -> List[Tuple[str, str]]:
 def load_tri_modal_dataset(
     tokenizer: Any,
     vocab_size: int,
-    max_cot_samples: int = 1500,
+    max_cot_samples: int = 2500,
     max_prompt_len: int = 256,
     max_target_len: int = 512,
 ) -> List[Dict[str, Any]]:
     """
     Constructs a balanced Tri-Modal dataset with token-level anchor masks:
-    - 45% Direct Slot QA (with answers wrapped cleanly in <act>)
-    - 40% Full-Horizon CoT from cerebro_cognitive_10k.jsonl (with answers after ####)
-    - 15% Tool Action selection traces
+    - 45% Direct Instruction & Slot QA (plain natural text answers with 3.5x AALW)
+    - 40% Full-Horizon CoT Reasoning (with answers weighted 3.5x after ####)
+    - 15% Structured Tool Action Traces (<act> ... </act>)
+    - Plus Conversational Dialogue & Anti-Sycophancy Truth Anchors
     """
     print("\n📦 Assembling Refined Tri-Modal SFT Dataset...")
     tokenized_entries = []
 
-    # 1. Direct Slot QA (45%)
-    direct_pairs = build_direct_slot_qa_corpus()
-    for q, a in direct_pairs:
+    # A. Ingest 10,000 Curated Tri-Modal Dataset from Parquet / JSONL
+    parquet_path = os.path.join(WORKSPACE_ROOT, "data", "cerebro_cognitive_8k", "cerebro_tri_modal_sft_10k.parquet")
+    jsonl_path = os.path.join(WORKSPACE_ROOT, "data", "cerebro_cognitive_8k", "cerebro_tri_modal_sft_10k.jsonl")
+    
+    tri_records = []
+    if os.path.exists(parquet_path):
+        try:
+            import pyarrow.parquet as pq
+            table = pq.read_table(parquet_path)
+            for idx in range(len(table)):
+                tri_records.append({
+                    "question": table["question"][idx].as_py(),
+                    "answer": table["answer"][idx].as_py(),
+                    "category": table["category"][idx].as_py() if "category" in table.column_names else "general",
+                    "is_direct_slot": bool(table["is_direct_slot"][idx].as_py()) if "is_direct_slot" in table.column_names else False,
+                    "has_anchor": bool(table["has_anchor"][idx].as_py()) if "has_anchor" in table.column_names else False,
+                })
+        except Exception as e:
+            print(f"   ⚠️ Parquet read failed ({e}), falling back to JSONL...")
+
+    if not tri_records and os.path.exists(jsonl_path):
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                tri_records.append(json.loads(line))
+
+    # Downsample tri_records to max_cot_samples for fast local iteration
+    if len(tri_records) > max_cot_samples:
+        random.seed(42)
+        tri_records = random.sample(tri_records, max_cot_samples)
+
+    for rec in tri_records:
+        q = rec.get("question", "").strip()
+        a = rec.get("answer", "").strip()
+        cat = rec.get("category", "")
+        is_slot = rec.get("is_direct_slot", False)
+
         p_str = format_stimulus_prompt(q)
-        # Wrap answer directly in <act> ... </act>
-        a_str = format_motor_response(a)
+        
+        # Tools get <act>...</act>; Conversational and QA get natural text
+        if cat == "agentic_tool" or "action:" in a:
+            a_str = format_motor_response(a)
+            item_type = "agentic_tool"
+            default_weight = 2.5
+        elif is_slot or "direct" in cat:
+            a_str = a  # Plain text answer!
+            item_type = "direct_slot"
+            default_weight = 3.5
+        else:
+            a_str = a
+            item_type = "cot_reasoning"
+            default_weight = 1.0
+
         p_ids = [t % vocab_size for t in encode_no_special(tokenizer, p_str)][:max_prompt_len]
         a_ids = [t % vocab_size for t in encode_no_special(tokenizer, a_str)][:max_target_len]
-        
+
         if len(p_ids) > 1 and len(a_ids) > 1:
-            # For direct answers, all tokens inside <act> ... </act> get 3.5x weight
-            weights = [3.5] * len(a_ids)
+            weights = [default_weight] * len(a_ids)
+            if item_type == "cot_reasoning":
+                raw_a_tokens = [tokenizer.decode([t]) for t in a_ids]
+                found_anchor = False
+                for i, tok_str in enumerate(raw_a_tokens):
+                    if "####" in tok_str or "##" in tok_str:
+                        found_anchor = True
+                    if found_anchor:
+                        weights[i] = 3.5
+
             tokenized_entries.append({
                 "prompt_ids": p_ids,
                 "target_ids": a_ids,
                 "weights": weights,
-                "type": "direct_slot"
+                "type": item_type
             })
 
-    print(f"   ✓ Direct Slot QA Pairs:     {len(tokenized_entries)} samples")
+    print(f"   ✓ Ingested from Curated Tri-Modal Corpus: {len(tokenized_entries)} samples")
 
-    # 2. Full-Horizon CoT Reasoning (40%)
-    cot_path = os.path.join(WORKSPACE_ROOT, "data", "cerebro_cognitive_8k", "cerebro_cognitive_10k.jsonl")
-    cot_loaded = 0
-    if os.path.exists(cot_path):
-        with open(cot_path, "r", encoding="utf-8") as f:
-            for idx, line in enumerate(f):
-                if cot_loaded >= max_cot_samples:
-                    break
+    # B. Conversational Dialogue & Greetings (Layman CoT)
+    conv_path = os.path.join(WORKSPACE_ROOT, "data", "layman_conversational_cot.jsonl")
+    conv_loaded = 0
+    if os.path.exists(conv_path):
+        with open(conv_path, "r", encoding="utf-8") as f:
+            for line in f:
                 entry = json.loads(line)
-                q = entry.get("question", "")
-                a = entry.get("answer", "")
-                p_str = format_stimulus_prompt(q)
-                a_str = format_motor_response(a)
+                p_str = format_stimulus_prompt(entry.get("prompt", ""))
+                a_str = entry.get("response", "").strip()
                 p_ids = [t % vocab_size for t in encode_no_special(tokenizer, p_str)][:max_prompt_len]
                 a_ids = [t % vocab_size for t in encode_no_special(tokenizer, a_str)][:max_target_len]
-                
-                if len(p_ids) > 2 and len(a_ids) > 2:
-                    # Weight 1.0 for reasoning steps, 3.5 for tokens after "####"
-                    weights = [1.0] * len(a_ids)
+                if len(p_ids) > 1 and len(a_ids) > 1:
+                    # 1.0 on think scratchpad, 2.5 on conversation
+                    weights = [2.0] * len(a_ids)
                     raw_a_tokens = [tokenizer.decode([t]) for t in a_ids]
-                    found_anchor = False
+                    inside_think = False
                     for i, tok_str in enumerate(raw_a_tokens):
-                        if "####" in tok_str or "##" in tok_str:
-                            found_anchor = True
-                        if found_anchor:
-                            weights[i] = 3.5
-
+                        if "<think>" in tok_str:
+                            inside_think = True
+                        if inside_think:
+                            weights[i] = 1.0
+                        if "</think>" in tok_str:
+                            inside_think = False
                     tokenized_entries.append({
                         "prompt_ids": p_ids,
                         "target_ids": a_ids,
                         "weights": weights,
-                        "type": "cot_reasoning"
+                        "type": "conversational"
                     })
-                    cot_loaded += 1
+                    conv_loaded += 1
+    print(f"   ✓ Conversational Dialogue Samples:       {conv_loaded} samples")
 
-    print(f"   ✓ Full-Horizon CoT Pairs:   {cot_loaded} samples")
+    # C. Anti-Sycophancy Truth Resistance
+    truth_path = os.path.join(WORKSPACE_ROOT, "data", "anti_sycophancy_truth_dataset.jsonl")
+    truth_loaded = 0
+    if os.path.exists(truth_path):
+        with open(truth_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if truth_loaded >= 400:
+                    break
+                entry = json.loads(line)
+                p_str = format_stimulus_prompt(entry.get("prompt", ""))
+                a_str = entry.get("response", "").strip()
+                p_ids = [t % vocab_size for t in encode_no_special(tokenizer, p_str)][:max_prompt_len]
+                a_ids = [t % vocab_size for t in encode_no_special(tokenizer, a_str)][:max_target_len]
+                if len(p_ids) > 1 and len(a_ids) > 1:
+                    weights = [2.5] * len(a_ids)
+                    tokenized_entries.append({
+                        "prompt_ids": p_ids,
+                        "target_ids": a_ids,
+                        "weights": weights,
+                        "type": "anti_sycophancy"
+                    })
+                    truth_loaded += 1
+    print(f"   ✓ Anti-Sycophancy Truth Samples:         {truth_loaded} samples")
 
-    # 3. Agentic Tool Actions (15%)
-    tool_samples = [
-        ("Search the web for the latest weather in Tokyo", "<act>action: search_web query: \"Tokyo weather\"</act>"),
-        ("Execute python code to compute factorial of 10", "<act>action: run_code language: python code: \"import math; print(math.factorial(10))\"</act>"),
-        ("Read the file at /workspace/config.json", "<act>action: read_file path: \"/workspace/config.json\"</act>"),
-        ("List all files in the current project directory", "<act>action: run_command cmd: \"ls -la\"</act>")
-    ] * 50
-    for q, a in tool_samples:
-        p_ids = [t % vocab_size for t in encode_no_special(tokenizer, format_stimulus_prompt(q))][:max_prompt_len]
-        a_ids = [t % vocab_size for t in encode_no_special(tokenizer, format_motor_response(a))][:max_target_len]
+    # D. Direct Slot QA Pairs (Reinforced)
+    direct_pairs = build_direct_slot_qa_corpus()
+    for q, a in direct_pairs:
+        p_str = format_stimulus_prompt(q)
+        a_str = a.strip()
+        p_ids = [t % vocab_size for t in encode_no_special(tokenizer, p_str)][:max_prompt_len]
+        a_ids = [t % vocab_size for t in encode_no_special(tokenizer, a_str)][:max_target_len]
         if len(p_ids) > 1 and len(a_ids) > 1:
             tokenized_entries.append({
                 "prompt_ids": p_ids,
                 "target_ids": a_ids,
-                "weights": [2.5] * len(a_ids),
-                "type": "agentic_tool"
+                "weights": [3.5] * len(a_ids),
+                "type": "direct_slot"
             })
+    print(f"   ✓ Reinforced Direct Slot Pairs:          {len(direct_pairs)} samples")
 
-    print(f"   ✓ Agentic Tool Traces:      {len(tool_samples)} samples")
-    print(f"   🌟 Total Combined SFT Set:  {len(tokenized_entries)} samples")
+    print(f"   🌟 Total Combined SFT Set:               {len(tokenized_entries)} samples")
     random.seed(42)
     random.shuffle(tokenized_entries)
     return tokenized_entries
@@ -284,8 +355,9 @@ def run_refined_sft(
     raw = torch.load(base_checkpoint, map_location="cpu", weights_only=False)
     cfg = infer_v5_config_from_state_dict(raw)
     model = CerebroSpheroidV5(cfg)
-    sd = raw.get("model_state", raw.get("model_state_dict", raw.get("model", raw)))
-    model.load_state_dict(sd, strict=False)
+    from src.spheroid_v5 import load_v5_checkpoint_into_torch
+    loaded, total = load_v5_checkpoint_into_torch(model, raw, verbose=True)
+    print(f"   ✓ Successfully loaded {loaded}/{total} parameter arrays into PyTorch V5 model")
 
     tokenizer = AutoTokenizer.from_pretrained(os.path.join(WORKSPACE_ROOT, "data", "tokenizer"))
     calibrate_control_tokens(model, tokenizer)
@@ -335,6 +407,8 @@ def run_refined_sft(
         ("What is the simple past tense of the irregular verb \"drink\"?", "drank"),
         ("If John has 3 apples and buys 2 more, how many apples does he have?", "5"),
         ("What is the capital of France?", "Paris"),
+        ("Question: What is 2 + 2?\nAnswer:", "4"),
+        ("What is the chemical formula for water?", "H2O"),
     ]
 
     print("\n🚀 Beginning Refined SFT Rollout with Answer-Anchor Weighting...")

@@ -2210,14 +2210,7 @@ class CerebroSpheroidV5(nn.Module):
         )
         is_slot_query = any(kw in prompt.lower() for kw in slot_keywords)
         if is_slot_query:
-            try:
-                nl_tokens = encode_no_special(tokenizer, "\n")
-                for nlt in nl_tokens:
-                    if nlt not in stop_list:
-                        stop_list.append(nlt)
-            except Exception:
-                pass
-            max_new_tokens = min(max_new_tokens, 48)
+            max_new_tokens = min(max_new_tokens, 64)
 
         stop_ids = tuple(s for s in stop_list if s is not None)
 
