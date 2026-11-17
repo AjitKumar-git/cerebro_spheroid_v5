@@ -1,0 +1,103 @@
+country_name,capital,continent,currency,currency_code,iso2,iso3
+United States,"Washington, D.C.",North America,US Dollar,USD,US,USA
+Canada,Ottawa,North America,Canadian Dollar,CAD,CA,CAN
+Mexico,Mexico City,North America,Mexican Peso,MXN,MX,MEX
+Brazil,Brasilia,South America,Brazilian Real,BRL,BR,BRA
+Argentina,Buenos Aires,South America,Argentine Peso,ARS,AR,ARG
+Chile,Santiago,South America,Chilean Peso,CLP,CL,CHL
+Colombia,Bogota,South America,Colombian Peso,COP,CO,COL
+Peru,Lima,South America,Peruvian Sol,PEN,PE,PER
+Venezuela,Caracas,South America,Venezuelan Bolivar,VES,VE,VEN
+Cuba,Havana,North America,Cuban Peso,CUP,CU,CUB
+United Kingdom,London,Europe,Pound Sterling,GBP,GB,GBR
+France,Paris,Europe,Euro,EUR,FR,FRA
+Germany,Berlin,Europe,Euro,EUR,DE,DEU
+Italy,Rome,Europe,Euro,EUR,IT,ITA
+Spain,Madrid,Europe,Euro,EUR,ES,ESP
+Portugal,Lisbon,Europe,Euro,EUR,PT,PRT
+Netherlands,Amsterdam,Europe,Euro,EUR,NL,NLD
+Belgium,Brussels,Europe,Euro,EUR,BE,BEL
+Switzerland,Bern,Europe,Swiss Franc,CHF,CH,CHE
+Austria,Vienna,Europe,Euro,EUR,AT,AUT
+Sweden,Stockholm,Europe,Swedish Krona,SEK,SE,SWE
+Norway,Oslo,Europe,Norwegian Krone,NOK,NO,NOR
+Denmark,Copenhagen,Europe,Danish Krone,DKK,DK,DNK
+Finland,Helsinki,Europe,Euro,EUR,FI,FIN
+Poland,Warsaw,Europe,Polish Zloty,PLN,PL,POL
+Greece,Athens,Europe,Euro,EUR,GR,GRC
+Ireland,Dublin,Europe,Euro,EUR,IE,IRL
+Czech Republic,Prague,Europe,Czech Koruna,CZK,CZ,CZE
+Hungary,Budapest,Europe,Hungarian Forint,HUF,HU,HUN
+Romania,Bucharest,Europe,Romanian Leu,RON,RO,ROU
+Ukraine,Kyiv,Europe,Ukrainian Hryvnia,UAH,UA,UKR
+Russia,Moscow,Europe/Asia,Russian Ruble,RUB,RU,RUS
+Turkey,Ankara,Europe/Asia,Turkish Lira,TRY,TR,TUR
+Japan,Tokyo,Asia,Japanese Yen,JPY,JP,JPN
+China,Beijing,Asia,Chinese Yuan,CNY,CN,CHN
+India,New Delhi,Asia,Indian Rupee,INR,IN,IND
+South Korea,Seoul,Asia,South Korean Won,KRW,KR,KOR
+Indonesia,Jakarta,Asia,Indonesian Rupiah,IDR,ID,IDN
+Saudi Arabia,Riyadh,Asia,Saudi Riyal,SAR,SA,SAU
+United Arab Emirates,Abu Dhabi,Asia,UAE Dirham,AED,AE,ARE
+Israel,Jerusalem,Asia,Israeli New Shekel,ILS,IL,ISR
+Singapore,Singapore,Asia,Singapore Dollar,SGD,SG,SGP
+Malaysia,Kuala Lumpur,Asia,Malaysian Ringgit,MYR,MY,MYS
+Thailand,Bangkok,Asia,Thai Baht,THB,TH,THA
+Vietnam,Hanoi,Asia,Vietnamese Dong,VND,VN,VNM
+Philippines,Manila,Asia,Philippine Peso,PHP,PH,PHL
+Pakistan,Islamabad,Asia,Pakistani Rupee,PKR,PK,PAK
+Bangladesh,Dhaka,Asia,Bangladeshi Taka,BDT,BD,BGD
+Australia,Canberra,Oceania,Australian Dollar,AUD,AU,AUS
+New Zealand,Wellington,Oceania,New Zealand Dollar,NZD,NZ,NZL
+Egypt,Cairo,Africa,Egyptian Pound,EGP,EG,EGY
+South Africa,Pretoria,Africa,South African Rand,ZAR,ZA,ZAF
+Nigeria,Abuja,Africa,Nigerian Naira,NGN,NG,NGA
+Kenya,Nairobi,Africa,Kenyan Shilling,KES,KE,KEN
+Ethiopia,Addis Ababa,Africa,Ethiopian Birr,ETB,ET,ETH
+Morocco,Rabat,Africa,Moroccan Dirham,MAD,MA,MAR
+Algeria,Algiers,Africa,Algerian Dinar,DZD,DZ,DZA
+Ghana,Accra,Africa,Ghanaian Cedi,GHS,GH,GHA
+Tanzania,Dodoma,Africa,Tanzanian Shilling,TZS,TZ,TZA
+Afghanistan,Kabul,Asia,Afghan Afghani,AFN,AF,AFG
+Albania,Tirana,Europe,Albanian Lek,ALL,AL,ALB
+Armenia,Yerevan,Asia,Armenian Dram,AMD,AM,ARM
+Azerbaijan,Baku,Asia,Azerbaijani Manat,AZN,AZ,AZE
+Bahamas,Nassau,North America,Bahamian Dollar,BSD,BS,BHS
+Bahrain,Manama,Asia,Bahraini Dinar,BHD,BH,BHR
+Belarus,Minsk,Europe,Belarusian Ruble,BYN,BY,BLR
+Bolivia,Sucre,South America,Bolivian Boliviano,BOB,BO,BOL
+Bosnia and Herzegovina,Sarajevo,Europe,Convertible Mark,BAM,BA,BIH
+Bulgaria,Sofia,Europe,Bulgarian Lev,BGN,BG,BGR
+Cambodia,Phnom Penh,Asia,Cambodian Riel,KHR,KH,KHM
+Cameroon,Yaounde,Africa,Central African CFA Franc,XAF,CM,CMR
+Costa Rica,San Jose,North America,Costa Rican Colon,CRC,CR,CRI
+Croatia,Zagreb,Europe,Euro,EUR,HR,HRV
+Cyprus,Nicosia,Europe,Euro,EUR,CY,CYP
+Ecuador,Quito,South America,US Dollar,USD,EC,ECU
+Estonia,Tallinn,Europe,Euro,EUR,EE,EST
+Georgia,Tbilisi,Asia/Europe,Georgian Lari,GEL,GE,GEO
+Guatemala,Guatemala City,North America,Guatemalan Quetzal,GTQ,GT,GTM
+Iceland,Reykjavik,Europe,Icelandic Krona,ISK,IS,ISL
+Iran,Tehran,Asia,Iranian Rial,IRR,IR,IRN
+Iraq,Baghdad,Asia,Iraqi Dinar,IQD,IQ,IRQ
+Jamaica,Kingston,North America,Jamaican Dollar,JMD,JM,JAM
+Jordan,Amman,Asia,Jordanian Dinar,JOD,JO,JOR
+Kazakhstan,Astana,Asia,Kazakhstani Tenge,KZT,KZ,KAZ
+Kuwait,Kuwait City,Asia,Kuwaiti Dinar,KWD,KW,KWT
+Latvia,Riga,Europe,Euro,EUR,LV,LVA
+Lebanon,Beirut,Asia,Lebanese Pound,LBP,LB,LBN
+Lithuania,Vilnius,Europe,Euro,EUR,LT,LTU
+Luxembourg,Luxembourg City,Europe,Euro,EUR,LU,LUX
+Monaco,Monaco,Europe,Euro,EUR,MC,MCO
+Mongolia,Ulaanbaatar,Asia,Mongolian Togrog,MNT,MN,MNG
+Nepal,Kathmandu,Asia,Nepalese Rupee,NPR,NP,NPL
+Oman,Muscat,Asia,Omani Rial,OMR,OM,OMN
+Panama,Panama City,North America,Panamanian Balboa,PAB,PA,PAN
+Paraguay,Asuncion,South America,Paraguayan Guarani,PYG,PY,PRY
+Qatar,Doha,Asia,Qatari Riyal,QAR,QA,QAT
+Serbia,Belgrade,Europe,Serbian Dinar,RSD,RS,SRB
+Slovakia,Bratislava,Europe,Euro,EUR,SK,SVK
+Slovenia,Ljubljana,Europe,Euro,EUR,SI,SVN
+Sri Lanka,Colombo,Asia,Sri Lankan Rupee,LKR,LK,LKA
+Uruguay,Montevideo,South America,Uruguayan Peso,UYU,UY,URY
+Uzbekistan,Tashkent,Asia,Uzbekistani Som,UZS,UZ,UZB
