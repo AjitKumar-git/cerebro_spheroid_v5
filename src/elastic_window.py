@@ -367,20 +367,24 @@ def build_online_dataset_iterator(
             print(f"🌐 Connecting online stream to custom Hugging Face repo: {repo_id}...")
             return iter(load_dataset(repo_id, split="train", streaming=True))
 
-        while True:
-            row, custom_it = _next_or_reopen(custom_it, _open_custom_stream)
-            prompt = str(row.get("prompt", "") or "").strip()
-            text = str(row.get("text", "") or "").strip()
-            answer = str(row.get("answer", "") or "").strip()
-            toks = row.get("tokens")
-            weights = row.get("target_weights")
-            yield {
-                "prompt": prompt,
-                "text": text if text else answer,
-                "answer": answer if answer else text,
-                "tokens": toks,
-                "target_weights": weights,
-            }
+        def _custom_gen():
+            nonlocal custom_it
+            while True:
+                row, custom_it = _next_or_reopen(custom_it, _open_custom_stream)
+                prompt = str(row.get("prompt", "") or "").strip()
+                text = str(row.get("text", "") or "").strip()
+                answer = str(row.get("answer", "") or "").strip()
+                toks = row.get("tokens")
+                weights = row.get("target_weights")
+                yield {
+                    "prompt": prompt,
+                    "text": text if text else answer,
+                    "answer": answer if answer else text,
+                    "tokens": toks,
+                    "target_weights": weights,
+                }
+
+        return _custom_gen()
 
     if source == "autonomous":
         # 4-Phase Developmental Autonomous Curriculum for V5 Base / 200B Campaign
