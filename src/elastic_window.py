@@ -258,6 +258,8 @@ def _open_hf_stream(
                 return iter(ds)
             except Exception as e:
                 err_str = str(e).lower()
+                if "no (supported) data files" in err_str or "not found" in err_str or "does not exist" in err_str:
+                    raise e
                 wait_t = min(30.0, (2.0 ** attempt) + random.uniform(0.5, 2.0))
                 if "429" in err_str or "rate limit" in err_str or "too many requests" in err_str:
                     print(f"⚠️ [DataStreamer] HuggingFace Rate Limit (429) on {repo}. Backing off {wait_t:.1f}s (retry {attempt+1}/{max_retries})...")
@@ -267,6 +269,8 @@ def _open_hf_stream(
 
         except Exception as e:
             err_str = str(e).lower()
+            if "no (supported) data files" in err_str or "not found" in err_str or "does not exist" in err_str:
+                raise e
             wait_t = min(30.0, (2.0 ** attempt) + random.uniform(0.5, 2.0))
             if "429" in err_str or "rate limit" in err_str or "too many requests" in err_str:
                 print(f"⚠️ [DataStreamer] HuggingFace Rate Limit (429) on {repo}. Backing off {wait_t:.1f}s (retry {attempt+1}/{max_retries})...")
