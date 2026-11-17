@@ -557,3 +557,33 @@ Standard causal language models are trained on raw next-token prediction over in
    - The formulation of the reasoning plan in `<think>`.
    - The exact tool call arguments in `<act>`.
    - The deductive synthesis that bridges the tool observation to the final grounded answer.
+
+---
+
+## 18. CerebroSpheroid V6 Blueprint: Radially-Tapered Cortical Spheroids ($D_k \propto r_k^2$)
+
+**Date:** November 17, 2026  
+**Implementation Modules:** [`src/spheroid_v5.py`](file:///home/ajit/Documents/Startup/Active_Development/cerebro_spheroid_v5/src/spheroid_v5.py), [`cerebro_spheroid_v6/docs/V6_RESEARCH_NOTES.md`](file:///home/ajit/Documents/Startup/Active_Development/cerebro_spheroid_v6/docs/V6_RESEARCH_NOTES.md)
+
+### 18.1 The Outward Volumetric Flow of Neural Capacity
+In a 3D spherical cavity, the differential volume and surface area scale quadratically: $A(r) = 4\pi r^2$.
+- The outer 20% of the radius ($r \in [0.8, 1.0]$) contains **48.8%** of the total sphere volume.
+- The inner core ($r \in [0.0, 0.2]$) contains only **0.8%** of the volume.
+
+Assigning uniform dimension $D$ across all concentric shells (as in V5) creates an information bottleneck: the core is over-parameterized relative to the surface channel bandwidth, causing shell depth scaling to plateau beyond $K = 32$.
+
+### 18.2 Quadratic Cortical Tapering Formulation
+In CerebroSpheroid V6, the channel dimension $D_k$ tapers quadratically from core to mantle:
+$$D_k = D_{\text{core}} + (D_{\text{mantle}} - D_{\text{core}}) \cdot \left(\frac{k}{K-1}\right)^2$$
+
+- **Outer Mantle ($k = K-1$):** $D_{\text{mantle}} = 1536 \dots 2048$ (high-resolution lexical, syntactic, and multimodal token interface).
+- **Intermediate Associative Shells ($k \approx K/2$):** $D_{\text{mid}} = 640 \dots 1024$ (relational routing and multi-hop association).
+- **Deep Subcortical Core ($k = 0$):** $D_{\text{core}} = 256 \dots 384$ (low-dimensional, highly stable invariant attractor manifold).
+
+### 18.3 Centripetal Compression vs. Centrifugal Expansion
+1. **Centripetal Wave (Surface $\to$ Core):** Successive inward projections $W_{k \to k-1}^{\text{in}} \in \mathbb{R}^{D_k \times D_{k-1}}$ compress surface lexical tokens into an invariant semantic centroid vector in $\mathbb{R}^{D_{\text{core}}}$.
+2. **Centrifugal Wave (Core $\to$ Surface):** Outward projections $W_{k \to k+1}^{\text{out}} \in \mathbb{R}^{D_k \times D_{k+1}}$ expand and articulate the core invariant, combining with Arcuate Fasciculus KV caches to predict tokens from the 32k vocabulary.
+
+### 18.4 Latency and FLOP Economics
+Because inner shell matrix operations ($256 \times 256$) are $36\times$ cheaper than mantle operations ($1536 \times 1536$), the average shell FLOP cost across the tapered hierarchy is $\approx 0.38 \cdot D_{\text{mantle}}^2$. A 64-shell tapered model runs with the computational footprint of a 24-shell uniform model, unlocking **512 effective layer operations at $T=4$** while breaking the $K=32$ plateau.
+
