@@ -1845,7 +1845,7 @@ class CerebroSpheroidV5(nn.Module):
                 soft_p = F.softmax(logits_in.float(), dim=-1).to(tied_w.dtype)
                 soft_emb = soft_p @ tied_w
                 soft_emb_diff = 0.2 * soft_emb + 0.8 * soft_emb.detach()
-                prev_thought, _ = self.sensory_dnn(soft_emb_diff, pos_offset=prompt_pos_offset + t + 1)
+                prev_thought, _ = self.sensory_dnn(soft_emb_diff, pos_offset=prompt_pos_offset + t)
 
                 state = self.volumetric_core.step_efference_fast(state, efference)
 
@@ -2091,7 +2091,7 @@ class CerebroSpheroidV5(nn.Module):
                 break
 
             # Thought re-afference & update causal KV buffer
-            prev_thought, (tok_k, tok_v) = self.sensory_dnn(flat_tok, pos_offset=L + t + 1)
+            prev_thought, (tok_k, tok_v) = self.sensory_dnn(flat_tok, pos_offset=L + t)
             causal_keys_list.append(tok_k)
             causal_values_list.append(tok_v)
 
@@ -2256,7 +2256,13 @@ class CerebroSpheroidV5(nn.Module):
         if return_parsed:
             return parsed
 
-        return parsed["answer"] if parsed["answer"] else (parsed["thinking"] if parsed["thinking"] else clean_motor_response(decoded))
+        if parsed.get("answer"):
+            return parsed["answer"]
+        if parsed.get("tool_calls"):
+            return parsed["tool_calls"][0]
+        if parsed.get("thinking"):
+            return parsed["thinking"]
+        return clean_motor_response(decoded)
 
     @torch.no_grad()
     def generate_tri_stream(

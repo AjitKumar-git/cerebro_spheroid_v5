@@ -1,61 +1,26 @@
 {
   "metadata": {
-    "checkpoint": "v5_small_sft_factual_calibrated.pt",
-    "step": 200,
-    "loss": 1.278980016708374,
-    "protocol": "stim_act",
-    "timestamp": "2026-11-16T06:29:13Z",
+    "checkpoint": "v5_small_latest_step920k.pt",
+    "step": 920500,
+    "loss": 2.6085169315338135,
+    "protocol": "raw",
+    "timestamp": "2026-11-17T14:50:09Z",
     "device": "cuda"
   },
   "summary": {
     "arc_challenge": {
       "acc": 0.0,
-      "acc_norm": 0.0,
-      "stderr": 0.0,
-      "n": 2,
-      "time_sec": 4.838561773300171
-    },
-    "arc_easy": {
-      "acc": 50.0,
-      "acc_norm": 0.0,
-      "stderr": 0.0,
-      "n": 2,
-      "time_sec": 0.07191038131713867
+      "acc_norm": 30.0,
+      "stderr": 14.491376746189438,
+      "n": 10,
+      "time_sec": 19.95926523208618
     },
     "hellaswag": {
-      "acc": 0.0,
-      "acc_norm": 0.0,
-      "stderr": 0.0,
-      "n": 2,
-      "time_sec": 0.06618523597717285
-    },
-    "mmlu": {
-      "acc": 0.0,
-      "acc_norm": 0.0,
-      "stderr": 0.0,
-      "n": 2,
-      "time_sec": 0.07357168197631836
-    },
-    "winogrande": {
-      "acc": 50.0,
-      "acc_norm": 50.0,
-      "stderr": 35.35533905932738,
-      "n": 2,
-      "time_sec": 2.435560703277588
-    },
-    "openbookqa": {
-      "acc": 0.0,
-      "acc_norm": 0.0,
-      "stderr": 0.0,
-      "n": 2,
-      "time_sec": 0.08022546768188477
-    },
-    "gsm8k": {
-      "acc": 0.0,
-      "acc_norm": 0.0,
-      "stderr": 0.0,
-      "n": 2,
-      "time_sec": 0.41651368141174316
+      "acc": 30.0,
+      "acc_norm": 30.0,
+      "stderr": 14.491376746189438,
+      "n": 10,
+      "time_sec": 0.36902379989624023
     }
   },
   "details": {
@@ -63,27 +28,61 @@
       {
         "q": "An astronomer observes that a planet rotates faster after a ",
         "target": "C",
-        "pred": "A",
-        "correct": false
+        "pred": "C",
+        "correct": true
       },
       {
         "q": "A group of engineers wanted to know how different building d",
         "target": "B",
         "pred": "D",
         "correct": false
-      }
-    ],
-    "arc_easy": [
+      },
       {
-        "q": "Which statement best explains why photosynthesis is the foun",
-        "target": "A",
+        "q": "The end result in the process of photosynthesis is the produ",
+        "target": "C",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "A physicist wants to determine the speed a car must reach to",
+        "target": "D",
+        "pred": "D",
+        "correct": true
+      },
+      {
+        "q": "An astronaut drops a 1.0 kg object and a 5.0 kg object on th",
+        "target": "D",
         "pred": "C",
         "correct": false
       },
       {
-        "q": "Which piece of safety equipment is used to keep mold spores ",
+        "q": "Devil facial tumor disease (DFTD) is a disease that is decim",
         "target": "B",
-        "pred": "A",
+        "pred": "C",
+        "correct": false
+      },
+      {
+        "q": "A type of small mammal from the mountain regions of the west",
+        "target": "C",
+        "pred": "C",
+        "correct": true
+      },
+      {
+        "q": "Petrified palm trees are found in sedimentary rock near glac",
+        "target": "C",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "Farmers in Wyoming were concerned because some of their chic",
+        "target": "B",
+        "pred": "D",
+        "correct": false
+      },
+      {
+        "q": "Copper is an element that is used in electrical wires. What ",
+        "target": "A",
+        "pred": "C",
         "correct": false
       }
     ],
@@ -91,69 +90,61 @@
       {
         "ctx": "A man is sitting on a roof. he",
         "target": 3,
-        "pred": 2,
+        "pred": 1,
         "correct": false
       },
       {
         "ctx": "A lady walks to a barbell. She bends down and grabs the pole",
         "target": 3,
-        "pred": 1,
+        "pred": 2,
         "correct": false
-      }
-    ],
-    "mmlu": [
+      },
       {
-        "q": "Find the degree for the given field extension Q(sqrt(2), sqr",
+        "ctx": "Two women in a child are shown in a canoe while a man pulls ",
+        "target": 2,
+        "pred": 2,
+        "correct": true
+      },
+      {
+        "ctx": "A boy is running down a track. the boy",
+        "target": 2,
+        "pred": 0,
+        "correct": false
+      },
+      {
+        "ctx": "The boy lifts his body above the height of a pole. The boy l",
         "target": 1,
         "pred": 2,
         "correct": false
       },
       {
-        "q": "Let p = (1, 2, 5, 4)(2, 3) in S_5 . Find the index of <p> in",
-        "target": 2,
-        "pred": 1,
+        "ctx": "The boy lands on his back on to a red mat. The boy gets up f",
+        "target": 1,
+        "pred": 2,
         "correct": false
-      }
-    ],
-    "winogrande": [
+      },
       {
-        "s": "Sarah was a much better surgeon than Maria so _ always got t",
+        "ctx": "A man is standing in front of a camera. He starts playing a ",
+        "target": 2,
+        "pred": 2,
+        "correct": true
+      },
+      {
+        "ctx": "A cartoon animation video is shown with people wandering aro",
+        "target": 0,
+        "pred": 2,
+        "correct": false
+      },
+      {
+        "ctx": "A man is holding a pocket knife while sitting on some rocks ",
         "target": 1,
         "pred": 1,
         "correct": true
       },
       {
-        "s": "Sarah was a much better surgeon than Maria so _ always got t",
-        "target": 0,
-        "pred": 1,
-        "correct": false
-      }
-    ],
-    "openbookqa": [
-      {
-        "q": "A person wants to start saving money so that they can afford",
+        "ctx": "Then he takes a small stone from the flowing river and smash",
         "target": 1,
-        "pred": 3,
-        "correct": false
-      },
-      {
-        "q": "There is most likely going to be fog around:",
-        "target": 0,
-        "pred": 1,
-        "correct": false
-      }
-    ],
-    "gsm8k": [
-      {
-        "q": "Janet\u2019s ducks lay 16 eggs per day. She eats three for breakf",
-        "target": "18",
-        "pred": null,
-        "correct": false
-      },
-      {
-        "q": "A robe takes 2 bolts of blue fiber and half that much white ",
-        "target": "3",
-        "pred": null,
+        "pred": 2,
         "correct": false
       }
     ]

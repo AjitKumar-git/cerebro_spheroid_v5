@@ -50,7 +50,9 @@ def run_probe(checkpoint_path: str, preset: str = "v5_small"):
     step = meta.get("step", "unknown")
     loss = meta.get("loss", "unknown")
     eval_loss = meta.get("eval_loss", "unknown")
-    print(f"✓ JAX Engine Ready | Step: {step} | Train Loss: {loss:.4f} | Eval Loss: {eval_loss:.4f}")
+    loss_str = f"{loss:.4f}" if isinstance(loss, (int, float)) else str(loss)
+    eval_str = f"{eval_loss:.4f}" if isinstance(eval_loss, (int, float)) else str(eval_loss)
+    print(f"✓ JAX Engine Ready | Step: {step} | Train Loss: {loss_str} | Eval Loss: {eval_str}")
     
     out_self_norm = float(jnp.linalg.norm(jax_params["sensory.out_self.weight"]))
     print(f"✓ Sensory Self-Attention Identity Parity: ||out_self|| = {out_self_norm:.6f} (0.0 = exact identity)\n")

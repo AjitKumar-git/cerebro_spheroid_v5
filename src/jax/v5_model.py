@@ -916,7 +916,7 @@ def training_rollout(
             tok_idx = lax.stop_gradient(jnp.where(pitfall_mask, top2[:, 1], top2[:, 0]))
         else:
             tok_idx = lax.stop_gradient(jnp.argmax(logits, axis=-1))
-        tok_flux, _ = encode_sensory(params, tok_idx[:, None], config=config, pos_offset=total_prompt_L + step_idx + 1)
+        tok_flux, _ = encode_sensory(params, tok_idx[:, None], config=config, pos_offset=total_prompt_L + step_idx)
         nxt_thought = lax.stop_gradient(tok_flux[:, 0, :]).astype(target_dtype)
 
         # Enforce exact carry type alignment
@@ -979,7 +979,7 @@ def training_rollout(
                     tok_idx,
                 )
             tok_flux, (new_k, new_v) = encode_sensory(
-                params, tok_idx[:, None], config=config, pos_offset=total_prompt_L + step_idx + 1
+                params, tok_idx[:, None], config=config, pos_offset=total_prompt_L + step_idx
             )
             nxt_thought = lax.stop_gradient(tok_flux[:, 0, :]).astype(target_dtype)
             new_k = lax.stop_gradient(new_k).astype(target_dtype)
