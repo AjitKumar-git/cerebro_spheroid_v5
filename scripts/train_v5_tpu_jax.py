@@ -209,6 +209,7 @@ def parse_args(args_list=None):
     parser.add_argument("--target-eval-loss", "--target_eval_loss", dest="target_eval_loss", type=float, default=1.60, help="Target held-out evaluation loss for convergence early stopping (default: 1.60)")
     parser.add_argument("--consistent-eval-threshold", "--consistent_eval_threshold", dest="consistent_eval_threshold", type=int, default=3, help="Consecutive evaluations required <= target-eval-loss to confirm convergence (default: 3)")
     parser.add_argument("--freeze_core", "--freeze-core", dest="freeze_core", action=argparse.BooleanOptionalAction, default=False, help="Enable cyclical cortical expansion pretraining (freeze core for 900 steps, anneal for 100 steps every 1000 steps)")
+    parser.add_argument("--freeze_until_step", "--freeze-until-step", dest="freeze_until_step", type=int, default=50000, help="Step number until which core freezing is active; after this step, core is permanently unfrozen for full end-to-end training (default: 50,000)")
     parser.add_argument("--cycle_length", "--cycle-length", dest="cycle_length", type=int, default=1000, help="Cycle length in steps for freeze/anneal consolidation (default: 1000)")
     parser.add_argument("--anneal_steps", "--anneal-steps", dest="anneal_steps", type=int, default=100, help="Steps within each cycle spent annealing/unfrozen (default: 100)")
     parser.add_argument("--teacher_digest", "--teacher-digest", dest="teacher_digest", type=str, default="none", choices=["online", "heuristic", "none"], help="Enable Teacher Digestion & Dynamic Next-Token Loss Weighting (default: none)")
@@ -495,7 +496,7 @@ def main(args=None):
 
     # Checkpoint Restoration or Clean Scratch Start
     if args.from_scratch:
-        print("\n🌱 [from_scratch=True] Initializing clean Step 0 training with random orthogonal weights (checkpoint restoration bypassed)!")
+        print("\n🌱 [from_scratch=True] Initializing clean Step 0 training with random orthogonal weights (zero foundation copying)!")
         start_step = 0
         best_eval_loss = float("inf")
         last_eval_loss = float("inf")
@@ -506,6 +507,43 @@ def main(args=None):
                     os.remove(old_f)
                 except Exception:
                     pass
+            old_j = old_f.replace(".pt", ".json")
+            if os.path.exists(old_j):
+                try:
+                    os.remove(old_j)
+                except Exception:
+                    pass
+
+        # Fix starting model at Step 0
+        step0_meta = {
+            "step": 0,
+            "loss": float("inf"),
+            "eval_loss": float("inf"),
+            "config": config,
+            "tokens_by_dataset": {},
+            "lifetime_tokens": 0,
+            "sync_model": sync_model_name,
+        }
+        step0_fname = f"{args.preset}_step0.pt"
+        step0_path = os.path.join(args.checkpoint_dir, step0_fname)
+        save_jax_to_torch_pt(params, buffers, local_latest, meta=step0_meta)
+        save_jax_to_torch_pt(params, buffers, step0_path, meta=step0_meta)
+        print(f"📦 [Starting Model Fixed] Clean base architecture saved at Step 0:\n   ├─ {local_latest}\n   └─ {step0_path}")
+
+        if args.cloud_sync:
+            try:
+                push_checkpoint_async(
+                    local_latest,
+                    step=0,
+                    loss=9.9999,
+                    target_type="latest",
+                    model=sync_model_name,
+                    url=args.cloud_url,
+                    token=args.cloud_token,
+                )
+                print(f"☁️ [cloud_sync] Fixed starting model registered on bioflo.in for model='{sync_model_name}' at Step 0.")
+            except Exception as e_sync:
+                print(f"⚠️ [cloud_sync] Notice on initial step 0 save: {e_sync}")
     else:
         # Cloud sync pull if active (pick whichever slot — named or root — has highest step)
         if args.cloud_sync:
@@ -551,62 +589,79 @@ def main(args=None):
                             local_latest = target_dest
                             print(f"✓ Restored latest checkpoint from cloud hub: {target_dest}")
                     else:
-                        print(f"ℹ️ [cloud_sync] No existing checkpoint on bioflo.in for {args.preset} (Step 0). Ready for foundation seeding.")
+                        print(f"ℹ️ [cloud_sync] No existing checkpoint on bioflo.in for {args.preset} (Step 0). Ready for clean training.")
             except Exception as e:
                 print(f"⚠️ [cloud_sync] Notice: {e}")
 
-        # Discover and restore latest local checkpoint or explicit foundation checkpoint
+        # Check if an existing checkpoint for THIS preset is already present (local or restored from cloud)
         discovered_ckpt = None
-        candidate_init = getattr(args, "init_from_checkpoint", None)
-        if candidate_init:
-            candidate_paths = [
-                candidate_init,
-                os.path.join(args.checkpoint_dir, candidate_init),
-                os.path.join(args.checkpoint_dir, f"{candidate_init}.pt"),
-                os.path.join("checkpoints", candidate_init),
-                os.path.join("checkpoints", f"{candidate_init}.pt"),
-                "/home/ajit/Documents/Startup/Active_Development/cerebro_spheroid_v5/checkpoints/v5_small_latest_step900k.pt"
-                if ("900" in str(candidate_init)) else None,
-                "/home/ajit/Documents/Startup/Active_Development/reasoning_agent/checkpoints/v5_small_latest_step900k.pt"
-                if ("900" in str(candidate_init)) else None,
-            ]
-            for p in candidate_paths:
-                if p and os.path.exists(p):
-                    discovered_ckpt = p
-                    break
+        existing_preset_step = 0
+        target_local = local_latest if os.path.exists(local_latest) else (fallback_latest if os.path.exists(fallback_latest) else None)
+        if target_local and os.path.exists(target_local):
+            try:
+                chk_test = torch.load(target_local, map_location="cpu", weights_only=False)
+                existing_preset_step = int(chk_test.get("step", 0))
+            except Exception:
+                existing_preset_step = 0
 
-            # If explicit foundation checkpoint not found locally, pull it from bioflo.in
-            if not discovered_ckpt and args.cloud_sync:
-                c_str = str(candidate_init).lower()
-                pull_model = "v5_small" if ("v5_small" in c_str or "step920" in c_str or "step900" in c_str or "foundation" in c_str) else None
-                dest_file = candidate_init if candidate_init.endswith(".pt") else f"{candidate_init}.pt"
-                dest_path = os.path.join(args.checkpoint_dir, dest_file)
-                print(f"🔄 [cloud_sync] Explicit foundation checkpoint '{candidate_init}' requested. Pulling model='{pull_model or 'v5_small'}' from bioflo.in...")
-                pulled_ok = pull_checkpoint(
-                    dest_path,
-                    target_type="latest",
-                    model=pull_model or "v5_small",
-                    url=args.cloud_url,
-                    token=args.cloud_token,
-                )
-                if pulled_ok and os.path.exists(dest_path):
-                    discovered_ckpt = dest_path
-                    print(f"✓ Restored foundation checkpoint from cloud hub: {dest_path}")
+        if existing_preset_step > 0:
+            discovered_ckpt = target_local
+            print(
+                f"✓ Found existing training checkpoint for {args.preset} at Step {existing_preset_step:,} ({discovered_ckpt}).\n"
+                f"   Resuming directly (foundation core re-copying completely bypassed to preserve trained weights)."
+            )
+        else:
+            # Only if no active preset checkpoint exists, check for explicit foundation checkpoint
+            candidate_init = getattr(args, "init_from_checkpoint", None)
+            if candidate_init:
+                candidate_paths = [
+                    candidate_init,
+                    os.path.join(args.checkpoint_dir, candidate_init),
+                    os.path.join(args.checkpoint_dir, f"{candidate_init}.pt"),
+                    os.path.join("checkpoints", candidate_init),
+                    os.path.join("checkpoints", f"{candidate_init}.pt"),
+                    "/home/ajit/Documents/Startup/Active_Development/cerebro_spheroid_v5/checkpoints/v5_small_latest_step900k.pt"
+                    if ("900" in str(candidate_init)) else None,
+                    "/home/ajit/Documents/Startup/Active_Development/reasoning_agent/checkpoints/v5_small_latest_step900k.pt"
+                    if ("900" in str(candidate_init)) else None,
+                ]
+                for p in candidate_paths:
+                    if p and os.path.exists(p):
+                        discovered_ckpt = p
+                        break
 
-            if discovered_ckpt:
-                print(f"📦 Loading base model weights from explicit checkpoint: {discovered_ckpt}")
-            else:
-                print(f"⚠️ Explicit checkpoint '{candidate_init}' not found locally or on cloud hub. Searching default checkpoint paths...")
+                # If explicit foundation checkpoint not found locally, pull it from bioflo.in
+                if not discovered_ckpt and args.cloud_sync:
+                    c_str = str(candidate_init).lower()
+                    pull_model = "v5_small" if ("v5_small" in c_str or "step920" in c_str or "step900" in c_str or "foundation" in c_str) else None
+                    dest_file = candidate_init if candidate_init.endswith(".pt") else f"{candidate_init}.pt"
+                    dest_path = os.path.join(args.checkpoint_dir, dest_file)
+                    print(f"🔄 [cloud_sync] Explicit foundation checkpoint '{candidate_init}' requested. Pulling model='{pull_model or 'v5_small'}' from bioflo.in...")
+                    pulled_ok = pull_checkpoint(
+                        dest_path,
+                        target_type="latest",
+                        model=pull_model or "v5_small",
+                        url=args.cloud_url,
+                        token=args.cloud_token,
+                    )
+                    if pulled_ok and os.path.exists(dest_path):
+                        discovered_ckpt = dest_path
+                        print(f"✓ Restored foundation checkpoint from cloud hub: {dest_path}")
 
-        if not discovered_ckpt:
-            if not os.path.exists(local_latest) and os.path.exists(fallback_latest):
-                local_latest = fallback_latest
-            if os.path.exists(local_latest):
-                discovered_ckpt = local_latest
-            else:
-                found_ckpt, found_step, found_loss = discover_latest_checkpoint(args.checkpoint_dir, preset=args.preset)
-                if found_ckpt:
-                    discovered_ckpt = found_ckpt
+                if discovered_ckpt:
+                    print(f"📦 Loading base model weights from explicit checkpoint: {discovered_ckpt}")
+                else:
+                    print(f"⚠️ Explicit checkpoint '{candidate_init}' not found locally or on cloud hub. Searching default checkpoint paths...")
+
+            if not discovered_ckpt:
+                if not os.path.exists(local_latest) and os.path.exists(fallback_latest):
+                    local_latest = fallback_latest
+                if os.path.exists(local_latest):
+                    discovered_ckpt = local_latest
+                else:
+                    found_ckpt, found_step, found_loss = discover_latest_checkpoint(args.checkpoint_dir, preset=args.preset)
+                    if found_ckpt:
+                        discovered_ckpt = found_ckpt
 
         if discovered_ckpt and os.path.exists(discovered_ckpt):
             try:
@@ -629,13 +684,16 @@ def main(args=None):
                 else:
                     print(f"⚠️ Restored & adapted {restored}/{len(params)} parameter arrays into JAX engine ({len(params) - restored} missing).")
                 
-                # Campaign Reset: Keep weights, reset schedule & step counter
+                # Campaign Reset: Keep weights, reset schedule & step counter ONLY when seeding from external foundation model
                 if getattr(args, "reset_step_counter", False):
-                    start_step = 0
-                    best_eval_loss = float("inf")
-                    last_eval_loss = float("inf")
-                    initial_ema_loss = None
-                    print("🌱 [Campaign Reset Active] Step counter reset to 0! Calibrating fresh schedule from adapted base weights.")
+                    if discovered_ckpt == target_local and existing_preset_step > 0:
+                        print(f"ℹ️ [Resumption Safeguard] Preserving Step {start_step:,} for active {args.preset} run (reset_step_counter ignored on resumption).")
+                    else:
+                        start_step = 0
+                        best_eval_loss = float("inf")
+                        last_eval_loss = float("inf")
+                        initial_ema_loss = None
+                        print("🌱 [Campaign Reset Active] Step counter reset to 0! Calibrating fresh schedule from adapted base weights.")
                 else:
                     if args.total_steps <= start_step:
                         args.total_steps = start_step + calculated_steps
@@ -670,6 +728,7 @@ def main(args=None):
         print(f"   • Total Compact Parameters  : {stats['total_params']:,} ({stats['total_params']/1e6:.2f}M)")
         print(f"   • Frozen Core & Headers      : {stats['frozen_params']:,} ({stats['frozen_pct']:.1f}%)")
         print(f"   • Trainable Outer Mantle     : {stats['trainable_params']:,} ({stats['trainable_pct']:.1f}%)")
+        print(f"   • Freeze Schedule Window     : Initial {getattr(args, 'freeze_until_step', 50000):,} steps (permanently unfrozen thereafter)")
         print(f"   • Cyclical Anneal Schedule   : Freeze {args.cycle_length - args.anneal_steps} steps ➔ Anneal {args.anneal_steps} steps (every {args.cycle_length} steps)")
         print("=" * 84 + "\n")
 
@@ -1095,8 +1154,18 @@ def main(args=None):
                 enc_alpha = 1.0
 
             # Cyclical Core Freeze & Consolidation Anneal Schedule
+            freeze_limit = getattr(args, "freeze_until_step", 50000)
+            is_past_freeze_limit = step >= freeze_limit
+            is_frozen_active = getattr(args, "freeze_core", False) and not is_past_freeze_limit
+
+            if getattr(args, "freeze_core", False) and step == freeze_limit:
+                print(
+                    f"\n🔓 [Cortical Maturation Triggered] Step {step:,} reached freeze limit ({freeze_limit:,})!\n"
+                    f"   Subcortical core permanently unfrozen. Full end-to-end mantle+core training active across all {config.num_shells} shells!\n"
+                )
+
             is_anneal = False
-            if getattr(args, "freeze_core", False):
+            if is_frozen_active:
                 step_in_cycle = step % args.cycle_length
                 is_anneal = step_in_cycle >= (args.cycle_length - args.anneal_steps)
                 if is_anneal:
@@ -1136,11 +1205,11 @@ def main(args=None):
                     step_tokens += prompt_b.shape[0] * (prompt_b.shape[1] + target_b.shape[1])
                 acc_grads = jax.tree_util.tree_map(lambda a: a * inv_accum, acc_grads)
                 loss = loss_acc * inv_accum
-                cur_apply_opt = apply_opt_step_anneal if (is_anneal or param_masks is None) else (apply_opt_step_frozen or apply_opt_step_anneal)
+                cur_apply_opt = apply_opt_step_anneal if (not is_frozen_active or is_anneal or param_masks is None) else (apply_opt_step_frozen or apply_opt_step_anneal)
                 params, opt_state = cur_apply_opt(params, opt_state, acc_grads, cur_lr)
             else:
                 prompt_b, target_b, feedback_b = _next_batch()
-                cur_train_step = train_step_fn_anneal if (is_anneal or param_masks is None) else (train_step_fn_frozen or train_step_fn_anneal)
+                cur_train_step = train_step_fn_anneal if (not is_frozen_active or is_anneal or param_masks is None) else (train_step_fn_frozen or train_step_fn_anneal)
                 params, opt_state, loss = cur_train_step(
                     params,
                     opt_state,
@@ -1186,7 +1255,10 @@ def main(args=None):
                 else:
                     tok_str = f"Tokens: {cumulative_tokens/1e9:5.3f}B | "
 
-                phase_tag = f" [{'ANNEAL' if is_anneal else 'FROZEN'}]" if getattr(args, "freeze_core", False) else ""
+                if getattr(args, "freeze_core", False):
+                    phase_tag = f" [{'ALL_TRAINABLE' if is_past_freeze_limit else ('ANNEAL' if is_anneal else 'FROZEN')}]"
+                else:
+                    phase_tag = ""
                 print(
                     f"[Step {step:6d}/{args.total_steps}]{phase_tag} "
                     f"{tok_str}"
