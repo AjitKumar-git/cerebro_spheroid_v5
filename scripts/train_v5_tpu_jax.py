@@ -1287,7 +1287,7 @@ def main(args=None):
                 if len(val_losses) == len(eval_domains):
                     for d_name, d_val in zip(eval_domains, val_losses):
                         d_ppl = math.exp(min(d_val, 20.0))
-                        print(f"   ├─ {d_name:<26}: Loss {d_val:.4f} (PPL: {d_ppl:.2f})")
+                        print(f"   ├─ {d_name:<44}: Loss {d_val:.4f} (PPL: {d_ppl:.2f})")
                 if hasattr(batcher, "get_tokens_by_dataset"):
                     ds_stats = batcher.get_tokens_by_dataset()
                     if ds_stats:

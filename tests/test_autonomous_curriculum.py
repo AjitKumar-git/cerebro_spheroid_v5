@@ -77,3 +77,104 @@ def test_offline_custom_dataset_schema():
         cols = table.column_names
         for expected in ["id", "category", "thinking_level", "prompt", "thinking", "action", "answer", "formatted_input", "formatted_output"]:
             assert expected in cols
+
+
+def test_canonical_eval_split_5pillars_alignment(monkeypatch):
+    import numpy as np
+    import src.elastic_window
+    from src.elastic_window import build_canonical_eval_split
+
+    # Fast offline execution via zero-latency fallback
+    monkeypatch.setattr(src.elastic_window, "_open_hf_stream", lambda *args, **kwargs: iter([]))
+
+    class MockTokenizer:
+        def __init__(self):
+            self.pad_token_id = 0
+            self.eos_token_id = 2
+
+        def encode(self, text, max_length=None):
+            words = text.split()
+            toks = [ord(w[0]) % 500 + 10 for w in words]
+            return toks[:max_length] if max_length else toks
+
+    tok = MockTokenizer()
+    eval_batches, eval_domains = build_canonical_eval_split(
+        tokenizer=tok,
+        batch_size=4,
+        prompt_len=128,
+        target_len=256,
+        target_pad_id=-100,
+        pad_id=0,
+    )
+
+    # Must contain exactly 5 aligned curriculum domains
+    assert len(eval_domains) == 5
+    assert "Educational Prose (FineWeb-Edu)" in eval_domains[0]
+    assert "Textbook Concepts (Cosmopedia v2)" in eval_domains[1]
+    assert "Mathematical Proofs (FineMath & GSM8K)" in eval_domains[2]
+    assert "Algorithmic Python (Code Large & Self-OSS)" in eval_domains[3]
+    assert "Commonsense Dialogue (SmolTalk)" in eval_domains[4]
+
+    assert len(eval_batches) == 5
+    for (q_arr, r_arr, fb_arr), d_name in zip(eval_batches, eval_domains):
+        assert q_arr.shape == (4, 128)
+        assert r_arr.shape == (4, 256)
+        assert fb_arr.shape == (4, 256)
+        assert q_arr.dtype == np.int32
+        assert r_arr.dtype == np.int32
+        assert fb_arr.dtype == np.int32
+
+        # Causal teacher-forcing feedback checks:
+        # Step 0 feedback token is always target_pad_id (-100)
+        assert np.all(fb_arr[:, 0] == -100)
+        # Shifted alignment: fb[:, 1:] equals target[:, :-1] wherever target is unpadded
+        unpadded_mask = (r_arr[:, 1:] != -100) & (r_arr[:, :-1] != -100)
+        assert np.array_equal(fb_arr[:, 1:][unpadded_mask], r_arr[:, :-1][unpadded_mask])
+        # Padded target positions are strictly masked with -100
+        assert np.all(fb_arr[r_arr == -100] == -100)
+
+
+def test_canonical_eval_split_streaming_records(monkeypatch):
+    import numpy as np
+    import src.elastic_window
+    from src.elastic_window import build_canonical_eval_split
+
+    # Mock _open_hf_stream yielding synthetic mock records
+    def mock_stream(repo, config_name=None, split="train", **kwargs):
+        return iter([
+            {"text": "Topic: General relativity and gravitational waves.\n\nGeneral relativity models gravitation as Riemannian curvature of spacetime.", "score": 4.5},
+            {"prompt": "Explain thermodynamics.", "text": "Thermodynamics governs heat, work, and entropy in physical systems.", "score": 4.2},
+            {"problem": "What is 5 * 6?", "solution": "<think>\nCompute 5 * 6 = 30.\n</think>\n30", "score": 4.8},
+            {"instruction": "Write a python function to add two numbers.", "code": "def add(a, b):\n    return a + b"},
+            {"messages": [{"role": "user", "content": "How are you?"}, {"role": "assistant", "content": "I am doing well, thank you!"}]},
+        ])
+
+    monkeypatch.setattr(src.elastic_window, "_open_hf_stream", mock_stream)
+
+    class MockTokenizer:
+        def __init__(self):
+            self.pad_token_id = 0
+            self.eos_token_id = 2
+
+        def encode(self, text, max_length=None):
+            words = text.split()
+            toks = [ord(w[0]) % 500 + 10 for w in words]
+            return toks[:max_length] if max_length else toks
+
+    tok = MockTokenizer()
+    eval_batches, eval_domains = build_canonical_eval_split(
+        tokenizer=tok,
+        batch_size=2,
+        prompt_len=64,
+        target_len=128,
+        target_pad_id=-100,
+        pad_id=0,
+    )
+
+    assert len(eval_domains) == 5
+    assert len(eval_batches) == 5
+    for q_arr, r_arr, fb_arr in eval_batches:
+        assert q_arr.shape == (2, 64)
+        assert r_arr.shape == (2, 128)
+        assert fb_arr.shape == (2, 128)
+        assert np.all(fb_arr[:, 0] == -100)
