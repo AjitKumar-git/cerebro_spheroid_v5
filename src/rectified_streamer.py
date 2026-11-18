@@ -309,13 +309,21 @@ class RectifiedContiguousPretrainStreamer:
                     except Exception:
                         continue
 
-                    # Tokenize without special prefix/suffix
-                    if hasattr(self.tokenizer, "encode"):
-                        toks = self.tokenizer.encode(doc_text, add_special_tokens=False)
+                    # Tokenize in bounded character chunks (<= 16k chars) to prevent HF >100k sequence length warnings
+                    CHUNK_CHAR_SIZE = 16384
+                    if len(doc_text) <= CHUNK_CHAR_SIZE:
+                        text_chunks = [doc_text]
                     else:
-                        toks = [ord(c) % 32000 for c in doc_text]
+                        text_chunks = [doc_text[ci : ci + CHUNK_CHAR_SIZE] for ci in range(0, len(doc_text), CHUNK_CHAR_SIZE)]
 
-                    buf.extend(toks)
+                    for c_text in text_chunks:
+                        if hasattr(self.tokenizer, "encode"):
+                            toks = self.tokenizer.encode(c_text, add_special_tokens=False)
+                        else:
+                            toks = [ord(c) % 32000 for c in c_text]
+                        buf.extend(toks)
+                        if len(buf) >= self.block_size * 2:
+                            break
                     buf.append(self.eos_token_id)
 
                 # Extract exactly block_size tokens

@@ -1143,10 +1143,13 @@ def main(args=None):
     if is_pretrain_source:
         try:
             from src.elastic_window import build_pretrain_eval_split
+            # Pretraining with RectifiedContiguousPretrainStreamer trains on contiguous document sequences
+            # seeded with a single BOS token (prompt_len=1). Align evaluation 1:1 with pretraining format.
+            eval_prompt_len = 1
             eval_batches, eval_domains, eval_weights = build_pretrain_eval_split(
                 tokenizer=tokenizer,
                 batch_size=args.batch_size,
-                prompt_len=args.prompt_len,
+                prompt_len=eval_prompt_len,
                 target_len=args.seq_len,
                 target_pad_id=-100,
                 pad_id=pad_id,

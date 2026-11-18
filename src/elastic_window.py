@@ -2071,8 +2071,12 @@ def build_pretrain_eval_split(
     eos_id = getattr(tokenizer, "eos_token_id", 2)
     if eos_id is None:
         eos_id = 2
+    bos_id = getattr(tokenizer, "bos_token_id", 1)
+    if bos_id is None:
+        bos_id = 1
 
-    seq_total = prompt_len + target_len
+    is_pure_pretrain = (prompt_len <= 1)
+    seq_total = target_len if is_pure_pretrain else (prompt_len + target_len)
     target_tokens_needed = batch_size * seq_total
 
     eval_batches = []
@@ -2095,7 +2099,7 @@ def build_pretrain_eval_split(
                     text = row
                 if text and len(text.strip()) >= 200:
                     collected_texts.append(text.strip())
-                if len(collected_texts) >= max(batch_size, 16) or scan_count >= 50:
+                if len(collected_texts) >= max(batch_size, 64) or scan_count >= max(batch_size * 2, 200):
                     break
         except Exception:
             pass
@@ -2114,7 +2118,7 @@ def build_pretrain_eval_split(
                                     for item in tbl[col].to_pylist():
                                         if item and len(item) > 200:
                                             collected_texts.append(item.strip())
-                                            if len(collected_texts) >= max(batch_size, 16):
+                                            if len(collected_texts) >= max(batch_size, 64):
                                                 break
                 elif ds_tag == "broad_web":
                     local_val_path = os.path.join(REPO_ROOT, "data", "cerebro_v5_custom_dataset", "validation.parquet")
@@ -2126,7 +2130,7 @@ def build_pretrain_eval_split(
                                 for item in tbl[col].to_pylist():
                                     if item and len(item) > 200:
                                         collected_texts.append(item.strip())
-                                        if len(collected_texts) >= max(batch_size, 16):
+                                        if len(collected_texts) >= max(batch_size, 64):
                                             break
             except Exception:
                 pass
@@ -2138,11 +2142,15 @@ def build_pretrain_eval_split(
         # Convert collected texts to unbroken contiguous token stream
         token_stream: List[int] = []
         for doc in collected_texts:
-            if hasattr(tokenizer, "encode"):
-                toks = encode_no_special(tokenizer, doc)
-            else:
-                toks = [ord(c) % 32000 for c in doc]
-            token_stream.extend(toks)
+            # Tokenize in safe chunks of <= 16k chars to prevent HF >100k sequence length warnings
+            CHUNK_CHAR_SIZE = 16384
+            doc_chunks = [doc[ci : ci + CHUNK_CHAR_SIZE] for ci in range(0, len(doc), CHUNK_CHAR_SIZE)] if len(doc) > CHUNK_CHAR_SIZE else [doc]
+            for c_doc in doc_chunks:
+                if hasattr(tokenizer, "encode"):
+                    toks = encode_no_special(tokenizer, c_doc)
+                else:
+                    toks = [ord(c) % 32000 for c in c_doc]
+                token_stream.extend(toks)
             token_stream.append(eos_id)
 
         # Safety fill if empty
@@ -2158,8 +2166,12 @@ def build_pretrain_eval_split(
         for i in range(batch_size):
             start_idx = i * seq_total
             chunk = token_stream[start_idx : start_idx + seq_total]
-            q_ids = chunk[:prompt_len]
-            r_ids = chunk[prompt_len : prompt_len + target_len]
+            if is_pure_pretrain:
+                q_ids = [bos_id]
+                r_ids = chunk[:target_len]
+            else:
+                q_ids = chunk[:prompt_len]
+                r_ids = chunk[prompt_len : prompt_len + target_len]
 
             if len(q_ids) < prompt_len:
                 q_ids = q_ids + [pad_id] * (prompt_len - len(q_ids))
