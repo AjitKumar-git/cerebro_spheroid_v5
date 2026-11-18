@@ -369,7 +369,8 @@ def main(args=None):
     print(f"✓ Total Parameters: {total_params / 1e6:.2f}M ({args.dtype.upper()} precision)")
 
     # 5. Initialize Optimizer State
-    opt_state = init_spheroid_opt_state(params, use_master_weights=(args.dtype != "fp32"))
+    # The optimizer always keeps float32 master weights for inexact parameters.
+    opt_state = init_spheroid_opt_state(params)
     step = 0
     best_eval_loss = float("inf")
 
