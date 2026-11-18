@@ -732,8 +732,14 @@ def main(args=None):
             try:
                 ckpt = torch.load(discovered_ckpt, map_location="cpu", weights_only=False)
                 start_step = int(ckpt.get("step", 0))
-                best_eval_loss = float(ckpt.get("eval_loss", ckpt.get("loss", float("inf"))))
-                last_eval_loss = best_eval_loss
+                saved_eval = float(ckpt.get("eval_loss", float("inf")))
+                saved_train_loss = float(ckpt.get("loss", float("inf")))
+                if saved_eval > 7.0 and saved_train_loss < 5.0:
+                    best_eval_loss = float("inf")
+                    last_eval_loss = float("inf")
+                else:
+                    best_eval_loss = saved_eval if math.isfinite(saved_eval) else saved_train_loss
+                    last_eval_loss = best_eval_loss
                 restored_ema = ckpt.get("ema_loss", ckpt.get("loss", ckpt.get("eval_loss", None)))
                 if restored_ema is not None and math.isfinite(float(restored_ema)) and float(restored_ema) > 0.0:
                     initial_ema_loss = float(restored_ema)
@@ -1143,10 +1149,13 @@ def main(args=None):
     if is_pretrain_source:
         try:
             from src.elastic_window import build_pretrain_eval_split
+            # Pretraining with RectifiedContiguousPretrainStreamer trains on contiguous document sequences
+            # seeded with a single BOS token (prompt_len=1). Align evaluation 1:1 with pretraining format.
+            eval_prompt_len = 1
             eval_batches, eval_domains, eval_weights = build_pretrain_eval_split(
                 tokenizer=tokenizer,
                 batch_size=args.batch_size,
-                prompt_len=args.prompt_len,
+                prompt_len=eval_prompt_len,
                 target_len=args.seq_len,
                 target_pad_id=-100,
                 pad_id=pad_id,

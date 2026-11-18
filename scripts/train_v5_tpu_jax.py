@@ -732,8 +732,14 @@ def main(args=None):
             try:
                 ckpt = torch.load(discovered_ckpt, map_location="cpu", weights_only=False)
                 start_step = int(ckpt.get("step", 0))
-                best_eval_loss = float(ckpt.get("eval_loss", ckpt.get("loss", float("inf"))))
-                last_eval_loss = best_eval_loss
+                saved_eval = float(ckpt.get("eval_loss", float("inf")))
+                saved_train_loss = float(ckpt.get("loss", float("inf")))
+                if saved_eval > 7.0 and saved_train_loss < 5.0:
+                    best_eval_loss = float("inf")
+                    last_eval_loss = float("inf")
+                else:
+                    best_eval_loss = saved_eval if math.isfinite(saved_eval) else saved_train_loss
+                    last_eval_loss = best_eval_loss
                 restored_ema = ckpt.get("ema_loss", ckpt.get("loss", ckpt.get("eval_loss", None)))
                 if restored_ema is not None and math.isfinite(float(restored_ema)) and float(restored_ema) > 0.0:
                     initial_ema_loss = float(restored_ema)
