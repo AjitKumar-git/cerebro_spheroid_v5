@@ -685,6 +685,12 @@ def main(args=None):
                     os.path.join(args.checkpoint_dir, f"{candidate_init}.pt"),
                     os.path.join("checkpoints", candidate_init),
                     os.path.join("checkpoints", f"{candidate_init}.pt"),
+                    os.path.join("/home/ajit/Documents/Startup/Active_Development/cerebro_checkpoints_archive", candidate_init),
+                    os.path.join("/home/ajit/Documents/Startup/Active_Development/cerebro_checkpoints_archive", f"{candidate_init}.pt"),
+                    os.path.join("/home/ajit/Documents/Startup/Active_Development/cerebro_checkpoints_archive/archived_v5_small_runs", candidate_init),
+                    os.path.join("/home/ajit/Documents/Startup/Active_Development/cerebro_checkpoints_archive/archived_v5_small_runs", f"{candidate_init}.pt"),
+                    "/home/ajit/Documents/Startup/Active_Development/cerebro_checkpoints_archive/archived_v5_small_runs/v5_small_latest_step900k.pt"
+                    if ("900" in str(candidate_init)) else None,
                     "/home/ajit/Documents/Startup/Active_Development/cerebro_spheroid_v5/checkpoints/v5_small_latest_step900k.pt"
                     if ("900" in str(candidate_init)) else None,
                     "/home/ajit/Documents/Startup/Active_Development/reasoning_agent/checkpoints/v5_small_latest_step900k.pt"

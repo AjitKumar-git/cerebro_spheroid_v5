@@ -136,7 +136,11 @@ def test_zero_regression_step_0_equivalence():
 
     ckpt_path = "checkpoints/v5_small_best.pt"
     if not os.path.exists(ckpt_path):
-        pytest.skip(f"Checkpoint {ckpt_path} not available for zero-regression integration test.")
+        archive_path = "/home/ajit/Documents/Startup/Active_Development/cerebro_checkpoints_archive/archived_v5_small_runs/v5_small_best.pt"
+        if os.path.exists(archive_path):
+            ckpt_path = archive_path
+        else:
+            pytest.skip(f"Checkpoint {ckpt_path} not available for zero-regression integration test.")
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 

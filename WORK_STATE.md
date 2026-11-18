@@ -1,19 +1,15 @@
 # Agent Work State & Activity Tracker
 
-> **Status**: 🟡 `IN_PROGRESS` | **Last Updated**: `2026-11-18T19:34:29.070609+05:30` | **Session**: `734a32d4-30f9-4fa4-b9c2-5336e0f58c27`
+> **Status**: 🟢 `COMPLETED` | **Last Updated**: `2026-11-18T19:35:25.353323+05:30` | **Session**: `734a32d4-30f9-4fa4-b9c2-5336e0f58c27`
 
 ## Current / Active Objective
 **Goal**: Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu') Registered Python module for 'tpu'. Device type: tpu, Device index: default Initializing TPU distributed runtime =========...
 
-- **Phase**: `executing`
-- **Current Task**: Executed run_command: Check git status before add
+- **Phase**: `completed`
+- **Current Task**: Idle / Awaiting next request
 
 ## Summary of Completed Work
-The auto-tuner, streaming, cloud sync, and XLA graph compilation all executed as expected:
-- **Auto-Tuning**: Selected verified parameters (`batch_size=128`, `remat=False`, targeting ~389,807 tok/s).
-- **Streamer**: Connected to `HuggingFaceFW/fineweb` (sample-10BT) and clean code stream.
-- **Starting Checkpoint**: Registered clean Step 0 weights to `bioflo.in` (211.8 MB).
-- **XLA Compilation**: Succeeded in 99.6s with an initial loss of **10.5372**.
+The held-out evaluation for Stage 1 base pretraining has been updated to evaluate exclusively on the **pretraining dataset distribution** (85% Broad Web + 15% Code Repositories). The synthetic dialogue, math derivation, and textbook benchmarks (`FineWeb-Edu`, `Cosmopedia v2`, `FineMath & GSM8K`, `SmolTalk`) have been removed from Stage 1 evaluation and deferred to Mid-training and SFT.
 
 ## Modified Files
 - [`scripts/run_weight_transfer_experiment.py`](scripts/run_weight_transfer_experiment.py)
@@ -126,6 +122,9 @@ The auto-tuner, streaming, cloud sync, and XLA graph compilation all executed as
 ## Recent Actions (Last 10)
 | Time | Tool | Details |
 | :--- | :--- | :--- |
+| `19:34:58` | `run_command` | Push to origin main |
+| `19:34:46` | `run_command` | Commit pretrain eval split changes |
+| `19:34:36` | `run_command` | Stage modified files |
 | `19:34:29` | `run_command` | Check git status before add |
 | `19:34:22` | `run_command` | Check git diff on other files |
 | `19:34:15` | `run_command` | Check git diff stat |
@@ -133,9 +132,6 @@ The auto-tuner, streaming, cloud sync, and XLA graph compilation all executed as
 | `19:33:42` | `edit_file` | edit_file |
 | `18:06:10` | `run_command` | Test build_pretrain_eval_split offline robustness |
 | `18:04:30` | `run_command` | Check task-4457 log |
-| `18:04:21` | `manage_task` | manage_task |
-| `18:03:58` | `read_file` | read_file |
-| `18:03:50` | `manage_task` | manage_task |
 
 ---
 *This file is automatically maintained by `auto-work-tracker`. Other agents can parse `.agents/work_state.json` or inspect this file directly to resume or review progress.*

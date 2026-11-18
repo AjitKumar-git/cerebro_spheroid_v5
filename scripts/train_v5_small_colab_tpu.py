@@ -127,10 +127,10 @@ def parse_args(args_list: Optional[List[str]] = None):
     # Training Mode & Curriculum Stage
     parser.add_argument("--mode", type=str, default="contiguous_pretrain",
                         choices=["contiguous_pretrain", "sft"],
-                        help="Training mode: 'contiguous_pretrain' (100% loss-bearing tokens on full dataset) or 'sft'")
+                        help="Training mode: 'contiguous_pretrain' (100%% loss-bearing tokens on full dataset) or 'sft'")
     parser.add_argument("--stage", type=str, default="pretrain",
                         choices=["pretrain", "midtrain", "balanced"],
-                        help="Curriculum stage: 'pretrain' (85% FineWeb broad web + 15% code; 10B-15B full dataset), 'midtrain' (skills, math, retrieval), or 'balanced'")
+                        help="Curriculum stage: 'pretrain' (85%% FineWeb broad web + 15%% code; 10B-15B full dataset), 'midtrain' (skills, math, retrieval), or 'balanced'")
 
     # Context & Target Horizon (Longest possible 4096-token window)
     parser.add_argument("--prompt-len", "--prompt_len", type=int, default=2048,

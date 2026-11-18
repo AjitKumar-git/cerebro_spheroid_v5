@@ -208,7 +208,7 @@ def main():
     parser.add_argument("--checkpoint", type=str, default="checkpoints/v5_small_agentic_tool_aligned.pt", help="Path to checkpoint .pt file")
     parser.add_argument("--lengths", type=str, default="256,512,1024,2048,4096", help="Comma-separated context lengths (default: 256,512,1024,2048,4096)")
     parser.add_argument("--depths", type=str, default="0.1,0.5,0.9", help="Comma-separated needle depths (default: 0.1,0.5,0.9)")
-    parser.add_argument("--trials", type=int, default=5, help="Number of trials per cell (default: 5 for 20% statistical granularity)")
+    parser.add_argument("--trials", type=int, default=5, help="Number of trials per cell (default: 5 for 20%% statistical granularity)")
     parser.add_argument("--digits", type=int, default=5, choices=[1, 2, 3, 4, 5], help="Number of digits in passkey (default: 5)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to run inference on")
     parser.add_argument("--tokenizer", type=str, default="auto", help="Tokenizer name, path, or 'auto' (detects 32k vs Qwen from config)")
