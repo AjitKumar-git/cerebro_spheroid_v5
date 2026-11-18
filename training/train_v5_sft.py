@@ -74,7 +74,12 @@ from src.jax.v5_model import (
     rms_norm,
 )
 from src.jax.checkpoint import adapt_and_load_checkpoint_weights, discover_latest_checkpoint, AsyncCheckpointManager
-from autotune import resolve_jax_compute_dtype, run_auto_tuner
+from autotune import (
+    resolve_jax_compute_dtype,
+    run_auto_tuner,
+    is_oom_error,
+    TrainingOOMHandler,
+)
 from src.jax.data_streamer import LinguisticDataStreamer
 from src.jax.spheroid_optimizer import init_spheroid_opt_state, build_spheroid_train_engine
 from src.elastic_window import (
@@ -317,6 +322,13 @@ def main(args=None):
         eff_bs = args.batch_size * args.grad_accum
 
     eff_batch_size = eff_bs
+    oom_handler = TrainingOOMHandler(
+        initial_batch_size=args.batch_size,
+        effective_batch_size=eff_batch_size,
+        initial_grad_accum=args.grad_accum,
+        min_batch_size=1,
+        verbose=True,
+    )
     tokens_per_opt_step = eff_batch_size * (args.prompt_len + args.seq_len)
     if getattr(args, "target_tokens", None) is not None and args.target_tokens > 0:
         calculated_steps = int(math.ceil(float(args.target_tokens) / max(1.0, float(tokens_per_opt_step))))
@@ -645,45 +657,60 @@ def main(args=None):
             else:
                 enc_alpha = 1.0
 
-            # SFT Optimization Step with Multi-Step Gradient Accumulation
-            if args.grad_accum > 1:
-                acc_grads = None
-                loss_acc = 0.0
-                step_tokens = 0
-                inv_accum = 1.0 / float(args.grad_accum)
-                for _ in range(args.grad_accum):
-                    b_tup = prefetched_sft.get_batch()
-                    prompt_b, target_b, feedback_b = _unpack_batch(b_tup)
-                    g_loss, micro_grads = compute_grad_step(
-                        params, prompt_b, target_b, feedback_tokens=feedback_b,
-                        sampling_p=args.sampling_p, deliberation_mode=args.deliberation_mode,
-                        encephalization_alpha=enc_alpha,
+            # SFT Optimization Step with Multi-Step Gradient Accumulation & OOM Fallback
+            step_executed = False
+            while not step_executed:
+                prompt_b, target_b, feedback_b = None, None, None
+                try:
+                    if args.grad_accum > 1:
+                        acc_grads = None
+                        loss_acc = 0.0
+                        step_tokens = 0
+                        inv_accum = 1.0 / float(args.grad_accum)
+                        for _ in range(args.grad_accum):
+                            prompt_b, target_b, feedback_b = oom_handler.slicer.get_micro_batch(
+                                args.batch_size, lambda: _unpack_batch(prefetched_sft.get_batch())
+                            )
+                            g_loss, micro_grads = compute_grad_step(
+                                params, prompt_b, target_b, feedback_tokens=feedback_b,
+                                sampling_p=args.sampling_p, deliberation_mode=args.deliberation_mode,
+                                encephalization_alpha=enc_alpha,
+                            )
+                            acc_grads = (
+                                micro_grads
+                                if acc_grads is None
+                                else jax.tree_util.tree_map(lambda a, b: a + b, acc_grads, micro_grads)
+                            )
+                            loss_acc = loss_acc + g_loss
+                            step_tokens += prompt_b.shape[0] * (prompt_b.shape[1] + target_b.shape[1])
+                        acc_grads = jax.tree_util.tree_map(lambda a: a * inv_accum, acc_grads)
+                        loss_val = float(loss_acc * inv_accum)
+                        params, opt_state = apply_opt_step(params, opt_state, acc_grads, cur_lr)
+                    else:
+                        prompt_b, target_b, feedback_b = oom_handler.slicer.get_micro_batch(
+                            args.batch_size, lambda: _unpack_batch(prefetched_sft.get_batch())
+                        )
+                        params, opt_state, loss = sft_single_step_fn(
+                            params,
+                            opt_state,
+                            prompt_b,
+                            target_b,
+                            cur_lr,
+                            feedback_tokens=feedback_b,
+                            sampling_p=args.sampling_p,
+                            encephalization_alpha=enc_alpha,
+                        )
+                        loss_val = float(loss)
+                        step_tokens = prompt_b.shape[0] * (prompt_b.shape[1] + target_b.shape[1])
+                    step_executed = True
+                except Exception as e_sft:
+                    if not is_oom_error(e_sft) or args.batch_size <= 1:
+                        raise
+                    failed_tup = (prompt_b, target_b, feedback_b) if prompt_b is not None else None
+                    args.batch_size, args.grad_accum = oom_handler.handle_oom(
+                        e_sft, step=step, failed_batch=failed_tup
                     )
-                    acc_grads = (
-                        micro_grads
-                        if acc_grads is None
-                        else jax.tree_util.tree_map(lambda a, b: a + b, acc_grads, micro_grads)
-                    )
-                    loss_acc = loss_acc + g_loss
-                    step_tokens += prompt_b.shape[0] * (prompt_b.shape[1] + target_b.shape[1])
-                acc_grads = jax.tree_util.tree_map(lambda a: a * inv_accum, acc_grads)
-                loss_val = float(loss_acc * inv_accum)
-                params, opt_state = apply_opt_step(params, opt_state, acc_grads, cur_lr)
-            else:
-                b_tup = prefetched_sft.get_batch()
-                prompt_b, target_b, feedback_b = _unpack_batch(b_tup)
-                params, opt_state, loss = sft_single_step_fn(
-                    params,
-                    opt_state,
-                    prompt_b,
-                    target_b,
-                    cur_lr,
-                    feedback_tokens=feedback_b,
-                    sampling_p=args.sampling_p,
-                    encephalization_alpha=enc_alpha,
-                )
-                loss_val = float(loss)
-                step_tokens = prompt_b.shape[0] * (prompt_b.shape[1] + target_b.shape[1])
+                    oom_handler.update_streamer(prefetched_sft)
 
             # Divergence Watchdog
             if math.isfinite(loss_val) and loss_val <= 4.5:

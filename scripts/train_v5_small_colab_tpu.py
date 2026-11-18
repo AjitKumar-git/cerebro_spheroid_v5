@@ -117,6 +117,7 @@ from src.elastic_window import (
 )
 from src.rectified_streamer import RectifiedContiguousPretrainStreamer
 from src.jax.data_streamer import LinguisticDataStreamer
+from autotune.fallback import is_oom_error, compute_fallback_batch_size
 
 
 def parse_args(args_list: Optional[List[str]] = None):
@@ -559,10 +560,28 @@ def main(args=None):
                 loss_scalar = float(loss_val)
         else:
             tokens_in_batch = prompts.shape[0] * (prompts.shape[1] + targets.shape[1])
-            params, opt_state, loss_val = train_step_fn(
-                params, opt_state, prompts, targets, cur_lr, fb_tokens, 1.0
-            )
-            loss_scalar = float(loss_val)
+            try:
+                params, opt_state, loss_val = train_step_fn(
+                    params, opt_state, prompts, targets, cur_lr, fb_tokens, 1.0
+                )
+                loss_scalar = float(loss_val)
+            except Exception as e_train:
+                if not is_oom_error(e_train) or prompts.shape[0] <= 1:
+                    raise
+                old_bs = prompts.shape[0]
+                new_bs = compute_fallback_batch_size(old_bs)
+                print(f"\n⚠️ [OOM Fallback] Out-Of-Memory detected at Step {step}! Falling back micro-batch {old_bs} -> {new_bs}...")
+                num_chunks = int(math.ceil(old_bs / new_bs))
+                losses = []
+                for c_idx in range(num_chunks):
+                    c_p = prompts[c_idx * new_bs : (c_idx + 1) * new_bs]
+                    c_t = targets[c_idx * new_bs : (c_idx + 1) * new_bs]
+                    c_fb = fb_tokens[c_idx * new_bs : (c_idx + 1) * new_bs] if fb_tokens is not None else None
+                    params, opt_state, loss_c = train_step_fn(
+                        params, opt_state, c_p, c_t, cur_lr, c_fb, 1.0
+                    )
+                    losses.append(float(loss_c))
+                loss_scalar = float(np.mean(losses))
 
         total_tokens_processed += tokens_in_batch
         step += 1

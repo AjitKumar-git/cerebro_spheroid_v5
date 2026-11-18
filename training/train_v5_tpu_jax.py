@@ -112,7 +112,12 @@ from src.elastic_window import (
     get_default_elastic_buckets,
 )
 from src.jax.data_streamer import LinguisticDataStreamer
-from autotune import run_auto_tuner, resolve_jax_compute_dtype
+from autotune import (
+    run_auto_tuner,
+    resolve_jax_compute_dtype,
+    is_oom_error,
+    TrainingOOMHandler,
+)
 
 
 def parse_args(args_list=None):
@@ -841,6 +846,13 @@ def main(args=None):
 
     # 6. Spheroid Optimizer & JIT / Multi-TPU Local-SGD Train Step Engine
     grad_accum = max(1, int(getattr(args, "grad_accum", 1)))
+    oom_handler = TrainingOOMHandler(
+        initial_batch_size=args.batch_size,
+        effective_batch_size=eff_batch_size,
+        initial_grad_accum=grad_accum,
+        min_batch_size=1,
+        verbose=True,
+    )
     multi_mode = getattr(args, "multi_tpu", "auto")
     use_multi_tpu_local_sgd = (num_devices > 1) and (args.optimizer == "spheroid") and (multi_mode != "single")
     eff_num_devices = num_devices if use_multi_tpu_local_sgd else 1
@@ -1155,36 +1167,55 @@ def main(args=None):
         init_loss_val = float(initial_loss[0])
         del _warm_p, _warm_opt
     else:
-        dummy_prompts = jnp.zeros((args.batch_size, dummy_prompt_len), dtype=jnp.int32)
-        dummy_targets = jnp.zeros((args.batch_size, dummy_target_len), dtype=jnp.int32)
-        dummy_feedback = (
-            jnp.full((args.batch_size, dummy_target_len), -100, dtype=jnp.int32)
-            if (elastic_batcher is not None or is_pretrain_source)
-            else None
-        )
-        if compute_grad_step is not None and grad_accum > 1:
-            _warm_loss, _warm_grads = compute_grad_step(
-                params,
-                dummy_prompts,
-                dummy_targets,
-                feedback_tokens=dummy_feedback,
-                sampling_p=args.min_sampling_p,
+        while True:
+            dummy_prompts = jnp.zeros((args.batch_size, dummy_prompt_len), dtype=jnp.int32)
+            dummy_targets = jnp.zeros((args.batch_size, dummy_target_len), dtype=jnp.int32)
+            dummy_feedback = (
+                jnp.full((args.batch_size, dummy_target_len), -100, dtype=jnp.int32)
+                if (elastic_batcher is not None or is_pretrain_source)
+                else None
             )
-            jax.block_until_ready(_warm_loss)
-            init_loss_val = float(_warm_loss)
-            del _warm_loss, _warm_grads
-        else:
-            _warm_p, _warm_opt, initial_loss = train_step_fn(
-                params,
-                opt_state,
-                dummy_prompts,
-                dummy_targets,
-                args.lr,
-                feedback_tokens=dummy_feedback,
-            )
-            jax.block_until_ready(initial_loss)
-            init_loss_val = float(initial_loss)
-            del _warm_p, _warm_opt
+            try:
+                if compute_grad_step is not None and grad_accum > 1:
+                    _warm_loss, _warm_grads = compute_grad_step(
+                        params,
+                        dummy_prompts,
+                        dummy_targets,
+                        feedback_tokens=dummy_feedback,
+                        sampling_p=args.min_sampling_p,
+                    )
+                    jax.block_until_ready(_warm_loss)
+                    init_loss_val = float(_warm_loss)
+                    del _warm_loss, _warm_grads
+                else:
+                    _warm_p, _warm_opt, initial_loss = train_step_fn(
+                        params,
+                        opt_state,
+                        dummy_prompts,
+                        dummy_targets,
+                        args.lr,
+                        feedback_tokens=dummy_feedback,
+                    )
+                    jax.block_until_ready(initial_loss)
+                    init_loss_val = float(initial_loss)
+                    del _warm_p, _warm_opt
+                break
+            except Exception as e_warm:
+                if not is_oom_error(e_warm) or args.batch_size <= 1:
+                    raise
+                args.batch_size, grad_accum = oom_handler.handle_oom(e_warm, step=0)
+                oom_handler.update_streamer(elastic_batcher or local_streamer)
+                if grad_accum > 1 and compute_grad_step is None:
+                    compute_grad_step, apply_opt_step_anneal = build_spheroid_train_engine(
+                        config, buffers, pad_id=pad_id, weight_decay=args.weight_decay,
+                        repetition_penalty=args.repetition_penalty, remat=remat_choice,
+                        deliberation_mode=args.deliberation_mode, param_masks=None,
+                    )
+                    _, apply_opt_step_frozen = build_spheroid_train_engine(
+                        config, buffers, pad_id=pad_id, weight_decay=args.weight_decay,
+                        repetition_penalty=args.repetition_penalty, remat=remat_choice,
+                        deliberation_mode=args.deliberation_mode, param_masks=param_masks,
+                    ) if param_masks is not None else (None, apply_opt_step_anneal)
     if start_step > 0 and math.isfinite(best_eval_loss):
         print(f"✓ XLA Compilation complete in {time.time() - t0_compile:.2f}s! Baseline Restored Loss: {best_eval_loss:.4f} (Tracer init: {init_loss_val:.2f})")
     else:
@@ -1552,45 +1583,70 @@ def main(args=None):
                 )
                 loss = float(loss_rep[0])
                 step_tokens, step_prompt, step_loss, step_pad = _count_real_tokens(q_shard, r_shard)
-            elif compute_grad_step is not None and grad_accum > 1:
-                acc_grads = None
-                loss_acc = 0.0
-                step_tokens, step_prompt, step_loss, step_pad = 0, 0, 0, 0
-                inv_accum = 1.0 / float(grad_accum)
-                for _ in range(grad_accum):
-                    prompt_b, target_b, feedback_b = _next_batch()
-                    g_loss, micro_grads = compute_grad_step(
-                        params, prompt_b, target_b, feedback_tokens=feedback_b, sampling_p=cur_sampling_p, deliberation_mode=args.deliberation_mode, encephalization_alpha=enc_alpha
-                    )
-                    acc_grads = (
-                        micro_grads
-                        if acc_grads is None
-                        else jax.tree_util.tree_map(lambda a, b: a + b, acc_grads, micro_grads)
-                    )
-                    loss_acc = loss_acc + g_loss
-                    m_tok, m_p, m_l, m_pad = _count_real_tokens(prompt_b, target_b)
-                    step_tokens += m_tok
-                    step_prompt += m_p
-                    step_loss += m_l
-                    step_pad += m_pad
-                acc_grads = jax.tree_util.tree_map(lambda a: a * inv_accum, acc_grads)
-                loss = loss_acc * inv_accum
-                cur_apply_opt = apply_opt_step_anneal if (not is_frozen_active or is_anneal or param_masks is None) else (apply_opt_step_frozen or apply_opt_step_anneal)
-                params, opt_state = cur_apply_opt(params, opt_state, acc_grads, cur_lr)
             else:
-                prompt_b, target_b, feedback_b = _next_batch()
-                cur_train_step = train_step_fn_anneal if (not is_frozen_active or is_anneal or param_masks is None) else (train_step_fn_frozen or train_step_fn_anneal)
-                params, opt_state, loss = cur_train_step(
-                    params,
-                    opt_state,
-                    prompt_b,
-                    target_b,
-                    cur_lr,
-                    feedback_tokens=feedback_b,
-                    sampling_p=cur_sampling_p,
-                    encephalization_alpha=enc_alpha,
-                )
-                step_tokens, step_prompt, step_loss, step_pad = _count_real_tokens(prompt_b, target_b)
+                step_executed = False
+                while not step_executed:
+                    prompt_b, target_b, feedback_b = None, None, None
+                    try:
+                        if compute_grad_step is not None and grad_accum > 1:
+                            acc_grads = None
+                            loss_acc = 0.0
+                            step_tokens, step_prompt, step_loss, step_pad = 0, 0, 0, 0
+                            inv_accum = 1.0 / float(grad_accum)
+                            for _ in range(grad_accum):
+                                prompt_b, target_b, feedback_b = oom_handler.slicer.get_micro_batch(args.batch_size, _next_batch)
+                                g_loss, micro_grads = compute_grad_step(
+                                    params, prompt_b, target_b, feedback_tokens=feedback_b, sampling_p=cur_sampling_p, deliberation_mode=args.deliberation_mode, encephalization_alpha=enc_alpha
+                                )
+                                acc_grads = (
+                                    micro_grads
+                                    if acc_grads is None
+                                    else jax.tree_util.tree_map(lambda a, b: a + b, acc_grads, micro_grads)
+                                )
+                                loss_acc = loss_acc + g_loss
+                                m_tok, m_p, m_l, m_pad = _count_real_tokens(prompt_b, target_b)
+                                step_tokens += m_tok
+                                step_prompt += m_p
+                                step_loss += m_l
+                                step_pad += m_pad
+                            acc_grads = jax.tree_util.tree_map(lambda a: a * inv_accum, acc_grads)
+                            loss = loss_acc * inv_accum
+                            cur_apply_opt = apply_opt_step_anneal if (not is_frozen_active or is_anneal or param_masks is None) else (apply_opt_step_frozen or apply_opt_step_anneal)
+                            params, opt_state = cur_apply_opt(params, opt_state, acc_grads, cur_lr)
+                        else:
+                            prompt_b, target_b, feedback_b = oom_handler.slicer.get_micro_batch(args.batch_size, _next_batch)
+                            cur_train_step = train_step_fn_anneal if (not is_frozen_active or is_anneal or param_masks is None) else (train_step_fn_frozen or train_step_fn_anneal)
+                            params, opt_state, loss = cur_train_step(
+                                params,
+                                opt_state,
+                                prompt_b,
+                                target_b,
+                                cur_lr,
+                                feedback_tokens=feedback_b,
+                                sampling_p=cur_sampling_p,
+                                encephalization_alpha=enc_alpha,
+                            )
+                            step_tokens, step_prompt, step_loss, step_pad = _count_real_tokens(prompt_b, target_b)
+                        step_executed = True
+                    except Exception as e_step:
+                        if not is_oom_error(e_step) or args.batch_size <= 1:
+                            raise
+                        failed_tup = (prompt_b, target_b, feedback_b) if prompt_b is not None else None
+                        args.batch_size, grad_accum = oom_handler.handle_oom(
+                            e_step, step=step, failed_batch=failed_tup
+                        )
+                        oom_handler.update_streamer(elastic_batcher or local_streamer)
+                        if compute_grad_step is None:
+                            compute_grad_step, apply_opt_step_anneal = build_spheroid_train_engine(
+                                config, buffers, pad_id=pad_id, weight_decay=args.weight_decay,
+                                repetition_penalty=args.repetition_penalty, remat=remat_choice,
+                                deliberation_mode=args.deliberation_mode, param_masks=None,
+                            )
+                            _, apply_opt_step_frozen = build_spheroid_train_engine(
+                                config, buffers, pad_id=pad_id, weight_decay=args.weight_decay,
+                                repetition_penalty=args.repetition_penalty, remat=remat_choice,
+                                deliberation_mode=args.deliberation_mode, param_masks=param_masks,
+                            ) if param_masks is not None else (None, apply_opt_step_anneal)
 
             loss_val = float(loss)
             if math.isfinite(loss_val):

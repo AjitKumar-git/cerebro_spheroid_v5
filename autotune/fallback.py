@@ -233,7 +233,9 @@ class TrainingOOMHandler:
         """Propagates the new batch size to the active data streamer or batcher."""
         if streamer is None:
             return
-        if hasattr(streamer, "batcher") and hasattr(streamer.batcher, "batch_size"):
-            streamer.batcher.batch_size = self.batch_size
-        elif hasattr(streamer, "batch_size"):
+        if hasattr(streamer, "batch_size"):
             streamer.batch_size = self.batch_size
+        if hasattr(streamer, "batcher") and getattr(streamer, "batcher", None) is not None:
+            batcher = getattr(streamer, "batcher")
+            if hasattr(batcher, "batch_size"):
+                batcher.batch_size = self.batch_size
