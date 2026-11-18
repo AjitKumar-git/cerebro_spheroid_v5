@@ -22,6 +22,7 @@ data/*
 !data/tokenizer/
 !data/tokenizer/**
 !data/chat_thinking_sft_15k.jsonl
+!data/retrieval_curriculum_data.jsonl
 archive/
 !colab/archive/
 .hf_cache/

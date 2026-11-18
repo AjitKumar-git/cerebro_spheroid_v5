@@ -132,13 +132,30 @@ def load_harmonized_dataset(
     vocab_size: int,
     slot_oversample: int = 6,
     max_cot_samples: int = 1500,
-    max_prompt_len: int = 256,
-    max_target_len: int = 512,
+    max_prompt_len: int = 2048,
+    max_target_len: int = 1024,
     anchor_weight: float = 5.0,
 ) -> List[Dict[str, Any]]:
     """Loads a balanced 50/50 dataset with oversampled slot QA and Answer-Anchor weighting."""
     print("\n📦 Assembling Harmonized 50/50 SFT Dataset...")
     tokenized_entries = []
+    eos_id = getattr(tokenizer, "eos_token_id", 2) or 2
+
+    def _prepare_prompt_ids(p_str: str) -> List[int]:
+        ids = [t % vocab_size for t in encode_no_special(tokenizer, p_str)]
+        if len(ids) > max_prompt_len:
+            prefix_len = min(32, max_prompt_len // 4)
+            suffix_len = max_prompt_len - prefix_len
+            ids = ids[:prefix_len] + ids[-suffix_len:]
+        return ids
+
+    def _prepare_target_ids(a_str: str) -> List[int]:
+        ids = [t % vocab_size for t in encode_no_special(tokenizer, a_str)]
+        if len(ids) == 0 or ids[-1] != eos_id:
+            ids.append(eos_id)
+        if len(ids) > max_target_len:
+            ids = ids[: max_target_len - 1] + [eos_id]
+        return ids
 
     # 1. Direct Slot QA (Oversampled to balance gradient volume)
     raw_slot_pairs = build_expanded_slot_qa_corpus()
@@ -148,8 +165,8 @@ def load_harmonized_dataset(
         for q, a in raw_slot_pairs:
             p_str = format_stimulus_prompt(q)
             a_str = format_motor_response(a)
-            p_ids = [t % vocab_size for t in encode_no_special(tokenizer, p_str)][:max_prompt_len]
-            a_ids = [t % vocab_size for t in encode_no_special(tokenizer, a_str)][:max_target_len]
+            p_ids = _prepare_prompt_ids(p_str)
+            a_ids = _prepare_target_ids(a_str)
             
             if len(p_ids) > 1 and len(a_ids) > 1:
                 # 5.0x penalty on all answer tokens
@@ -177,8 +194,8 @@ def load_harmonized_dataset(
                 a = entry.get("answer", "")
                 p_str = format_stimulus_prompt(q)
                 a_str = format_motor_response(a)
-                p_ids = [t % vocab_size for t in encode_no_special(tokenizer, p_str)][:max_prompt_len]
-                a_ids = [t % vocab_size for t in encode_no_special(tokenizer, a_str)][:max_target_len]
+                p_ids = _prepare_prompt_ids(p_str)
+                a_ids = _prepare_target_ids(a_str)
                 
                 if len(p_ids) > 2 and len(a_ids) > 2:
                     weights = [1.0] * len(a_ids)

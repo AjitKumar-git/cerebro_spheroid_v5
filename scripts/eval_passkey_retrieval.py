@@ -191,7 +191,10 @@ def evaluate_passkey_matrix(
 
     print("-" * 78)
     overall_mean = sum(all_accs) / max(len(all_accs), 1)
-    print(f"Overall Retrieval Score: {overall_mean:5.1f}%\n")
+    status_str = "🟢 RELIABLE" if overall_mean >= 75.0 else ("🟡 PARTIAL / DEVELOPING" if overall_mean >= 40.0 else "🔴 WEAK / UNRELIABLE")
+    print(f"Overall Retrieval Score: {overall_mean:5.1f}% [{status_str}] (Trials per cell: {trials_per_cell})\n")
+    if overall_mean < 75.0:
+        print("💡 Diagnostic Note: Evidence reflects partial capability, not reliable long-context attention. Full 4K retrieval requires balanced prompt centroid pooling, deeper sensory layers, and expanded retrieval curriculum training.\n")
 
     return {
         "matrix": results_matrix,
@@ -205,7 +208,7 @@ def main():
     parser.add_argument("--checkpoint", type=str, default="checkpoints/v5_small_agentic_tool_aligned.pt", help="Path to checkpoint .pt file")
     parser.add_argument("--lengths", type=str, default="256,512,1024,2048,4096", help="Comma-separated context lengths (default: 256,512,1024,2048,4096)")
     parser.add_argument("--depths", type=str, default="0.1,0.5,0.9", help="Comma-separated needle depths (default: 0.1,0.5,0.9)")
-    parser.add_argument("--trials", type=int, default=3, help="Number of trials per cell")
+    parser.add_argument("--trials", type=int, default=5, help="Number of trials per cell (default: 5 for 20% statistical granularity)")
     parser.add_argument("--digits", type=int, default=5, choices=[1, 2, 3, 4, 5], help="Number of digits in passkey (default: 5)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to run inference on")
     parser.add_argument("--tokenizer", type=str, default="auto", help="Tokenizer name, path, or 'auto' (detects 32k vs Qwen from config)")

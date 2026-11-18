@@ -258,11 +258,13 @@ _DEFAULT_DATASET_REVISIONS: Dict[str, str] = {
     # (~15+ GB per rank) and trigger host OOM SIGKILL on 2xT4 containers. The
     # auto-converted Parquet branch streams row-groups in <250 MB RSS per rank.
     "teknium/OpenHermes-2.5": "refs/convert/parquet",
-    "HuggingFaceFW/fineweb-edu": "main",
-    "HuggingFaceTB/cosmopedia-v2": "main",
-    "openai/gsm8k": "main",
-    "HuggingFaceTB/smoltalk": "main",
-    "HuggingFaceTB/finemath": "main",
+    # Pinned immutable commit SHAs to guarantee exact reproducibility and prevent upstream dataset mutation:
+    "HuggingFaceFW/fineweb-edu": "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9",
+    "HuggingFaceTB/cosmopedia-v2": "3ba9d605774198c5868892d7a8deda78031a781f",
+    "openai/gsm8k": "740312add88f781978c0658806c59bc2815b9866",
+    "HuggingFaceTB/smoltalk": "5feaf2fd3ffca7c237fc38d1861bc30365d48ffa",
+    "HuggingFaceTB/finemath": "e92b25a616738fe95dc186b64dfb19f9c8525594",
+    "open-r1/OpenR1-Math-220k": "e4e141ec9dea9f8326f4d347be56105859b2bd68",
 }
 
 _DEFAULT_DATASET_CONFIGS: Dict[str, str] = {
@@ -418,7 +420,13 @@ def build_online_dataset_iterator(
             return base_gen
         retrieval_path = os.path.join(REPO_ROOT, "data", "retrieval_curriculum_data.jsonl")
         if not os.path.exists(retrieval_path):
+            print(
+                f"⚠️ [Retrieval Injection Warning] inject_retrieval=True, but '{retrieval_path}' does not exist!\n"
+                f"   Running without retrieval injection. Generate it via: python3 scripts/generate_retrieval_curriculum_data.py"
+            )
             return base_gen
+
+        print(f"📦 [Retrieval Injector] Active: Injecting long-context curriculum samples from '{retrieval_path}' (every 10th sample, ~10% mix)")
 
         def _open_retrieval_stream():
             while True:
@@ -1318,6 +1326,7 @@ def select_best_bucket(p_len: int, t_len: int, buckets: List[Tuple[str, int, int
     """
     Selects the bucket that minimizes wasted padding while strictly preserving full-text prompt intactness.
     Prompt truncation carries a massive penalty (50,000) so a bucket accommodating the full question is always prioritized.
+    Target truncation carries a heavy penalty (25,000) so that complete reasoning answers are never cut short.
     """
     best_idx = min(1, len(buckets) - 1)
     min_penalty = float("inf")
@@ -1327,11 +1336,11 @@ def select_best_bucket(p_len: int, t_len: int, buckets: List[Tuple[str, int, int
             # Fits completely: penalty is wasted padding
             penalty = (bp - p_len) + (bt - t_len)
         elif p_len <= bp:
-            # Fits prompt completely, target has mild truncation: penalize target truncation
-            penalty = (bp - p_len) + (t_len - bt) * 3
+            # Fits prompt completely, target exceeds bucket: heavily penalize target truncation so full response is preserved!
+            penalty = 25000 + (bp - p_len) + (t_len - bt) * 50
         else:
             # Prompt exceeds bucket: massive penalty! Never truncate the prompt if another bucket fits it!
-            penalty = 50000 + (p_len - bp) * 100 + max(0, t_len - bt) * 3
+            penalty = 50000 + (p_len - bp) * 100 + max(0, t_len - bt) * 50
 
         if penalty < min_penalty:
             min_penalty = penalty
@@ -1545,7 +1554,7 @@ class ElasticBucketBatcher:
                     r_ids_batch = self.tokenizer(
                         r_texts, max_length=max_enc, truncation=True, add_special_tokens=False
                     )["input_ids"]
-                    tokenized_pairs = list(zip(q_ids_batch, r_ids_batch, d_names))
+                    tokenized_pairs = list(zip(q_ids_batch, r_ids_batch, d_names, r_texts))
                 except Exception:
                     tokenized_pairs = None
 
@@ -1558,10 +1567,10 @@ class ElasticBucketBatcher:
                     else:
                         q_ids = [1] * len(q_txt.split())
                         r_ids = [1] * len(r_txt.split())
-                    tokenized_pairs.append((q_ids, r_ids, ds))
+                    tokenized_pairs.append((q_ids, r_ids, ds, r_txt))
 
             eos_id = self.tokenizer.eos_token_id if (hasattr(self.tokenizer, "eos_token_id") and self.tokenizer.eos_token_id is not None) else 2
-            for q_ids, r_ids, ds in tokenized_pairs:
+            for q_ids, r_ids, ds, r_txt in tokenized_pairs:
                 if len(r_ids) == 0 or r_ids[-1] != eos_id:
                     r_ids = r_ids + [eos_id]
 
@@ -1571,45 +1580,49 @@ class ElasticBucketBatcher:
                 b_idx = select_best_bucket(q_len, r_len, self.buckets)
                 name, bp, bt = self.buckets[b_idx]
 
-                # Pad / truncate to the exact bucket dimensions (preserve most recent turns for prompts)
+                # Pad / truncate to the exact bucket dimensions (preserve stimulus prefix + question suffix for prompts)
                 if len(q_ids) > bp:
-                    q_padded = q_ids[-bp:]
+                    prefix_len = min(32, bp // 4)
+                    suffix_len = bp - prefix_len
+                    q_padded = q_ids[:prefix_len] + q_ids[-suffix_len:]
                 else:
                     q_padded = q_ids + [self.pad_id] * (bp - len(q_ids))
 
                 if len(r_ids) > bt:
-                    # Contiguous sequential document/trajectory slicing with true preceding context carry
-                    chunks = []
                     is_reasoning_or_qa = any(
                         kw in ds.lower()
-                        for kw in ("math", "gsm8k", "openhermes", "smoltalk", "cot", "reason", "qa", "hermes", "r1")
-                    ) or ("<think>" in r_txt or "<act>" in r_txt)
+                        for kw in (
+                            "math", "gsm8k", "openhermes", "smoltalk", "cot", "reason", "qa",
+                            "hermes", "r1", "sft", "instruct", "chat", "dialog", "turn", "retrieval", "tool", "agent"
+                        )
+                    ) or ("<think>" in str(r_txt) or "<act>" in str(r_txt))
 
-                    for start in range(0, len(r_ids), bt):
-                        chunk = r_ids[start : start + bt]
-                        if start == 0:
-                            chunk_prompt = q_padded
-                            ctx_tok = None
-                        else:
-                            # Preceding context carry: For reasoning/QA, preserve prompt header so reasoning trajectories retain the original question!
-                            if is_reasoning_or_qa and len(q_ids) > 0:
-                                header_len = min(len(q_ids), max(16, bp // 3))
-                                q_hdr = q_ids[:header_len]
-                                rem_bp = max(0, bp - len(q_hdr))
-                                preceding = r_ids[max(0, start - rem_bp) : start]
-                                chunk_prompt = q_hdr + preceding
+                    if is_reasoning_or_qa:
+                        # For reasoning, QA, SFT & dialogues: never sever responses into headless fragments.
+                        # Preserve intact trajectory capped at bt, guaranteeing terminating eos_id!
+                        r_capped = r_ids[: bt - 1] + [eos_id]
+                        chunks = [(q_padded, r_capped, None)]
+                    else:
+                        # Contiguous sequential document/trajectory slicing with true preceding context carry for pretraining
+                        chunks = []
+                        for start in range(0, len(r_ids), bt):
+                            chunk = r_ids[start : start + bt]
+                            if start == 0:
+                                chunk_prompt = q_padded
+                                ctx_tok = None
                             else:
                                 preceding = r_ids[max(0, start - bp) : start]
                                 chunk_prompt = preceding
 
-                            if len(chunk_prompt) < bp:
-                                chunk_prompt = chunk_prompt + [self.pad_id] * (bp - len(chunk_prompt))
-                            else:
-                                chunk_prompt = chunk_prompt[:bp]
-                            ctx_tok = r_ids[start - 1]
+                                if len(chunk_prompt) < bp:
+                                    chunk_prompt = chunk_prompt + [self.pad_id] * (bp - len(chunk_prompt))
+                                else:
+                                    chunk_prompt = chunk_prompt[:bp]
+                                ctx_tok = r_ids[start - 1]
 
-                        if len(chunk) < bt:
-                            chunk = chunk + [self.target_pad_id] * (bt - len(chunk))
+                            if len(chunk) < bt:
+                                chunk = chunk + [self.target_pad_id] * (bt - len(chunk))
+                            chunks.append((chunk_prompt, chunk, ctx_tok))
                         chunks.append((chunk_prompt, chunk, ctx_tok))
                 else:
                     chunks = [(q_padded, r_ids + [self.target_pad_id] * (bt - len(r_ids)), None)]
@@ -1931,15 +1944,17 @@ def build_canonical_eval_split(
             if len(r_ids) == 0 or r_ids[-1] != eos_id:
                 r_ids.append(eos_id)
 
-            # Pad or truncate prompt
+            # Pad or truncate prompt (preserve stimulus header prefix and question suffix)
             if len(q_ids) > prompt_len:
-                q_pad = q_ids[:prompt_len]
+                prefix_len = min(32, prompt_len // 4)
+                suffix_len = prompt_len - prefix_len
+                q_pad = q_ids[:prefix_len] + q_ids[-suffix_len:]
             else:
                 q_pad = q_ids + [pad_id] * (prompt_len - len(q_ids))
 
-            # Pad or truncate target
+            # Pad or truncate target (always guarantee terminating eos_id)
             if len(r_ids) > target_len:
-                r_pad = r_ids[:target_len]
+                r_pad = r_ids[: target_len - 1] + [eos_id]
             else:
                 r_pad = r_ids + [target_pad_id] * (target_len - len(r_ids))
 

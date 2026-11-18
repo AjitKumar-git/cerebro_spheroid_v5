@@ -110,16 +110,16 @@ def parse_args():
         "--prompt_len",
         dest="prompt_len",
         type=int,
-        default=256,
-        help="Sensory context prompt length (default: 256 tokens)",
+        default=1024,
+        help="Sensory context prompt length (default: 1024 tokens)",
     )
     parser.add_argument(
         "--seq-len",
         "--seq_len",
         dest="seq_len",
         type=int,
-        default=512,
-        help="Motor action target generation length (default: 512 tokens)",
+        default=1024,
+        help="Motor action target generation length (default: 1024 tokens)",
     )
     parser.add_argument(
         "--lr",

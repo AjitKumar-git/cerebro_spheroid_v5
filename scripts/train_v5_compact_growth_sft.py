@@ -198,8 +198,8 @@ def load_tokenized_dataset(
     parquet_path: str,
     tokenizer: Any,
     max_samples: int = 30000,
-    max_prompt_len: int = 160,
-    max_target_len: int = 160,
+    max_prompt_len: int = 2048,
+    max_target_len: int = 1024,
 ) -> List[Dict[str, Any]]:
     print(f"📦 Loading & tokenizing step-by-step reasoning dataset from: {parquet_path}")
     if not os.path.exists(parquet_path):
@@ -228,8 +228,21 @@ def load_tokenized_dataset(
             full_target = answer
 
         p_str = format_stimulus_prompt(prompt)
-        p_ids = encode_no_special(tokenizer, p_str)[:max_prompt_len]
-        t_ids = encode_no_special(tokenizer, full_target)[: max_target_len - 1] + [eos_id]
+        raw_p = [t % vocab_size for t in encode_no_special(tokenizer, p_str)]
+        if len(raw_p) > max_prompt_len:
+            prefix_len = min(32, max_prompt_len // 4)
+            suffix_len = max_prompt_len - prefix_len
+            p_ids = raw_p[:prefix_len] + raw_p[-suffix_len:]
+        else:
+            p_ids = raw_p
+
+        raw_t = [t % vocab_size for t in encode_no_special(tokenizer, full_target)]
+        if not raw_t or raw_t[-1] != eos_id:
+            raw_t.append(eos_id)
+        if len(raw_t) > max_target_len:
+            t_ids = raw_t[: max_target_len - 1] + [eos_id]
+        else:
+            t_ids = raw_t
 
         if len(p_ids) > 0 and len(t_ids) > 1:
             entries.append({"prompt_ids": p_ids, "target_ids": t_ids})
@@ -253,8 +266,8 @@ def build_fallback_reasoning_data(tokenizer: Any, max_samples: int = 1000) -> Li
     eos_id = getattr(tokenizer, "eos_token_id", 2) or 2
     for _ in range(max_samples // len(qa_pairs) + 1):
         for p, a in qa_pairs:
-            p_ids = encode_no_special(tokenizer, format_stimulus_prompt(p))[:160]
-            t_ids = encode_no_special(tokenizer, a)[:160] + [eos_id]
+            p_ids = encode_no_special(tokenizer, format_stimulus_prompt(p))[:2048]
+            t_ids = encode_no_special(tokenizer, a)[:1023] + [eos_id]
             entries.append({"prompt_ids": p_ids, "target_ids": t_ids})
             if len(entries) >= max_samples:
                 break

@@ -88,3 +88,20 @@ def test_normalize_3tier_response_gsm8k_derivation():
     norm_gsm = _normalize_3tier_response(gsm)
     assert "<act> calc(5) </act>" in norm_gsm
     assert "Answer: 5" in norm_gsm
+
+
+def test_suppress_premature_act_penalty():
+    import torch
+    from src.spheroid_v5 import CerebroSpheroidV5, ModelConfigV5
+
+    cfg = ModelConfigV5(vocab_size=1000, surface_dim=64, radial_dim=32, num_shells=4, num_shortcut_tracts=4, num_heads=2)
+    model = CerebroSpheroidV5(cfg)
+    
+    prompts = torch.tensor([[10, 20, 30]])
+    targets = torch.tensor([[40, 50, 60]]) # No act (33) in target
+    
+    loss_standard, _ = model(prompts=prompts, targets=targets, suppress_premature_act=False)
+    loss_penalized, _ = model(prompts=prompts, targets=targets, suppress_premature_act=True, act_penalty_weight=1.0)
+    
+    assert loss_penalized >= loss_standard
+

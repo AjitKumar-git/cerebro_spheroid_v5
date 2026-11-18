@@ -892,12 +892,19 @@ def main(args=None):
                 )
             loss_val, grads = jax.value_and_grad(loss_fn)(p)
             grad_norm = optax.global_norm(grads)
+            is_grad_finite = jnp.isfinite(grad_norm)
             raw_updates, next_optax_s = optimizer.update(grads, opt_s["optax"], p)
             # Dynamically scale by scheduled cur_lr (negative for gradient descent in optax.apply_updates)
             updates = jax.tree_util.tree_map(lambda u: -cur_lr * u, raw_updates)
             next_p = optax.apply_updates(p, updates)
 
             params_finite = jnp.all(jnp.array([jnp.all(jnp.isfinite(np_)) for np_ in jax.tree_util.tree_leaves(next_p)]))
+            is_step_valid = is_grad_finite & params_finite
+
+            # Strict non-finite skip protection: restore previous parameters and optimizer state on NaN/Inf
+            safe_p = jax.tree_util.tree_map(lambda np_, op_: jnp.where(is_step_valid, np_, op_), next_p, p)
+            safe_optax_s = jax.tree_util.tree_map(lambda ns_, os_: jnp.where(is_step_valid, ns_, os_), next_optax_s, opt_s["optax"])
+
             sq_diff = sum(jnp.sum(jnp.square(u)) for u in jax.tree_util.tree_leaves(updates))
             sq_norm = sum(jnp.sum(jnp.square(p_i)) for p_i in jax.tree_util.tree_leaves(p))
             u_ratio = jnp.sqrt(sq_diff / (sq_norm + 1e-8))
@@ -905,17 +912,17 @@ def main(args=None):
             adamw_diag = {
                 "grad_norm": grad_norm,
                 "was_clipped": jnp.where(grad_norm > 1.0, 1.0, 0.0),
-                "was_skipped": jnp.where(params_finite, 0.0, 1.0),
-                "u_ratio_manifold": u_ratio,
-                "u_ratio_vocab": u_ratio,
-                "u_ratio_1d": u_ratio,
+                "was_skipped": jnp.where(is_step_valid, 0.0, 1.0),
+                "u_ratio_manifold": jnp.where(is_step_valid, u_ratio, 0.0),
+                "u_ratio_vocab": jnp.where(is_step_valid, u_ratio, 0.0),
+                "u_ratio_1d": jnp.where(is_step_valid, u_ratio, 0.0),
                 "replica_drift": jnp.array(0.0, dtype=jnp.float32),
             }
             next_opt_s = {
-                "optax": next_optax_s,
+                "optax": safe_optax_s,
                 "diag": adamw_diag,
             }
-            return next_p, next_opt_s, loss_val
+            return safe_p, next_opt_s, loss_val
 
         def train_step_fn(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens=None, sampling_p=1.0, encephalization_alpha=1.0):
             pure_tf = (args.deliberation_mode in ("teacher_forcing", "pure_tf")) and (not isinstance(sampling_p, jax.Array)) and (float(sampling_p) >= 1.0)

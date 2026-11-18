@@ -469,7 +469,11 @@ def load_tri_modal_dataset(
                     p_str = format_stimulus_prompt(p_str)
                 a_str = rec.get("response", "")
                 cat = rec.get("category", "retrieval")
-                p_ids = _prepare_prompt_ids(p_str)
+                raw_p_ids = [t % vocab_size for t in encode_no_special(tokenizer, p_str)]
+                if len(raw_p_ids) > max_prompt_len:
+                    # Needle would be amputated if sliced; only ingest retrieval tasks that fit intact within the prompt horizon
+                    continue
+                p_ids = raw_p_ids
                 a_ids = _prepare_target_ids(a_str)
                 if len(p_ids) > 1 and len(a_ids) > 1:
                     weights = [4.0 if ("<act>" in a_str or "</think>" in a_str or "passkey" in cat) else 3.5] * len(a_ids)
@@ -530,6 +534,8 @@ def run_refined_sft(
     use_rope: Optional[bool] = None,
     max_prompt_len: int = 2048,
     max_target_len: int = 1024,
+    suppress_premature_act: bool = True,
+    act_penalty_weight: float = 0.5,
 ):
     print("=" * 80)
     print("🎯 CEREBRO-SPHEROID REFINED SFT EXECUTION ENGINE (ADAMW / AALW)")
@@ -643,12 +649,14 @@ def run_refined_sft(
             w_tensor[b_idx, :len(weights)] = torch.tensor(weights, dtype=torch.float, device=device)
 
         with torch.amp.autocast("cuda", dtype=dtype):
-            # Forward pass with Answer-Anchor Loss Weighting passed explicitly
+            # Forward pass with Answer-Anchor Loss Weighting and Anti-Premature Act Suppression
             loss, _ = model(
                 prompts=p_tensor,
                 targets=t_tensor,
                 target_weights=w_tensor,
                 deliberation_mode="teacher_forcing",
+                suppress_premature_act=suppress_premature_act,
+                act_penalty_weight=act_penalty_weight,
             )
             # Accumulation scaling
             loss_scaled = loss / accum_steps
@@ -743,8 +751,10 @@ def run_refined_sft(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Refined SFT Engine for CerebroSpheroid V5 (AdamW / SCM)")
-    parser.add_argument("--base-checkpoint", type=str, default="checkpoints/v5_qwen_0_5b_uwbl_scm.pt")
+    default_base = "checkpoints/curriculum/v5_curriculum_stage5_4096.pt" if os.path.exists("checkpoints/curriculum/v5_curriculum_stage5_4096.pt") else "checkpoints/v5_qwen_0_5b_uwbl_scm.pt"
+    parser.add_argument("--base-checkpoint", type=str, default=default_base)
     parser.add_argument("--output-checkpoint", type=str, default="checkpoints/v5_qwen_0_5b_local_sft.pt")
+    parser.add_argument("--device", "--device-str", dest="device_str", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "scm"])
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=2)
@@ -758,6 +768,8 @@ if __name__ == "__main__":
     parser.add_argument("--use-rope", type=lambda x: (str(x).lower() in ['true', '1', 'yes']) if x is not None else None, default=None, help="Enable RoPE rotary position embeddings (defaults to checkpoint config)")
     parser.add_argument("--max-prompt-len", type=int, default=2048, help="Maximum prompt context length (default: 2048)")
     parser.add_argument("--max-target-len", type=int, default=1024, help="Maximum response generation length (default: 1024)")
+    parser.add_argument("--suppress-premature-act", type=lambda x: (str(x).lower() in ['true', '1', 'yes']), default=True, help="Penalize premature act token emissions")
+    parser.add_argument("--act-penalty-weight", type=float, default=0.5, help="Weight of anti-premature act unlikelihood loss")
     args = parser.parse_args()
 
     run_refined_sft(
@@ -772,8 +784,11 @@ if __name__ == "__main__":
         weight_decay=args.weight_decay,
         warmup_steps=args.warmup_steps,
         probe_interval=args.probe_interval,
+        device_str=args.device_str,
         max_cot_samples=args.max_cot_samples,
         use_rope=args.use_rope,
         max_prompt_len=args.max_prompt_len,
         max_target_len=args.max_target_len,
+        suppress_premature_act=args.suppress_premature_act,
+        act_penalty_weight=args.act_penalty_weight,
     )

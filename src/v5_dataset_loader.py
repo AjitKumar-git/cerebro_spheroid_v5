@@ -31,8 +31,8 @@ class CerebroV5Dataset(Dataset):
         file_path: str,
         tokenizer: Any,
         vocab_size: int = 32000,
-        max_prompt_len: int = 256,
-        max_target_len: int = 512,
+        max_prompt_len: int = 2048,
+        max_target_len: int = 1024,
         anchor_weight: float = 4.5,
         action_weight: float = 3.5,
         think_close_weight: float = 2.0,
@@ -83,15 +83,24 @@ class CerebroV5Dataset(Dataset):
         o_raw = item["formatted_output"]
         lvl = item.get("thinking_level", 0)
 
-        # 1. Tokenize Input (<stim> ... </stim>)
-        p_ids = [t % self.vocab_size for t in encode_no_special(self.tokenizer, p_raw)][:self.max_prompt_len]
-        if not p_ids:
-            p_ids = [1]
+        # 1. Tokenize Input (<stim> ... </stim>) preserving stimulus header prefix and question suffix
+        raw_p = [t % self.vocab_size for t in encode_no_special(self.tokenizer, p_raw)]
+        if len(raw_p) > self.max_prompt_len:
+            prefix_len = min(32, self.max_prompt_len // 4)
+            suffix_len = self.max_prompt_len - prefix_len
+            p_ids = raw_p[:prefix_len] + raw_p[-suffix_len:]
+        else:
+            p_ids = raw_p or [1]
 
-        # 2. Tokenize Output
-        o_ids = [t % self.vocab_size for t in encode_no_special(self.tokenizer, o_raw)][:self.max_target_len]
-        if not o_ids:
-            o_ids = [2]
+        # 2. Tokenize Output ensuring terminating eos_token_id is always intact
+        eos_id = getattr(self.tokenizer, "eos_token_id", 2) or 2
+        raw_o = [t % self.vocab_size for t in encode_no_special(self.tokenizer, o_raw)]
+        if not raw_o or raw_o[-1] != eos_id:
+            raw_o.append(eos_id)
+        if len(raw_o) > self.max_target_len:
+            o_ids = raw_o[: self.max_target_len - 1] + [eos_id]
+        else:
+            o_ids = raw_o
 
         # 3. Compute Token-Level Loss Weights (AALW)
         weights = [self.think_weight] * len(o_ids)
@@ -174,8 +183,8 @@ def get_v5_dataloader(
     tokenizer: Any,
     batch_size: int = 16,
     shuffle: bool = True,
-    max_prompt_len: int = 256,
-    max_target_len: int = 512,
+    max_prompt_len: int = 2048,
+    max_target_len: int = 1024,
     num_workers: int = 0,
 ) -> DataLoader:
     """Creates a configured PyTorch DataLoader ready for SFT training."""

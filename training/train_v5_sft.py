@@ -155,7 +155,7 @@ def run_live_probe(
     config: ModelConfigV5,
     tokenizer: Any,
     prompt_len: int,
-    gen_len: int = 128,
+    gen_len: int = 512,
 ):
     """Executes live greedy autoregressive rollout on test prompts to inspect conversational alignment."""
     print("\n" + "-" * 76)
@@ -165,11 +165,16 @@ def run_live_probe(
     for idx, p_text in enumerate(SFT_PROBE_PROMPTS, 1):
         formatted_prompt = format_stimulus_prompt(p_text)
         if hasattr(tokenizer, "encode"):
-            raw_ids = encode_no_special(tokenizer, formatted_prompt, max_length=prompt_len)
+            raw_ids = encode_no_special(tokenizer, formatted_prompt)
         else:
-            raw_ids = [1] * min(len(formatted_prompt.split()), prompt_len)
+            raw_ids = [1] * len(formatted_prompt.split())
 
-        p_padded = raw_ids[:prompt_len] if len(raw_ids) >= prompt_len else raw_ids + [0] * (prompt_len - len(raw_ids))
+        if len(raw_ids) > prompt_len:
+            prefix_len = min(32, prompt_len // 4)
+            suffix_len = prompt_len - prefix_len
+            p_padded = raw_ids[:prefix_len] + raw_ids[-suffix_len:]
+        else:
+            p_padded = raw_ids + [0] * (prompt_len - len(raw_ids))
         p_arr = jnp.asarray([p_padded], dtype=jnp.int32)
 
         try:

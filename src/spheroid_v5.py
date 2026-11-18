@@ -1666,6 +1666,8 @@ class CerebroSpheroidV5(nn.Module):
         anchor_token_id: int = 3191,
         anchor_weight: float = 3.5,
         use_anchor_loss: bool = True,
+        suppress_premature_act: bool = False,
+        act_penalty_weight: float = 0.5,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """
         Differentiable training rollout engine:
@@ -2017,6 +2019,18 @@ class CerebroSpheroidV5(nn.Module):
                     tgt_slice.contiguous().view(-1),
                     ignore_index=-100,
                 )
+
+            # Anti-Premature <act> Unlikelihood Penalty: penalizes token 33 (<act>) whenever target is NOT <act>
+            if suppress_premature_act and t_len > 0:
+                act_id = getattr(self.config, "act_token_id", 33)
+                non_act_mask = (tgt_slice >= 0) & (tgt_slice != -100) & (tgt_slice != act_id)
+                if non_act_mask.any():
+                    log_probs = F.log_softmax(logits_stacked.float(), dim=-1)
+                    act_log_prob = log_probs[:, :, act_id]
+                    act_prob = torch.exp(act_log_prob)
+                    act_unlikelihood = -torch.log(torch.clamp(1.0 - act_prob, min=1e-5))
+                    act_penalty = (act_unlikelihood * non_act_mask.float()).sum() / torch.clamp(non_act_mask.float().sum(), min=1.0)
+                    loss = loss + act_penalty_weight * act_penalty
 
             # Auxiliary predictive coding thought alignment loss
             if deliberation_mode == "predictive_coding" and t_len > 1 and pred_loss_total.item() > 0:

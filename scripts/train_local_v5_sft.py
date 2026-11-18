@@ -64,8 +64,8 @@ def load_tokenized_dataset(
     tokenizer: Any,
     vocab_size: int,
     max_samples: int = 30000,
-    max_prompt_len: int = 160,
-    max_target_len: int = 160,
+    max_prompt_len: int = 2048,
+    max_target_len: int = 1024,
 ) -> List[Dict[str, Any]]:
     print(f"📦 Loading & tokenizing step-by-step reasoning dataset from: {parquet_path}")
     df = pd.read_parquet(parquet_path)
@@ -98,12 +98,21 @@ def load_tokenized_dataset(
             direct_count += 1
 
         p_str = format_stimulus_prompt(prompt)
-        p_ids = [t % vocab_size for t in encode_no_special(tokenizer, p_str)][:max_prompt_len]
-        a_ids = [t % vocab_size for t in encode_no_special(tokenizer, full_target)][:max_target_len]
+        raw_p = [t % vocab_size for t in encode_no_special(tokenizer, p_str)]
+        if len(raw_p) > max_prompt_len:
+            prefix_len = min(32, max_prompt_len // 4)
+            suffix_len = max_prompt_len - prefix_len
+            p_ids = raw_p[:prefix_len] + raw_p[-suffix_len:]
+        else:
+            p_ids = raw_p
 
-        # Append EOS to target
-        if not a_ids or a_ids[-1] != eos_id:
-            a_ids.append(eos_id)
+        raw_a = [t % vocab_size for t in encode_no_special(tokenizer, full_target)]
+        if not raw_a or raw_a[-1] != eos_id:
+            raw_a.append(eos_id)
+        if len(raw_a) > max_target_len:
+            a_ids = raw_a[: max_target_len - 1] + [eos_id]
+        else:
+            a_ids = raw_a
 
         if len(p_ids) < 2 or len(a_ids) < 2:
             continue
