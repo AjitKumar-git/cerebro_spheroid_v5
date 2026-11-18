@@ -1374,6 +1374,54 @@ if ($action === 'upload_chunk') {
     exit;
 }
 
+// Action: CLEAR / RESET (Clean historical loss histories and checkpoints)
+// --------------------------------------------------------------------------------------------
+if ($action === 'clear' || $action === 'reset') {
+    header('Content-Type: application/json');
+
+    $model = isset($_REQUEST['model']) ? normalize_model_name($_REQUEST['model']) : '';
+    $clear_all = isset($_REQUEST['all']) && ($_REQUEST['all'] === 'true' || $_REQUEST['all'] === '1');
+    $clear_checkpoints = isset($_REQUEST['checkpoints']) && ($_REQUEST['checkpoints'] === 'true' || $_REQUEST['checkpoints'] === '1');
+
+    $deleted_files = [];
+    if (!empty($model) && !$clear_all) {
+        $targets = [
+            $storage_dir . '/token_tracker_' . $model . '.json',
+            $storage_dir . '/loss_history_' . $model . '.json',
+            $storage_dir . '/active_session_' . $model . '.json',
+        ];
+        if ($clear_checkpoints) {
+            $targets[] = $storage_dir . '/' . $model . '_latest.pt';
+            $targets[] = $storage_dir . '/' . $model . '_best.pt';
+        }
+        foreach ($targets as $f) {
+            if (file_exists($f)) {
+                unlink($f);
+                $deleted_files[] = basename($f);
+            }
+        }
+        $manifest_file = $storage_dir . '/manifest.json';
+        if (file_exists($manifest_file)) {
+            $manifest = json_decode(file_get_contents($manifest_file), true);
+            if (is_array($manifest)) {
+                unset($manifest[$model . '_latest']);
+                unset($manifest[$model . '_best']);
+                unset($manifest['active_session_' . $model]);
+                file_put_contents($manifest_file, json_encode($manifest, JSON_PRETTY_PRINT));
+            }
+        }
+    }
+
+    echo json_encode([
+        'success' => true,
+        'status' => 'cleared',
+        'model' => $model ?: 'all',
+        'deleted' => $deleted_files,
+        'server_time' => date('c'),
+    ]);
+    exit;
+}
+
 http_response_code(400);
 header('Content-Type: application/json');
 echo json_encode(['error' => "Unknown action '{$action}'"]);
