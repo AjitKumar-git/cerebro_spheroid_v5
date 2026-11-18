@@ -342,6 +342,20 @@ class RectifiedContiguousPretrainStreamer:
     def __next__(self) -> Dict[str, np.ndarray]:
         return self.batch_queue.get(block=True)
 
+    def get_batch(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Returns (prompt, target) tuple matching JAX LinguisticDataStreamer interface."""
+        batch = next(self)
+        return batch["prompt"], batch["target"]
+
+    def next_batch(self, bucket_idx: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, None]:
+        """Returns (prompt, target, feedback) tuple matching ElasticBucketBatcher interface."""
+        batch = next(self)
+        return batch["prompt"], batch["target"], None
+
+    def stop(self):
+        """Stops background worker thread."""
+        self.running = False
+
     def get_token_mix_status(self) -> str:
         """Returns concise single-line breakdown of actual token percentages."""
         snap = self.quota_mgr.get_snapshot()

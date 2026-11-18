@@ -22,6 +22,7 @@ from functools import partial
 import glob
 import json
 import math
+import dataclasses
 import os
 import random
 import re
@@ -133,9 +134,14 @@ def parse_args(args_list=None):
     parser.add_argument("--seq-len", "--target_len", dest="seq_len", type=int, default=512, help="Target response sequence length (default: 512 for deep reasoning)")
     parser.add_argument("--target-seq-len", "--target_seq_len", dest="target_seq_len", type=int, default=None, help="Target sequence length to transition toward (e.g. 512 or 1024)")
     parser.add_argument("--seq-transition-steps", "--seq_transition_steps", dest="seq_transition_steps", type=int, default=0, help="Steps over which to transition sequence length (0 = immediate transition to target_seq_len)")
-    parser.add_argument("--prompt_len", type=int, default=256, help="Prompt context length (used when --elastic_window is disabled, default: 256)")
-    parser.add_argument("--total_window", type=int, default=768, help="Total sequence budget for elastic sliding window (default: 768 tokens, 256 prompt + 512 target)")
-    parser.add_argument("--elastic_window", action="store_true", default=False, help="Enable elastic sliding context window with complementary buckets")
+    parser.add_argument("--prompt_len", type=int, default=256, help="Prompt context length (default: 256)")
+    parser.add_argument("--total_window", type=int, default=None, help="Total sequence budget for elastic sliding window (default: prompt_len + seq_len)")
+    parser.add_argument("--elastic_window", action=argparse.BooleanOptionalAction, default=True, help="Enable complementary context/target buckets")
+    parser.add_argument("--context-curriculum", action=argparse.BooleanOptionalAction, default=True, help="Grow context window through 512, 1024, 2048, and 4096 token stages")
+    parser.add_argument("--context-stage-steps", type=int, default=0, help="Steps per context stage (0 divides the run evenly among stages)")
+    parser.add_argument("--use-rope", "--use_rope", dest="use_rope", action=argparse.BooleanOptionalAction, default=True, help="Use rotary Q/K positions for new long-context training runs (default: True)")
+    parser.add_argument("--max-phase-steps", "--max_phase_steps", dest="max_phase_steps", type=int, default=4096, help="Learned output phase-clock horizon for new runs (default: 4096)")
+    parser.add_argument("--sensory-position-steps", "--sensory_position_steps", dest="sensory_position_steps", type=int, default=4096, help="Learned sensory positional embedding steps (default: 4096)")
 
     # Learning Rate & Optimization
     parser.add_argument("--lr", type=float, default=2e-3, help="Peak Spheroid learning rate (default: 2e-3)")
@@ -184,7 +190,10 @@ def parse_args(args_list=None):
 
     # Data Source & Tokenizer
     parser.add_argument("--dataset_source", "--dataset-source", dest="dataset_source", type=str, default="autonomous",
-                        help="Data stream: 'autonomous', custom Hugging Face repo (e.g. 'AjitKumar-Bio/cosmopedia-v2-digested'), 'reasoning_anneal', 'dense_edu', 'conversation_sft', 'consolidation'")
+                        help="Data stream: 'autonomous', 'fineweb' (sample-10BT), or a Hugging Face dataset repo")
+    parser.add_argument("--dataset-config", type=str, default=None, help="Optional Hugging Face dataset config (FineWeb defaults to sample-10BT)")
+    parser.add_argument("--dataset-revision", type=str, default=None, help="Optional immutable Hugging Face commit/revision override")
+    parser.add_argument("--retrieval-injection", action=argparse.BooleanOptionalAction, default=True, help="Mix curated retrieval examples into online streams (disable for a clean general-text baseline)")
     parser.add_argument("--tokenizer_name", type=str, default="llama", help="Tokenizer model name or path (default: 'llama' -> data/tokenizer)")
 
     # Checkpoint & Cloud Sync
@@ -217,7 +226,23 @@ def parse_args(args_list=None):
     parser.add_argument("--teacher_scale", "--teacher-scale", dest="teacher_scale", type=float, default=1.5, help="Scaling factor alpha for dynamic next-token weights")
     parser.add_argument("--encephalization_warmup_steps", "--encephalization-warmup-steps", dest="encephalization_warmup_steps", type=int, default=1000, help="Steps to smoothly transition motor surface readout from core to outer mantle")
 
-    return parser.parse_args(args_list)
+    parsed = parser.parse_args(args_list)
+    raw_args = args_list if args_list is not None else sys.argv[1:]
+    parsed.batch_size_explicit = any(
+        arg == "--batch-size" or arg == "--batch_size" or arg.startswith("--batch-size=") or arg.startswith("--batch_size=")
+        for arg in raw_args
+    )
+    parsed.total_steps_explicit = any(
+        arg == "--total-steps" or arg == "--total_steps" or arg.startswith("--total-steps=") or arg.startswith("--total_steps=")
+        for arg in raw_args
+    )
+    parsed.effective_batch_size_explicit = any(
+        arg == "--effective-batch-size" or arg == "--effective_batch_size" or arg.startswith("--effective-batch-size=") or arg.startswith("--effective_batch_size=")
+        for arg in raw_args
+    )
+    if parsed.total_window is None:
+        parsed.total_window = parsed.prompt_len + parsed.seq_len
+    return parsed
 
 
 def build_data_stream(
@@ -232,6 +257,10 @@ def build_data_stream(
     prefetch_queue_size: int = 16,
     step_getter: Optional[Any] = None,
     total_steps: int = 1_500_000,
+    prefetch: bool = True,
+    dataset_config: Optional[str] = None,
+    dataset_revision: Optional[str] = None,
+    retrieval_injection: bool = True,
 ):
     """Initializes multi-corpus streaming engine with background prefetching and offline fallback."""
     # Check if HuggingFace datasets library is available for online streaming
@@ -242,8 +271,25 @@ def build_data_stream(
     except ImportError:
         pass
 
-    if dataset_source in ("local", "pretrain", "offline") or not HAS_DATASETS:
-        if dataset_source not in ("local", "pretrain", "offline") and not HAS_DATASETS:
+    # 100% Loss-Bearing Rectified Contiguous Pretraining Streamer
+    if dataset_source in ("pretrain", "rectified", "rectified_pretrain", "clean_pretrain", "midtrain", "rectified_midtrain") and HAS_DATASETS:
+        from src.rectified_streamer import RectifiedContiguousPretrainStreamer
+        streamer_stage = "midtrain" if "midtrain" in dataset_source else "pretrain"
+        print(f"\n📦 Initializing 100% Loss-Bearing Rectified Contiguous Streamer [{dataset_source.upper()}]...")
+        print(f"   • Stage:          {streamer_stage.upper()}")
+        print(f"   • Context Window: {total_window} tokens (contiguous unbroken next-token loss)")
+        print(f"   • Global Batch:   {batch_size} sequences/step")
+        streamer = RectifiedContiguousPretrainStreamer(
+            tokenizer=tokenizer,
+            batch_size=batch_size,
+            block_size=total_window,
+            stage=streamer_stage,
+            queue_size=max(16, int(prefetch_queue_size)),
+        )
+        return streamer, None
+
+    if dataset_source in ("local", "offline") or not HAS_DATASETS:
+        if dataset_source not in ("local", "offline") and not HAS_DATASETS:
             print(f"⚠️ [DataStreamer] 'datasets' library not found. Falling back to high-throughput local corpus.")
         print(f"📦 Initializing background linguistic streaming queue (Local Corpus in data/)...")
         streamer = LinguisticDataStreamer(
@@ -265,6 +311,9 @@ def build_data_stream(
             dataset_source=dataset_source,
             step_getter=step_getter,
             total_steps=total_steps,
+            inject_retrieval=retrieval_injection,
+            dataset_config=dataset_config,
+            dataset_revision=dataset_revision,
         )
         first_row = next(raw_iter)
         data_iter = itertools.chain([first_row], raw_iter)
@@ -285,6 +334,8 @@ def build_data_stream(
             )
 
         q_depth = max(16, int(prefetch_queue_size))
+        if not prefetch:
+            return None, batcher
         prefetched = PrefetchedBatcher(batcher, queue_size=q_depth)
         print(f"⚡ Background Asynchronous Batch Prefetcher Active (Queue Depth: {q_depth} batches)")
         return None, prefetched
@@ -316,6 +367,8 @@ def build_data_stream(
                     )
 
                 q_depth = max(16, int(prefetch_queue_size))
+                if not prefetch:
+                    return None, batcher
                 prefetched = PrefetchedBatcher(batcher, queue_size=q_depth)
                 print(f"⚡ Background Asynchronous Batch Prefetcher Active for 'autonomous' (Queue Depth: {q_depth} batches)")
                 return None, prefetched
@@ -350,9 +403,16 @@ def main(args=None):
     signal.signal(signal.SIGTERM, sig_handler)
 
     # Sequence Length Transition & Context Budget Progression
-    if getattr(args, "target_seq_len", None) is not None and args.target_seq_len > args.seq_len:
-        print(f"\n🔄 [Sequence Transition] Advancing target sequence length from {args.seq_len} -> {args.target_seq_len} tokens for deep reasoning!")
-        args.seq_len = args.target_seq_len
+    initial_seq_len = args.seq_len
+    target_seq_len = getattr(args, "target_seq_len", None)
+    seq_trans_steps = getattr(args, "seq_transition_steps", 0)
+
+    if target_seq_len is not None and target_seq_len > args.seq_len:
+        if seq_trans_steps <= 0:
+            print(f"\n🔄 [Sequence Transition] Advancing target sequence length immediately from {args.seq_len} -> {target_seq_len} tokens for deep reasoning!")
+            args.seq_len = target_seq_len
+        else:
+            print(f"\n🔄 [Sequence Transition Scheduled] Gradual transition planned from {args.seq_len} -> {target_seq_len} tokens over {seq_trans_steps:,} steps.")
 
     if args.total_window in (288, 768) and (args.seq_len != 512 or args.prompt_len != 256):
         args.total_window = args.prompt_len + args.seq_len
@@ -404,7 +464,8 @@ def main(args=None):
             prompt_len=args.prompt_len,
             max_batch_size=max_bs,
         )
-        args.batch_size = best_cfg["batch_size"]
+        if not getattr(args, "batch_size_explicit", False):
+            args.batch_size = best_cfg["batch_size"]
         remat_choice = best_cfg["remat"]
         print(f"\n⚡ Applying Tuned Hyperparameters: batch_size={args.batch_size}, remat={remat_choice}")
         if "tok_per_sec" in best_cfg and best_cfg["tok_per_sec"] > 0:
@@ -418,7 +479,7 @@ def main(args=None):
         args.batch_size = min(int(args.batch_size), int(max_bs))
 
     # Effective Batch Size & Gradient Accumulation
-    if getattr(args, "effective_batch_size", None) is not None and args.effective_batch_size > 0:
+    if getattr(args, "effective_batch_size_explicit", False) and args.effective_batch_size > 0:
         eff_target = args.effective_batch_size
         if eff_target == 126:
             if args.batch_size > 126:
@@ -438,7 +499,7 @@ def main(args=None):
 
     eff_batch_size = args.batch_size * getattr(args, "grad_accum", 1)
     tokens_per_opt_step = eff_batch_size * (args.prompt_len + args.seq_len)
-    if getattr(args, "target_tokens", None) is not None and args.target_tokens > 0:
+    if not getattr(args, "total_steps_explicit", False) and getattr(args, "target_tokens", None) is not None and args.target_tokens > 0:
         calculated_steps = int(math.ceil(float(args.target_tokens) / max(1.0, float(tokens_per_opt_step))))
         args.total_steps = calculated_steps
         print(f"🎯 [Target Token Budget] {args.target_tokens/1e9:.2f} Billion Tokens -> Scheduled for {args.total_steps:,} Steps (at {tokens_per_opt_step:,} tok/step)")
@@ -448,6 +509,10 @@ def main(args=None):
     if config_preset not in PRESETS_V5:
         config_preset = "v5_small"
     cfg_kwargs = PRESETS_V5[config_preset].copy()
+    cfg_kwargs["use_rope"] = bool(args.use_rope)
+    cfg_kwargs["max_phase_steps"] = int(args.max_phase_steps)
+    if getattr(args, "sensory_position_steps", None) is not None:
+        cfg_kwargs["sensory_position_steps"] = int(args.sensory_position_steps)
     if getattr(args, "num_mtp_heads", None) is not None:
         cfg_kwargs["num_mtp_heads"] = args.num_mtp_heads
     if getattr(args, "use_adaptive_thinking", None) is not None:
@@ -519,7 +584,7 @@ def main(args=None):
             "step": 0,
             "loss": float("inf"),
             "eval_loss": float("inf"),
-            "config": config,
+            "config": dataclasses.asdict(config) if dataclasses.is_dataclass(config) else config,
             "tokens_by_dataset": {},
             "lifetime_tokens": 0,
             "sync_model": sync_model_name,
@@ -714,9 +779,8 @@ def main(args=None):
     eff_local_steps = max(1, int(getattr(args, "local_steps", 4))) if use_multi_tpu_local_sgd else 1
     step_stride = eff_num_devices * eff_local_steps
 
-    if use_multi_tpu_local_sgd and args.elastic_window:
-        print("ℹ️ Multi-TPU Local-SGD enforces fixed static shapes for uniform pmap shards; disabling --elastic_window.")
-        args.elastic_window = False
+    # Multi-TPU rounds select a single elastic bucket and bypass the async
+    # prefetch wrapper, which otherwise mixes shapes within a pmap scan.
 
     param_masks = None
     if getattr(args, "freeze_core", False):
@@ -818,10 +882,22 @@ def main(args=None):
             raise ImportError("optax is required for AdamW training. Install via: pip install optax")
         optimizer = optax.chain(
             optax.clip_by_global_norm(1.0),
-            optax.adamw(learning_rate=args.lr, b1=0.9, b2=0.95, weight_decay=args.weight_decay),
+            optax.scale_by_adam(b1=0.9, b2=0.95),
+            optax.add_decayed_weights(weight_decay=args.weight_decay),
         )
-        opt_state = optimizer.init(params)
-        compute_grad_step, apply_opt_step = None, None
+        optax_init_state = optimizer.init(params)
+        opt_state = {
+            "optax": optax_init_state,
+            "diag": {
+                "grad_norm": jnp.array(0.0, dtype=jnp.float32),
+                "was_clipped": jnp.array(0.0, dtype=jnp.float32),
+                "was_skipped": jnp.array(0.0, dtype=jnp.float32),
+                "u_ratio_manifold": jnp.array(0.0, dtype=jnp.float32),
+                "u_ratio_vocab": jnp.array(0.0, dtype=jnp.float32),
+                "u_ratio_1d": jnp.array(0.0, dtype=jnp.float32),
+                "replica_drift": jnp.array(0.0, dtype=jnp.float32),
+            },
+        }
 
         @partial(jax.jit, static_argnames=("pure_tf", "deliberation_mode"))
         def _train_step_adamw_jit(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens, sampling_p, pure_tf: bool, deliberation_mode: str, encephalization_alpha: float = 1.0):
@@ -844,9 +920,38 @@ def main(args=None):
                     encephalization_alpha=encephalization_alpha,
                 )
             loss_val, grads = jax.value_and_grad(loss_fn)(p)
-            updates, next_opt_s = optimizer.update(grads, opt_s, p)
+            grad_norm = optax.global_norm(grads)
+            is_grad_finite = jnp.isfinite(grad_norm)
+            raw_updates, next_optax_s = optimizer.update(grads, opt_s["optax"], p)
+            # Dynamically scale by scheduled cur_lr (negative for gradient descent in optax.apply_updates)
+            updates = jax.tree_util.tree_map(lambda u: -cur_lr * u, raw_updates)
             next_p = optax.apply_updates(p, updates)
-            return next_p, next_opt_s, loss_val
+
+            params_finite = jnp.all(jnp.array([jnp.all(jnp.isfinite(np_)) for np_ in jax.tree_util.tree_leaves(next_p)]))
+            is_step_valid = is_grad_finite & params_finite
+
+            # Strict non-finite skip protection: restore previous parameters and optimizer state on NaN/Inf
+            safe_p = jax.tree_util.tree_map(lambda np_, op_: jnp.where(is_step_valid, np_, op_), next_p, p)
+            safe_optax_s = jax.tree_util.tree_map(lambda ns_, os_: jnp.where(is_step_valid, ns_, os_), next_optax_s, opt_s["optax"])
+
+            sq_diff = sum(jnp.sum(jnp.square(u)) for u in jax.tree_util.tree_leaves(updates))
+            sq_norm = sum(jnp.sum(jnp.square(p_i)) for p_i in jax.tree_util.tree_leaves(p))
+            u_ratio = jnp.sqrt(sq_diff / (sq_norm + 1e-8))
+
+            adamw_diag = {
+                "grad_norm": grad_norm,
+                "was_clipped": jnp.where(grad_norm > 1.0, 1.0, 0.0),
+                "was_skipped": jnp.where(is_step_valid, 0.0, 1.0),
+                "u_ratio_manifold": jnp.where(is_step_valid, u_ratio, 0.0),
+                "u_ratio_vocab": jnp.where(is_step_valid, u_ratio, 0.0),
+                "u_ratio_1d": jnp.where(is_step_valid, u_ratio, 0.0),
+                "replica_drift": jnp.array(0.0, dtype=jnp.float32),
+            }
+            next_opt_s = {
+                "optax": safe_optax_s,
+                "diag": adamw_diag,
+            }
+            return safe_p, next_opt_s, loss_val
 
         def train_step_fn(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens=None, sampling_p=1.0, encephalization_alpha=1.0):
             pure_tf = (args.deliberation_mode in ("teacher_forcing", "pure_tf")) and (not isinstance(sampling_p, jax.Array)) and (float(sampling_p) >= 1.0)
@@ -854,7 +959,100 @@ def main(args=None):
                 p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens, sampling_p, pure_tf, args.deliberation_mode, encephalization_alpha
             )
 
-    # 7. Multi-Stream Ingestion & Prefetching
+        @partial(jax.jit, static_argnames=("pure_tf", "deliberation_mode"))
+        def _compute_grad_adamw_jit(p, q_batch, r_batch, feedback_tokens, sampling_p, pure_tf: bool, deliberation_mode: str, encephalization_alpha: float = 1.0):
+            def loss_fn(param_dict):
+                return training_rollout(
+                    params=param_dict,
+                    prompts=q_batch,
+                    target_len=r_batch.shape[1],
+                    buffers=buffers,
+                    config=config,
+                    feedback_tokens=feedback_tokens,
+                    feedback_is_shifted=True,
+                    pad_id=pad_id,
+                    sampling_p=sampling_p,
+                    repetition_penalty=args.repetition_penalty,
+                    targets=r_batch,
+                    remat=remat_choice,
+                    pure_teacher_forcing=pure_tf,
+                    deliberation_mode=deliberation_mode,
+                    encephalization_alpha=encephalization_alpha,
+                )
+            return jax.value_and_grad(loss_fn)(p)
+
+        @jax.jit
+        def _apply_opt_adamw_jit(p, opt_s, acc_grads, cur_lr):
+            grad_norm = optax.global_norm(acc_grads)
+            is_grad_finite = jnp.isfinite(grad_norm)
+            raw_updates, next_optax_s = optimizer.update(acc_grads, opt_s["optax"], p)
+            updates = jax.tree_util.tree_map(lambda u: -cur_lr * u, raw_updates)
+            next_p = optax.apply_updates(p, updates)
+
+            params_finite = jnp.all(jnp.array([jnp.all(jnp.isfinite(np_)) for np_ in jax.tree_util.tree_leaves(next_p)]))
+            is_step_valid = is_grad_finite & params_finite
+
+            # Strict non-finite skip protection: exactly mirrors Spheroid optimizer
+            safe_p = jax.tree_util.tree_map(lambda np_, op_: jnp.where(is_step_valid, np_, op_), next_p, p)
+            safe_optax_s = jax.tree_util.tree_map(lambda ns_, os_: jnp.where(is_step_valid, ns_, os_), next_optax_s, opt_s["optax"])
+
+            sq_diff = sum(jnp.sum(jnp.square(u)) for u in jax.tree_util.tree_leaves(updates))
+            sq_norm = sum(jnp.sum(jnp.square(p_i)) for p_i in jax.tree_util.tree_leaves(p))
+            u_ratio = jnp.sqrt(sq_diff / (sq_norm + 1e-8))
+
+            adamw_diag = {
+                "grad_norm": grad_norm,
+                "was_clipped": jnp.where(grad_norm > 1.0, 1.0, 0.0),
+                "was_skipped": jnp.where(is_step_valid, 0.0, 1.0),
+                "u_ratio_manifold": jnp.where(is_step_valid, u_ratio, 0.0),
+                "u_ratio_vocab": jnp.where(is_step_valid, u_ratio, 0.0),
+                "u_ratio_1d": jnp.where(is_step_valid, u_ratio, 0.0),
+                "replica_drift": jnp.array(0.0, dtype=jnp.float32),
+            }
+            next_opt_s = {
+                "optax": safe_optax_s,
+                "diag": adamw_diag,
+            }
+            return safe_p, next_opt_s
+
+        def compute_grad_step(p, q_batch, r_batch, feedback_tokens=None, sampling_p=1.0, deliberation_mode=args.deliberation_mode, encephalization_alpha=1.0):
+            pure_tf = (deliberation_mode in ("teacher_forcing", "pure_tf")) and (not isinstance(sampling_p, jax.Array)) and (float(sampling_p) >= 1.0)
+            return _compute_grad_adamw_jit(p, q_batch, r_batch, feedback_tokens, sampling_p, pure_tf, deliberation_mode, encephalization_alpha)
+
+        apply_opt_step = _apply_opt_adamw_jit
+        apply_opt_step_anneal = _apply_opt_adamw_jit
+        apply_opt_step_frozen = _apply_opt_adamw_jit
+        train_step_fn_anneal = train_step_fn
+        train_step_fn_frozen = train_step_fn
+
+    # 7. Context Stage Curriculum & Multi-Stream Ingestion
+    context_stages = [512, 1024, 2048, 4096]
+    max_curriculum_window = args.total_window
+    if max_curriculum_window is None:
+        if getattr(args, "context_curriculum", False):
+            max_curriculum_window = 4096  # Curriculum defaults to advancing through the full 4K horizon
+        else:
+            max_curriculum_window = args.prompt_len + args.seq_len
+    if getattr(args, "target_seq_len", None) is not None:
+        max_curriculum_window = max(max_curriculum_window, args.prompt_len + args.target_seq_len)
+
+    if getattr(args, "context_curriculum", False):
+        context_stages = [w for w in context_stages if w <= max_curriculum_window]
+        if not context_stages:
+            context_stages = [max_curriculum_window]
+        context_stage_steps = args.context_stage_steps
+        if context_stage_steps <= 0:
+            context_stage_steps = max(2000, args.total_steps // len(context_stages))
+        active_stage_idx = min(len(context_stages) - 1, start_step // context_stage_steps)
+        args.total_window = context_stages[active_stage_idx]
+        print(
+            f"🌊 [Context Curriculum Active] Stages: {context_stages} tokens | {context_stage_steps:,} steps/stage\n"
+            f"   Initial Stage {active_stage_idx}: Total Window = {args.total_window} tokens"
+        )
+    else:
+        context_stage_steps = max(1, args.total_steps)
+        active_stage_idx = 0
+
     current_step_holder = [start_step]
     local_streamer = None
     elastic_batcher = None
@@ -875,6 +1073,10 @@ def main(args=None):
         prefetch_queue_size=max(16, eff_num_devices * eff_local_steps * 2),
         step_getter=lambda: current_step_holder[0],
         total_steps=args.total_steps,
+        prefetch=not use_multi_tpu_local_sgd,
+        dataset_config=args.dataset_config,
+        dataset_revision=args.dataset_revision,
+        retrieval_injection=args.retrieval_injection,
     )
     batcher = elastic_batcher
 
@@ -1065,11 +1267,25 @@ def main(args=None):
         prompt_b, target_b = local_streamer.get_batch()
         return prompt_b, target_b, None
 
+    _round_bucket_idx = 0
+
     def _next_multi_tpu_round():
+        nonlocal _round_bucket_idx
         total_shards = eff_num_devices * eff_local_steps
+        bucket_batcher = elastic_batcher
+        if bucket_batcher is not None and hasattr(bucket_batcher, "batcher"):
+            bucket_batcher = bucket_batcher.batcher
+        bucket_idx = None
+        if bucket_batcher is not None and hasattr(bucket_batcher, "buckets"):
+            bucket_idx = _round_bucket_idx % len(bucket_batcher.buckets)
+            _round_bucket_idx += 1
         qs, rs, fbs = [], [], []
         for _ in range(total_shards):
-            pb, tb, fb = _next_batch()
+            if bucket_idx is not None:
+                batch_tuple = bucket_batcher.next_batch(bucket_idx=bucket_idx)
+                pb, tb, fb = _unpack_batch(batch_tuple)
+            else:
+                pb, tb, fb = _next_batch()
             qs.append(np.asarray(pb, dtype=np.int32))
             rs.append(np.asarray(tb, dtype=np.int32))
             if fb is not None:
@@ -1090,6 +1306,22 @@ def main(args=None):
             return jax.tree_util.tree_map(lambda x: jax.device_get(x[0]), rep_params)
         return params
 
+    def _count_real_tokens(prompts: Any, targets: Any) -> Tuple[int, int, int, int]:
+        """Count non-padding input and loss-bearing target tokens separately.
+
+        Static TPU shapes are an implementation detail, not training-data
+        volume. Reporting valid prompt and loss-bearing tokens separately ensures
+        honest token accounting.
+        """
+        p = np.asarray(prompts)
+        t = np.asarray(targets)
+        valid_prompt = int(np.count_nonzero(p != pad_id))
+        valid_loss = int(np.count_nonzero(t >= 0))
+        total_slots = int(p.size + t.size)
+        real_tokens = valid_prompt + valid_loss
+        padded_slots = total_slots - real_tokens
+        return real_tokens, valid_prompt, valid_loss, padded_slots
+
     step = start_step
     t_start = time.time()
     t_last_log = time.time()
@@ -1103,11 +1335,22 @@ def main(args=None):
     loaded_ckpt = ckpt if ("ckpt" in locals() and isinstance(ckpt, dict)) else {}
     if getattr(args, "reset_step_counter", False):
         cumulative_tokens = 0
+        cumulative_prompt_tokens = 0
+        cumulative_loss_tokens = 0
+        cumulative_padded_tokens = 0
         initial_lifetime_tokens = int(loaded_ckpt.get("lifetime_tokens", 14_745_600_000))
     else:
         cumulative_tokens = int(loaded_ckpt.get("cumulative_tokens", 0))
+        cumulative_prompt_tokens = int(loaded_ckpt.get("cumulative_prompt_tokens", 0))
+        cumulative_loss_tokens = int(loaded_ckpt.get("cumulative_loss_tokens", 0))
+        cumulative_padded_tokens = int(loaded_ckpt.get("cumulative_padded_tokens", 0))
         initial_lifetime_tokens = int(loaded_ckpt.get("lifetime_tokens", 0))
     lifetime_tokens = initial_lifetime_tokens + cumulative_tokens
+
+    # Diagnostic Tracking for Optimizer Health & Stability
+    cumulative_skips = 0
+    window_clipped_count = 0
+    window_step_count = 0
 
     # Restore per-dataset token attribution if present
     if not getattr(args, "reset_step_counter", False):
@@ -1123,6 +1366,38 @@ def main(args=None):
             current_step_holder[0] = step
             is_champion = False
             save_latest = False
+
+            # Context Stage Curriculum Transition Check
+            if getattr(args, "context_curriculum", False):
+                cur_stage_idx = min(len(context_stages) - 1, step // context_stage_steps)
+                if cur_stage_idx != active_stage_idx:
+                    active_stage_idx = cur_stage_idx
+                    active_window = context_stages[active_stage_idx]
+                    args.total_window = active_window
+                    new_buckets = get_default_elastic_buckets(active_window)
+                    print(
+                        f"\n🔄 [Context Curriculum Transition] Step {step:,}: Advancing to Stage {active_stage_idx} ({active_window} tokens)!\n"
+                        f"   Active Buckets: {new_buckets}\n"
+                    )
+                    b_target = elastic_batcher
+                    if b_target is not None:
+                        if hasattr(b_target, "update_buckets"):
+                            b_target.update_buckets(new_buckets, new_total_window=active_window)
+                        elif hasattr(b_target, "batcher") and hasattr(b_target.batcher, "update_buckets"):
+                            b_target.batcher.update_buckets(new_buckets, new_total_window=active_window)
+
+            # Dynamic Sequence Length Transition Check (if seq_transition_steps > 0)
+            if target_seq_len is not None and target_seq_len > initial_seq_len and seq_trans_steps > 0:
+                elapsed_trans = max(0, step - start_step)
+                trans_frac = min(1.0, float(elapsed_trans) / float(seq_trans_steps))
+                cur_target_len = initial_seq_len + int((target_seq_len - initial_seq_len) * trans_frac)
+                cur_target_len = min(target_seq_len, max(initial_seq_len, (cur_target_len // 64) * 64))
+                if cur_target_len != args.seq_len:
+                    old_len = args.seq_len
+                    args.seq_len = cur_target_len
+                    print(f"\n🔄 [Sequence Transition] Step {step:,}: Progressing target sequence length {old_len} -> {args.seq_len} (Final Target: {target_seq_len})")
+                    if elastic_batcher is not None and hasattr(elastic_batcher, "update_target_len"):
+                        elastic_batcher.update_target_len(args.seq_len)
 
             cur_lr = get_learning_rate(step, args.total_steps, args.lr, args.min_lr, args.warmup_steps)
 
@@ -1185,11 +1460,11 @@ def main(args=None):
                     sampling_p=cur_sampling_p,
                 )
                 loss = float(loss_rep[0])
-                step_tokens = int(q_shard.shape[0] * q_shard.shape[1] * q_shard.shape[2] * (q_shard.shape[3] + r_shard.shape[3]))
+                step_tokens, step_prompt, step_loss, step_pad = _count_real_tokens(q_shard, r_shard)
             elif compute_grad_step is not None and grad_accum > 1:
                 acc_grads = None
                 loss_acc = 0.0
-                step_tokens = 0
+                step_tokens, step_prompt, step_loss, step_pad = 0, 0, 0, 0
                 inv_accum = 1.0 / float(grad_accum)
                 for _ in range(grad_accum):
                     prompt_b, target_b, feedback_b = _next_batch()
@@ -1202,7 +1477,11 @@ def main(args=None):
                         else jax.tree_util.tree_map(lambda a, b: a + b, acc_grads, micro_grads)
                     )
                     loss_acc = loss_acc + g_loss
-                    step_tokens += prompt_b.shape[0] * (prompt_b.shape[1] + target_b.shape[1])
+                    m_tok, m_p, m_l, m_pad = _count_real_tokens(prompt_b, target_b)
+                    step_tokens += m_tok
+                    step_prompt += m_p
+                    step_loss += m_l
+                    step_pad += m_pad
                 acc_grads = jax.tree_util.tree_map(lambda a: a * inv_accum, acc_grads)
                 loss = loss_acc * inv_accum
                 cur_apply_opt = apply_opt_step_anneal if (not is_frozen_active or is_anneal or param_masks is None) else (apply_opt_step_frozen or apply_opt_step_anneal)
@@ -1220,7 +1499,7 @@ def main(args=None):
                     sampling_p=cur_sampling_p,
                     encephalization_alpha=enc_alpha,
                 )
-                step_tokens = prompt_b.shape[0] * (prompt_b.shape[1] + target_b.shape[1])
+                step_tokens, step_prompt, step_loss, step_pad = _count_real_tokens(prompt_b, target_b)
 
             loss_val = float(loss)
             if math.isfinite(loss_val):
@@ -1231,10 +1510,36 @@ def main(args=None):
                 ema_loss = last_eval_loss if math.isfinite(last_eval_loss) else 3.00
                 cur_lr = cur_lr * 0.75
 
+            # Extract optimizer diagnostics (grad norm, clipping, skips, update ratios, multi-TPU drift)
+            cur_diag = None
+            if use_multi_tpu_local_sgd and rep_opt_state is not None:
+                raw_diag = rep_opt_state.get("diag")
+                if raw_diag is not None:
+                    cur_diag = {k: float(jax.device_get(v[0])) for k, v in raw_diag.items()}
+            elif opt_state is not None and isinstance(opt_state, dict) and "diag" in opt_state:
+                raw_diag = opt_state["diag"]
+                cur_diag = {k: float(jax.device_get(v)) for k, v in raw_diag.items()}
+
+            if cur_diag is not None:
+                was_skip = cur_diag.get("was_skipped", 0.0)
+                if was_skip > 0.0:
+                    cumulative_skips += 1
+                    print(
+                        f"\n⚠️ [Optimizer Skip @ Step {step:,}] Step was SKIPPED by optimizer! "
+                        f"(Non-finite gradient or parameters detected. Total skips: {cumulative_skips})"
+                    )
+                was_clip = cur_diag.get("was_clipped", 0.0)
+                if was_clip > 0.0:
+                    window_clipped_count += 1
+            window_step_count += step_stride
+
             # Step & token throughput accounting
             step_window_tokens += step_tokens
             step_window_count += step_stride
             cumulative_tokens += step_tokens
+            cumulative_prompt_tokens += step_prompt
+            cumulative_loss_tokens += step_loss
+            cumulative_padded_tokens += step_pad
             lifetime_tokens = initial_lifetime_tokens + cumulative_tokens
 
             # Console Progress Logging
@@ -1246,19 +1551,42 @@ def main(args=None):
 
                 gov_str = f" | Gov: {alpha_gov:.2f}" if getattr(args, "loss_window_governor", True) and alpha_gov > 0.01 else ""
 
+                pad_ratio = (cumulative_padded_tokens / max(cumulative_tokens + cumulative_padded_tokens, 1)) * 100.0
                 tgt_tok = getattr(args, "target_tokens", 200_000_000_000)
                 if tgt_tok and tgt_tok > 0:
                     pct = (cumulative_tokens / tgt_tok) * 100.0
                     eta_sec = max(0.0, tgt_tok - cumulative_tokens) / max(tok_per_sec, 1e-6)
                     eta_h = eta_sec / 3600.0
-                    tok_str = f"Tokens: {cumulative_tokens/1e9:5.3f}B/{tgt_tok/1e9:4.2f}B ({pct:5.2f}%) | ETA: {eta_h:4.1f}h | "
+                    tok_str = (
+                        f"RealTok: {cumulative_tokens/1e9:5.3f}B/{tgt_tok/1e9:4.2f}B ({pct:5.2f}%) "
+                        f"[Loss: {cumulative_loss_tokens/1e9:5.3f}B, Prompt: {cumulative_prompt_tokens/1e9:5.3f}B | Pad: {pad_ratio:4.1f}%] | "
+                        f"ETA: {eta_h:4.1f}h | "
+                    )
                 else:
-                    tok_str = f"Tokens: {cumulative_tokens/1e9:5.3f}B | "
+                    tok_str = (
+                        f"RealTok: {cumulative_tokens/1e9:5.3f}B "
+                        f"[Loss: {cumulative_loss_tokens/1e9:5.3f}B, Prompt: {cumulative_prompt_tokens/1e9:5.3f}B | Pad: {pad_ratio:4.1f}%] | "
+                    )
 
                 if getattr(args, "freeze_core", False):
                     phase_tag = f" [{'ALL_TRAINABLE' if is_past_freeze_limit else ('ANNEAL' if is_anneal else 'FROZEN')}]"
                 else:
                     phase_tag = ""
+
+                clip_pct = (window_clipped_count / max(1, window_step_count)) * 100.0
+                diag_info = ""
+                if cur_diag is not None:
+                    gn = cur_diag.get("grad_norm", 0.0)
+                    u_m = cur_diag.get("u_ratio_manifold", 0.0)
+                    u_v = cur_diag.get("u_ratio_vocab", 0.0)
+                    u_1d = cur_diag.get("u_ratio_1d", 0.0)
+                    drift = cur_diag.get("replica_drift", 0.0)
+                    drift_str = f" | Drift: {drift:.2e}" if use_multi_tpu_local_sgd else ""
+                    diag_info = (
+                        f"\n       ↳ [Optimizer Diag] GradNorm: {gn:5.2f} (Clip: {clip_pct:4.1f}%) | "
+                        f"Skips: {cumulative_skips} | U/W [M: {u_m:.2e}, Vocab: {u_v:.2e}, 1D: {u_1d:.2e}]{drift_str}"
+                    )
+
                 print(
                     f"[Step {step:6d}/{args.total_steps}]{phase_tag} "
                     f"{tok_str}"
@@ -1267,10 +1595,12 @@ def main(args=None):
                     f"Tok/s: {tok_per_sec:7,.0f} | "
                     f"LR: {cur_lr:.2e} | "
                     f"Samp_p: {cur_sampling_p:.2f}{gov_str}"
+                    f"{diag_info}"
                 )
                 t_last_log = time.time()
                 step_window_tokens = 0
                 step_window_count = 0
+                window_clipped_count = 0
 
             # Held-Out Validation Evaluation
             crossed_eval = bool(eval_batches) and ((step // max(1, args.eval_interval)) > (prev_step // max(1, args.eval_interval)))
@@ -1335,8 +1665,13 @@ def main(args=None):
                         "ema_loss": ema_loss if ema_loss is not None else float(loss),
                         "ppl": eval_ppl,
                         "preset": args.preset,
+                        "use_rope": config.use_rope,
+                        "max_phase_steps": config.max_phase_steps,
                         "sync_model": sync_model_name,
                         "cumulative_tokens": cumulative_tokens,
+                        "cumulative_prompt_tokens": cumulative_prompt_tokens,
+                        "cumulative_loss_tokens": cumulative_loss_tokens,
+                        "cumulative_padded_tokens": cumulative_padded_tokens,
                         "lifetime_tokens": lifetime_tokens,
                         "target_tokens": getattr(args, "target_tokens", 200_000_000_000),
                         "effective_batch_size": args.batch_size * grad_accum,
@@ -1393,8 +1728,13 @@ def main(args=None):
                     "eval_loss": last_eval_loss if math.isfinite(last_eval_loss) else float(loss),
                     "best_eval_loss": best_eval_loss,
                     "preset": args.preset,
+                    "use_rope": config.use_rope,
+                    "max_phase_steps": config.max_phase_steps,
                     "sync_model": sync_model_name,
                     "cumulative_tokens": cumulative_tokens,
+                    "cumulative_prompt_tokens": cumulative_prompt_tokens,
+                    "cumulative_loss_tokens": cumulative_loss_tokens,
+                    "cumulative_padded_tokens": cumulative_padded_tokens,
                     "lifetime_tokens": lifetime_tokens,
                     "target_tokens": getattr(args, "target_tokens", 200_000_000_000),
                     "effective_batch_size": args.batch_size * grad_accum,
@@ -1488,8 +1828,13 @@ def main(args=None):
             "ema_loss": ema_loss if ("ema_loss" in locals() and ema_loss is not None) else (float(loss) if "loss" in locals() else 0.0),
             "eval_loss": best_eval_loss if "best_eval_loss" in locals() else float("inf"),
             "preset": args.preset,
+            "use_rope": config.use_rope,
+            "max_phase_steps": config.max_phase_steps,
             "sync_model": sync_model_name if "sync_model_name" in locals() else args.preset,
             "cumulative_tokens": cumulative_tokens if "cumulative_tokens" in locals() else 0,
+            "cumulative_prompt_tokens": cumulative_prompt_tokens if "cumulative_prompt_tokens" in locals() else 0,
+            "cumulative_loss_tokens": cumulative_loss_tokens if "cumulative_loss_tokens" in locals() else 0,
+            "cumulative_padded_tokens": cumulative_padded_tokens if "cumulative_padded_tokens" in locals() else 0,
             "lifetime_tokens": lifetime_tokens if "lifetime_tokens" in locals() else 0,
             "target_tokens": getattr(args, "target_tokens", 200_000_000_000),
             "effective_batch_size": args.batch_size * (grad_accum if "grad_accum" in locals() else 1),
@@ -1530,11 +1875,14 @@ def run_training(**kwargs):
     """Programmatic entrypoint for Jupyter / Colab notebooks."""
     args = parse_args([])
     for k, v in kwargs.items():
-        if hasattr(args, k):
+        attr = k.replace("-", "_")
+        if hasattr(args, attr):
+            setattr(args, attr, v)
+        elif hasattr(args, k):
             setattr(args, k, v)
-        elif k == "drive_dir":
+        elif k in ("drive_dir", "checkpoint_dir"):
             setattr(args, "checkpoint_dir", v)
-        elif k == "max_steps":
+        elif k in ("max_steps", "total_steps"):
             setattr(args, "total_steps", v)
         elif k == "remat":
             setattr(args, "remat", str(v).lower())

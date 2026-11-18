@@ -141,6 +141,7 @@ def parse_args(args_list=None):
     parser.add_argument("--context-stage-steps", type=int, default=0, help="Steps per context stage (0 divides the run evenly among stages)")
     parser.add_argument("--use-rope", "--use_rope", dest="use_rope", action=argparse.BooleanOptionalAction, default=True, help="Use rotary Q/K positions for new long-context training runs (default: True)")
     parser.add_argument("--max-phase-steps", "--max_phase_steps", dest="max_phase_steps", type=int, default=4096, help="Learned output phase-clock horizon for new runs (default: 4096)")
+    parser.add_argument("--sensory-position-steps", "--sensory_position_steps", dest="sensory_position_steps", type=int, default=4096, help="Learned sensory positional embedding steps (default: 4096)")
 
     # Learning Rate & Optimization
     parser.add_argument("--lr", type=float, default=2e-3, help="Peak Spheroid learning rate (default: 2e-3)")
@@ -270,8 +271,25 @@ def build_data_stream(
     except ImportError:
         pass
 
-    if dataset_source in ("local", "pretrain", "offline") or not HAS_DATASETS:
-        if dataset_source not in ("local", "pretrain", "offline") and not HAS_DATASETS:
+    # 100% Loss-Bearing Rectified Contiguous Pretraining Streamer
+    if dataset_source in ("pretrain", "rectified", "rectified_pretrain", "clean_pretrain", "midtrain", "rectified_midtrain") and HAS_DATASETS:
+        from src.rectified_streamer import RectifiedContiguousPretrainStreamer
+        streamer_stage = "midtrain" if "midtrain" in dataset_source else "pretrain"
+        print(f"\n📦 Initializing 100% Loss-Bearing Rectified Contiguous Streamer [{dataset_source.upper()}]...")
+        print(f"   • Stage:          {streamer_stage.upper()}")
+        print(f"   • Context Window: {total_window} tokens (contiguous unbroken next-token loss)")
+        print(f"   • Global Batch:   {batch_size} sequences/step")
+        streamer = RectifiedContiguousPretrainStreamer(
+            tokenizer=tokenizer,
+            batch_size=batch_size,
+            block_size=total_window,
+            stage=streamer_stage,
+            queue_size=max(16, int(prefetch_queue_size)),
+        )
+        return streamer, None
+
+    if dataset_source in ("local", "offline") or not HAS_DATASETS:
+        if dataset_source not in ("local", "offline") and not HAS_DATASETS:
             print(f"⚠️ [DataStreamer] 'datasets' library not found. Falling back to high-throughput local corpus.")
         print(f"📦 Initializing background linguistic streaming queue (Local Corpus in data/)...")
         streamer = LinguisticDataStreamer(
@@ -493,6 +511,8 @@ def main(args=None):
     cfg_kwargs = PRESETS_V5[config_preset].copy()
     cfg_kwargs["use_rope"] = bool(args.use_rope)
     cfg_kwargs["max_phase_steps"] = int(args.max_phase_steps)
+    if getattr(args, "sensory_position_steps", None) is not None:
+        cfg_kwargs["sensory_position_steps"] = int(args.sensory_position_steps)
     if getattr(args, "num_mtp_heads", None) is not None:
         cfg_kwargs["num_mtp_heads"] = args.num_mtp_heads
     if getattr(args, "use_adaptive_thinking", None) is not None:
@@ -1855,11 +1875,14 @@ def run_training(**kwargs):
     """Programmatic entrypoint for Jupyter / Colab notebooks."""
     args = parse_args([])
     for k, v in kwargs.items():
-        if hasattr(args, k):
+        attr = k.replace("-", "_")
+        if hasattr(args, attr):
+            setattr(args, attr, v)
+        elif hasattr(args, k):
             setattr(args, k, v)
-        elif k == "drive_dir":
+        elif k in ("drive_dir", "checkpoint_dir"):
             setattr(args, "checkpoint_dir", v)
-        elif k == "max_steps":
+        elif k in ("max_steps", "total_steps"):
             setattr(args, "total_steps", v)
         elif k == "remat":
             setattr(args, "remat", str(v).lower())
