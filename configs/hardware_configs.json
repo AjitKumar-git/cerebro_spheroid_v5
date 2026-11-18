@@ -79,6 +79,15 @@
       "tune_objective": "balanced",
       "max_batch_size": null,
       "tuner_version": 2
+    },
+    "NVIDIA_GeForce_RTX_3050_Laptop_GPU_4GB": {
+      "batch_size": 64,
+      "remat": true,
+      "seq_len": 64,
+      "tok_per_sec": 99999.0,
+      "step_ms": 100.0,
+      "vram_gb": 4.0,
+      "vram_utilization_pct": 50.0
     }
   }
 }
