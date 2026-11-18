@@ -1,0 +1,5 @@
+transformers>=4.40.0
+datasets>=2.18.0
+pyarrow>=14.0.0
+optax>=0.2.0
+torch>=2.0.0
