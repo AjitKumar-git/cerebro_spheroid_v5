@@ -39,6 +39,7 @@ def parse_args():
         help="Optimization objective: 'tok_per_sec' (tokens/sec), 'steps_per_sec' (steps/s), 'loss_reduction_per_sec' (loss reduction/sec), or 'balanced'",
     )
     parser.add_argument("--force-tune", "--force_tune", dest="force_tune", action="store_true", default=False, help="Force re-benchmark even if cached on bioflo.in")
+    parser.add_argument("--fast", "--fast-tune", dest="fast", action=argparse.BooleanOptionalAction, default=True, help="Fast search mode with geometric ladder and plateau early exit (default: True)")
     parser.add_argument("--launch-training", action="store_true", default=False, help="Launch pretraining with winning configuration immediately")
     parser.add_argument("--total-steps", type=int, default=1_000_000, help="Total training steps if launching")
     parser.add_argument("--scratch", "--from-scratch", dest="from_scratch", action="store_true", default=False, help="Start from scratch at Step 0 (bypass checkpoint resumption)")
@@ -54,6 +55,7 @@ def main():
         force_tune=args.force_tune,
         tune_objective=args.tune_objective,
         verbose=True,
+        fast=args.fast,
     )
 
     if args.launch_training:

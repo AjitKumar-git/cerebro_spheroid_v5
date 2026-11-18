@@ -112,7 +112,7 @@ from src.elastic_window import (
     get_default_elastic_buckets,
 )
 from src.jax.data_streamer import LinguisticDataStreamer
-from src.jax.auto_tuner import run_auto_tuner, resolve_jax_compute_dtype
+from autotune import run_auto_tuner, resolve_jax_compute_dtype
 
 
 def parse_args(args_list=None):

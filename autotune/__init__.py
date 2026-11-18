@@ -60,6 +60,10 @@ from .benchmark import (
     BenchmarkResult,
     BenchmarkRunner,
 )
+from .memory import (
+    MemoryBreakdown,
+    estimate_peak_hbm,
+)
 from .engine import (
     AutoTuner,
     auto_tune_environment,
@@ -86,6 +90,8 @@ __all__ = [
     "LOCAL_CONFIG_PATH",
     "BenchmarkResult",
     "BenchmarkRunner",
+    "MemoryBreakdown",
+    "estimate_peak_hbm",
     "auto_tune_environment",
     "run_auto_tuner",
 ]

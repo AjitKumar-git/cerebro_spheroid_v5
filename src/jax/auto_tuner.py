@@ -132,6 +132,8 @@ def auto_tune_environment(
     tune_objective: str = "balanced",
     prompt_len: int = 256,
     max_batch_size: Optional[int] = None,
+    fast: bool = True,
+    num_steps: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Explores candidate execution configurations and identifies the setting that
@@ -151,6 +153,7 @@ def auto_tune_environment(
         cloud_url=cloud_url,
         cloud_token=cloud_token,
         verbose=verbose,
+        fast=fast,
     )
     return tuner.tune(
         preset=preset,
@@ -163,6 +166,8 @@ def auto_tune_environment(
         prompt_len=prompt_len,
         max_batch_size=max_batch_size,
         benchmark_fn=benchmark_config,
+        fast=fast,
+        num_steps=num_steps,
     )
 
 

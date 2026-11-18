@@ -328,6 +328,52 @@ class TestAutotuneLibrary(unittest.TestCase):
         self.assertIn("OOM", res_oom["status"])
         self.assertEqual(res_oom["steps_per_sec"], 0.0)
 
+    def test_candidate_ladder_plateau_pruning(self):
+        """Verifies that throughput plateau / degradation early-stops larger batch explorations."""
+        candidates = [
+            {"batch_size": 32, "remat": False},
+            {"batch_size": 64, "remat": False},
+            {"batch_size": 128, "remat": False},
+            {"batch_size": 256, "remat": False},
+            {"batch_size": 384, "remat": False},
+            {"batch_size": 512, "remat": False},
+        ]
+        ladder = CandidateLadder(candidates, enable_plateau_pruning=True, plateau_tolerance=2)
+
+        # 32: 30k
+        ladder.record_result(32, False, "PASS", tok_per_sec=30000.0)
+        self.assertFalse(ladder.should_skip(64, False))
+
+        # 64: 60k (growing)
+        ladder.record_result(64, False, "PASS", tok_per_sec=60000.0)
+        self.assertFalse(ladder.should_skip(128, False))
+
+        # 128: 100k (peak throughput)
+        ladder.record_result(128, False, "PASS", tok_per_sec=100000.0)
+        self.assertFalse(ladder.should_skip(256, False))
+
+        # 256: 95k (first degradation)
+        ladder.record_result(256, False, "PASS", tok_per_sec=95000.0)
+        self.assertFalse(ladder.stopped_due_to_plateau)
+
+        # 384: 90k (second degradation -> threshold reached)
+        ladder.record_result(384, False, "PASS", tok_per_sec=90000.0)
+        self.assertTrue(ladder.stopped_due_to_plateau)
+
+        # 512 must be skipped because plateau was reached!
+        self.assertTrue(ladder.should_skip(512, False))
+
+    def test_fast_candidate_generation(self):
+        """Verifies fast candidate generation produces a thinned geometric ladder."""
+        full_ladder = generate_vram_maximizing_candidates("v5_small", total_gb=16.0, fast=False)
+        fast_ladder = generate_vram_maximizing_candidates("v5_small", total_gb=16.0, fast=True)
+        self.assertLess(len(fast_ladder), len(full_ladder))
+        # Ensure optimal anchor batch sizes remain present in fast ladder
+        fast_batches = [c["batch_size"] for c in fast_ladder]
+        self.assertIn(64, fast_batches)
+        self.assertIn(128, fast_batches)
+        self.assertIn(256, fast_batches)
+
 
 if __name__ == "__main__":
     unittest.main()

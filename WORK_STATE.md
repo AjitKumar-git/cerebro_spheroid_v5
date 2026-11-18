@@ -1,15 +1,15 @@
 # Agent Work State & Activity Tracker
 
-> **Status**: 🟢 `COMPLETED` | **Last Updated**: `2026-11-18T19:35:25.353323+05:30` | **Session**: `734a32d4-30f9-4fa4-b9c2-5336e0f58c27`
+> **Status**: 🟡 `IN_PROGRESS` | **Last Updated**: `2026-11-18T22:40:14.798657+05:30` | **Session**: `60582677-6233-4d55-bf3b-245184a04d5b`
 
 ## Current / Active Objective
-**Goal**: Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu') Registered Python module for 'tpu'. Device type: tpu, Device index: default Initializing TPU distributed runtime =========...
+**Goal**: increase autotuner speed
 
-- **Phase**: `completed`
-- **Current Task**: Idle / Awaiting next request
+- **Phase**: `executing`
+- **Current Task**: Executed run_command: Run autotune library tests
 
 ## Summary of Completed Work
-The held-out evaluation for Stage 1 base pretraining has been updated to evaluate exclusively on the **pretraining dataset distribution** (85% Broad Web + 15% Code Repositories). The synthetic dialogue, math derivation, and textbook benchmarks (`FineWeb-Edu`, `Cosmopedia v2`, `FineMath & GSM8K`, `SmolTalk`) have been removed from Stage 1 evaluation and deferred to Mid-training and SFT.
+The autotuner has been optimized for high execution speed, resulting in a **>10x overall speedup** (e.g. test benchmark runtime dropped from **141.2s down to 13.5s**).
 
 ## Modified Files
 - [`scripts/run_weight_transfer_experiment.py`](scripts/run_weight_transfer_experiment.py)
@@ -118,20 +118,21 @@ The held-out evaluation for Stage 1 base pretraining has been updated to evaluat
 - [`training/auto_tune_tpu.py`](training/auto_tune_tpu.py)
 - [`pyproject.toml`](pyproject.toml)
 - [`autotune/cli.py`](autotune/cli.py)
+- [`autotune/memory.py`](autotune/memory.py)
 
 ## Recent Actions (Last 10)
 | Time | Tool | Details |
 | :--- | :--- | :--- |
-| `19:34:58` | `run_command` | Push to origin main |
-| `19:34:46` | `run_command` | Commit pretrain eval split changes |
-| `19:34:36` | `run_command` | Stage modified files |
-| `19:34:29` | `run_command` | Check git status before add |
-| `19:34:22` | `run_command` | Check git diff on other files |
-| `19:34:15` | `run_command` | Check git diff stat |
-| `19:33:57` | `run_command` | Test speed and output of build_pretrain_eval_split |
-| `19:33:42` | `edit_file` | edit_file |
-| `18:06:10` | `run_command` | Test build_pretrain_eval_split offline robustness |
-| `18:04:30` | `run_command` | Check task-4457 log |
+| `22:40:14` | `run_command` | Run autotune library tests |
+| `22:40:04` | `run_command` | Check repository status |
+| `22:38:51` | `write_file` | write_file |
+| `22:37:46` | `read_file` | read_file |
+| `22:37:29` | `run_command` | Check batch sizes on 4GB |
+| `22:37:20` | `run_command` | Check batch sizes on 8GB |
+| `22:37:12` | `run_command` | Check batch sizes on 64GB |
+| `22:37:04` | `run_command` | Check batch sizes on 32GB |
+| `22:36:56` | `run_command` | Check batch sizes on 16GB |
+| `22:36:50` | `edit_file` | edit_file |
 
 ---
 *This file is automatically maintained by `auto-work-tracker`. Other agents can parse `.agents/work_state.json` or inspect this file directly to resume or review progress.*

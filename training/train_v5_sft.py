@@ -74,7 +74,7 @@ from src.jax.v5_model import (
     rms_norm,
 )
 from src.jax.checkpoint import adapt_and_load_checkpoint_weights, discover_latest_checkpoint, AsyncCheckpointManager
-from src.jax.auto_tuner import resolve_jax_compute_dtype, run_auto_tuner
+from autotune import resolve_jax_compute_dtype, run_auto_tuner
 from src.jax.data_streamer import LinguisticDataStreamer
 from src.jax.spheroid_optimizer import init_spheroid_opt_state, build_spheroid_train_engine
 from src.elastic_window import (

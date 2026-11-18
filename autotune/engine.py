@@ -4,14 +4,14 @@ Core AutoTuner Engine & Execution Coordinator.
 
 Orchestrates accelerator discovery, architecture fingerprinting,
 memory-ladder candidate exploration, safe OOM branch pruning, and
-Pareto-optimal parameter selection.
+Pareto-optimal parameter selection with fast bisection & theoretical HBM bounds.
 """
 
 from __future__ import annotations
 
 import os
 import sys
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .objectives import TuneObjective
 from .hardware import get_hardware_info, resolve_jax_compute_dtype
@@ -32,11 +32,12 @@ from .benchmark import BenchmarkRunner
 
 class AutoTuner:
     """
-    Modular Accelerator and Architecture Auto-Tuner.
+    High-Speed Modular Accelerator and Architecture Auto-Tuner.
 
     Features:
-    - Zero-overhead cached retrieval for previously analyzed architectures.
+    - Zero-overhead cached retrieval (0ms) for previously analyzed architectures.
     - Automatic detection when a new model architecture or hardware topology is introduced.
+    - Fast geometric bisection exploration with theoretical HBM OOM pre-check.
     - Memory-maximizing exploration across TPU and GPU tiers.
     - Multi-objective optimization: tokens/sec, steps/s, loss reduction/sec, balanced.
     """
@@ -51,6 +52,7 @@ class AutoTuner:
         cloud_url: Optional[str] = None,
         cloud_token: Optional[str] = None,
         verbose: bool = True,
+        fast: bool = True,
     ):
         self.objective = TuneObjective.from_str(objective)
         self.cache_manager = cache_manager or HardwareConfigCache()
@@ -61,6 +63,7 @@ class AutoTuner:
         self.cloud_url = cloud_url
         self.cloud_token = cloud_token
         self.verbose = verbose
+        self.fast = fast
 
     def is_new_architecture(
         self,
@@ -92,6 +95,7 @@ class AutoTuner:
         max_batch_size: Optional[int] = None,
         candidates: Optional[List[Dict[str, Any]]] = None,
         force_tune: bool = False,
+        fast: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """
         Executes auto-tuning ONLY when a new architecture or unknown accelerator
@@ -150,7 +154,165 @@ class AutoTuner:
             prompt_len=prompt_len,
             max_batch_size=max_batch_size,
             benchmark_fn=benchmark_fn,
+            fast=self.fast if fast is None else fast,
         )
+
+    def _tune_bisection(
+        self,
+        preset: str,
+        candidates: List[Dict[str, Any]],
+        runner: BenchmarkRunner,
+        ladder: CandidateLadder,
+        dtype: str,
+        seq_len: int,
+        prompt_len: int,
+        benchmark_steps: int,
+        obj_name: str,
+        verbose: bool,
+        mem_type: str,
+    ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """
+        Executes fast logarithmic geometric bisection search across candidate batch sizes.
+        Reduces exploration complexity from O(N) to O(log N), finishing in 3-5 runs.
+        """
+        unique_batches = sorted(list(set(c["batch_size"] for c in candidates)))
+        results: List[Dict[str, Any]] = []
+        best_config: Optional[Dict[str, Any]] = None
+        best_score = -1.0
+        eval_cache: Dict[Tuple[int, bool], Dict[str, Any]] = {}
+
+        def eval_batch(b: int, r: bool) -> Dict[str, Any]:
+            nonlocal best_config, best_score
+            key = (b, r)
+            if key in eval_cache:
+                return eval_cache[key]
+
+            if ladder.should_skip(b, r):
+                skip_res = {
+                    "preset": preset,
+                    "batch_size": b,
+                    "remat": r,
+                    "tok_per_sec": 0.0,
+                    "steps_per_sec": 0.0,
+                    "step_ms": None,
+                    "compile_time": None,
+                    "memory_gb": 0.0,
+                    "memory_utilization_pct": 0.0,
+                    "status": "SKIPPED (Pruned by Ladder)",
+                }
+                eval_cache[key] = skip_res
+                return skip_res
+
+            if verbose:
+                print(f"[Bisection Probe] Testing: Batch {b:3d} | Remat: {str(r):5s} ... ", end="", flush=True)
+
+            res = runner.run(
+                preset=preset,
+                batch_size=b,
+                remat=r,
+                seq_len=seq_len,
+                num_steps=benchmark_steps,
+                dtype=dtype,
+                prompt_len=prompt_len,
+            )
+            results.append(res)
+            eval_cache[key] = res
+            ladder.record_result(b, r, res.get("status", "FAIL"), tok_per_sec=res.get("tok_per_sec", 0.0))
+
+            if res.get("status") == "PASS":
+                tok_s = res.get("tok_per_sec", 0.0)
+                steps_s = res.get("steps_per_sec", 0.0)
+                m_gb = res.get("memory_gb", res.get("vram_gb", 0))
+                m_pct = res.get("memory_utilization_pct", res.get("vram_utilization_pct", 0))
+                loss_v = res.get("loss_reduction_per_sec", 0.0)
+                loss_str = f" | dLoss/s: {loss_v:6.4f}" if loss_v > 0 else ""
+
+                if verbose:
+                    print(
+                        f"✓ {steps_s:5.2f} steps/s | {tok_s:8,.0f} tok/s | "
+                        f"{mem_type}: {m_gb:4.1f} GB ({m_pct:4.1f}%){loss_str} | Latency: {res.get('step_ms', 0):6.1f}ms"
+                    )
+                score = score_benchmark_result(res, obj_name)
+                if score > best_score:
+                    best_score = score
+                    best_config = res
+            else:
+                if verbose:
+                    print(f"❌ {res.get('status')}")
+
+            return res
+
+        if not unique_batches:
+            return results, best_config
+
+        # 1. Anchor probe: test the median batch size with remat=False
+        low = 0
+        high = len(unique_batches) - 1
+        mid = (low + high) // 2
+        anchor_batch = unique_batches[mid]
+
+        res_anchor = eval_batch(anchor_batch, remat=False)
+
+        if res_anchor.get("status") == "PASS":
+            best_pass_idx = mid
+            # Probe highest candidate to find upper bound
+            res_high = eval_batch(unique_batches[high], remat=False)
+            if res_high.get("status") == "PASS":
+                best_pass_idx = high
+            else:
+                # Bracket is [mid, high]: bisect between them
+                l, r = mid, high
+                while r - l > 1:
+                    m = (l + r) // 2
+                    res_m = eval_batch(unique_batches[m], remat=False)
+                    if res_m.get("status") == "PASS":
+                        l = m
+                        best_pass_idx = m
+                    else:
+                        r = m
+        else:
+            # Anchor OOMed! Bisect downward between low and mid
+            best_pass_idx = None
+            l, r = low, mid
+            while r - l > 1:
+                m = (l + r) // 2
+                res_m = eval_batch(unique_batches[m], remat=False)
+                if res_m.get("status") == "PASS":
+                    l = m
+                    best_pass_idx = m
+                else:
+                    r = m
+            if best_pass_idx is None:
+                res_low = eval_batch(unique_batches[low], remat=False)
+                if res_low.get("status") == "PASS":
+                    best_pass_idx = low
+
+        # 2. Check activation rematerialization (remat=True)
+        # Test if next larger batch fits with activation checkpointing and beats best score
+        if best_pass_idx is not None and best_pass_idx + 1 < len(unique_batches):
+            next_b = unique_batches[best_pass_idx + 1]
+            res_remat = eval_batch(next_b, remat=True)
+            if res_remat.get("status") == "PASS":
+                curr_idx = best_pass_idx + 1
+                while curr_idx + 1 < len(unique_batches):
+                    higher_b = unique_batches[curr_idx + 1]
+                    res_h = eval_batch(higher_b, remat=True)
+                    if res_h.get("status") == "PASS":
+                        curr_idx += 1
+                    else:
+                        break
+        elif best_pass_idx is None:
+            # If all remat=False OOMed, bisect with remat=True
+            l, r = low, high
+            while l <= r:
+                m = (l + r) // 2
+                res_m = eval_batch(unique_batches[m], remat=True)
+                if res_m.get("status") == "PASS":
+                    l = m + 1
+                else:
+                    r = m - 1
+
+        return results, best_config
 
     def tune(
         self,
@@ -168,6 +330,9 @@ class AutoTuner:
         prompt_len: int = 256,
         max_batch_size: Optional[int] = None,
         benchmark_fn: Optional[Callable[..., Dict[str, Any]]] = None,
+        fast: Optional[bool] = None,
+        num_steps: Optional[int] = None,
+        strategy: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Explores candidate configurations and selects the optimal hyperparameter settings."""
         if verbose is None:
@@ -178,6 +343,13 @@ class AutoTuner:
             cloud_url = self.cloud_url
         if cloud_token is None:
             cloud_token = self.cloud_token
+
+        # Default strategy: bisection when fast=True and candidates is None
+        is_custom_candidates = candidates is not None
+        if fast is None:
+            fast = self.fast if not is_custom_candidates else False
+        if strategy is None:
+            strategy = "bisection" if (fast and not is_custom_candidates) else "linear"
 
         obj_enum = TuneObjective.from_str(tune_objective or self.objective)
         obj_name = obj_enum.value
@@ -281,9 +453,10 @@ class AutoTuner:
                     print(f"ℹ️ [AutoTuner] Remote config check notice: {e}")
 
         # 2. Benchmarking execution
+        speed_tag = " [GEOMETRIC BISECTION SEARCH]" if strategy == "bisection" else ""
         if verbose:
             print("=" * 80)
-            print(f"🚀 AUTOTUNER: AUTOMATIC {obj_enum.label.upper()} & {mem_type} OPTIMIZATION")
+            print(f"🚀 AUTOTUNER: AUTOMATIC {obj_enum.label.upper()} & {mem_type} OPTIMIZATION{speed_tag}")
             print("=" * 80)
             print(f"Hardware Platform  : {hw.get('device_count', 1)} x {dev_kind} ({sig})")
             print(f"Detected Memory    : {total_gb:.1f} GB Available {mem_type}")
@@ -292,62 +465,105 @@ class AutoTuner:
             print(f"Tune Objective     : {obj_enum.label}")
             print("-" * 80)
 
+        # Smart candidate ladder generation: on >=16GB accelerators, start at 32 or 64
+        min_batch = None
+        if total_gb >= 16.0 and max_batch_size is None:
+            min_batch = 32 if total_gb < 64.0 else 64
+        elif total_gb >= 12.0 and max_batch_size is None:
+            min_batch = 16
+
         if candidates is None:
             candidates = generate_vram_maximizing_candidates(
                 preset=preset,
                 total_gb=total_gb,
                 seq_len=seq_len,
                 max_batch_size=max_batch_size,
+                min_batch_size=min_batch,
+                fast=fast,
             )
 
-        ladder = CandidateLadder(candidates)
-        results = []
-        best_config = None
-        best_score = -1.0
+        ladder = CandidateLadder(
+            candidates,
+            enable_plateau_pruning=fast,
+            plateau_tolerance=2,
+        )
 
-        for idx, c in enumerate(candidates, 1):
-            b = c["batch_size"]
-            r = c.get("remat", True)
+        benchmark_steps = (
+            num_steps if num_steps is not None else (2 if (is_tpu or is_gpu) else 1)
+        )
 
-            # Smart branch pruning
-            if ladder.should_skip(b, r):
-                continue
-
-            if verbose:
-                print(f"[{idx}/{len(candidates)}] Testing: Batch {b:3d} | Remat: {str(r):5s} ... ", end="", flush=True)
-
-            res = runner.run(
+        # Execution mode: Bisection vs Linear
+        if strategy == "bisection" and not is_custom_candidates:
+            results, best_config = self._tune_bisection(
                 preset=preset,
-                batch_size=b,
-                remat=r,
-                seq_len=seq_len,
-                num_steps=4 if (is_tpu or is_gpu) else 2,
+                candidates=candidates,
+                runner=runner,
+                ladder=ladder,
                 dtype=dtype,
+                seq_len=seq_len,
                 prompt_len=prompt_len,
+                benchmark_steps=benchmark_steps,
+                obj_name=obj_name,
+                verbose=verbose,
+                mem_type=mem_type,
             )
-            results.append(res)
-            ladder.record_result(b, r, res.get("status", "FAIL"))
+        else:
+            results = []
+            best_config = None
+            best_score = -1.0
 
-            if res.get("status") == "PASS":
-                tok_s = res.get("tok_per_sec", 0.0)
-                steps_s = res.get("steps_per_sec", 0.0)
-                m_gb = res.get("memory_gb", res.get("vram_gb", 0))
-                m_pct = res.get("memory_utilization_pct", res.get("vram_utilization_pct", 0))
-                loss_v = res.get("loss_reduction_per_sec", 0.0)
-                loss_str = f" | dLoss/s: {loss_v:6.4f}" if loss_v > 0 else ""
+            for idx, c in enumerate(candidates, 1):
+                b = c["batch_size"]
+                r = c.get("remat", True)
+
+                # Smart branch pruning & plateau early-stopping
+                if ladder.should_skip(b, r):
+                    continue
 
                 if verbose:
+                    print(f"[{idx}/{len(candidates)}] Testing: Batch {b:3d} | Remat: {str(r):5s} ... ", end="", flush=True)
+
+                res = runner.run(
+                    preset=preset,
+                    batch_size=b,
+                    remat=r,
+                    seq_len=seq_len,
+                    num_steps=benchmark_steps,
+                    dtype=dtype,
+                    prompt_len=prompt_len,
+                )
+                results.append(res)
+                ladder.record_result(
+                    b, r, res.get("status", "FAIL"), tok_per_sec=res.get("tok_per_sec", 0.0)
+                )
+
+                if res.get("status") == "PASS":
+                    tok_s = res.get("tok_per_sec", 0.0)
+                    steps_s = res.get("steps_per_sec", 0.0)
+                    m_gb = res.get("memory_gb", res.get("vram_gb", 0))
+                    m_pct = res.get("memory_utilization_pct", res.get("vram_utilization_pct", 0))
+                    loss_v = res.get("loss_reduction_per_sec", 0.0)
+                    loss_str = f" | dLoss/s: {loss_v:6.4f}" if loss_v > 0 else ""
+
+                    if verbose:
+                        print(
+                            f"✓ {steps_s:5.2f} steps/s | {tok_s:8,.0f} tok/s | "
+                            f"{mem_type}: {m_gb:4.1f} GB ({m_pct:4.1f}%){loss_str} | Latency: {res.get('step_ms', 0):6.1f}ms"
+                        )
+                    score = score_benchmark_result(res, obj_name)
+                    if score > best_score:
+                        best_score = score
+                        best_config = res
+                else:
+                    if verbose:
+                        print(f"❌ {res.get('status')}")
+
+                if ladder.stopped_due_to_plateau and verbose:
                     print(
-                        f"✓ {steps_s:5.2f} steps/s | {tok_s:8,.0f} tok/s | "
-                        f"{mem_type}: {m_gb:4.1f} GB ({m_pct:4.1f}%){loss_str} | Latency: {res.get('step_ms', 0):6.1f}ms"
+                        f"🛑 [AutoTuner] Peak throughput reached ({ladder.peak_throughput:,.0f} tok/s at Batch {ladder.peak_batch}). "
+                        f"Early-stopping search ladder to save time."
                     )
-                score = score_benchmark_result(res, obj_name)
-                if score > best_score:
-                    best_score = score
-                    best_config = res
-            else:
-                if verbose:
-                    print(f"❌ {res.get('status')}")
+                    break
 
         if verbose:
             print("\n" + "=" * 92)
@@ -441,6 +657,9 @@ def auto_tune_environment(
     tune_objective: str = "balanced",
     prompt_len: int = 256,
     max_batch_size: Optional[int] = None,
+    fast: bool = True,
+    num_steps: Optional[int] = None,
+    strategy: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Functional convenience entrypoint matching legacy CerebroSpheroid auto_tune_environment."""
     tuner = AutoTuner(
@@ -450,6 +669,7 @@ def auto_tune_environment(
         cloud_url=cloud_url,
         cloud_token=cloud_token,
         verbose=verbose,
+        fast=fast,
     )
     return tuner.tune(
         preset=preset,
@@ -461,6 +681,9 @@ def auto_tune_environment(
         tune_objective=tune_objective,
         prompt_len=prompt_len,
         max_batch_size=max_batch_size,
+        fast=fast,
+        num_steps=num_steps,
+        strategy=strategy,
     )
 
 

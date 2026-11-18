@@ -16,6 +16,7 @@ from typing import Optional
 from .hardware import get_hardware_info, resolve_jax_compute_dtype
 from .search import generate_vram_maximizing_candidates
 from .objectives import TuneObjective
+from .engine import AutoTuner
 
 
 def main(args: Optional[list] = None):
@@ -34,6 +35,15 @@ def main(args: Optional[list] = None):
     ladder_parser.add_argument("--preset", type=str, default="v5_small", help="Model preset / architecture name")
     ladder_parser.add_argument("--seq-len", type=int, default=256, help="Sequence length")
     ladder_parser.add_argument("--max-batch-size", type=int, default=None, help="Batch size ceiling")
+    ladder_parser.add_argument("--fast", action=argparse.BooleanOptionalAction, default=True, help="Fast geometric ladder")
+
+    # Command: tune
+    tune_parser = subparsers.add_parser("tune", help="Run auto-tuning on current hardware")
+    tune_parser.add_argument("--preset", type=str, default="v5_small", help="Model preset / architecture name")
+    tune_parser.add_argument("--seq-len", type=int, default=256, help="Sequence length")
+    tune_parser.add_argument("--objective", type=str, default="balanced", help="Optimization objective (tok_per_sec, steps_per_sec, loss_reduction_per_sec, balanced)")
+    tune_parser.add_argument("--fast", action=argparse.BooleanOptionalAction, default=True, help="High-speed tuning mode")
+    tune_parser.add_argument("--force-tune", action="store_true", default=False, help="Bypass local cache")
 
     parsed = parser.parse_args(args)
 
@@ -57,20 +67,36 @@ def main(args: Optional[list] = None):
 
     elif parsed.command == "ladder":
         hw = get_hardware_info()
+        fast_mode = getattr(parsed, "fast", True)
         candidates = generate_vram_maximizing_candidates(
             preset=parsed.preset,
             total_gb=hw["total_gb"],
             seq_len=parsed.seq_len,
             max_batch_size=parsed.max_batch_size,
+            fast=fast_mode,
         )
+        tag = "FAST GEOMETRIC" if fast_mode else "STANDARD LINEAR"
         print("=" * 60)
-        print(f"🔍 CANDIDATE SEARCH LADDER: {parsed.preset} ({hw['total_gb']:.1f}GB {hw['memory_type']})")
+        print(f"🔍 CANDIDATE SEARCH LADDER [{tag}]: {parsed.preset} ({hw['total_gb']:.1f}GB {hw['memory_type']})")
         print("=" * 60)
         print(f"{'Idx':<4} | {'Batch Size':<12} | {'Remat / Checkpointing':<24}")
         print("-" * 60)
         for idx, c in enumerate(candidates, 1):
             print(f"{idx:<4} | {c['batch_size']:<12} | {str(c['remat']):<24}")
         print("=" * 60)
+
+    elif parsed.command == "tune":
+        tuner = AutoTuner(
+            objective=parsed.objective,
+            fast=parsed.fast,
+            verbose=True,
+        )
+        tuner.tune(
+            preset=parsed.preset,
+            seq_len=parsed.seq_len,
+            force_tune=parsed.force_tune,
+            fast=parsed.fast,
+        )
 
 
 if __name__ == "__main__":
