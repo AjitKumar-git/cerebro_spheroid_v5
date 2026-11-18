@@ -377,6 +377,11 @@ def init_params_v5(key: jax.random.PRNGKey, config: ModelConfigV5) -> Tuple[Dict
             params[f"{pfx}swiglu.fc_val.weight"] = jax.random.normal(extra_keys[k_base + 4], (s_dim * 2, s_dim)) * (1.0 / math.sqrt(s_dim))
             params[f"{pfx}swiglu.fc_down.weight"] = jax.random.normal(extra_keys[k_base + 5], (s_dim, s_dim * 2)) * (1.0 / math.sqrt(s_dim * 2))
 
+    # 5. Dynamic Halting Gate for Adaptive Deliberation (System-2 Reasoning)
+    if getattr(config, "use_adaptive_thinking", False):
+        params["core.halting_gate.weight"] = jnp.zeros((1, s_dim), dtype=jnp.float32)
+        params["core.halting_gate.bias"] = jnp.array([-1.5], dtype=jnp.float32)
+
     src_idx, dst_idx = generate_small_world_indices(K, T)
     buffers = (src_idx, dst_idx)
     return params, buffers
@@ -610,6 +615,80 @@ def deliberate_step(params: Dict[str, jnp.ndarray], state: jnp.ndarray, buffers:
     # Return unnormalized residual state to preserve genuine radial shell amplitude hierarchy
     state_next = state_radial.at[:, dst_idx, :].add(s_mix * shortcut_flux)
     return state_next
+
+
+def deliberate_cycles_jax(
+    params: Dict[str, jnp.ndarray],
+    state: jnp.ndarray,
+    buffers: Tuple[jnp.ndarray, jnp.ndarray],
+    config: Optional[ModelConfigV5] = None,
+    is_training: bool = False,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Executes subconscious deliberation cycles across concentric laminae with static-iteration
+    lax.scan Adaptive Computation Time (ACT) for TPU/XLA compilation efficiency.
+
+    Returns:
+        (final_state, ponder_cost)
+    """
+    if config is None:
+        use_adapt = False
+        cycles = 4
+    else:
+        use_adapt = bool(getattr(config, "use_adaptive_thinking", False)) and ("core.halting_gate.weight" in params)
+        cycles = int(getattr(config, "max_thinking_cycles", getattr(config, "thinking_cycles", 4))) if use_adapt else int(getattr(config, "thinking_cycles", 4))
+
+    if not use_adapt:
+        def step_fn(curr_state, _):
+            next_state = deliberate_step(params, curr_state, buffers)
+            return next_state, None
+
+        final_state, _ = lax.scan(step_fn, state, None, length=cycles)
+        return final_state, jnp.array(0.0, dtype=jnp.float32)
+
+    # Static ACT formulation for TPU/XLA:
+    B, K, D = state.shape
+    threshold = float(getattr(config, "thinking_halt_threshold", 0.75))
+    w_gate = params["core.halting_gate.weight"]  # [1, D]
+    b_gate = params["core.halting_gate.bias"]    # [1]
+
+    # Carry: (curr_state, accum_state, cum_p, cum_ponder)
+    init_accum = jnp.zeros_like(state)
+    init_cum_p = jnp.zeros((B,), dtype=jnp.float32)
+    init_ponder = jnp.zeros((B,), dtype=jnp.float32)
+
+    def scan_body(carry, step_idx):
+        curr_state, accum_state, cum_p, cum_ponder = carry
+        next_state = deliberate_step(params, curr_state, buffers)
+
+        # Deliberation state pooling across cortical/subcortical laminae
+        state_mean = jnp.mean(next_state.astype(jnp.float32), axis=1)  # [B, D]
+        halt_logit = jnp.squeeze(jnp.matmul(state_mean, w_gate.T), axis=-1) + b_gate[0]
+        halt_prob = jax.nn.sigmoid(halt_logit)  # [B]
+
+        # Differentiable Graves ACT ponder cost
+        is_last = (step_idx == cycles - 1)
+        rem_p = jnp.maximum(0.0, 1.0 - cum_p)
+        step_weight = jnp.where(is_last, rem_p, jnp.minimum(halt_prob, rem_p))
+
+        # Update cumulative probability and accumulated convex state
+        new_cum_p = cum_p + step_weight
+        accum_state = accum_state + step_weight[:, None, None].astype(state.dtype) * next_state
+        cum_ponder = cum_ponder + rem_p
+
+        return (next_state, accum_state, new_cum_p, cum_ponder), None
+
+    (_, final_accum, final_cum_p, cum_ponder), _ = lax.scan(
+        scan_body,
+        (state, init_accum, init_cum_p, init_ponder),
+        jnp.arange(cycles),
+    )
+
+    norm_factor = jnp.maximum(final_cum_p[:, None, None], 1e-6)
+    final_state = (final_accum / norm_factor).astype(state.dtype)
+    ponder_cost = jnp.mean(cum_ponder)
+
+    return final_state, ponder_cost
 
 
 def emit_step(
@@ -902,9 +981,10 @@ def training_rollout(
     else:
         state = init_state.at[:, -1, :].set(prompt_flux)
 
-    # Subconscious deliberation cycles (4 full radial+shortcut cycles before emission)
-    for _ in range(thinking_cycles):
-        state = deliberate_step(params, state, buffers)
+    # Subconscious deliberation cycles with Adaptive Computation Time (ACT)
+    state, ponder_cost = deliberate_cycles_jax(
+        params, state, buffers, config=config, is_training=(targets is not None)
+    )
 
     # Initial executive plan and refractory trace
     init_plan = jnp.zeros((B, surface_dim), dtype=target_dtype)
@@ -1275,6 +1355,8 @@ def training_rollout(
             mask_sum = jnp.sum(chunk_masks)
 
         base_loss = loss_sum / jnp.maximum(mask_sum, 1.0)
+        if ponder_cost is not None and getattr(config, "use_adaptive_thinking", False):
+            base_loss = base_loss + float(getattr(config, "thinking_cost_weight", 0.01)) * ponder_cost
 
         # Supervise Temporal Router on prompt_flux
         w_r = params.get("motor.temporal_router.weight")
@@ -1297,6 +1379,8 @@ def training_rollout(
     if targets is not None:
         _, (all_loss, all_mask) = lax.scan(scan_fn, (state, init_refractory, init_plan, init_thought), jnp.arange(target_len))
         base_ce = jnp.sum(all_loss) / jnp.maximum(jnp.sum(all_mask), 1.0)
+        if ponder_cost is not None and getattr(config, "use_adaptive_thinking", False):
+            base_ce = base_ce + float(getattr(config, "thinking_cost_weight", 0.01)) * ponder_cost
         w_r = params.get("motor.temporal_router.weight")
         b_r = params.get("motor.temporal_router.bias")
         if w_r is not None and b_r is not None:
@@ -1545,8 +1629,7 @@ def generate_tri_stream_jax(
 
     init_state = jnp.zeros((B, num_shells, surface_dim), dtype=target_dtype)
     state = init_state.at[:, -1, :].set(prompt_centroid)
-    for _ in range(thinking_cycles):
-        state = deliberate_step(params, state, buffers)
+    state, _ = deliberate_cycles_jax(params, state, buffers, config=config, is_training=False)
 
     plan = jnp.zeros((B, surface_dim), dtype=target_dtype)
     refractory = jnp.zeros((B, vocab_size), dtype=target_dtype)

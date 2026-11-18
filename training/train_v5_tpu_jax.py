@@ -946,13 +946,14 @@ def main(args=None):
             ) if param_masks is not None else (None, apply_opt_step_anneal)
             apply_opt_step = apply_opt_step_anneal
 
-            def train_step_fn(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens=None, sampling_p=1.0, encephalization_alpha=1.0):
+            def train_step_fn(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens=None, sampling_p=1.0, encephalization_alpha=1.0, target_weights=None):
                 loss_val, grads = compute_grad_step(
                     p, q_batch, r_batch,
                     feedback_tokens=feedback_tokens,
                     sampling_p=sampling_p,
                     deliberation_mode=args.deliberation_mode,
                     encephalization_alpha=encephalization_alpha,
+                    target_weights=target_weights,
                 )
                 new_p, new_opt_s = apply_opt_step(p, opt_s, grads, cur_lr)
                 return new_p, new_opt_s, loss_val
@@ -980,7 +981,7 @@ def main(args=None):
         }
 
         @partial(jax.jit, static_argnames=("pure_tf", "deliberation_mode"))
-        def _train_step_adamw_jit(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens, sampling_p, pure_tf: bool, deliberation_mode: str, encephalization_alpha: float = 1.0):
+        def _train_step_adamw_jit(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens, sampling_p, pure_tf: bool, deliberation_mode: str, encephalization_alpha: float = 1.0, target_weights: Optional[jnp.ndarray] = None):
             def loss_fn(param_dict):
                 return training_rollout(
                     params=param_dict,
@@ -998,6 +999,7 @@ def main(args=None):
                     pure_teacher_forcing=pure_tf,
                     deliberation_mode=deliberation_mode,
                     encephalization_alpha=encephalization_alpha,
+                    target_weights=target_weights,
                 )
             loss_val, grads = jax.value_and_grad(loss_fn)(p)
             grad_norm = optax.global_norm(grads)
@@ -1033,14 +1035,14 @@ def main(args=None):
             }
             return safe_p, next_opt_s, loss_val
 
-        def train_step_fn(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens=None, sampling_p=1.0, encephalization_alpha=1.0):
+        def train_step_fn(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens=None, sampling_p=1.0, encephalization_alpha=1.0, target_weights=None):
             pure_tf = (args.deliberation_mode in ("teacher_forcing", "pure_tf")) and (not isinstance(sampling_p, jax.Array)) and (float(sampling_p) >= 1.0)
             return _train_step_adamw_jit(
-                p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens, sampling_p, pure_tf, args.deliberation_mode, encephalization_alpha
+                p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens, sampling_p, pure_tf, args.deliberation_mode, encephalization_alpha, target_weights
             )
 
         @partial(jax.jit, static_argnames=("pure_tf", "deliberation_mode"))
-        def _compute_grad_adamw_jit(p, q_batch, r_batch, feedback_tokens, sampling_p, pure_tf: bool, deliberation_mode: str, encephalization_alpha: float = 1.0):
+        def _compute_grad_adamw_jit(p, q_batch, r_batch, feedback_tokens, sampling_p, pure_tf: bool, deliberation_mode: str, encephalization_alpha: float = 1.0, target_weights: Optional[jnp.ndarray] = None):
             def loss_fn(param_dict):
                 return training_rollout(
                     params=param_dict,
@@ -1058,6 +1060,7 @@ def main(args=None):
                     pure_teacher_forcing=pure_tf,
                     deliberation_mode=deliberation_mode,
                     encephalization_alpha=encephalization_alpha,
+                    target_weights=target_weights,
                 )
             return jax.value_and_grad(loss_fn)(p)
 
@@ -1095,9 +1098,9 @@ def main(args=None):
             }
             return safe_p, next_opt_s
 
-        def compute_grad_step(p, q_batch, r_batch, feedback_tokens=None, sampling_p=1.0, deliberation_mode=args.deliberation_mode, encephalization_alpha=1.0):
+        def compute_grad_step(p, q_batch, r_batch, feedback_tokens=None, sampling_p=1.0, deliberation_mode=args.deliberation_mode, encephalization_alpha=1.0, target_weights=None):
             pure_tf = (deliberation_mode in ("teacher_forcing", "pure_tf")) and (not isinstance(sampling_p, jax.Array)) and (float(sampling_p) >= 1.0)
-            return _compute_grad_adamw_jit(p, q_batch, r_batch, feedback_tokens, sampling_p, pure_tf, deliberation_mode, encephalization_alpha)
+            return _compute_grad_adamw_jit(p, q_batch, r_batch, feedback_tokens, sampling_p, pure_tf, deliberation_mode, encephalization_alpha, target_weights)
 
         apply_opt_step = _apply_opt_adamw_jit
         apply_opt_step_anneal = _apply_opt_adamw_jit
@@ -1134,13 +1137,17 @@ def main(args=None):
     batcher = elastic_batcher
 
     def _unpack_batch(batch_tuple):
+        if len(batch_tuple) == 6:
+            return batch_tuple[2], batch_tuple[3], batch_tuple[4], batch_tuple[5]
         if len(batch_tuple) == 5:
-            return batch_tuple[2], batch_tuple[3], batch_tuple[4]
+            return batch_tuple[2], batch_tuple[3], batch_tuple[4], None
         if len(batch_tuple) == 4:
-            return batch_tuple[2], batch_tuple[3], None
+            if hasattr(batch_tuple[0], "shape") and hasattr(batch_tuple[1], "shape"):
+                return batch_tuple[0], batch_tuple[1], batch_tuple[2], batch_tuple[3]
+            return batch_tuple[2], batch_tuple[3], None, None
         if len(batch_tuple) == 3:
-            return batch_tuple[0], batch_tuple[1], batch_tuple[2]
-        return batch_tuple[0], batch_tuple[1], None
+            return batch_tuple[0], batch_tuple[1], batch_tuple[2], None
+        return batch_tuple[0], batch_tuple[1], None, None
 
     # 10. XLA Ahead-Of-Time Compilation (non-mutating warmup matching real feedback signature)
     print("\n⚡ Compiling XLA computation graph on TPU...")
@@ -1586,7 +1593,7 @@ def main(args=None):
             else:
                 step_executed = False
                 while not step_executed:
-                    prompt_b, target_b, feedback_b = None, None, None
+                    prompt_b, target_b, feedback_b, weights_b = None, None, None, None
                     try:
                         if compute_grad_step is not None and grad_accum > 1:
                             acc_grads = None
@@ -1594,9 +1601,14 @@ def main(args=None):
                             step_tokens, step_prompt, step_loss, step_pad = 0, 0, 0, 0
                             inv_accum = 1.0 / float(grad_accum)
                             for _ in range(grad_accum):
-                                prompt_b, target_b, feedback_b = oom_handler.slicer.get_micro_batch(args.batch_size, _next_batch)
+                                batch_data = oom_handler.slicer.get_micro_batch(args.batch_size, _next_batch)
+                                if len(batch_data) == 4:
+                                    prompt_b, target_b, feedback_b, weights_b = batch_data
+                                else:
+                                    prompt_b, target_b, feedback_b = batch_data
+                                    weights_b = None
                                 g_loss, micro_grads = compute_grad_step(
-                                    params, prompt_b, target_b, feedback_tokens=feedback_b, sampling_p=cur_sampling_p, deliberation_mode=args.deliberation_mode, encephalization_alpha=enc_alpha
+                                    params, prompt_b, target_b, feedback_tokens=feedback_b, sampling_p=cur_sampling_p, deliberation_mode=args.deliberation_mode, encephalization_alpha=enc_alpha, target_weights=weights_b
                                 )
                                 acc_grads = (
                                     micro_grads
@@ -1614,7 +1626,12 @@ def main(args=None):
                             cur_apply_opt = apply_opt_step_anneal if (not is_frozen_active or is_anneal or param_masks is None) else (apply_opt_step_frozen or apply_opt_step_anneal)
                             params, opt_state = cur_apply_opt(params, opt_state, acc_grads, cur_lr)
                         else:
-                            prompt_b, target_b, feedback_b = oom_handler.slicer.get_micro_batch(args.batch_size, _next_batch)
+                            batch_data = oom_handler.slicer.get_micro_batch(args.batch_size, _next_batch)
+                            if len(batch_data) == 4:
+                                prompt_b, target_b, feedback_b, weights_b = batch_data
+                            else:
+                                prompt_b, target_b, feedback_b = batch_data
+                                weights_b = None
                             cur_train_step = train_step_fn_anneal if (not is_frozen_active or is_anneal or param_masks is None) else (train_step_fn_frozen or train_step_fn_anneal)
                             params, opt_state, loss = cur_train_step(
                                 params,
@@ -1625,13 +1642,14 @@ def main(args=None):
                                 feedback_tokens=feedback_b,
                                 sampling_p=cur_sampling_p,
                                 encephalization_alpha=enc_alpha,
+                                target_weights=weights_b,
                             )
                             step_tokens, step_prompt, step_loss, step_pad = _count_real_tokens(prompt_b, target_b)
                         step_executed = True
                     except Exception as e_step:
                         if not is_oom_error(e_step) or args.batch_size <= 1:
                             raise
-                        failed_tup = (prompt_b, target_b, feedback_b) if prompt_b is not None else None
+                        failed_tup = (prompt_b, target_b, feedback_b, weights_b) if weights_b is not None else ((prompt_b, target_b, feedback_b) if prompt_b is not None else None)
                         args.batch_size, grad_accum = oom_handler.handle_oom(
                             e_step, step=step, failed_batch=failed_tup
                         )

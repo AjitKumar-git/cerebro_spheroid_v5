@@ -536,9 +536,9 @@ def main(args=None):
     )
 
     @jax.jit
-    def sft_single_step_fn(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens=None, sampling_p=1.0, encephalization_alpha=1.0):
+    def sft_single_step_fn(p, opt_s, q_batch, r_batch, cur_lr, feedback_tokens=None, sampling_p=1.0, encephalization_alpha=1.0, target_weights=None):
         loss_val, grads = compute_grad_step(
-            p, q_batch, r_batch, feedback_tokens=feedback_tokens, sampling_p=sampling_p, deliberation_mode=args.deliberation_mode, encephalization_alpha=encephalization_alpha
+            p, q_batch, r_batch, feedback_tokens=feedback_tokens, sampling_p=sampling_p, deliberation_mode=args.deliberation_mode, encephalization_alpha=encephalization_alpha, target_weights=target_weights
         )
         new_p, new_opt_s = apply_opt_step(p, opt_s, grads, cur_lr)
         return new_p, new_opt_s, loss_val
@@ -560,13 +560,17 @@ def main(args=None):
     prefetched_sft = PrefetchedBatcher(batcher, queue_size=16)
 
     def _unpack_batch(batch_tuple):
+        if len(batch_tuple) == 6:
+            return batch_tuple[2], batch_tuple[3], batch_tuple[4], batch_tuple[5]
         if len(batch_tuple) == 5:
-            return batch_tuple[2], batch_tuple[3], batch_tuple[4]
+            return batch_tuple[2], batch_tuple[3], batch_tuple[4], None
         if len(batch_tuple) == 4:
-            return batch_tuple[2], batch_tuple[3], None
+            if hasattr(batch_tuple[0], "shape") and hasattr(batch_tuple[1], "shape"):
+                return batch_tuple[0], batch_tuple[1], batch_tuple[2], batch_tuple[3]
+            return batch_tuple[2], batch_tuple[3], None, None
         if len(batch_tuple) == 3:
-            return batch_tuple[0], batch_tuple[1], batch_tuple[2]
-        return batch_tuple[0], batch_tuple[1], None
+            return batch_tuple[0], batch_tuple[1], batch_tuple[2], None
+        return batch_tuple[0], batch_tuple[1], None, None
 
     # 7. Canonical SFT Evaluation Split
     eval_batches, eval_domains = [], []
@@ -660,7 +664,7 @@ def main(args=None):
             # SFT Optimization Step with Multi-Step Gradient Accumulation & OOM Fallback
             step_executed = False
             while not step_executed:
-                prompt_b, target_b, feedback_b = None, None, None
+                prompt_b, target_b, feedback_b, weights_b = None, None, None, None
                 try:
                     if args.grad_accum > 1:
                         acc_grads = None
@@ -668,13 +672,18 @@ def main(args=None):
                         step_tokens = 0
                         inv_accum = 1.0 / float(args.grad_accum)
                         for _ in range(args.grad_accum):
-                            prompt_b, target_b, feedback_b = oom_handler.slicer.get_micro_batch(
+                            batch_data = oom_handler.slicer.get_micro_batch(
                                 args.batch_size, lambda: _unpack_batch(prefetched_sft.get_batch())
                             )
+                            if len(batch_data) == 4:
+                                prompt_b, target_b, feedback_b, weights_b = batch_data
+                            else:
+                                prompt_b, target_b, feedback_b = batch_data
+                                weights_b = None
                             g_loss, micro_grads = compute_grad_step(
                                 params, prompt_b, target_b, feedback_tokens=feedback_b,
                                 sampling_p=args.sampling_p, deliberation_mode=args.deliberation_mode,
-                                encephalization_alpha=enc_alpha,
+                                encephalization_alpha=enc_alpha, target_weights=weights_b,
                             )
                             acc_grads = (
                                 micro_grads
@@ -687,9 +696,14 @@ def main(args=None):
                         loss_val = float(loss_acc * inv_accum)
                         params, opt_state = apply_opt_step(params, opt_state, acc_grads, cur_lr)
                     else:
-                        prompt_b, target_b, feedback_b = oom_handler.slicer.get_micro_batch(
+                        batch_data = oom_handler.slicer.get_micro_batch(
                             args.batch_size, lambda: _unpack_batch(prefetched_sft.get_batch())
                         )
+                        if len(batch_data) == 4:
+                            prompt_b, target_b, feedback_b, weights_b = batch_data
+                        else:
+                            prompt_b, target_b, feedback_b = batch_data
+                            weights_b = None
                         params, opt_state, loss = sft_single_step_fn(
                             params,
                             opt_state,
@@ -699,6 +713,7 @@ def main(args=None):
                             feedback_tokens=feedback_b,
                             sampling_p=args.sampling_p,
                             encephalization_alpha=enc_alpha,
+                            target_weights=weights_b,
                         )
                         loss_val = float(loss)
                         step_tokens = prompt_b.shape[0] * (prompt_b.shape[1] + target_b.shape[1])
@@ -706,7 +721,7 @@ def main(args=None):
                 except Exception as e_sft:
                     if not is_oom_error(e_sft) or args.batch_size <= 1:
                         raise
-                    failed_tup = (prompt_b, target_b, feedback_b) if prompt_b is not None else None
+                    failed_tup = (prompt_b, target_b, feedback_b, weights_b) if weights_b is not None else ((prompt_b, target_b, feedback_b) if prompt_b is not None else None)
                     args.batch_size, args.grad_accum = oom_handler.handle_oom(
                         e_sft, step=step, failed_batch=failed_tup
                     )

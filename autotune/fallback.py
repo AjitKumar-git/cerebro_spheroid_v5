@@ -102,12 +102,20 @@ class MicroBatchSlicer:
         self.remainder_prompt: Optional[Any] = None
         self.remainder_target: Optional[Any] = None
         self.remainder_feedback: Optional[Any] = None
+        self.remainder_weights: Optional[Any] = None
 
-    def stash_remainder(self, prompt: Any, target: Any, feedback: Optional[Any] = None) -> None:
+    def stash_remainder(
+        self,
+        prompt: Any,
+        target: Any,
+        feedback: Optional[Any] = None,
+        weights: Optional[Any] = None,
+    ) -> None:
         """Stashes an uncompleted or failed batch to be sliced in subsequent steps."""
         self.remainder_prompt = prompt
         self.remainder_target = target
         self.remainder_feedback = feedback
+        self.remainder_weights = weights
 
     def has_remainder(self) -> bool:
         if self.remainder_prompt is None:
@@ -121,19 +129,33 @@ class MicroBatchSlicer:
         self,
         micro_bs: int,
         next_batch_fn: Optional[Callable[[], Tuple[Any, ...]]] = None,
-    ) -> Tuple[Any, Any, Optional[Any]]:
+    ) -> Tuple[Any, ...]:
         """
         Retrieves a micro-batch of exact batch size `micro_bs`. Slices from existing
         remainder if available; otherwise fetches a new batch from `next_batch_fn`.
+        Returns 3-tuple (p, t, fb) or 4-tuple (p, t, fb, w) depending on whether weights exist.
         """
         fetch_fn = next_batch_fn or self.next_batch_fn
         if fetch_fn is None and not self.has_remainder():
             raise ValueError("No next_batch_fn provided and no remainder batch stashed.")
 
         if self.has_remainder():
-            p, t, fb = self.remainder_prompt, self.remainder_target, self.remainder_feedback
+            p, t, fb, w = (
+                self.remainder_prompt,
+                self.remainder_target,
+                self.remainder_feedback,
+                self.remainder_weights,
+            )
         else:
-            p, t, fb = fetch_fn()
+            raw = fetch_fn()
+            if len(raw) == 4:
+                p, t, fb, w = raw[0], raw[1], raw[2], raw[3]
+            elif len(raw) == 3:
+                p, t, fb, w = raw[0], raw[1], raw[2], None
+            elif len(raw) == 2:
+                p, t, fb, w = raw[0], raw[1], None, None
+            else:
+                p, t, fb, w = raw[0], raw[1], None, None
 
         batch_len = p.shape[0] if hasattr(p, "shape") else len(p)
 
@@ -142,18 +164,21 @@ class MicroBatchSlicer:
             self.remainder_prompt = None
             self.remainder_target = None
             self.remainder_feedback = None
-            return p, t, fb
+            self.remainder_weights = None
+            return (p, t, fb, w) if w is not None else (p, t, fb)
 
         # Slicing: take micro_bs items, stash remainder
         p_slice = p[:micro_bs]
         t_slice = t[:micro_bs]
         fb_slice = fb[:micro_bs] if fb is not None else None
+        w_slice = w[:micro_bs] if w is not None else None
 
         self.remainder_prompt = p[micro_bs:]
         self.remainder_target = t[micro_bs:]
         self.remainder_feedback = fb[micro_bs:] if fb is not None else None
+        self.remainder_weights = w[micro_bs:] if w is not None else None
 
-        return p_slice, t_slice, fb_slice
+        return (p_slice, t_slice, fb_slice, w_slice) if w is not None else (p_slice, t_slice, fb_slice)
 
 
 class TrainingOOMHandler:
