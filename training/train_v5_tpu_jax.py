@@ -189,6 +189,7 @@ def parse_args(args_list=None):
     parser.add_argument("--max_thinking_cycles", "--max-thinking-cycles", dest="max_thinking_cycles", type=int, default=16, help="Maximum thinking cycles when adaptive thinking is active (default: 16)")
 
     # Data Source & Tokenizer
+    parser.add_argument("--hf-token", "--hf_token", dest="hf_token", type=str, default=None, help="Hugging Face API token for authenticated dataset streaming")
     parser.add_argument("--dataset_source", "--dataset-source", dest="dataset_source", type=str, default="autonomous",
                         help="Data stream: 'autonomous', 'fineweb' (sample-10BT), or a Hugging Face dataset repo")
     parser.add_argument("--dataset-config", type=str, default=None, help="Optional Hugging Face dataset config (FineWeb defaults to sample-10BT)")
@@ -390,6 +391,10 @@ def build_data_stream(
 def main(args=None):
     if args is None:
         args = parse_args()
+
+    # 0. Hugging Face Authentication & Token Resolution
+    from src.hf_utils import setup_hf_token
+    setup_hf_token(getattr(args, "hf_token", None), verbose=True)
 
     # Graceful shutdown handler
     shutdown_requested = False

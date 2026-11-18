@@ -90,6 +90,7 @@ def parse_sft_args(args_list: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="CerebroSpheroid V5 Supervised Fine-Tuning (SFT) & Conversational Alignment Engine"
     )
+    parser.add_argument("--hf-token", "--hf_token", dest="hf_token", type=str, default=None, help="Hugging Face API token for authenticated dataset streaming")
     parser.add_argument("--preset", type=str, default="auto", choices=["auto", "v5_small", "v5_compact_32shells", "v5_compact", "v5_base", "tpu_v5e_1", "tpu_v6e_1"], help="Architecture preset")
     parser.add_argument("--freeze_core", "--freeze-core", dest="freeze_core", action=argparse.BooleanOptionalAction, default=None, help="Freeze subcortical core (Shells 0-15) and headers, training only outer cortical mantle")
     parser.add_argument("--sft_model_name", "--sft-model-name", dest="sft_model_name", type=str, default=None, help="Cloud sync and checkpoint model name (default: {preset}_sft)")
@@ -224,6 +225,10 @@ def run_live_probe(
 def main(args=None):
     if args is None:
         args = parse_sft_args()
+
+    # 0. Hugging Face Authentication & Token Resolution
+    from src.hf_utils import setup_hf_token
+    setup_hf_token(getattr(args, "hf_token", None), verbose=True)
 
     # Graceful shutdown handling
     shutdown_requested = False

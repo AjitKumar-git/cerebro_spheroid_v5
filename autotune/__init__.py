@@ -64,6 +64,13 @@ from .memory import (
     MemoryBreakdown,
     estimate_peak_hbm,
 )
+from .fallback import (
+    is_oom_error,
+    compute_fallback_batch_size,
+    adjust_gradient_accumulation,
+    MicroBatchSlicer,
+    TrainingOOMHandler,
+)
 from .engine import (
     AutoTuner,
     auto_tune_environment,
@@ -92,6 +99,11 @@ __all__ = [
     "BenchmarkRunner",
     "MemoryBreakdown",
     "estimate_peak_hbm",
+    "is_oom_error",
+    "compute_fallback_batch_size",
+    "adjust_gradient_accumulation",
+    "MicroBatchSlicer",
+    "TrainingOOMHandler",
     "auto_tune_environment",
     "run_auto_tuner",
 ]

@@ -173,6 +173,14 @@ def auto_tune_environment(
     )
 
 
+from autotune.fallback import (
+    is_oom_error,
+    compute_fallback_batch_size,
+    adjust_gradient_accumulation,
+    MicroBatchSlicer,
+    TrainingOOMHandler,
+)
+
 # Backward-compatible alias
 run_auto_tuner = auto_tune_environment
 
@@ -189,4 +197,9 @@ __all__ = [
     "_score_benchmark_result",
     "LOCAL_CONFIG_PATH",
     "_BF16_GPU_MARKERS",
+    "is_oom_error",
+    "compute_fallback_batch_size",
+    "adjust_gradient_accumulation",
+    "MicroBatchSlicer",
+    "TrainingOOMHandler",
 ]

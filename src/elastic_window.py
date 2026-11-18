@@ -281,20 +281,9 @@ _DEFAULT_DATASET_CONFIGS: Dict[str, str] = {
 
 
 def _get_hf_token() -> Optional[str]:
-    """Retrieve Hugging Face API token from environment variables or cache."""
-    import os
-    env_token = (
-        os.environ.get("HF_TOKEN")
-        or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    )
-    if env_token:
-        return env_token
-    try:
-        from huggingface_hub import get_token
-        return get_token()
-    except Exception:
-        return None
+    """Retrieve Hugging Face API token using unified hf_utils resolver."""
+    from src.hf_utils import get_hf_token
+    return get_hf_token()
 
 
 def _open_hf_stream(

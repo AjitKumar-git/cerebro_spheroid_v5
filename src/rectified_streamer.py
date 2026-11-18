@@ -197,8 +197,13 @@ class RectifiedContiguousPretrainStreamer:
         """Streams broad clean web text from HuggingFaceFW/fineweb."""
         try:
             from datasets import load_dataset
+            from src.hf_utils import get_hf_token
+            hf_tok = get_hf_token()
+            kw = {"name": "sample-10BT", "split": "train", "streaming": True}
+            if hf_tok:
+                kw["token"] = hf_tok
             print("🌐 [Streamer] Connecting to HuggingFaceFW/fineweb (sample-10BT)...")
-            ds = load_dataset("HuggingFaceFW/fineweb", name="sample-10BT", split="train", streaming=True)
+            ds = load_dataset("HuggingFaceFW/fineweb", **kw)
             for row in ds:
                 text = row.get("text", "")
                 if text and len(text) > 200:
@@ -212,8 +217,13 @@ class RectifiedContiguousPretrainStreamer:
         """Streams academic and educational text from FineWeb-Edu / Cosmopedia."""
         try:
             from datasets import load_dataset
+            from src.hf_utils import get_hf_token
+            hf_tok = get_hf_token()
+            kw = {"name": "sample-10BT", "split": "train", "streaming": True}
+            if hf_tok:
+                kw["token"] = hf_tok
             print("📚 [Streamer] Connecting to HuggingFaceFW/fineweb-edu (sample-10BT)...")
-            ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
+            ds = load_dataset("HuggingFaceFW/fineweb-edu", **kw)
             for row in ds:
                 score = float(row.get("score", 0.0) or 0.0)
                 if score >= 3.0:
@@ -229,6 +239,8 @@ class RectifiedContiguousPretrainStreamer:
         """Streams algorithmic and software Python code."""
         try:
             from datasets import load_dataset
+            from src.hf_utils import get_hf_token
+            hf_tok = get_hf_token()
             print("💻 [Streamer] Connecting to clean code stream (bigcode/the-stack-dedup or Python)...")
             # First priority: local cognitive code parquets if present
             local_code = glob.glob(os.path.join(REPO_ROOT, "data", "*code*.parquet"))
@@ -242,7 +254,10 @@ class RectifiedContiguousPretrainStreamer:
                                 if item and len(item) > 100:
                                     yield item
             # Online stream fallback
-            ds = load_dataset("bigcode/the-stack-dedup", data_dir="data/python", split="train", streaming=True)
+            kw = {"data_dir": "data/python", "split": "train", "streaming": True}
+            if hf_tok:
+                kw["token"] = hf_tok
+            ds = load_dataset("bigcode/the-stack-dedup", **kw)
             for row in ds:
                 c = row.get("content", "")
                 if c and len(c) > 100:
@@ -261,8 +276,13 @@ class RectifiedContiguousPretrainStreamer:
         """Streams mathematical web text and proofs (FineMath)."""
         try:
             from datasets import load_dataset
+            from src.hf_utils import get_hf_token
+            hf_tok = get_hf_token()
+            kw = {"name": "finemath-4plus", "split": "train", "streaming": True}
+            if hf_tok:
+                kw["token"] = hf_tok
             print("📐 [Streamer] Connecting to HuggingFaceTB/finemath...")
-            ds = load_dataset("HuggingFaceTB/finemath", name="finemath-4plus", split="train", streaming=True)
+            ds = load_dataset("HuggingFaceTB/finemath", **kw)
             for row in ds:
                 t = row.get("text", "")
                 if t and len(t) > 150:

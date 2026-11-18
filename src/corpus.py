@@ -181,24 +181,9 @@ def small_parquet_pairs(path: str, seed: int = 0, holdout_every: int = 0,
 # --------------------------------------------------------------------------------------------
 
 def _get_hf_token() -> Optional[str]:
-    """Retrieve Hugging Face API token from environment or cache if present."""
-    if "HF_HOME" not in os.environ:
-        user_hf = os.path.expanduser("~/.hf_cache")
-        os.makedirs(user_hf, exist_ok=True)
-        os.environ["HF_HOME"] = user_hf
-        os.environ["HF_HUB_CACHE"] = os.path.join(user_hf, "hub")
-    env_token = (
-        os.environ.get("HF_TOKEN")
-        or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    )
-    if env_token:
-        return env_token
-    try:
-        from huggingface_hub import get_token
-        return get_token()
-    except Exception:
-        return None
+    """Retrieve Hugging Face API token using unified hf_utils resolver."""
+    from src.hf_utils import get_hf_token
+    return get_hf_token()
 
 
 def cosmopedia_stream(seed: int = 0) -> Iterator[Pair]:
