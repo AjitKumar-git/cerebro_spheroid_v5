@@ -186,6 +186,10 @@ def generate_vram_maximizing_candidates(
         # Entry GPU (e.g. 4GB) or CPU
         base_ladder = [2, 4, 8, 16]
 
+    # Keep a common set of probe sizes in every hardware tier. The hardware
+    # specific ladder above still adds larger sizes where memory allows.
+    base_ladder = sorted(set(base_ladder).union({1, 2, 4, 8, 16, 32, 48, 64, 128, 256}))
+
     if max_batch_size is not None:
         cap = max(1, int(max_batch_size))
         filtered = [b for b in base_ladder if b <= cap]
@@ -558,17 +562,16 @@ def auto_tune_environment(
     results = []
     best_config = None
     best_score = -1.0
-    oom_remat_false_seen = False
-    oom_remat_true_seen = False
     passed_remat_false_batches = set()
 
     for idx, c in enumerate(candidates, 1):
         b = c["batch_size"]
         r = c.get("remat", True)
 
-        if not r and oom_remat_false_seen:
-            continue
-        if r and (oom_remat_true_seen or b in passed_remat_false_batches):
+        # Always reach every requested batch size, including candidates above
+        # an OOM point. For a batch size that passed without remat, skip its
+        # redundant remat variant.
+        if r and b in passed_remat_false_batches:
             continue
 
         if verbose:
@@ -602,11 +605,6 @@ def auto_tune_environment(
                 best_score = score
                 best_config = res
         else:
-            if "OOM" in res["status"]:
-                if r:
-                    oom_remat_true_seen = True
-                else:
-                    oom_remat_false_seen = True
             if verbose:
                 print(f"❌ {res['status']}")
 
