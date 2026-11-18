@@ -58,14 +58,15 @@ def load_tokenized_dataset(
     tokenizer: Any,
     vocab_size: int,
     max_samples: int = 25000,
-    max_prompt_len: int = 256,
-    max_target_len: int = 512,
+    max_prompt_len: int = 2048,
+    max_target_len: int = 1024,
 ) -> List[Dict[str, Any]]:
     """Loads and tokenizes diverse SFT examples with token-level anchor weighting."""
     print(f"\n📦 Tokenizing Diverse SFT Dataset from {dataset_path}...")
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"Dataset not found at {dataset_path}. Run build_diverse_sft_dataset.py first!")
 
+    eos_id = getattr(tokenizer, "eos_token_id", 2) or 2
     entries = []
     with open(dataset_path, "r", encoding="utf-8") as f:
         for idx, line in enumerate(f):
@@ -86,8 +87,14 @@ def load_tokenized_dataset(
             p_str = format_stimulus_prompt(prompt)
             a_str = format_motor_response(response)
 
-            p_ids = [t % vocab_size for t in encode_no_special(tokenizer, p_str)][:max_prompt_len]
-            a_ids = [t % vocab_size for t in encode_no_special(tokenizer, a_str)][:max_target_len]
+            p_ids = [t % vocab_size for t in encode_no_special(tokenizer, p_str)]
+            if len(p_ids) > max_prompt_len:
+                p_ids = p_ids[:min(32, max_prompt_len // 4)] + p_ids[-(max_prompt_len - min(32, max_prompt_len // 4)):]
+            a_ids = [t % vocab_size for t in encode_no_special(tokenizer, a_str)]
+            if len(a_ids) == 0 or a_ids[-1] != eos_id:
+                a_ids.append(eos_id)
+            if len(a_ids) > max_target_len:
+                a_ids = a_ids[:max_target_len - 1] + [eos_id]
 
             if len(p_ids) < 2 or len(a_ids) < 2:
                 continue

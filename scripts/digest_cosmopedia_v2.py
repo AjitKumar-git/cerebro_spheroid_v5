@@ -46,6 +46,7 @@ import pyarrow.parquet as pq
 import numpy as np
 
 os.environ["HF_HOME"] = os.path.expanduser("~/.hf_cache")
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 WORKSPACE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if WORKSPACE_ROOT not in sys.path:
@@ -66,7 +67,7 @@ tags:
 - cosmopedia-v2
 - cerebro-spheroid
 - teacher-digestion
-- qwen2.5-1.5b
+- qwen2.5
 - dynamic-loss-weighting
 - information-density
 - pretraining
@@ -82,7 +83,7 @@ configs:
 # Cosmopedia v2 Teacher-Digested Pretraining Corpus
 
 This dataset is a teacher-digested transformation of [HuggingFaceTB/smollm-corpus](https://huggingface.co/datasets/HuggingFaceTB/smollm-corpus) (Cosmopedia v2 split, 39.13M documents, ~30 Billion tokens).
-Each document is digested by **Qwen2.5-1.5B-Instruct** to compute dynamic per-token information-density loss weights, losslessly projected onto **CerebroSpheroid's 32,000 vocabulary**.
+Each document is digested by **Qwen2.5 Teacher LM** to compute dynamic per-token information-density loss weights, losslessly projected onto **CerebroSpheroid's 32,000 vocabulary**.
 
 ## Dataset Schema
 
@@ -154,12 +155,11 @@ def digest_single_shard(
     push_to_hub: bool = True,
     keep_local: bool = False,
     clean_download_cache: bool = True,
+    stream: bool = True,
 ) -> Dict[str, Any]:
     """
-    Downloads, digests, writes, and uploads a single Cosmopedia v2 shard.
+    Downloads/streams, digests, writes, and uploads a single Cosmopedia v2 shard.
     """
-    from huggingface_hub import hf_hub_download
-
     shard_name = f"train-{shard_idx:05d}-of-{total_shards:05d}.parquet"
     source_filename = f"cosmopedia-v2/{shard_name}"
     target_repo_path = f"data/{shard_name}"
@@ -167,25 +167,48 @@ def digest_single_shard(
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"\n{'=' * 80}")
-    print(f"📦 [SHARD {shard_idx + 1}/{total_shards}] Processing {source_filename}")
+    print(f"📦 [SHARD {shard_idx + 1}/{total_shards}] Processing {source_filename} (stream={stream})")
     print(f"{'=' * 80}")
 
-    # 1. Download raw shard from source dataset
-    t0_dl = time.time()
-    print(f"  📥 Downloading raw source shard from {source_repo}...")
-    try:
-        raw_shard_path = hf_hub_download(
-            repo_id=source_repo,
-            filename=source_filename,
-            repo_type="dataset",
-            cache_dir=os.environ.get("HF_HOME"),
-        )
-        dl_time = time.time() - t0_dl
-        file_size_mb = os.path.getsize(raw_shard_path) / (1024 * 1024)
-        print(f"  ✓ Downloaded raw shard ({file_size_mb:.1f} MB in {dl_time:.1f}s)")
-    except Exception as e:
-        print(f"  ❌ Error downloading {source_filename}: {e}")
-        return {"status": "error", "shard": shard_idx, "error": str(e)}
+    raw_shard_path = None
+    stream_dataset = None
+
+    if stream:
+        from datasets import load_dataset
+        print(f"  🌊 Streaming samples on-the-fly from {source_repo} (cosmopedia-v2)...")
+        try:
+            stream_dataset = load_dataset(
+                source_repo,
+                "cosmopedia-v2",
+                split="train",
+                streaming=True,
+            )
+            target_rows = max_samples if max_samples is not None else 50000
+        except Exception as e:
+            print(f"  ❌ Error initializing stream from {source_repo}: {e}")
+            return {"status": "error", "shard": shard_idx, "error": str(e)}
+    else:
+        # 1. Download raw shard from source dataset
+        from huggingface_hub import hf_hub_download
+        t0_dl = time.time()
+        print(f"  📥 Downloading raw source shard from {source_repo}...")
+        try:
+            raw_shard_path = hf_hub_download(
+                repo_id=source_repo,
+                filename=source_filename,
+                repo_type="dataset",
+                cache_dir=os.environ.get("HF_HOME"),
+            )
+            dl_time = time.time() - t0_dl
+            file_size_mb = os.path.getsize(raw_shard_path) / (1024 * 1024)
+            print(f"  ✓ Downloaded raw shard ({file_size_mb:.1f} MB in {dl_time:.1f}s)")
+        except Exception as e:
+            print(f"  ❌ Error downloading {source_filename}: {e}")
+            return {"status": "error", "shard": shard_idx, "error": str(e)}
+
+        parquet_file = pq.ParquetFile(raw_shard_path)
+        total_rows = parquet_file.metadata.num_rows
+        target_rows = min(total_rows, max_samples) if max_samples is not None else total_rows
 
     # 2. Setup pyarrow streaming writer
     schema = pa.schema([
@@ -202,16 +225,7 @@ def digest_single_shard(
     ])
 
     writer = pq.ParquetWriter(local_output_path, schema, compression="snappy")
-
-    # 3. Read and Digest Records
-    parquet_file = pq.ParquetFile(raw_shard_path)
-    total_rows = parquet_file.metadata.num_rows
-    if max_samples is not None:
-        target_rows = min(total_rows, max_samples)
-    else:
-        target_rows = total_rows
-
-    print(f"  🧠 Digesting {target_rows:,} samples (out of {total_rows:,} rows in shard)...")
+    print(f"  🧠 Digesting {target_rows:,} samples into {local_output_path}...")
 
     processed_count = 0
     total_tokens_digested = 0
@@ -227,66 +241,84 @@ def digest_single_shard(
         writer.write_table(batch_table)
         batch_buffer = []
 
-    # Stream batch by batch
-    for batch in parquet_file.iter_batches(batch_size=500):
-        b_dict = batch.to_pydict()
-        prompts = b_dict.get("prompt", [])
-        texts = b_dict.get("text", [])
-        audiences = b_dict.get("audience", [])
-        formats = b_dict.get("format", [])
-
-        num_in_batch = len(texts)
-        for i in range(num_in_batch):
-            if processed_count >= target_rows:
-                break
-
-            doc_text = texts[i]
-            if not doc_text or len(doc_text.strip()) == 0:
-                continue
-
-            # Teacher digestion
-            tokens, weights = digester.digest_text(
-                doc_text,
-                spheroid_tokenizer,
-                max_length=max_length,
+    if stream:
+        sample_iter = (
+            (
+                s.get("prompt", ""),
+                s.get("text", ""),
+                s.get("audience", ""),
+                s.get("format", ""),
             )
+            for s in stream_dataset
+        )
+    else:
+        def parquet_generator():
+            for batch in parquet_file.iter_batches(batch_size=500):
+                b_dict = batch.to_pydict()
+                prompts = b_dict.get("prompt", [])
+                texts = b_dict.get("text", [])
+                audiences = b_dict.get("audience", [])
+                formats = b_dict.get("format", [])
+                for i in range(len(texts)):
+                    yield (
+                        prompts[i] if i < len(prompts) else "",
+                        texts[i],
+                        audiences[i] if i < len(audiences) else "",
+                        formats[i] if i < len(formats) else "",
+                    )
+        sample_iter = parquet_generator()
 
-            if len(tokens) == 0:
-                continue
+    # Stream record by record
+    for prompt_val, doc_text, audience_val, format_val in sample_iter:
+        if processed_count >= target_rows:
+            break
 
-            weights_arr = np.array(weights, dtype=np.float32)
-            total_tokens_digested += len(tokens)
+        if not doc_text or len(doc_text.strip()) == 0:
+            continue
 
-            record = {
-                "id": f"cosmo2_{shard_idx:05d}_{processed_count:07d}",
-                "prompt": str(prompts[i]) if i < len(prompts) and prompts[i] is not None else "",
-                "audience": str(audiences[i]) if i < len(audiences) and audiences[i] is not None else "",
-                "format": str(formats[i]) if i < len(formats) and formats[i] is not None else "",
-                "tokens": [int(t) for t in tokens],
-                "target_weights": [float(w) for w in weights_arr.astype(np.float16)],
-                "seq_len": int(len(tokens)),
-                "mean_weight": float(weights_arr.mean()),
-                "max_weight": float(weights_arr.max()),
-                "min_weight": float(weights_arr.min()),
-            }
-            batch_buffer.append(record)
-            processed_count += 1
+        # Teacher digestion
+        tokens, weights = digester.digest_text(
+            doc_text,
+            spheroid_tokenizer,
+            max_length=max_length,
+        )
 
-            if len(batch_buffer) >= batch_flush_size:
-                flush_buffer()
+        if len(tokens) == 0:
+            continue
 
-            now = time.time()
-            if now - last_log_time >= 10.0 or processed_count == target_rows:
-                elapsed = now - t_start
-                rate = processed_count / max(1e-3, elapsed)
-                tok_rate = total_tokens_digested / max(1e-3, elapsed)
-                eta = (target_rows - processed_count) / max(1e-3, rate)
-                print(
-                    f"  [{shard_name}] {processed_count:,}/{target_rows:,} samples "
-                    f"({processed_count / target_rows * 100:.1f}%) | "
-                    f"{rate:.1f} doc/s | {tok_rate:.0f} tok/s | ETA: {eta / 60:.1f}m"
-                )
-                last_log_time = now
+        weights_arr = np.array(weights, dtype=np.float32)
+        total_tokens_digested += len(tokens)
+
+        record = {
+            "id": f"cosmo2_{shard_idx:05d}_{processed_count:07d}",
+            "prompt": str(prompt_val) if prompt_val is not None else "",
+            "audience": str(audience_val) if audience_val is not None else "",
+            "format": str(format_val) if format_val is not None else "",
+            "tokens": [int(t) for t in tokens],
+            "target_weights": [float(w) for w in weights_arr.astype(np.float16)],
+            "seq_len": int(len(tokens)),
+            "mean_weight": float(weights_arr.mean()),
+            "max_weight": float(weights_arr.max()),
+            "min_weight": float(weights_arr.min()),
+        }
+        batch_buffer.append(record)
+        processed_count += 1
+
+        if len(batch_buffer) >= batch_flush_size:
+            flush_buffer()
+
+        now = time.time()
+        if now - last_log_time >= 10.0 or processed_count == target_rows:
+            elapsed = now - t_start
+            rate = processed_count / max(1e-3, elapsed)
+            tok_rate = total_tokens_digested / max(1e-3, elapsed)
+            eta = (target_rows - processed_count) / max(1e-3, rate)
+            print(
+                f"  [{shard_name}] {processed_count:,}/{target_rows:,} samples "
+                f"({processed_count / target_rows * 100:.1f}%) | "
+                f"{rate:.1f} doc/s | {tok_rate:.0f} tok/s | ETA: {eta / 60:.1f}m"
+            )
+            last_log_time = now
 
         if processed_count >= target_rows:
             break
@@ -320,7 +352,7 @@ def digest_single_shard(
         os.remove(local_output_path)
         print(f"  🧹 Cleaned local digested parquet: {local_output_path}")
 
-    if clean_download_cache and os.path.exists(raw_shard_path):
+    if clean_download_cache and raw_shard_path and os.path.exists(raw_shard_path):
         try:
             os.remove(raw_shard_path)
             print(f"  🧹 Cleaned downloaded raw source shard: {raw_shard_path}")
@@ -347,7 +379,7 @@ def run_pipeline(
     num_workers: int = 1,
     max_samples_per_shard: Optional[int] = None,
     max_length: int = 1024,
-    teacher_model: str = "Qwen/Qwen2.5-1.5B-Instruct",
+    teacher_model: str = "Qwen/Qwen2.5-0.5B-Instruct",
     digest_mode: str = "online",
     device_str: str = "cuda",
     teacher_scale: float = 1.5,
@@ -358,6 +390,7 @@ def run_pipeline(
     skip_existing: bool = True,
     keep_local: bool = False,
     private: bool = False,
+    stream: bool = True,
 ):
     print("=" * 80)
     print("🧠 CEREBROSPHEROID V5: COSMOPEDIA V2 TEACHER DIGESTION PIPELINE")
@@ -370,6 +403,7 @@ def run_pipeline(
     print(f"  Max Sequence Length : {max_length}")
     print(f"  Device              : {device_str}")
     print(f"  Worker Config       : Worker {worker_id + 1} of {num_workers}")
+    print(f"  Stream Samples      : {stream}")
     print(f"  Push to Hub         : {push_to_hub}")
     print(f"  Skip Existing       : {skip_existing}")
     print("=" * 80 + "\n")
@@ -456,6 +490,7 @@ def run_pipeline(
             push_to_hub=push_to_hub,
             keep_local=keep_local,
             clean_download_cache=True,
+            stream=stream,
         )
 
         if result.get("status") == "success":
@@ -485,7 +520,7 @@ def main():
     parser.add_argument("--num-workers", type=int, default=1, help="Total number of parallel workers")
     parser.add_argument("--max-samples-per-shard", type=int, default=None, help="Max samples per shard (for testing/smoke runs)")
     parser.add_argument("--max-length", type=int, default=1024, help="Maximum token sequence length")
-    parser.add_argument("--teacher-model", type=str, default="Qwen/Qwen2.5-1.5B-Instruct", help="HuggingFace teacher model ID")
+    parser.add_argument("--teacher-model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct", help="HuggingFace teacher model ID")
     parser.add_argument("--digest-mode", type=str, default="online", choices=["online", "heuristic"], help="Teacher digestion mode")
     parser.add_argument("--device", type=str, default="cuda", help="Execution device ('cuda' or 'cpu')")
     parser.add_argument("--teacher-scale", type=float, default=1.5, help="Teacher dynamic weight scale alpha")
@@ -496,6 +531,7 @@ def main():
     parser.add_argument("--no-skip", action="store_true", help="Do not skip existing shards on Hub")
     parser.add_argument("--keep-local", action="store_true", help="Keep local parquet files after upload")
     parser.add_argument("--private", action="store_true", help="Make HuggingFace dataset private")
+    parser.add_argument("--no-stream", action="store_true", help="Download raw parquet shards to disk instead of streaming")
 
     args = parser.parse_args()
 
@@ -525,6 +561,7 @@ def main():
         skip_existing=not args.no_skip,
         keep_local=args.keep_local,
         private=args.private,
+        stream=not args.no_stream,
     )
 
 

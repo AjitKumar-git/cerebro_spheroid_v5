@@ -40,16 +40,26 @@ def run_probe(checkpoint_path: str, preset: str = "v5_small"):
     tok_dir = os.path.join(WORKSPACE_ROOT, "data", "tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(tok_dir)
 
-    raw_cfg = PRESETS_V5.get(preset, PRESETS_V5["v5_small"])
-    cfg = ModelConfigV5(**raw_cfg) if isinstance(raw_cfg, dict) else raw_cfg
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    state = ckpt.get("model", ckpt.get("model_state", ckpt))
+
+    if "config" in ckpt and isinstance(ckpt["config"], ModelConfigV5):
+        cfg = ckpt["config"]
+    else:
+        from src.spheroid_v5 import infer_v5_config_from_state_dict
+        cfg = infer_v5_config_from_state_dict(state, preset_name=preset)
+
     cfg.use_sensory_self_attn = True
+    if preset == "v5_small":
+        cfg.use_rope = False
+        cfg.top_k_resonance = 0
 
     # 1. Load into JAX
     print("⏳ Loading checkpoint into JAX engine with sensory self-attention...")
     jax_params, jax_buffers, meta = load_torch_pt_to_jax(checkpoint_path, cfg)
-    step = meta.get("step", "unknown")
-    loss = meta.get("loss", "unknown")
-    eval_loss = meta.get("eval_loss", "unknown")
+    step = meta.get("step", ckpt.get("step", "unknown"))
+    loss = meta.get("loss", ckpt.get("loss", "unknown"))
+    eval_loss = meta.get("eval_loss", ckpt.get("eval_loss", "unknown"))
     loss_str = f"{loss:.4f}" if isinstance(loss, (int, float)) else str(loss)
     eval_str = f"{eval_loss:.4f}" if isinstance(eval_loss, (int, float)) else str(eval_loss)
     print(f"✓ JAX Engine Ready | Step: {step} | Train Loss: {loss_str} | Eval Loss: {eval_str}")
@@ -60,15 +70,13 @@ def run_probe(checkpoint_path: str, preset: str = "v5_small"):
     # 2. Load into PyTorch
     print("⏳ Loading checkpoint into PyTorch engine with sensory self-attention...")
     pt_model = CerebroSpheroidV5(cfg)
-    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    state = ckpt.get("model", ckpt.get("model_state", ckpt))
     if any(k.startswith(("sensory.", "core.", "motor.")) for k in state.keys()):
         state = adapt_jax_to_torch_state_dict(state, cfg)
     pt_model.load_state_dict(state, strict=False)
     pt_model.eval()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pt_model.to(device)
-    print(f"✓ PyTorch Engine Ready on {device}\n")
+    print(f"✓ PyTorch Engine Ready on {device} (use_rope={cfg.use_rope}, top_k_resonance={cfg.top_k_resonance})\n")
 
     print(f"{'='*80}")
     print(f"PROMPT EVALUATION BATTERY (Step {step})")
@@ -78,26 +86,45 @@ def run_probe(checkpoint_path: str, preset: str = "v5_small"):
         print(f"--- [{cat}] ---")
         print(f"Prompt: {prompt.strip()}")
 
-        # PyTorch Greedy (T=0.1)
+        # PyTorch Greedy (T=0.1 with tool execution)
         with torch.no_grad():
             pt_greedy = pt_model.generate_text(
                 prompt=prompt,
                 tokenizer=tokenizer,
-                max_new_tokens=64,
+                max_new_tokens=96,
                 temperature=0.1,
                 top_p=0.95,
                 repetition_penalty=1.2,
                 device=device,
                 strict_act=False,
+                execute_tools=True,
             )
-        print(f"\n[PyTorch Greedy (T=0.1)]:\n{pt_greedy.strip()}")
+        print(f"\n[PyTorch Output (T=0.1, Tool-Enabled)]:\n{pt_greedy.strip()}")
+
+        # PyTorch Agentic Closed-Loop ReAct
+        try:
+            with torch.no_grad():
+                loop_res = pt_model.generate_with_agentic_loop(
+                    prompt=prompt,
+                    tokenizer=tokenizer,
+                    max_new_tokens=96,
+                    temperature=0.1,
+                    device=device,
+                )
+            if loop_res.get("tool_call"):
+                print(f"\n[Agentic Sandbox Closed Loop]:")
+                print(f"  ⚡ Action Dispatched: <act> {loop_res['tool_call']} </act>")
+                print(f"  🔍 Sandbox Observation: {loop_res['tool_result']}")
+                print(f"  🎯 Grounded Final Answer: {loop_res['answer']}")
+        except Exception as e:
+            print(f"\n[Agentic Loop Note]: {e}")
 
         # PyTorch Sampling (T=0.7)
         with torch.no_grad():
             pt_sample = pt_model.generate_text(
                 prompt=prompt,
                 tokenizer=tokenizer,
-                max_new_tokens=64,
+                max_new_tokens=96,
                 temperature=0.7,
                 top_p=0.9,
                 repetition_penalty=1.2,

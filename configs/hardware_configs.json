@@ -57,7 +57,28 @@
       "step_ms": 435.2,
       "vram_gb": 12.8,
       "vram_utilization_pct": 80.0
+    },
+    "cpu_8GB_seq8": {
+      "preset": "v5_test",
+      "batch_size": 192,
+      "remat": false,
+      "seq_len": 8,
+      "prompt_len": 8,
+      "dtype": "<class 'float32'>",
+      "compile_time": 5.1236412525177,
+      "step_ms": 154.7863483428955,
+      "steps_per_sec": 6.460518067037265,
+      "tok_per_sec": 19846.71150193848,
+      "memory_gb": 0.05481337755918503,
+      "memory_utilization_pct": 0.6851672194898129,
+      "memory_type": "RAM",
+      "vram_gb": 0.05481337755918503,
+      "vram_utilization_pct": 0.6851672194898129,
+      "initial_loss": 7.611417293548584,
+      "status": "PASS",
+      "tune_objective": "balanced",
+      "max_batch_size": null,
+      "tuner_version": 2
     }
   }
 }
-

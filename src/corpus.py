@@ -607,9 +607,9 @@ def format_stimulus_prompt(prompt: str) -> str:
     return p
 
 
-def format_motor_response(answer: str) -> str:
-    """Encloses answer in <act> ... </act> delimiters."""
-    a = answer.strip()
+def format_tool_action(action: str) -> str:
+    """Encloses external tool execution in <act> ... </act> delimiters."""
+    a = str(action or "").strip()
     if a.startswith("act "):
         a = a[4:].strip()
     if not a.startswith("<act>"):
@@ -619,14 +619,38 @@ def format_motor_response(answer: str) -> str:
     return a
 
 
+def format_motor_response(answer: str) -> str:
+    """
+    Formats model response following the 3-Tier Cognitive Output Architecture:
+    1. Tool Calling (<act> ... </act>): Strictly for external tool invocations (calc, python, etc.).
+    2. Normal Output: Kept outside <act> in natural plain text / code blocks.
+    """
+    a = str(answer or "").strip()
+    # If already formatted with <act> or <think>, preserve exact structured boundaries
+    if "<act>" in a or "<think>" in a:
+        return a
+    # Only wrap in <act> if it is an explicit tool call instruction (calc:, tool:, etc.)
+    tool_prefixes = ("calc:", "calc(", "calculator:", "python(", "tool:", "sql:")
+    if any(a.lower().startswith(p) for p in tool_prefixes):
+        return format_tool_action(a)
+    # Normal output stays OUTSIDE <act>
+    return a
+
+
 def clean_motor_response(text: str, strict: bool = True) -> str:
     """
-    Strips biological <act> and </act> delimiters and returns strictly the interior payload.
-    If <act> and </act> tags are present, extracts strictly the text between them,
-    discarding all tokens before <act> and all tokens after </act>.
-    If only <act> is present without </act>, extracts from <act> onwards.
+    Returns the normal output outside <think> and <act> delimiters.
+    If normal text is present outside <act>, returns that text.
+    If only <act> is present (e.g. pure tool execution), returns the payload inside <act>.
     """
-    t = text.strip()
+    t = str(text or "").strip()
+    parsed = parse_model_output(t)
+    if parsed.get("answer"):
+        return parsed["answer"]
+    if parsed.get("tool_calls"):
+        return parsed["tool_calls"][0]
+    if parsed.get("thinking"):
+        return parsed["thinking"]
     m = re.search(r"<act>\s*(.*?)(?:\s*</act>|$)", t, re.DOTALL)
     if m:
         return m.group(1).strip()
@@ -634,12 +658,6 @@ def clean_motor_response(text: str, strict: bool = True) -> str:
         t = t[5:].strip()
     if t.endswith("</act>"):
         t = t[:-6].strip()
-    if t.startswith("act "):
-        t = t[4:].strip()
-    if t.startswith("act:"):
-        t = t[4:].strip()
-    if strict and "</act>" in t:
-        t = t.split("</act>")[0].strip()
     return t
 
 
@@ -693,12 +711,26 @@ def extract_strict_act_payload(
     return clean_motor_response(decoded, strict=True)
 
 
+def is_valid_tool_call(tc: str) -> bool:
+    """Checks whether a string is an authentic tool execution invocation."""
+    s = str(tc or "").strip()
+    if not s:
+        return False
+    tool_prefixes = ("calc(", "calc:", "calculator:", "python(", "python:", "sql:", "search(", "search:", "bash(", "bash:")
+    if any(s.lower().startswith(p) for p in tool_prefixes):
+        return True
+    # Generic tool invocation signature: identifier(args)
+    if re.match(r"^[a-zA-Z_]\w*\s*\(.*?\)$", s, re.DOTALL):
+        return True
+    return False
+
+
 def parse_model_output(text: str) -> Dict[str, Any]:
     """
     Parses CerebroSpheroid output following the 3-tier cognitive protocol:
     1. Thinking           : <think> ... </think> -> Private scratchpad (hidden or collapsible)
-    2. Non-Conversational : <act> ... </act>     -> Coding, Calculator, & Tool actions
-    3. Talking / Answering: Unbounded Plain Text -> Fluid, polite conversational response
+    2. Non-Conversational : <act> ... </act>     -> External Tool actions ONLY (calc, python, etc.)
+    3. Talking / Answering: Unbounded Plain Text -> Normal output outside <act>
     """
     raw = str(text or "").strip()
 
@@ -722,7 +754,7 @@ def parse_model_output(text: str) -> Dict[str, Any]:
         clean_text = clean_text.replace(stray, "")
     answer = clean_text.strip()
 
-    # 4. Filter & Route Action Blocks (Coding, Calculator, Tools vs Legacy Wrapped Text)
+    # 4. Filter & Route Action Blocks: Strictly validate tool calls
     tool_calls = []
     for tc in raw_tools:
         tc_clean = re.sub(r"<think>.*?(?:</think>|$)", "", tc, flags=re.DOTALL).strip()
@@ -732,15 +764,11 @@ def parse_model_output(text: str) -> Dict[str, Any]:
         if not tc_clean:
             continue
 
-        # If answer is present outside <act>, everything inside <act> is a valid action!
-        if answer:
+        if is_valid_tool_call(tc_clean):
             tool_calls.append(tc_clean)
         else:
-            # If answer is empty, check if this is a real non-conversational action or legacy wrapped text
-            has_code_or_tool = any(ch in tc_clean for ch in ("=", "(", ")", "[", "]", "{", "}", ":", "+", "*", "/")) or "\n" in tc_clean
-            if has_code_or_tool:
-                tool_calls.append(tc_clean)
-            else:
+            # If plain text was wrapped inside <act>, recover it as normal answer output outside <act>
+            if not answer:
                 answer = tc_clean
 
     return {

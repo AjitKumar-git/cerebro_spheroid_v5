@@ -99,12 +99,29 @@ class QwenTeacherDigester:
         print(f"📖 [TEACHER DIGESTER] Loading teacher model: {self.model_id} on {self.device} ({self.dtype})...")
         from transformers import AutoTokenizer, AutoModelForCausalLM
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, trust_remote_code=True)
+        # Resolve local cached snapshot path if model_id is a repo ID
+        resolved_path = self.model_id
+        if not os.path.exists(resolved_path):
+            repo_slug = self.model_id.replace("/", "--")
+            possible_roots = [
+                os.path.expanduser(f"~/.hf_cache/hub/models--{repo_slug}/snapshots"),
+                os.path.expanduser(f"~/.cache/hf_home/hub/models--{repo_slug}/snapshots"),
+                os.path.expanduser(f"~/.cache/huggingface/hub/models--{repo_slug}/snapshots"),
+            ]
+            for root in possible_roots:
+                if os.path.isdir(root):
+                    snaps = os.listdir(root)
+                    if snaps:
+                        resolved_path = os.path.join(root, snaps[0])
+                        print(f"  ✓ Resolved local cached snapshot: {resolved_path}")
+                        break
+
+        self.tokenizer = AutoTokenizer.from_pretrained(resolved_path, trust_remote_code=True)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
         self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_id,
+            resolved_path,
             torch_dtype=self.dtype,
             device_map=str(self.device) if "cuda" in str(self.device) else None,
             trust_remote_code=True,
@@ -135,6 +152,9 @@ class QwenTeacherDigester:
         input_ids = input_ids.to(self.device)
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.device)
+
+        if input_ids.shape[1] <= 1:
+            return torch.ones((input_ids.shape[0], max(0, input_ids.shape[1] - 1)), dtype=torch.float32, device=self.device)
 
         with torch.no_grad():
             outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)

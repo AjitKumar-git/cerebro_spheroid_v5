@@ -149,6 +149,15 @@ def init_spheroid_opt_state(params: Dict[str, jnp.ndarray], key: Optional[jax.Ar
         "v": opt_v,
         "master_p": master_p,
         "power_v": power_v,
+        "diag": {
+            "grad_norm": jnp.array(0.0, dtype=jnp.float32),
+            "was_clipped": jnp.array(0.0, dtype=jnp.float32),
+            "was_skipped": jnp.array(0.0, dtype=jnp.float32),
+            "u_ratio_manifold": jnp.array(0.0, dtype=jnp.float32),
+            "u_ratio_vocab": jnp.array(0.0, dtype=jnp.float32),
+            "u_ratio_1d": jnp.array(0.0, dtype=jnp.float32),
+            "replica_drift": jnp.array(0.0, dtype=jnp.float32),
+        },
     }
 
 
@@ -227,6 +236,14 @@ def _apply_spheroid_grads(
         lr_1d = 0.2 * base_lr
         lr_vocab = jnp.minimum(base_lr, 6.0e-4)
 
+        # Track squared update and parameter norms per group for diagnostic logging
+        sq_diff_m = 0.0
+        sq_norm_m = 0.0
+        sq_diff_v = 0.0
+        sq_norm_v = 0.0
+        sq_diff_1d = 0.0
+        sq_norm_1d = 0.0
+
         for k, param in p.items():
             if not jnp.issubdtype(param.dtype, jnp.inexact):
                 new_params[k] = param
@@ -252,6 +269,9 @@ def _apply_spheroid_grads(
                     p_updated, v_next = clamp_spectral_norm_jax(p_updated, opt_s["power_v"][k], max_spec_norm=1.0)
                     new_power_v[k] = v_next
 
+                sq_diff_m = sq_diff_m + jnp.sum(jnp.square(p_updated - p_f32))
+                sq_norm_m = sq_norm_m + jnp.sum(jnp.square(p_f32))
+
                 new_master_p[k] = p_updated.astype(jnp.float32)
                 new_params[k] = p_updated.astype(param.dtype)
 
@@ -267,6 +287,10 @@ def _apply_spheroid_grads(
                 step_dir = m_hat / (jnp.sqrt(v_hat) + 1e-6)
                 p_decayed = p_f32 * (1.0 - lr_vocab * weight_decay)
                 p_updated = p_decayed - lr_vocab * step_dir
+
+                sq_diff_v = sq_diff_v + jnp.sum(jnp.square(p_updated - p_f32))
+                sq_norm_v = sq_norm_v + jnp.sum(jnp.square(p_f32))
+
                 new_master_p[k] = p_updated.astype(jnp.float32)
                 new_params[k] = p_updated.astype(param.dtype)
 
@@ -281,6 +305,10 @@ def _apply_spheroid_grads(
                 v_hat = v_new / (1.0 - jnp.power(0.95, cur_step))
                 step_dir = m_hat / (jnp.sqrt(v_hat) + 1e-6)
                 p_updated = p_f32 - lr_1d * step_dir
+
+                sq_diff_1d = sq_diff_1d + jnp.sum(jnp.square(p_updated - p_f32))
+                sq_norm_1d = sq_norm_1d + jnp.sum(jnp.square(p_f32))
+
                 new_master_p[k] = p_updated.astype(jnp.float32)
                 new_params[k] = p_updated.astype(param.dtype)
 
@@ -302,11 +330,28 @@ def _apply_spheroid_grads(
         safe_v = jax.tree_util.tree_map(lambda nv, ov: jnp.where(params_finite, nv, ov), new_v, opt_s["v"])
         safe_step = jnp.where(params_finite, cur_step, opt_s["step"])
 
+        u_ratio_m = jnp.sqrt(sq_diff_m / (sq_norm_m + 1e-8))
+        u_ratio_v = jnp.sqrt(sq_diff_v / (sq_norm_v + 1e-8))
+        u_ratio_1d = jnp.sqrt(sq_diff_1d / (sq_norm_1d + 1e-8))
+        was_clipped = jnp.where(grad_norm > 1.0, 1.0, 0.0)
+        was_skipped = jnp.where(params_finite, 0.0, 1.0)
+
+        step_diag = {
+            "grad_norm": grad_norm,
+            "was_clipped": was_clipped,
+            "was_skipped": was_skipped,
+            "u_ratio_manifold": jnp.where(params_finite, u_ratio_m, 0.0),
+            "u_ratio_vocab": jnp.where(params_finite, u_ratio_v, 0.0),
+            "u_ratio_1d": jnp.where(params_finite, u_ratio_1d, 0.0),
+            "replica_drift": jnp.array(0.0, dtype=jnp.float32),
+        }
+
         new_opt_state = {
             "step": safe_step,
             "m": safe_m,
             "v": safe_v,
             "power_v": new_power_v,
+            "diag": step_diag,
         }
         if has_master:
             new_opt_state["master_p"] = jax.tree_util.tree_map(
@@ -315,7 +360,18 @@ def _apply_spheroid_grads(
         return safe_params, new_opt_state
 
     def _skip_step():
-        return p, opt_s
+        skip_diag = {
+            "grad_norm": jnp.where(is_finite, grad_norm, jnp.array(-1.0, dtype=jnp.float32)),
+            "was_clipped": jnp.array(0.0, dtype=jnp.float32),
+            "was_skipped": jnp.array(1.0, dtype=jnp.float32),
+            "u_ratio_manifold": jnp.array(0.0, dtype=jnp.float32),
+            "u_ratio_vocab": jnp.array(0.0, dtype=jnp.float32),
+            "u_ratio_1d": jnp.array(0.0, dtype=jnp.float32),
+            "replica_drift": jnp.array(0.0, dtype=jnp.float32),
+        }
+        skip_opt_state = dict(opt_s)
+        skip_opt_state["diag"] = skip_diag
+        return p, skip_opt_state
 
     return lax.cond(is_finite, _apply_step, _skip_step)
 
@@ -402,12 +458,20 @@ def merge_spheroid_replicas(
     merged_power_v: Dict[str, jnp.ndarray] = {}
     merged_params: Dict[str, jnp.ndarray] = {}
 
+    # Track inter-TPU replica drift before averaging
+    sq_drift = 0.0
+    sq_norm = 0.0
+
     for k, param in p.items():
         if not jnp.issubdtype(param.dtype, jnp.inexact):
             merged_params[k] = param
             continue
         m_p = opt_s["master_p"][k] if has_master else param.astype(jnp.float32)
         avg_master = lax.pmean(m_p.astype(jnp.float32), axis_name=axis_name)
+
+        sq_drift = sq_drift + jnp.sum(jnp.square(m_p.astype(jnp.float32) - avg_master))
+        sq_norm = sq_norm + jnp.sum(jnp.square(avg_master))
+
         if k in RECURRENT_KEYS and k in opt_s.get("power_v", {}):
             v_avg = lax.pmean(opt_s["power_v"][k].astype(jnp.float32), axis_name=axis_name)
             v_norm = v_avg / jnp.sqrt(jnp.sum(jnp.square(v_avg), axis=1, keepdims=True) + 1e-6)
@@ -416,17 +480,32 @@ def merge_spheroid_replicas(
         merged_master[k] = avg_master.astype(jnp.float32)
         merged_params[k] = avg_master.astype(param.dtype)
 
+    local_drift = jnp.sqrt(sq_drift / (sq_norm + 1e-12))
+    mean_drift = lax.pmean(local_drift, axis_name=axis_name)
+
     for k, v_val in opt_s.get("power_v", {}).items():
         if k not in merged_power_v:
             v_avg = lax.pmean(v_val.astype(jnp.float32), axis_name=axis_name)
             v_norm = v_avg / jnp.sqrt(jnp.sum(jnp.square(v_avg), axis=1, keepdims=True) + 1e-6)
             merged_power_v[k] = v_norm.astype(v_val.dtype)
 
+    prev_diag = opt_s.get("diag", {})
+    merged_diag = {
+        "grad_norm": lax.pmean(prev_diag.get("grad_norm", jnp.array(0.0, dtype=jnp.float32)), axis_name=axis_name),
+        "was_clipped": lax.pmean(prev_diag.get("was_clipped", jnp.array(0.0, dtype=jnp.float32)), axis_name=axis_name),
+        "was_skipped": lax.pmean(prev_diag.get("was_skipped", jnp.array(0.0, dtype=jnp.float32)), axis_name=axis_name),
+        "u_ratio_manifold": lax.pmean(prev_diag.get("u_ratio_manifold", jnp.array(0.0, dtype=jnp.float32)), axis_name=axis_name),
+        "u_ratio_vocab": lax.pmean(prev_diag.get("u_ratio_vocab", jnp.array(0.0, dtype=jnp.float32)), axis_name=axis_name),
+        "u_ratio_1d": lax.pmean(prev_diag.get("u_ratio_1d", jnp.array(0.0, dtype=jnp.float32)), axis_name=axis_name),
+        "replica_drift": mean_drift,
+    }
+
     merged_opt_state = {
         "step": opt_s["step"],
         "m": merged_m,
         "v": merged_v,
         "power_v": merged_power_v,
+        "diag": merged_diag,
     }
     if has_master:
         merged_opt_state["master_p"] = merged_master

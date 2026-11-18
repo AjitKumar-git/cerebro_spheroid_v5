@@ -18,6 +18,7 @@ import glob
 import json
 import shutil
 import time
+import dataclasses
 from typing import Dict, Tuple, Optional, Any, List, Union
 import concurrent.futures
 
@@ -94,8 +95,13 @@ def save_jax_to_torch_pt(
 
     if meta:
         meta_path = save_path.replace(".pt", ".json")
+        def _json_default(obj):
+            if dataclasses.is_dataclass(obj):
+                return dataclasses.asdict(obj)
+            return str(obj)
+
         with open(meta_path, "w") as f:
-            json.dump(meta, f, indent=2)
+            json.dump(meta, f, indent=2, default=_json_default)
 
 
 def _to_numpy(t):

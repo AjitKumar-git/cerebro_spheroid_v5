@@ -31,6 +31,79 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 from src.corpus import encode_no_special
 
 
+class DatasetTelemetry:
+    """Tracks per-source data health, yield counts, rejection reasons, and token lengths."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.examined: Dict[str, int] = collections.defaultdict(int)
+        self.accepted: Dict[str, int] = collections.defaultdict(int)
+        self.rejections: Dict[str, Dict[str, int]] = collections.defaultdict(lambda: collections.defaultdict(int))
+        self.token_lengths: Dict[str, List[int]] = collections.defaultdict(list)
+        self.last_log_time = time.time()
+
+    def record_examined(self, source: str):
+        with self.lock:
+            self.examined[source] += 1
+
+    def record_rejected(self, source: str, reason: str):
+        with self.lock:
+            self.rejections[source][reason] += 1
+
+    def record_accepted(self, source: str, prompt_tokens: int, target_tokens: int):
+        with self.lock:
+            self.accepted[source] += 1
+            tok_list = self.token_lengths[source]
+            total_tok = int(prompt_tokens + target_tokens)
+            if len(tok_list) < 2000:
+                tok_list.append(total_tok)
+            else:
+                tok_list[random.randint(0, 1999)] = total_tok
+
+    def get_summary(self) -> Dict[str, Any]:
+        with self.lock:
+            summary = {}
+            for src in set(list(self.examined.keys()) + list(self.accepted.keys())):
+                exam = self.examined.get(src, 0)
+                acc = self.accepted.get(src, 0)
+                rej = exam - acc if exam >= acc else 0
+                rej_rate = (rej / exam * 100.0) if exam > 0 else 0.0
+                lens = self.token_lengths.get(src, [])
+                summary[src] = {
+                    "examined": exam,
+                    "accepted": acc,
+                    "rejected": rej,
+                    "rejection_rate_pct": round(rej_rate, 2),
+                    "rejection_breakdown": dict(self.rejections[src]),
+                    "median_tokens": int(np.median(lens)) if lens else 0,
+                    "p95_tokens": int(np.percentile(lens, 95)) if lens else 0,
+                }
+            return summary
+
+    def log_report(self, force: bool = False):
+        now = time.time()
+        if not force and (now - self.last_log_time < 30.0):
+            return
+        self.last_log_time = now
+        summary = self.get_summary()
+        if not summary:
+            return
+        print("\n" + "=" * 80)
+        print("📊 DATASET PIPELINE HEALTH & QUALITY TELEMETRY")
+        print("=" * 80)
+        for src, stats in summary.items():
+            print(
+                f"  [{src:20s}] Yielded: {stats['accepted']:,} | Examined: {stats['examined']:,} | "
+                f"Rej: {stats['rejection_rate_pct']:.1f}% | Median Tok: {stats['median_tokens']} (P95: {stats['p95_tokens']})"
+            )
+            if stats["rejection_breakdown"]:
+                reasons = ", ".join(f"{k}: {v}" for k, v in stats["rejection_breakdown"].items())
+                print(f"    ↳ Rejection causes: {reasons}")
+        print("=" * 80 + "\n")
+
+
+GLOBAL_TELEMETRY = DatasetTelemetry()
+
+
 def _normalize_3tier_response(r_txt: str, q_txt: str = "") -> str:
     """
     Enforces the 3-Tier Cognitive Output Architecture:
@@ -45,25 +118,14 @@ def _normalize_3tier_response(r_txt: str, q_txt: str = "") -> str:
     r_txt = r_txt.replace("<thought>", "<think>").replace("</thought>", "</think>")
 
     # 1. Arithmetic & GSM8K derivations ending in '#### <ans>'
+    # Deterministic tool call goes in <act>, final answer is normal text OUTSIDE <act>
     if "####" in r_txt and "<act>" not in r_txt:
         parts = r_txt.split("####", 1)
         deriv = parts[0].strip()
         ans_str = parts[1].strip()
         if not deriv.startswith("<think>"):
             deriv = f"<think>\n{deriv}\n</think>"
-        return f"{deriv}\n<act>\ncalculator: {ans_str}\n</act>\n{ans_str}"
-
-    # 2. Markdown code fences -> Non-conversational Action <act> ... </act>
-    if "<act>" not in r_txt:
-        # Match fenced code block (python, py, bash, sh, json, or untyped)
-        pattern = r"```(?:python|py|bash|sh|json)?\s*\n(.*?)\n```"
-        match = re.search(pattern, r_txt, re.DOTALL)
-        if match:
-            code_content = match.group(1).strip()
-            # Replace code block with <act> ... </act>
-            r_txt = r_txt[:match.start()] + f"<act>\n{code_content}\n</act>" + r_txt[match.end():]
-        elif any(r_txt.strip().startswith(prefix) for prefix in ("def ", "class ", "import ", "from ", "#!/usr/bin/env")):
-            r_txt = f"<act>\n{r_txt.strip()}\n</act>"
+        return f"{deriv}\n<act> calc({ans_str}) </act>\nAnswer: {ans_str}"
 
     return r_txt
 
@@ -85,43 +147,67 @@ def extract_prompt_response_pair(row: Any) -> Tuple[str, str]:
             if q_txt and r_txt:
                 return q_txt, _normalize_3tier_response(r_txt, q_txt)
 
-        # 1. OpenHermes / ShareGPT format
+        # 1. OpenHermes / ShareGPT format (Preserving Complete Multi-Turn History)
         convs = row.get("conversations", [])
         if convs:
-            q_txt, r_txt = "", ""
             sys_txt = ""
+            turns = []
             for turn in convs:
                 sender = str(turn.get("from", "")).lower()
-                val = turn.get("value", "")
+                val = str(turn.get("value", "") or "").strip()
+                if not val:
+                    continue
                 if "system" in sender and not sys_txt:
-                    sys_txt = str(val).strip()
-                elif ("human" in sender or "user" in sender) and not q_txt:
-                    q_txt = str(val).strip()
-                elif ("gpt" in sender or "assistant" in sender or "model" in sender) and not r_txt:
-                    r_txt = str(val).strip()
-            if sys_txt and q_txt:
-                q_txt = f"{sys_txt}\n\n{q_txt}"
-            if q_txt and r_txt:
-                return str(q_txt), _normalize_3tier_response(str(r_txt), str(q_txt))
+                    sys_txt = val
+                elif "human" in sender or "user" in sender:
+                    turns.append(("user", val))
+                elif "gpt" in sender or "assistant" in sender or "model" in sender:
+                    turns.append(("assistant", val))
 
-        # 2. SmolTalk / UltraChat / ChatML format
+            if turns and turns[-1][0] == "assistant":
+                last_response = turns[-1][1]
+                history_turns = turns[:-1]
+                parts = []
+                if sys_txt:
+                    parts.append(f"System: {sys_txt}")
+                for r, text in history_turns:
+                    prefix = "User" if r == "user" else "Assistant"
+                    parts.append(f"{prefix}: {text}")
+                q_txt = "\n\n".join(parts)
+                if not q_txt:
+                    q_txt = "User: Please assist with the following task."
+                return str(q_txt), _normalize_3tier_response(str(last_response), str(q_txt))
+
+        # 2. SmolTalk / UltraChat / ChatML format (Preserving Complete Multi-Turn History)
         msgs = row.get("messages", [])
         if msgs:
-            q_txt, r_txt = "", ""
             sys_txt = ""
+            turns = []
             for msg in msgs:
                 role = str(msg.get("role", "")).lower()
-                val = msg.get("content", "")
+                val = str(msg.get("content", "") or "").strip()
+                if not val:
+                    continue
                 if "system" in role and not sys_txt:
-                    sys_txt = str(val).strip()
-                elif ("user" in role or "human" in role) and not q_txt:
-                    q_txt = str(val).strip()
-                elif ("assistant" in role or "model" in role or "gpt" in role) and not r_txt:
-                    r_txt = str(val).strip()
-            if sys_txt and q_txt:
-                q_txt = f"{sys_txt}\n\n{q_txt}"
-            if q_txt and r_txt:
-                return str(q_txt), _normalize_3tier_response(str(r_txt), str(q_txt))
+                    sys_txt = val
+                elif "user" in role or "human" in role:
+                    turns.append(("user", val))
+                elif "assistant" in role or "model" in role or "gpt" in role:
+                    turns.append(("assistant", val))
+
+            if turns and turns[-1][0] == "assistant":
+                last_response = turns[-1][1]
+                history_turns = turns[:-1]
+                parts = []
+                if sys_txt:
+                    parts.append(f"System: {sys_txt}")
+                for r, text in history_turns:
+                    prefix = "User" if r == "user" else "Assistant"
+                    parts.append(f"{prefix}: {text}")
+                q_txt = "\n\n".join(parts)
+                if not q_txt:
+                    q_txt = "User: Please assist with the following task."
+                return str(q_txt), _normalize_3tier_response(str(last_response), str(q_txt))
 
         # 3. Frontier Reasoning / Math / CoT / Q&A format
         q_val = row.get("problem") or row.get("instruction") or row.get("question") or row.get("prompt") or row.get("input") or row.get("query")
@@ -134,15 +220,32 @@ def extract_prompt_response_pair(row: Any) -> Tuple[str, str]:
             if th_txt and "<think>" not in r_txt:
                 r_txt = f"<think>\n{th_txt}\n</think>\n{r_txt}"
             return q_txt, _normalize_3tier_response(r_txt, q_txt)
+
+        # 4. Code Corpora: Extract Docstring Specifications or Causal Continuation
         if not q_val and "code" in row:
             raw_c = str(row["code"]).strip()
-            return "Implement the following Python code:", f"<act>\n{raw_c}\n</act>"
+            # Check for function or class signature with docstring
+            doc_match = re.search(r'^(?:def\s+[a-zA-Z_]\w*|class\s+[a-zA-Z_]\w*).*?:\s*"""(.*?)"""', raw_c, re.DOTALL | re.MULTILINE)
+            if doc_match:
+                docstring = doc_match.group(1).strip()
+                q_txt = f"Implement a Python solution for the following specification:\n\n{docstring}"
+                r_txt = raw_c
+                return q_txt, _normalize_3tier_response(r_txt, q_txt)
+            else:
+                lines = raw_c.splitlines()
+                if len(lines) > 4:
+                    p = "\n".join(lines[:3])
+                    r = "\n".join(lines[3:])
+                    return p, r
+                return "# Python source code:", raw_c
+
+        # 5. Raw Text Corpora (FineWeb-Edu, Reference Documents)
         if not q_val and "text" in row:
             raw_t = str(row["text"]).strip()
-            if "\n\n" in raw_t:
+            if "\n\n" in raw_t and len(raw_t.split("\n\n")[0]) > 40:
                 p, r = raw_t.split("\n\n", 1)
             else:
-                p, r = "Explain and analyze the following topic:", raw_t
+                p, r = "Study and comprehend the following material:", raw_t
             return p.strip(), _normalize_3tier_response(r.strip(), p.strip())
         return str(q_val or ""), _normalize_3tier_response(str(r_val or ""), str(q_val or ""))
     return "", ""
@@ -155,6 +258,11 @@ _DEFAULT_DATASET_REVISIONS: Dict[str, str] = {
     # (~15+ GB per rank) and trigger host OOM SIGKILL on 2xT4 containers. The
     # auto-converted Parquet branch streams row-groups in <250 MB RSS per rank.
     "teknium/OpenHermes-2.5": "refs/convert/parquet",
+    "HuggingFaceFW/fineweb-edu": "main",
+    "HuggingFaceTB/cosmopedia-v2": "main",
+    "openai/gsm8k": "main",
+    "HuggingFaceTB/smoltalk": "main",
+    "HuggingFaceTB/finemath": "main",
 }
 
 _DEFAULT_DATASET_CONFIGS: Dict[str, str] = {
@@ -293,6 +401,7 @@ def build_online_dataset_iterator(
     world_size: int = 1,
     step_getter: Optional[Any] = None,
     total_steps: int = 1_500_000,
+    inject_retrieval: bool = True,
 ) -> Iterator[Dict[str, Any]]:
     """
     Infinite, resilient HuggingFace multi-corpus streaming iterator shared by TPU and GPU trainers.
@@ -304,6 +413,45 @@ def build_online_dataset_iterator(
       - 'code': Pure indented Python software and algorithmic problem solving.
       - 'consolidation': Final cooling replay mixture.
     """
+    def _wrap_with_retrieval_injection(base_gen: Iterator[Dict[str, Any]]) -> Iterator[Dict[str, Any]]:
+        if not inject_retrieval:
+            return base_gen
+        retrieval_path = os.path.join(REPO_ROOT, "data", "retrieval_curriculum_data.jsonl")
+        if not os.path.exists(retrieval_path):
+            return base_gen
+
+        def _open_retrieval_stream():
+            while True:
+                with open(retrieval_path, "r", encoding="utf-8") as rf:
+                    for line in rf:
+                        line = line.strip()
+                        if line:
+                            try:
+                                d = json.loads(line)
+                                d["_dataset"] = "retrieval_curriculum"
+                                yield d
+                            except Exception:
+                                pass
+
+        def _wrapped():
+            r_it = _open_retrieval_stream()
+            t = 0
+            while True:
+                if r_it is not None and (t % 10 == 9):
+                    try:
+                        item = next(r_it)
+                        yield item
+                        t += 1
+                        continue
+                    except Exception:
+                        r_it = _open_retrieval_stream()
+                try:
+                    item = next(base_gen)
+                    yield item
+                    t += 1
+                except StopIteration:
+                    break
+        return _wrapped()
     source = (dataset_source or "dense_edu").lower()
     if source in ("chat_thinking", "db_thinking", "specialized_trihead", "specialized_sft"):
         source = "chat_thinking"
@@ -367,14 +515,67 @@ def build_online_dataset_iterator(
                 return False
         return True
 
-    def _next_filtered_fineweb(it: Optional[Iterator[Any]], opener, min_score: float = 3.0):
-        for _ in range(50):
+    def _doc_passes_filter(row: Dict[str, Any], min_score: float) -> Tuple[bool, str]:
+        score_val = row.get("score")
+        if score_val is None:
+            score_val = row.get("educational_score")
+        if score_val is None:
+            score_val = row.get("int_score")
+        try:
+            score = float(score_val if score_val is not None else 0.0)
+        except (ValueError, TypeError):
+            score = 0.0
+
+        if score < min_score:
+            return False, "score"
+
+        lang = str(row.get("language", "en") or "en").lower()
+        try:
+            lang_score = float(row.get("language_score", 1.0) or 1.0)
+        except (ValueError, TypeError):
+            lang_score = 1.0
+        if lang != "en" or lang_score < 0.70:
+            return False, "language"
+
+        text = str(row.get("text", "") or "")
+        if not _is_valid_doc(text, min_chars=150):
+            return False, "length_repetition"
+
+        return True, "ok"
+
+    def _next_filtered_fineweb(it: Optional[Iterator[Any]], opener, min_score: float = 3.0, max_attempts: int = 1000):
+        """
+        Strict Educational Web Filter:
+        Guarantees that ONLY high-quality, English, non-repetitive educational text
+        with educational_score >= min_score is returned. Never yields rejected rows.
+        """
+        attempts = 0
+        while attempts < max_attempts:
             row, it = _next_or_reopen(it, opener)
-            score = float(row.get("score", 0.0) or row.get("educational_score", 0.0) or row.get("int_score", 0.0))
+            attempts += 1
+            GLOBAL_TELEMETRY.record_examined("fineweb_edu")
+
+            passed, reason = _doc_passes_filter(row, min_score)
+            if not passed:
+                GLOBAL_TELEMETRY.record_rejected("fineweb_edu", reason)
+                continue
+
             text = str(row.get("text", "") or "")
-            if score >= min_score and _is_valid_doc(text, min_chars=150):
-                return row, it
-        return row, it
+            GLOBAL_TELEMETRY.record_accepted("fineweb_edu", 0, len(text.split()))
+            return row, it
+
+        # If 1000 records failed in current stream slice, cleanly reopen stream and continue searching with strict filter
+        it = opener()
+        while True:
+            row, it = _next_or_reopen(it, opener)
+            GLOBAL_TELEMETRY.record_examined("fineweb_edu")
+            passed, reason = _doc_passes_filter(row, min_score)
+            if not passed:
+                GLOBAL_TELEMETRY.record_rejected("fineweb_edu", reason)
+                continue
+            text = str(row.get("text", "") or "")
+            GLOBAL_TELEMETRY.record_accepted("fineweb_edu", 0, len(text.split()))
+            return row, it
 
     if "/" in dataset_source:
         repo_id = dataset_source
@@ -402,7 +603,7 @@ def build_online_dataset_iterator(
                     "target_weights": weights,
                 }
 
-        return _custom_gen()
+        return _wrap_with_retrieval_injection(_custom_gen())
 
     if source == "autonomous":
         # Refined 4-Phase Developmental Autonomous Curriculum for CerebroSpheroid V5
@@ -682,7 +883,7 @@ def build_online_dataset_iterator(
                         time.sleep(0.5)
                 turn += 1
 
-        return _autonomous_gen()
+        return _wrap_with_retrieval_injection(_autonomous_gen())
 
     if source == "chat_thinking":
         # 100% Offline Database-Augmented Chat, Reasoning & Action Streamer:
@@ -715,7 +916,7 @@ def build_online_dataset_iterator(
                 else:
                     time.sleep(1.0)
 
-        return _chat_thinking_gen()
+        return _wrap_with_retrieval_injection(_chat_thinking_gen())
 
     if source == "conversational_sft":
         # Specialized Layman Conversational & Step-by-Step CoT Reasoning Mixture:
@@ -839,7 +1040,7 @@ def build_online_dataset_iterator(
                     time.sleep(0.5)
                 turn += 1
 
-        return _conversational_gen()
+        return _wrap_with_retrieval_injection(_conversational_gen())
 
     if source == "dense_edu":
         cosmo_it: Optional[Iterator[Any]] = None
@@ -880,7 +1081,7 @@ def build_online_dataset_iterator(
                     time.sleep(0.5)
                 turn += 1
 
-        return _dense_gen()
+        return _wrap_with_retrieval_injection(_dense_gen())
 
     if source in ("conversation_sft", "code"):
         smol_it: Optional[Iterator[Any]] = None
@@ -914,7 +1115,7 @@ def build_online_dataset_iterator(
                     time.sleep(0.5)
                 turn += 1
 
-        return _conv_gen()
+        return _wrap_with_retrieval_injection(_conv_gen())
 
     if source == "reasoning_anneal":
         gsm_it: Optional[Iterator[Any]] = None
@@ -987,7 +1188,7 @@ def build_online_dataset_iterator(
                     time.sleep(0.5)
                 turn += 1
 
-        return _reason_gen()
+        return _wrap_with_retrieval_injection(_reason_gen())
 
     if source == "consolidation":
         dense_it: Optional[Iterator[Any]] = None
@@ -1016,7 +1217,7 @@ def build_online_dataset_iterator(
                     time.sleep(0.5)
                 turn += 1
 
-        return _consol_gen()
+        return _wrap_with_retrieval_injection(_consol_gen())
 
     # Fallback: OpenHermes-2.5
     oh_it: Optional[Iterator[Any]] = None
@@ -1032,7 +1233,7 @@ def build_online_dataset_iterator(
             except Exception:
                 time.sleep(0.5)
 
-    return _oh_gen()
+    return _wrap_with_retrieval_injection(_oh_gen())
 
 
 def sample_window(
@@ -1062,32 +1263,55 @@ def sample_window(
     return answer_ids[start], answer_ids[start + 1 : start + 1 + window]
 
 
-def get_default_elastic_buckets(total_window: int = 1024) -> List[Tuple[str, int, int]]:
+def get_default_elastic_buckets(total_window: int = 1024, max_target: Optional[int] = None) -> List[Tuple[str, int, int]]:
     """Returns high-density complementary sliding window buckets preserving intact prompts and deep reasoning trajectories."""
-    assert total_window >= 256, "total_window must be at least 256 tokens"
-    if total_window >= 1024:
-        return [
+    assert total_window >= 4, "total_window must be at least 4 tokens"
+    if total_window >= 4096:
+        base = [
+            ("short_prompt_long_target", 256, 3840),
+            ("balanced_long", 2048, 2048),
+            ("long_prompt", 3840, 256),
+        ]
+    elif total_window >= 2048:
+        base = [
+            ("short_prompt_long_target", 256, 1792),
+            ("balanced_long", 1024, 1024),
+            ("long_prompt", 1792, 256),
+        ]
+    elif total_window >= 1024:
+        base = [
             ("standard_cot", 256, 512),
             ("deep_reasoning", 256, 768),
             ("balanced", 384, 512),
             ("long_prompt", 512, 512),
         ]
     elif total_window >= 768:
-        return [
+        base = [
             ("short_prompt_deep_cot", 128, 512),
             ("standard_cot", 256, 512),
             ("balanced", 256, 384),
             ("long_prompt", 384, 384),
         ]
     elif total_window >= 512:
-        return [
+        base = [
             ("standard_cot", 128, 384),
             ("balanced", 256, 256),
             ("deep_reasoning", 128, 384),
         ]
     else:
         half = total_window // 2
-        return [("balanced", half, half)]
+        base = [("balanced", half, half)]
+
+    if max_target is not None and max_target > 0:
+        capped = []
+        for name, p_l, t_l in base:
+            if t_l > max_target:
+                p_new = min(total_window - max_target, p_l + (t_l - max_target))
+                capped.append((name, p_new, max_target))
+            else:
+                capped.append((name, p_l, t_l))
+        return capped
+    return base
 
 
 def select_best_bucket(p_len: int, t_len: int, buckets: List[Tuple[str, int, int]]) -> int:
@@ -1164,6 +1388,21 @@ class ElasticBucketBatcher:
         with self._lock:
             self.tokens_by_dataset = collections.defaultdict(int, {str(k): int(v) for k, v in d.items()})
 
+    def update_buckets(self, new_buckets: List[Tuple[str, int, int]], new_total_window: Optional[int] = None) -> None:
+        """Dynamically transitions active context buckets for curriculum scaling."""
+        with self._lock:
+            self.buckets = list(new_buckets)
+            if new_total_window is not None:
+                self.total_window = int(new_total_window)
+            # Re-initialize bucket queues with new dimensions
+            self.queues = {i: collections.deque(maxlen=self.max_queue_size) for i in range(len(self.buckets))}
+
+    def update_target_len(self, new_target_len: int) -> None:
+        """Dynamically updates target length and re-computes active buckets."""
+        with self._lock:
+            new_buckets = get_default_elastic_buckets(self.total_window, max_target=int(new_target_len))
+            self.update_buckets(new_buckets, new_total_window=self.total_window)
+
     def _extract_text_pair(self, row: Any) -> Tuple[str, str]:
         """Extracts (prompt, response) from diverse dataset formats via shared extractor."""
         return extract_prompt_response_pair(row)
@@ -1212,21 +1451,28 @@ class ElasticBucketBatcher:
     def get_batch(self) -> Any:
         return self.next_batch()
 
-    def next_batch(self) -> Any:
+    def next_batch(self, bucket_idx: Optional[int] = None) -> Any:
         """
         Pulls from dataset stream until any bucket has batch_size examples.
         Returns: (bucket_idx, bucket_name, prompt_batch, target_batch[, feedback_batch])
         """
         while True:
             # Check if any bucket queue is ready to pop a full batch
-            for b_idx in range(len(self.buckets)):
+            bucket_order = [bucket_idx] if bucket_idx is not None else range(len(self.buckets))
+            for b_idx in bucket_order:
+                if b_idx not in self.queues:
+                    raise IndexError(f"Unknown elastic bucket index: {b_idx}")
                 if len(self.queues[b_idx]) >= self.batch_size:
                     name, p_len, t_len = self.buckets[b_idx]
                     batch_items = [self.queues[b_idx].popleft() for _ in range(self.batch_size)]
                     p_list, t_list, c_list, d_list = zip(*batch_items)
                     with self._lock:
                         for ds, p, t in zip(d_list, p_list, t_list):
-                            self.tokens_by_dataset[ds] += (len(p) + len(t))
+                            # Attribute actual tokens, not fixed-shape padding.
+                            self.tokens_by_dataset[ds] += int(
+                                np.count_nonzero(np.asarray(p) != self.pad_id)
+                                + np.count_nonzero(np.asarray(t) >= 0)
+                            )
                     return self._format_batch(b_idx, name, p_list, t_list, c_list)
 
             # Pull raw records (batch-tokenize when a fast Rust tokenizer is available)
@@ -1258,14 +1504,12 @@ class ElasticBucketBatcher:
 
                 # 3-Tier Cognitive Formatting for Response:
                 # 1. If response already contains <act> or <think>, preserve exact structured boundaries.
-                # 2. Non-conversational output: Coding, Calculator, Tools are enclosed in <act> ... </act>.
-                # 3. Conversational dialogue: Natural fluid plain text outside <act>.
+                # 2. Tool action output: External tool calls are enclosed in <act> ... </act>.
+                # 3. Conversational dialogue & code generation: Natural fluid plain text outside <act>.
                 r_txt = _normalize_3tier_response(r_txt, q_txt)
                 if "<act>" not in r_txt:
-                    if any(kw in ds_name.lower() for kw in ("code", "python", "self_oss")):
-                        r_txt = f"<act>\n{r_txt.strip()}\n</act>"
-                    elif "calculator" in ds_name.lower():
-                        r_txt = f"<act>\ncalculator: {r_txt.strip()}\n</act>"
+                    if "calculator" in ds_name.lower():
+                        r_txt = f"<act> calc({r_txt.strip()}) </act>\nAnswer: {r_txt.strip()}"
                 raw_pairs.append((q_txt, r_txt, ds_name))
 
             if not raw_pairs and stream_ended:
@@ -1281,7 +1525,10 @@ class ElasticBucketBatcher:
                 p_list, t_list, c_list, d_list = zip(*items)
                 with self._lock:
                     for ds, p, t in zip(d_list, p_list, t_list):
-                        self.tokens_by_dataset[ds] += (len(p) + len(t))
+                        self.tokens_by_dataset[ds] += int(
+                            np.count_nonzero(np.asarray(p) != self.pad_id)
+                            + np.count_nonzero(np.asarray(t) >= 0)
+                        )
                 return self._format_batch(best_b, name, p_list, t_list, c_list)
 
             # Tokenize bounded to prevent processing gigantic out-of-distribution text
@@ -1324,20 +1571,51 @@ class ElasticBucketBatcher:
                 b_idx = select_best_bucket(q_len, r_len, self.buckets)
                 name, bp, bt = self.buckets[b_idx]
 
-                # Pad / truncate to the exact bucket dimensions
+                # Pad / truncate to the exact bucket dimensions (preserve most recent turns for prompts)
                 if len(q_ids) > bp:
-                    q_padded = q_ids[:bp]
+                    q_padded = q_ids[-bp:]
                 else:
                     q_padded = q_ids + [self.pad_id] * (bp - len(q_ids))
 
                 if len(r_ids) > bt:
-                    context_token, scored = sample_window(r_ids, bt, self.rng, self.tail_probability)
-                    r_padded = scored
-                else:
-                    context_token = None
-                    r_padded = r_ids + [self.target_pad_id] * (bt - len(r_ids))
+                    # Contiguous sequential document/trajectory slicing with true preceding context carry
+                    chunks = []
+                    is_reasoning_or_qa = any(
+                        kw in ds.lower()
+                        for kw in ("math", "gsm8k", "openhermes", "smoltalk", "cot", "reason", "qa", "hermes", "r1")
+                    ) or ("<think>" in r_txt or "<act>" in r_txt)
 
-                self.queues[b_idx].append((q_padded, r_padded, context_token, ds))
+                    for start in range(0, len(r_ids), bt):
+                        chunk = r_ids[start : start + bt]
+                        if start == 0:
+                            chunk_prompt = q_padded
+                            ctx_tok = None
+                        else:
+                            # Preceding context carry: For reasoning/QA, preserve prompt header so reasoning trajectories retain the original question!
+                            if is_reasoning_or_qa and len(q_ids) > 0:
+                                header_len = min(len(q_ids), max(16, bp // 3))
+                                q_hdr = q_ids[:header_len]
+                                rem_bp = max(0, bp - len(q_hdr))
+                                preceding = r_ids[max(0, start - rem_bp) : start]
+                                chunk_prompt = q_hdr + preceding
+                            else:
+                                preceding = r_ids[max(0, start - bp) : start]
+                                chunk_prompt = preceding
+
+                            if len(chunk_prompt) < bp:
+                                chunk_prompt = chunk_prompt + [self.pad_id] * (bp - len(chunk_prompt))
+                            else:
+                                chunk_prompt = chunk_prompt[:bp]
+                            ctx_tok = r_ids[start - 1]
+
+                        if len(chunk) < bt:
+                            chunk = chunk + [self.target_pad_id] * (bt - len(chunk))
+                        chunks.append((chunk_prompt, chunk, ctx_tok))
+                else:
+                    chunks = [(q_padded, r_ids + [self.target_pad_id] * (bt - len(r_ids)), None)]
+
+                for chunk_prompt, r_padded, context_token in chunks:
+                    self.queues[b_idx].append((chunk_prompt, r_padded, context_token, ds))
 
 
 class PrefetchedBatcher:
@@ -1394,6 +1672,25 @@ class PrefetchedBatcher:
     def set_tokens_by_dataset(self, d: Dict[str, int]) -> None:
         """Forwards token setting to underlying batcher."""
         self.batcher.set_tokens_by_dataset(d)
+
+    def update_buckets(self, new_buckets: List[Tuple[str, int, int]], new_total_window: Optional[int] = None) -> None:
+        """Flushes buffered batches and applies new context buckets to underlying batcher."""
+        # Safely flush prefetched queue of obsolete shapes
+        while not self.queue.empty():
+            try:
+                self.queue.get_nowait()
+            except Exception:
+                break
+        self.batcher.update_buckets(new_buckets, new_total_window)
+
+    def update_target_len(self, new_target_len: int) -> None:
+        """Flushes buffered batches and updates target length on the underlying batcher."""
+        while not self.queue.empty():
+            try:
+                self.queue.get_nowait()
+            except Exception:
+                break
+        self.batcher.update_target_len(new_target_len)
 
     def stop(self):
         self.shutdown()
@@ -1621,10 +1918,8 @@ def build_canonical_eval_split(
             q_fmt = format_stimulus_prompt(q_txt)
             r_fmt = _normalize_3tier_response(r_txt.strip(), q_txt)
             if "<act>" not in r_fmt:
-                if any(kw in ds_tag.lower() for kw in ("code", "python")):
-                    r_fmt = f"<act>\n{r_fmt}\n</act>"
-                elif "calculator" in ds_tag.lower():
-                    r_fmt = f"<act>\ncalculator: {r_fmt}\n</act>"
+                if "calculator" in ds_tag.lower():
+                    r_fmt = f"<act> calc({r_fmt}) </act>\nAnswer: {r_fmt}"
 
             if hasattr(tokenizer, "encode"):
                 q_ids = encode_no_special(tokenizer, q_fmt, max_length=prompt_len)

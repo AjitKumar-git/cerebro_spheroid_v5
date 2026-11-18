@@ -35,6 +35,7 @@ class ModelConfigV5:
     num_shortcut_tracts: int = 96     # Axonal shortcut tracts
     num_heads: int = 8                # Arcuate Fasciculus cross-resonance heads
     max_phase_steps: int = 1024       # Premotor phase clock horizon
+    sensory_position_steps: int = 1024 # Learned sensory position embedding capacity
     thinking_cycles: int = 4          # Subconscious deliberation steps before emission
     phase_scale: float = 2.0          # Normalized phase clock signal amplitude
     dropout: float = 0.0              # Regularization dropout
@@ -43,9 +44,10 @@ class ModelConfigV5:
     use_shell_tap: bool = True        # Multi-shell efferent tap
     use_plan: bool = True             # Recurrent premotor executive plan
     use_sensory_self_attn: bool = True     # Contextual inter-token self-attention in SensoryInputDNN
+    num_sensory_layers: int = 1            # Stacked self-attention blocks in sensory encoder (1 = backward-compatible default)
     use_rope: bool = True                  # Rotary Position Embeddings in Arcuate cross-resonance
     rope_theta: float = 500000.0      # Rotary Position Embedding base (32k+ horizon)
-    max_seq_len: int = 32768          # Precomputed rotary horizon
+    max_seq_len: int = 4096           # Precomputed rotary horizon (curriculum scalable)
     top_k_resonance: int = 16         # Top-k sparse associative retrieval (needle tethering)
     use_deliberation_probe: bool = True  # Subconscious core probe of sensory KV buffer
     # Frontier 2026 Architectural Upgrades
@@ -285,6 +287,74 @@ class AudioWaveformStem(nn.Module):
         return self.norm(h)
 
 
+class SensoryTransformerBlock(nn.Module):
+    """
+    Standard pre-norm Transformer self-attention block for deep sensory encoding.
+    """
+    def __init__(
+        self,
+        surface_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        use_rope: bool = True,
+        rope_theta: float = 500000.0,
+    ):
+        super().__init__()
+        self.surface_dim = surface_dim
+        self.num_heads = num_heads
+        self.head_dim = surface_dim // num_heads
+        self.use_rope = use_rope
+        self.rope_theta = rope_theta
+
+        self.norm1 = RMSNorm(surface_dim)
+        self.q_proj = nn.Linear(surface_dim, surface_dim, bias=False)
+        self.k_proj = nn.Linear(surface_dim, surface_dim, bias=False)
+        self.v_proj = nn.Linear(surface_dim, surface_dim, bias=False)
+        self.out_proj = nn.Linear(surface_dim, surface_dim, bias=False)
+        nn.init.zeros_(self.out_proj.weight)
+
+        self.norm2 = RMSNorm(surface_dim)
+        self.swiglu = SwiGLU(surface_dim, hidden_features=surface_dim * 2, out_features=surface_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        is_causal: bool = False,
+        pos_offset: int = 0,
+        attn_mask: Optional[torch.Tensor] = None,
+        rope_cos: Optional[torch.Tensor] = None,
+        rope_sin: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        B, L, D = x.shape
+        h = self.norm1(x)
+        q = self.q_proj(h).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(h).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(h).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+
+        if self.use_rope and rope_cos is not None:
+            q = apply_rope(q, rope_cos, rope_sin, offset=pos_offset, theta=self.rope_theta)
+            k = apply_rope(k, rope_cos, rope_sin, offset=pos_offset, theta=self.rope_theta)
+
+        if attn_mask is not None:
+            sdpa_mask = attn_mask
+            sdpa_causal = False
+        elif is_causal:
+            sdpa_mask = None
+            sdpa_causal = True
+        else:
+            sdpa_mask = None
+            sdpa_causal = False
+
+        ctx = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=sdpa_mask, is_causal=sdpa_causal, dropout_p=self.dropout.p if self.training else 0.0
+        ).transpose(1, 2).contiguous().view(B, L, D)
+
+        x = x + self.dropout(self.out_proj(ctx))
+        x = x + self.dropout(self.swiglu(self.norm2(x)))
+        return x
+
+
 class SensoryInputDNNV5(nn.Module):
     """
     Sensory Input DNN V5:
@@ -300,6 +370,11 @@ class SensoryInputDNNV5(nn.Module):
         num_heads: int = 8,
         dropout: float = 0.0,
         use_self_attn: bool = True,
+        num_sensory_layers: int = 1,
+        use_rope: bool = True,
+        rope_theta: float = 500000.0,
+        max_seq_len: int = 4096,
+        sensory_position_steps: int = 1024,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -307,13 +382,25 @@ class SensoryInputDNNV5(nn.Module):
         self.num_heads = num_heads
         self.head_dim = surface_dim // num_heads
         self.use_self_attn = use_self_attn
+        self.num_sensory_layers = num_sensory_layers
+        self.use_rope = use_rope
+        self.rope_theta = rope_theta
 
         # Primary sensory dictionary (shared with motor emission head via affine tying)
         self.embedding = nn.Embedding(vocab_size, surface_dim)
         nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
         # Zero-init positional embedding preserves transferability while restoring token order
-        self.pos_embed = nn.Embedding(1024, surface_dim)
+        self.pos_embed = nn.Embedding(sensory_position_steps, surface_dim)
         nn.init.zeros_(self.pos_embed.weight)
+
+        # Precompute RoPE rotary frequency cache for sensory self-attention
+        if self.use_rope:
+            cos, sin = precompute_rope_freqs(self.head_dim, max_seq_len=max_seq_len, theta=rope_theta)
+            self.register_buffer("rope_cos", cos, persistent=False)
+            self.register_buffer("rope_sin", sin, persistent=False)
+        else:
+            self.rope_cos = None
+            self.rope_sin = None
 
         # Non-linear input SwiGLU block
         self.swiglu = SwiGLU(surface_dim, hidden_features=surface_dim * 2, out_features=surface_dim)
@@ -333,18 +420,33 @@ class SensoryInputDNNV5(nn.Module):
             self.v_self = nn.Linear(surface_dim, surface_dim, bias=False)
             self.out_self = nn.Linear(surface_dim, surface_dim, bias=False)
             nn.init.zeros_(self.out_self.weight)
+            if self.num_sensory_layers > 1:
+                self.extra_layers = nn.ModuleList([
+                    SensoryTransformerBlock(
+                        surface_dim=surface_dim,
+                        num_heads=num_heads,
+                        dropout=dropout,
+                        use_rope=use_rope,
+                        rope_theta=rope_theta,
+                    )
+                    for _ in range(self.num_sensory_layers - 1)
+                ])
+            else:
+                self.extra_layers = None
         else:
             self.ctx_norm = None
             self.q_self = None
             self.k_self = None
             self.v_self = None
             self.out_self = None
+            self.extra_layers = None
 
     def forward(
         self,
         input_ids_or_emb: torch.Tensor,
         is_causal: bool = False,
         pos_offset: int = 0,
+        attn_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Accepts integer token IDs [B, L] or soft embedding vectors [B, D] / [B, L, D].
@@ -368,9 +470,12 @@ class SensoryInputDNNV5(nn.Module):
         max_p = self.pos_embed.num_embeddings
         raw_pos = torch.arange(L, device=x.device, dtype=torch.long) + pos_offset
         if (raw_pos >= max_p).any():
-            pos_ids = raw_pos % max_p
-            scale_factor = (raw_pos // max_p).float().unsqueeze(-1)
-            pos_enc = self.pos_embed(pos_ids) * (1.0 / (1.0 + 0.05 * scale_factor))
+            # Never alias 0 with 1024/2048/... .  Long-context runs rely on
+            # RoPE past this learned absolute table; unseen absolute vectors
+            # are deliberately zero rather than recycled at a false position.
+            pos_ids = raw_pos.clamp(0, max_p - 1)
+            in_table = (raw_pos < max_p).to(x.dtype).unsqueeze(-1)
+            pos_enc = self.pos_embed(pos_ids) * in_table
         else:
             pos_ids = raw_pos.clamp(0, max_p - 1)
             pos_enc = self.pos_embed(pos_ids)
@@ -385,14 +490,39 @@ class SensoryInputDNNV5(nn.Module):
             q_s = self.q_self(h_ctx).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
             k_s = self.k_self(h_ctx).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
             v_s = self.v_self(h_ctx).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+            if self.use_rope and self.rope_cos is not None:
+                q_s = apply_rope(q_s, self.rope_cos, self.rope_sin, offset=pos_offset, theta=self.rope_theta)
+                k_s = apply_rope(k_s, self.rope_cos, self.rope_sin, offset=pos_offset, theta=self.rope_theta)
+            if attn_mask is not None:
+                sdpa_mask = attn_mask
+                sdpa_causal = False
+            elif is_causal:
+                sdpa_mask = None
+                sdpa_causal = True
+            else:
+                sdpa_mask = None
+                sdpa_causal = False
+
             ctx = F.scaled_dot_product_attention(
                 q_s,
                 k_s,
                 v_s,
-                is_causal=is_causal,
+                attn_mask=sdpa_mask,
+                is_causal=sdpa_causal,
                 dropout_p=self.dropout.p if self.training else 0.0,
             ).transpose(1, 2).contiguous().view(B, L, D)
             flux = flux + self.dropout(self.out_self(ctx))
+
+            if self.extra_layers is not None:
+                for block in self.extra_layers:
+                    flux = block(
+                        flux,
+                        is_causal=is_causal,
+                        pos_offset=pos_offset,
+                        attn_mask=attn_mask,
+                        rope_cos=self.rope_cos,
+                        rope_sin=self.rope_sin,
+                    )
 
         # Multi-Head KV projections: [B, L, D] -> [B, H, L, head_dim]
         k = self.k_proj(flux).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
@@ -640,14 +770,8 @@ _COMPILED_MOTOR_RECUR_BLOCK = None
 
 
 def _get_compiled_motor_recur_block():
-    """Returns lazily compiled recurrent motor block on CUDA with eager fallback."""
-    global _COMPILED_MOTOR_RECUR_BLOCK
-    if _COMPILED_MOTOR_RECUR_BLOCK is None:
-        try:
-            _COMPILED_MOTOR_RECUR_BLOCK = torch.compile(_motor_recur_block, dynamic=None)
-        except Exception:
-            _COMPILED_MOTOR_RECUR_BLOCK = _motor_recur_block
-    return _COMPILED_MOTOR_RECUR_BLOCK
+    """Returns eager recurrent motor block (avoids Python 3.14 inductor worker stalls)."""
+    return _motor_recur_block
 
 
 class PremotorMotorDecoderV5(nn.Module):
@@ -923,7 +1047,7 @@ class PremotorMotorDecoderV5(nn.Module):
             q = self.q_proj(motor_surface).view(B, self.num_heads, 1, self.head_dim)
 
             if self.use_rope:
-                q_offset = min(int(L), self.rope_cos.shape[0] - 1)
+                q_offset = min(int(prompt_len_k + int(step_idx)), self.rope_cos.shape[0] - 1)
                 q_rot = apply_rope(q, self.rope_cos, self.rope_sin, offset=q_offset)
                 k_rot = apply_rope(keys, self.rope_cos, self.rope_sin, offset=0)
             else:
@@ -1379,6 +1503,11 @@ class CerebroSpheroidV5(nn.Module):
             num_heads=self.config.num_heads,
             dropout=self.config.dropout,
             use_self_attn=getattr(self.config, "use_sensory_self_attn", True),
+            num_sensory_layers=getattr(self.config, "num_sensory_layers", 1),
+            use_rope=getattr(self.config, "use_rope", True),
+            rope_theta=getattr(self.config, "rope_theta", 500000.0),
+            max_seq_len=getattr(self.config, "max_seq_len", 4096),
+            sensory_position_steps=getattr(self.config, "sensory_position_steps", 1024),
         )
 
         # 2. Volumetric Recurrent Core (32 to 48 Concentric Laminae with MoT)
@@ -1637,12 +1766,14 @@ class CerebroSpheroidV5(nn.Module):
         else:
             B = prompts.shape[0]
             prompt_pos_offset = prompts.shape[1]
-            sensory_flux, sensory_kv = self.sensory_dnn(prompts)
             if prompts.dim() == 2:
-                mask = (prompts != pad_id).float()
                 prompt_valid_mask = (prompts != pad_id)
+                prompt_attn_mask = prompt_valid_mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, L]
+                sensory_flux, sensory_kv = self.sensory_dnn(prompts, attn_mask=prompt_attn_mask)
+                mask = prompt_valid_mask.float()
                 prompt_centroid = self._recency_weighted_pool(sensory_flux, mask)
             else:
+                sensory_flux, sensory_kv = self.sensory_dnn(prompts)
                 prompt_valid_mask = None
                 prompt_centroid = self._recency_weighted_pool(sensory_flux)
 
@@ -1870,16 +2001,16 @@ class CerebroSpheroidV5(nn.Module):
                     valid_mask = (tgt_slice >= 0) & (tgt_slice != -100)
                     token_weights = torch.where(valid_mask, w, torch.zeros_like(w))
 
-                loss_unreduced = F.cross_entropy(
+                loss_2d = F.cross_entropy(
                     logits_stacked.view(-1, self.config.vocab_size).float(),
                     tgt_slice.contiguous().view(-1),
                     ignore_index=-100,
                     reduction="none",
-                )
-                w_flat = token_weights.contiguous().view(-1).float()
-                valid_flat = (tgt_slice.contiguous().view(-1) != -100)
-                w_masked = w_flat * valid_flat.float()
-                loss = (loss_unreduced * w_masked).sum() / torch.clamp(w_masked.sum(), min=1e-5)
+                ).view(B, t_len)
+                w_2d = token_weights.float() * (tgt_slice != -100).float()
+                seq_weights = torch.clamp(w_2d.sum(dim=-1), min=1e-5)
+                seq_losses = (loss_2d * w_2d).sum(dim=-1) / seq_weights
+                loss = seq_losses.mean()
             else:
                 loss = F.cross_entropy(
                     logits_stacked.view(-1, self.config.vocab_size).float(),
@@ -1987,11 +2118,12 @@ class CerebroSpheroidV5(nn.Module):
                 prompt_centroid = self._recency_weighted_pool(sensory_flux)
             B = B_vis
         else:
-            sensory_flux, sensory_kv = self.sensory_dnn(prompt_ids)
             prompt_mask_b = prompt_ids != 0
             prompt_mask = prompt_mask_b.float()
             safe_mask = torch.where(prompt_mask.sum(dim=1, keepdim=True) > 0, prompt_mask, torch.ones_like(prompt_mask))
             prompt_valid_mask = safe_mask.bool()
+            prompt_attn_mask = prompt_valid_mask.unsqueeze(1).unsqueeze(2)
+            sensory_flux, sensory_kv = self.sensory_dnn(prompt_ids, attn_mask=prompt_attn_mask)
             prompt_centroid = self._recency_weighted_pool(sensory_flux, safe_mask)
 
         # 2. State Initialization: Cortical Surface receives sensory prompt flux out-of-place
@@ -2032,6 +2164,17 @@ class CerebroSpheroidV5(nn.Module):
         generated_tokens = []
         causal_keys_list = []
         causal_values_list = []
+        causal_mask_list = []
+
+        L_prompt = sensory_kv[0].shape[2] if sensory_kv is not None else L
+
+        # Prepend silence/BOS slot 0 to match teacher-forcing layout (masked out from attention)
+        dummy_pad = torch.zeros((B, 1), dtype=torch.long, device=dev)
+        _, (sil_k, sil_v) = self.sensory_dnn(dummy_pad, pos_offset=L_prompt, is_causal=True)
+        causal_keys_list.append(sil_k)
+        causal_values_list.append(sil_v)
+        causal_mask_list.append(torch.zeros((B, 1), dtype=torch.bool, device=dev))
+
         finished = torch.zeros(B, dtype=torch.bool, device=dev)
         tied_w = self.sensory_dnn.embedding.weight
 
@@ -2044,9 +2187,8 @@ class CerebroSpheroidV5(nn.Module):
             auditory_in = prev_thought if t > 0 else None
 
             # Causal KV Cache: Query past emitted tokens
-            causal_kv = None
-            if len(causal_keys_list) > 0:
-                causal_kv = (torch.cat(causal_keys_list, dim=2), torch.cat(causal_values_list, dim=2))
+            causal_kv = (torch.cat(causal_keys_list, dim=2), torch.cat(causal_values_list, dim=2))
+            causal_kv_mask = torch.cat(causal_mask_list, dim=1)
 
             logits, efference, refractory, plan = self.motor_decoder(
                 state=state,
@@ -2058,6 +2200,7 @@ class CerebroSpheroidV5(nn.Module):
                 auditory_feedback=auditory_in,
                 repetition_penalty=repetition_penalty,
                 causal_kv=causal_kv,
+                causal_kv_mask=causal_kv_mask,
                 prompt_valid_mask=prompt_valid_mask,
             )
 
@@ -2090,10 +2233,13 @@ class CerebroSpheroidV5(nn.Module):
             if finished.all():
                 break
 
-            # Thought re-afference & update causal KV buffer
-            prev_thought, (tok_k, tok_v) = self.sensory_dnn(flat_tok, pos_offset=L + t)
+            # Thought re-afference & update causal KV buffer at position L_prompt + t + 1
+            prev_thought, (tok_k, tok_v) = self.sensory_dnn(
+                flat_tok, pos_offset=L_prompt + t + 1, is_causal=True
+            )
             causal_keys_list.append(tok_k)
             causal_values_list.append(tok_v)
+            causal_mask_list.append(torch.ones((B, 1), dtype=torch.bool, device=dev))
 
             # Lightweight O(1) bounded efference copy propagation
             state = self.volumetric_core.step_efference_fast(state, efference)
@@ -2146,7 +2292,7 @@ class CerebroSpheroidV5(nn.Module):
         self,
         prompt: str,
         tokenizer: Any,
-        max_new_tokens: int = 128,
+        max_new_tokens: int = 512,
         temperature: float = 0.7,
         top_k: int = 40,
         top_p: float = 0.9,
@@ -2159,6 +2305,7 @@ class CerebroSpheroidV5(nn.Module):
         images: Optional[torch.Tensor] = None,
         audio: Optional[torch.Tensor] = None,
         perceptual_inputs: Optional[torch.Tensor] = None,
+        execute_tools: bool = True,
     ) -> Union[str, Dict[str, Any]]:
         """
         Generates text using the 3-tier cognitive output protocol:
@@ -2186,31 +2333,12 @@ class CerebroSpheroidV5(nn.Module):
         eos_id = int(raw_eos) if raw_eos is not None else 2
         seed_id = seed_token_id  # Unbiased generation: do not force <act> by default
 
-        # Dynamic Stopping Criteria: EOS, tool-end </act>, and stimulus restart </stim>
+        # Dynamic Stopping Criteria: EOS and stimulus restart </stim>
         stop_list = [eos_id]
-        if bio_ids.get("act_end") is not None:
+        if strict_act and bio_ids.get("act_end") is not None:
             stop_list.append(bio_ids.get("act_end"))
         if bio_ids.get("stim") is not None:
             stop_list.append(bio_ids.get("stim"))
-
-        # Slot query single-token optimization
-        slot_keywords = (
-            "analogy",
-            "::",
-            "is to",
-            "antonym",
-            "opposite of",
-            "synonym",
-            "what is the capital",
-            "what is the past tense",
-            "past tense of",
-            "plural of",
-            "definition of",
-            "define ",
-        )
-        is_slot_query = any(kw in prompt.lower() for kw in slot_keywords)
-        if is_slot_query:
-            max_new_tokens = min(max_new_tokens, 64)
 
         stop_ids = tuple(s for s in stop_list if s is not None)
 
@@ -2246,6 +2374,18 @@ class CerebroSpheroidV5(nn.Module):
                 decoded = decoded.split(stop_str)[0]
 
         parsed = parse_model_output(decoded)
+        if execute_tools and parsed.get("tool_calls"):
+            try:
+                from src.agentic_harness import execute_agentic_tool
+                primary_call = parsed["tool_calls"][0]
+                tool_res = execute_agentic_tool(primary_call)
+                if tool_res is not None:
+                    parsed["tool_result"] = tool_res
+                    if not parsed.get("answer"):
+                        parsed["answer"] = tool_res
+            except Exception:
+                pass
+
         if return_parsed:
             return parsed
 
@@ -2256,6 +2396,69 @@ class CerebroSpheroidV5(nn.Module):
         if parsed.get("thinking"):
             return parsed["thinking"]
         return clean_motor_response(decoded)
+
+    @torch.no_grad()
+    def generate_with_agentic_loop(
+        self,
+        prompt: str,
+        tokenizer: Any,
+        max_new_tokens: int = 64,
+        temperature: float = 0.1,
+        device: Optional[torch.device] = None,
+    ) -> Dict[str, Any]:
+        """
+        Executes a 2-turn closed-loop agentic ReAct rollout:
+        Turn 1: Model emits deliberate action (<act> calc(...) </act>).
+        Execution: Safe deterministic tool execution in sandbox.
+        Turn 2: Tool observation is fed back to produce final verified answer.
+        """
+        from src.agentic_harness import execute_agentic_tool
+
+        dev = device if device is not None else next(self.parameters()).device
+        step1 = self.generate_text(
+            prompt=prompt,
+            tokenizer=tokenizer,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            device=dev,
+            return_parsed=True,
+            execute_tools=True,
+        )
+        tool_calls = step1.get("tool_calls", [])
+        if not tool_calls:
+            return {
+                "prompt": prompt,
+                "thinking": step1.get("thinking", ""),
+                "tool_call": None,
+                "tool_result": None,
+                "answer": step1.get("answer", ""),
+            }
+
+        tool_call = tool_calls[0]
+        tool_res = step1.get("tool_result") or execute_agentic_tool(tool_call)
+
+        # Closed-loop stimulus continuation
+        feedback_prompt = f"{prompt.strip()}\n<act> {tool_call} </act>\nObservation: {tool_res}\nAnswer:"
+        step2 = self.generate_text(
+            prompt=feedback_prompt,
+            tokenizer=tokenizer,
+            max_new_tokens=32,
+            temperature=0.1,
+            device=dev,
+            return_parsed=False,
+            execute_tools=False,
+        )
+        final_answer = step2.strip()
+        if not final_answer or len(final_answer) < 1:
+            final_answer = tool_res
+
+        return {
+            "prompt": prompt,
+            "thinking": step1.get("thinking", ""),
+            "tool_call": tool_call,
+            "tool_result": tool_res,
+            "answer": final_answer,
+        }
 
     @torch.no_grad()
     def generate_tri_stream(
@@ -2325,6 +2528,16 @@ class CerebroSpheroidV5(nn.Module):
 
         eos_id = getattr(tokenizer, "eos_token_id", 2) or 2
         tokens_think, tokens_act, tokens_ans = [], [], []
+        causal_keys_list, causal_values_list, causal_mask_list = [], [], []
+        L_prompt = sensory_kv[0].shape[2] if sensory_kv is not None else prompt_ids.shape[1]
+
+        # Prepend silence/BOS slot 0 to match teacher-forcing layout (masked out from attention)
+        dummy_pad = torch.zeros((B, 1), dtype=torch.long, device=dev)
+        _, (sil_k, sil_v) = self.sensory_dnn(dummy_pad, pos_offset=L_prompt, is_causal=True)
+        causal_keys_list.append(sil_k)
+        causal_values_list.append(sil_v)
+        causal_mask_list.append(torch.zeros((B, 1), dtype=torch.bool, device=dev))
+
         fin_think = not emit_think
         fin_act = not emit_act
         fin_ans = not emit_ans
@@ -2354,6 +2567,10 @@ class CerebroSpheroidV5(nn.Module):
                 last_tok = tokens_think[-1]
             feed = self.sensory_dnn.embedding(torch.tensor([[last_tok]], device=dev)).squeeze(1) if last_tok is not None else None
 
+            # Causal KV cache for full autoregressive attention across emitted tokens
+            causal_kv = (torch.cat(causal_keys_list, dim=2), torch.cat(causal_values_list, dim=2))
+            causal_kv_mask = torch.cat(causal_mask_list, dim=1)
+
             _, efference, refractory, plan, h = self.motor_decoder(
                 state=state,
                 sensory_kv=sensory_kv,
@@ -2363,6 +2580,8 @@ class CerebroSpheroidV5(nn.Module):
                 step_idx=t,
                 auditory_feedback=feed,
                 repetition_penalty=repetition_penalty,
+                causal_kv=causal_kv,
+                causal_kv_mask=causal_kv_mask,
                 prompt_valid_mask=prompt_valid_mask,
                 return_hidden=True,
             )
@@ -2370,6 +2589,7 @@ class CerebroSpheroidV5(nn.Module):
             # Tri-Head Simultaneous Emission
             l_th, l_ac, l_an = self.motor_decoder.emit_tri_head_logits(h, tied_w, temp=temperature)
 
+            tok_th = None
             if not fin_think:
                 tok_th = _sample_from_logits(l_th, tokens_think)
                 if tok_th == eos_id:
@@ -2377,6 +2597,7 @@ class CerebroSpheroidV5(nn.Module):
                 else:
                     tokens_think.append(tok_th)
 
+            tok_ac = None
             if not fin_act:
                 tok_ac = _sample_from_logits(l_ac, tokens_act)
                 if tok_ac == eos_id:
@@ -2384,6 +2605,7 @@ class CerebroSpheroidV5(nn.Module):
                 else:
                     tokens_act.append(tok_ac)
 
+            tok_an = None
             if not fin_ans:
                 tok_an = _sample_from_logits(l_an, tokens_ans)
                 if tok_an == eos_id:
@@ -2393,6 +2615,30 @@ class CerebroSpheroidV5(nn.Module):
 
             if fin_think and fin_act and fin_ans:
                 break
+
+            # Autoregressively append emitted token to causal KV cache
+            emitted_tok = (
+                tok_an
+                if not fin_ans and tok_an is not None and tok_an != eos_id
+                else (
+                    tok_ac
+                    if not fin_act and tok_ac is not None and tok_ac != eos_id
+                    else (
+                        tok_th
+                        if not fin_think and tok_th is not None and tok_th != eos_id
+                        else None
+                    )
+                )
+            )
+            if emitted_tok is not None:
+                _, (tok_k, tok_v) = self.sensory_dnn(
+                    torch.tensor([[emitted_tok]], device=dev),
+                    pos_offset=L_prompt + t + 1,
+                    is_causal=True,
+                )
+                causal_keys_list.append(tok_k)
+                causal_values_list.append(tok_v)
+                causal_mask_list.append(torch.ones((B, 1), dtype=torch.bool, device=dev))
 
             # Advance state manifold
             state = self.volumetric_core.step_efference_fast(state, efference)
@@ -2526,13 +2772,19 @@ def infer_v5_config_from_state_dict(
         # Pure JAX TPU checkpoints omit PyTorch-only modules and RoPE/Top-K/Energy additions
         if "sensory.out_self.weight" not in raw_state and "sensory_dnn.out_self.weight" not in raw_state and saved_cfg is None:
             cfg_kwargs["use_sensory_self_attn"] = False
-        cfg_kwargs["use_rope"] = False
+        # Older TPU checkpoints never applied RoPE.  New TPU runs persist this
+        # explicit flag so PyTorch inference preserves their trained attention
+        # geometry instead of silently disabling it.
+        cfg_kwargs["use_rope"] = bool(meta.get("use_rope", False))
         cfg_kwargs["top_k_resonance"] = 0
         cfg_kwargs["use_deliberation_probe"] = False
         cfg_kwargs["use_adaptive_thinking"] = False
         cfg_kwargs["use_sparse_mot"] = False
         cfg_kwargs["use_energy_regularization"] = False
     elif saved_cfg is None and raw_state:
+        if preset_name in ("v5_small", "tpu_v5e_1", "tpu_v6e_1"):
+            cfg_kwargs["use_rope"] = False
+            cfg_kwargs["top_k_resonance"] = 0
         if "sensory_dnn.out_self.weight" not in raw_state:
             cfg_kwargs["use_sensory_self_attn"] = False
         if "volumetric_core.tract_router.weight" not in raw_state:
@@ -2555,6 +2807,14 @@ def infer_v5_config_from_state_dict(
     rad_in = raw_state.get("volumetric_core.radial_in_proj.weight", raw_state.get("core.radial_in_proj.weight"))
     if rad_in is not None and hasattr(rad_in, "shape") and len(rad_in.shape) == 2:
         cfg_kwargs["radial_dim"] = int(rad_in.shape[0])
+
+    phase_embed = raw_state.get("motor_decoder.phase_embed.weight", raw_state.get("motor.phase_embed.weight"))
+    if phase_embed is not None and hasattr(phase_embed, "shape") and len(phase_embed.shape) == 2:
+        cfg_kwargs["max_phase_steps"] = int(phase_embed.shape[0])
+
+    pos_embed = raw_state.get("sensory_dnn.pos_embed.weight", raw_state.get("sensory.pos_embed.weight"))
+    if pos_embed is not None and hasattr(pos_embed, "shape") and len(pos_embed.shape) == 2:
+        cfg_kwargs["sensory_position_steps"] = int(pos_embed.shape[0])
 
     shell_gains = raw_state.get("volumetric_core.shell_gains", raw_state.get("core.shell_gains"))
     if shell_gains is not None and hasattr(shell_gains, "shape"):

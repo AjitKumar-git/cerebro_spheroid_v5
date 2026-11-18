@@ -302,13 +302,16 @@ def test_strict_act_token_and_payload_extraction():
     payload_text = extract_strict_act_payload(raw_stream, tok)
     assert payload_text == "Hello world"
 
-    # Test clean_motor_response string behavior
-    text_with_noise = "<act> The atom is the basic unit of chemical elements. </act> and furthermore there is extra noise"
-    cleaned = clean_motor_response(text_with_noise, strict=True)
-    assert cleaned == "The atom is the basic unit of chemical elements."
-    assert "extra noise" not in cleaned
+    # Test clean_motor_response string behavior (tool call in <act>, normal output outside)
+    text_with_tool = "<act> calc(15 + 27) </act>\nAnswer: The atom is the basic unit of chemical elements."
+    cleaned = clean_motor_response(text_with_tool, strict=True)
+    assert cleaned == "Answer: The atom is the basic unit of chemical elements."
     assert "<act>" not in cleaned
     assert "</act>" not in cleaned
+
+    # Pure tool payload fallback
+    text_pure_tool = "<act> calc(15 + 27) </act>"
+    assert clean_motor_response(text_pure_tool, strict=True) == "calc(15 + 27)"
 
 
 def test_jax_to_torch_state_dict_bidirectional_adaptation():

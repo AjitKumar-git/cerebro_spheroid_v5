@@ -6,6 +6,7 @@ import collections
 import os
 import unittest
 from unittest.mock import MagicMock, patch
+import numpy as np
 
 from src.elastic_window import ElasticBucketBatcher, PrefetchedBatcher
 from src.cloud_sync import push_remote_token_tracker, fetch_remote_token_tracker
@@ -51,14 +52,17 @@ class TestTokenTrackerAndBatcher(unittest.TestCase):
         )
 
         # Pull 5 batches
+        observed_tokens = 0
         for _ in range(5):
-            batcher.next_batch()
+            _, _, prompts, targets, _ = batcher.next_batch()
+            observed_tokens += int(np.count_nonzero(prompts != tok.pad_token_id))
+            observed_tokens += int(np.count_nonzero(targets >= 0))
 
         stats = batcher.get_tokens_by_dataset()
         self.assertIsInstance(stats, dict)
         total_ingested = sum(stats.values())
-        expected_tokens = 5 * batch_size * window  # 5 * 8 * 512 = 20,480
-        self.assertEqual(total_ingested, expected_tokens)
+        # Tracking must exactly match real, non-padding tokens in emitted data.
+        self.assertEqual(total_ingested, observed_tokens)
 
         for ds in datasets:
             self.assertIn(ds, stats)

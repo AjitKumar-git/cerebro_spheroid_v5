@@ -31,7 +31,11 @@ class ModelConfigV5:
     num_shells: int = 32
     num_shortcut_tracts: int = 96
     num_heads: int = 8
-    max_phase_steps: int = 1024
+    # New runs use a 4k output-position horizon.  RoPE carries relative
+    # position beyond this learned phase table, so this is no longer a claimed
+    # 32k capacity backed by a 1k-only clock.
+    max_phase_steps: int = 4096
+    sensory_position_steps: int = 1024
     thinking_cycles: int = 4
     phase_scale: float = 2.0
     use_tied_embeddings: bool = True
@@ -39,6 +43,8 @@ class ModelConfigV5:
     use_shell_tap: bool = True
     use_plan: bool = True
     use_sensory_self_attn: bool = True
+    num_sensory_layers: int = 1
+    use_rope: bool = True
     rope_theta: float = 500000.0
     max_seq_len: int = 32768
     top_k_resonance: int = 16
@@ -62,8 +68,8 @@ jax.tree_util.register_pytree_node(
     ModelConfigV5,
     lambda c: ((), (
         c.vocab_size, c.surface_dim, c.radial_dim, c.num_shells, c.num_shortcut_tracts,
-        c.num_heads, c.max_phase_steps, c.thinking_cycles, c.phase_scale,
-        c.use_tied_embeddings, c.use_swiglu, c.use_shell_tap, c.use_plan, c.use_sensory_self_attn,
+        c.num_heads, c.max_phase_steps, c.sensory_position_steps, c.thinking_cycles, c.phase_scale,
+        c.use_tied_embeddings, c.use_swiglu, c.use_shell_tap, c.use_plan, c.use_sensory_self_attn, c.num_sensory_layers, c.use_rope,
         c.rope_theta, c.max_seq_len, c.top_k_resonance, c.use_deliberation_probe,
         c.use_adaptive_thinking, c.max_thinking_cycles, c.thinking_halt_threshold,
         c.num_mtp_heads, c.use_sparse_mot, c.top_k_tracts, c.use_energy_regularization,
@@ -199,6 +205,31 @@ def swiglu(x: jnp.ndarray, w_gate: jnp.ndarray, w_val: jnp.ndarray, w_down: jnp.
     return jnp.matmul(g * v, w_down.T)
 
 
+def apply_rope(
+    x: jnp.ndarray,
+    positions: Union[int, jnp.ndarray],
+    theta: float = 500000.0,
+) -> jnp.ndarray:
+    """Apply rotary position embeddings to ``[B, H, L, D]`` attention states.
+
+    Frequencies are computed from positions rather than a finite lookup cache,
+    so a new run can train past the learned absolute-position table without
+    modulo collisions.
+    """
+    dim = x.shape[-1]
+    if dim % 2:
+        raise ValueError(f"RoPE head dimension must be even, got {dim}")
+    inv_freq = 1.0 / (theta ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
+    angles = jnp.asarray(positions, dtype=jnp.float32)[..., None] * inv_freq
+    cos = jnp.cos(angles).astype(x.dtype)
+    sin = jnp.sin(angles).astype(x.dtype)
+    # Positions are scalar for one-token decoding and [L] for block training.
+    cos = cos.reshape((1,) * (x.ndim - 2) + cos.shape)
+    sin = sin.reshape((1,) * (x.ndim - 2) + sin.shape)
+    x_even, x_odd = x[..., 0::2], x[..., 1::2]
+    return jnp.stack((x_even * cos - x_odd * sin, x_even * sin + x_odd * cos), axis=-1).reshape(x.shape)
+
+
 def generate_small_world_indices(num_shells: int, num_tracts: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Generates deterministic small-world axonal shortcut wiring in JAX."""
     srcs, dsts = [], []
@@ -231,7 +262,7 @@ def init_params_v5(key: jax.random.PRNGKey, config: ModelConfigV5) -> Tuple[Dict
     params: Dict[str, jnp.ndarray] = {
         # 1. Sensory DNN (Shared embedding table + zero-init positional embedding)
         "sensory.embedding.weight": jax.random.normal(keys[0], (V, s_dim)) * 0.02,
-        "sensory.pos_embed.weight": jnp.zeros((config.max_phase_steps, s_dim), dtype=jnp.float32),
+        "sensory.pos_embed.weight": jnp.zeros((config.sensory_position_steps, s_dim), dtype=jnp.float32),
         "sensory.swiglu.fc_gate.weight": jax.random.normal(keys[1], (s_dim * 2, s_dim)) * (1.0 / math.sqrt(s_dim)),
         "sensory.swiglu.fc_val.weight": jax.random.normal(keys[2], (s_dim * 2, s_dim)) * (1.0 / math.sqrt(s_dim)),
         "sensory.swiglu.fc_down.weight": jax.random.normal(keys[3], (s_dim, s_dim * 2)) * (1.0 / math.sqrt(s_dim * 2)),
@@ -330,6 +361,22 @@ def init_params_v5(key: jax.random.PRNGKey, config: ModelConfigV5) -> Tuple[Dict
         params["perceptual.swiglu.fc_down.weight"] = jax.random.normal(keys[33], (s_dim, s_dim * 2)) * (1.0 / math.sqrt(s_dim * 2))
         params["perceptual.norm_out.weight"] = jnp.ones(s_dim, dtype=jnp.float32)
 
+    num_sens_layers = getattr(config, "num_sensory_layers", 1)
+    if num_sens_layers > 1:
+        extra_keys = jax.random.split(keys[34], (num_sens_layers - 1) * 6)
+        for idx in range(num_sens_layers - 1):
+            pfx = f"sensory_dnn.extra_layers.{idx}."
+            k_base = idx * 6
+            params[f"{pfx}norm1.weight"] = jnp.ones(s_dim, dtype=jnp.float32)
+            params[f"{pfx}q_proj.weight"] = jax.random.normal(extra_keys[k_base], (s_dim, s_dim)) * (1.0 / math.sqrt(s_dim))
+            params[f"{pfx}k_proj.weight"] = jax.random.normal(extra_keys[k_base + 1], (s_dim, s_dim)) * (1.0 / math.sqrt(s_dim))
+            params[f"{pfx}v_proj.weight"] = jax.random.normal(extra_keys[k_base + 2], (s_dim, s_dim)) * (1.0 / math.sqrt(s_dim))
+            params[f"{pfx}out_proj.weight"] = jnp.zeros((s_dim, s_dim), dtype=jnp.float32)
+            params[f"{pfx}norm2.weight"] = jnp.ones(s_dim, dtype=jnp.float32)
+            params[f"{pfx}swiglu.fc_gate.weight"] = jax.random.normal(extra_keys[k_base + 3], (s_dim * 2, s_dim)) * (1.0 / math.sqrt(s_dim))
+            params[f"{pfx}swiglu.fc_val.weight"] = jax.random.normal(extra_keys[k_base + 4], (s_dim * 2, s_dim)) * (1.0 / math.sqrt(s_dim))
+            params[f"{pfx}swiglu.fc_down.weight"] = jax.random.normal(extra_keys[k_base + 5], (s_dim, s_dim * 2)) * (1.0 / math.sqrt(s_dim * 2))
+
     src_idx, dst_idx = generate_small_world_indices(K, T)
     buffers = (src_idx, dst_idx)
     return params, buffers
@@ -407,6 +454,7 @@ def encode_sensory(
     config: Optional[ModelConfigV5] = None,
     pos_offset: Union[int, jnp.ndarray] = 0,
     is_causal: bool = False,
+    attn_mask: Optional[jnp.ndarray] = None,
 ):
     """Encodes sensory input tokens into Arcuate KV pairs and position-aware representations."""
     w_emb = params["sensory.embedding.weight"]
@@ -428,9 +476,11 @@ def encode_sensory(
         pos_tbl = params["sensory.pos_embed.weight"]
         max_p = pos_tbl.shape[0]
         raw_pos = jnp.arange(L) + pos_offset
-        pos_ids = raw_pos % max_p
-        scale_factor = (raw_pos // max_p).astype(jnp.float32)[:, None]
-        pos_enc = pos_tbl[pos_ids] * (1.0 / (1.0 + 0.05 * scale_factor))
+        # Do not alias position 0 with 1024, 2048, ... .  RoPE supplies
+        # position information outside this learned-table training range.
+        pos_ids = jnp.clip(raw_pos, 0, max_p - 1)
+        in_table = (raw_pos < max_p).astype(pos_tbl.dtype)[:, None]
+        pos_enc = pos_tbl[pos_ids] * in_table
         x = x + pos_enc[None, :, :].astype(x.dtype)
 
     h = rms_norm(x, params["sensory.norm_in.weight"])
@@ -447,14 +497,62 @@ def encode_sensory(
         v_s = jnp.matmul(h_ctx, params["sensory.v_self.weight"].T).reshape(B, L, num_heads, head_dim)
         v_s = jnp.swapaxes(v_s, 1, 2)  # [B, H, L, head_dim]
 
+        if config is not None and getattr(config, "use_rope", True):
+            sens_pos = jnp.arange(L) + pos_offset
+            q_s = apply_rope(q_s, sens_pos, theta=config.rope_theta)
+            k_s = apply_rope(k_s, sens_pos, theta=config.rope_theta)
+
         scores = jnp.matmul(q_s, jnp.swapaxes(k_s, -1, -2)) / math.sqrt(head_dim)
-        if is_causal:
+        if attn_mask is not None:
+            scores = jnp.where(attn_mask, scores, -1e4)
+        elif is_causal:
             causal_mask = jnp.tril(jnp.ones((L, L), dtype=bool))[None, None, :, :]
             scores = jnp.where(causal_mask, scores, -1e4)
         attn_w = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(flux.dtype)
         ctx = jnp.matmul(attn_w, v_s)  # [B, H, L, head_dim]
         ctx = jnp.swapaxes(ctx, 1, 2).reshape(B, L, D)  # [B, L, D]
         flux = flux + jnp.matmul(ctx, params["sensory.out_self.weight"].T)
+
+    # Stacked extra sensory layers (if num_sensory_layers > 1)
+    num_sens_layers = getattr(config, "num_sensory_layers", 1) if config is not None else 1
+    if L > 1 and num_sens_layers > 1:
+        for idx in range(num_sens_layers - 1):
+            pfx = f"sensory_dnn.extra_layers.{idx}."
+            if f"{pfx}norm1.weight" not in params:
+                pfx = f"sensory.extra_layers.{idx}."
+            if f"{pfx}norm1.weight" in params:
+                h_l = rms_norm(flux, params[f"{pfx}norm1.weight"])
+                q_l = jnp.matmul(h_l, params[f"{pfx}q_proj.weight"].T).reshape(B, L, num_heads, head_dim)
+                q_l = jnp.swapaxes(q_l, 1, 2)
+                k_l = jnp.matmul(h_l, params[f"{pfx}k_proj.weight"].T).reshape(B, L, num_heads, head_dim)
+                k_l = jnp.swapaxes(k_l, 1, 2)
+                v_l = jnp.matmul(h_l, params[f"{pfx}v_proj.weight"].T).reshape(B, L, num_heads, head_dim)
+                v_l = jnp.swapaxes(v_l, 1, 2)
+
+                if config is not None and getattr(config, "use_rope", True):
+                    sens_pos = jnp.arange(L) + pos_offset
+                    q_l = apply_rope(q_l, sens_pos, theta=config.rope_theta)
+                    k_l = apply_rope(k_l, sens_pos, theta=config.rope_theta)
+
+                scores_l = jnp.matmul(q_l, jnp.swapaxes(k_l, -1, -2)) / math.sqrt(head_dim)
+                if attn_mask is not None:
+                    scores_l = jnp.where(attn_mask, scores_l, -1e4)
+                elif is_causal:
+                    causal_mask = jnp.tril(jnp.ones((L, L), dtype=bool))[None, None, :, :]
+                    scores_l = jnp.where(causal_mask, scores_l, -1e4)
+                attn_w_l = jax.nn.softmax(scores_l.astype(jnp.float32), axis=-1).astype(flux.dtype)
+                ctx_l = jnp.matmul(attn_w_l, v_l)
+                ctx_l = jnp.swapaxes(ctx_l, 1, 2).reshape(B, L, D)
+                flux = flux + jnp.matmul(ctx_l, params[f"{pfx}out_proj.weight"].T)
+
+                h2 = rms_norm(flux, params[f"{pfx}norm2.weight"])
+                h2_swiglu = swiglu(
+                    h2,
+                    params[f"{pfx}swiglu.fc_gate.weight"],
+                    params[f"{pfx}swiglu.fc_val.weight"],
+                    params[f"{pfx}swiglu.fc_down.weight"],
+                )
+                flux = flux + h2_swiglu
 
     k = jnp.matmul(flux, params["sensory.k_proj.weight"].T).reshape(B, L, num_heads, head_dim)
     k = jnp.swapaxes(k, 1, 2)  # [B, H, L, head_dim]
@@ -528,6 +626,7 @@ def emit_step(
     attn_mask: Optional[jnp.ndarray] = None,
     return_hidden: bool = False,
     encephalization_alpha: float = 1.0,
+    query_position: Optional[Union[int, jnp.ndarray]] = None,
 ) -> Union[
     Tuple[jnp.ndarray, jnp.ndarray, Optional[jnp.ndarray], jnp.ndarray],
     Tuple[jnp.ndarray, jnp.ndarray, Optional[jnp.ndarray], jnp.ndarray, jnp.ndarray],
@@ -559,6 +658,10 @@ def emit_step(
     keys, values = sensory_kv
     q = jnp.matmul(motor_surface, params["motor.q_proj.weight"].T).reshape(B, 1, num_heads, head_dim)
     q = jnp.swapaxes(q, 1, 2)  # [B, H, 1, head_dim]
+    if config is not None and config.use_rope:
+        q_pos = step_idx if query_position is None else query_position
+        q = apply_rope(q, q_pos, theta=config.rope_theta)
+        keys = apply_rope(keys, jnp.arange(keys.shape[2]), theta=config.rope_theta)
     scores = jnp.matmul(q, jnp.swapaxes(keys, -1, -2)) / math.sqrt(head_dim)
     if attn_mask is not None:
         scores = jnp.where(attn_mask, scores, -1e4)
@@ -776,7 +879,8 @@ def training_rollout(
     else:
         B, L = prompts.shape
         total_prompt_L = L
-        sensory_flux, sensory_kv = encode_sensory(params, prompts, config=config, pos_offset=0)
+        prompt_valid = (prompts != pad_id)[:, None, None, :]
+        sensory_flux, sensory_kv = encode_sensory(params, prompts, config=config, pos_offset=0, attn_mask=prompt_valid)
         mask_2d = (prompts != pad_id).astype(jnp.float32)  # [B, L]
         pos_idx = jnp.arange(L, dtype=jnp.float32)[None, :]  # [1, L]
         last_valid_pos = jnp.max(jnp.where(mask_2d > 0.0, pos_idx, 0.0), axis=1, keepdims=True)
@@ -785,7 +889,6 @@ def training_rollout(
         prompt_flux = (
             jnp.sum(sensory_flux.astype(jnp.float32) * recency_weights[:, :, None], axis=1) / weight_sum
         ).astype(target_dtype)
-        prompt_valid = (prompts != pad_id)[:, None, None, :]
 
     num_shells = config.num_shells if config is not None else 32
     surface_dim = config.surface_dim if config is not None else 768
@@ -906,6 +1009,7 @@ def training_rollout(
             repetition_penalty=repetition_penalty,
             attn_mask=step_mask,
             encephalization_alpha=encephalization_alpha,
+            query_position=total_prompt_L + step_idx,
         )
 
         # Scheduled sampling re-afference using full sensory encoder (position + SwiGLU aligned)
@@ -945,7 +1049,11 @@ def training_rollout(
     if targets is None and feedback_tokens is None:
         init_k_buf = jnp.zeros((B, num_heads, target_len, head_dim), dtype=target_dtype)
         init_v_buf = jnp.zeros((B, num_heads, target_len, head_dim), dtype=target_dtype)
-        gen_valid = jnp.concatenate([prompt_valid, jnp.ones((B, 1, 1, target_len), dtype=bool)], axis=-1)
+        # Align with prev_tokens: slot 0 is the step-0 silence placeholder (masked out)
+        target_gen_valid = jnp.concatenate(
+            [jnp.zeros((B, 1, 1, 1), dtype=bool), jnp.ones((B, 1, 1, max(0, target_len - 1)), dtype=bool)], axis=-1
+        ) if target_len > 1 else jnp.zeros((B, 1, 1, 1), dtype=bool)
+        gen_valid = jnp.concatenate([prompt_valid, target_gen_valid], axis=-1)
 
         def _emit_gen(carry, step_idx):
             cur_state, cur_trace, cur_plan, prev_thought, k_buf, v_buf = carry
@@ -954,7 +1062,7 @@ def training_rollout(
             cur_all_k = jnp.concatenate([prompt_k, k_buf], axis=2)
             cur_all_v = jnp.concatenate([prompt_v, v_buf], axis=2)
             pos = jnp.arange(total_prompt_L + target_len)
-            step_mask = gen_valid & (pos < (total_prompt_L + step_idx))[None, None, None, :]
+            step_mask = gen_valid & (pos <= (total_prompt_L + step_idx))[None, None, None, :]
 
             logits, nxt_s, nxt_t, nxt_p = emit_step(
                 params,
@@ -969,6 +1077,7 @@ def training_rollout(
                 repetition_penalty=repetition_penalty,
                 attn_mask=step_mask,
                 encephalization_alpha=encephalization_alpha,
+                query_position=total_prompt_L + step_idx,
             )
 
             tok_idx = lax.stop_gradient(jnp.argmax(logits, axis=-1))
@@ -979,14 +1088,16 @@ def training_rollout(
                     tok_idx,
                 )
             tok_flux, (new_k, new_v) = encode_sensory(
-                params, tok_idx[:, None], config=config, pos_offset=total_prompt_L + step_idx
+                params, tok_idx[:, None], config=config, pos_offset=total_prompt_L + step_idx + 1
             )
             nxt_thought = lax.stop_gradient(tok_flux[:, 0, :]).astype(target_dtype)
             new_k = lax.stop_gradient(new_k).astype(target_dtype)
             new_v = lax.stop_gradient(new_v).astype(target_dtype)
 
-            nxt_k_buf = lax.dynamic_update_slice(k_buf, new_k, (0, 0, step_idx, 0))
-            nxt_v_buf = lax.dynamic_update_slice(v_buf, new_v, (0, 0, step_idx, 0))
+            # Insert at slot step_idx + 1 to align 1:1 with prev_tokens[1..]
+            update_slot = jnp.minimum(step_idx + 1, target_len - 1)
+            nxt_k_buf = lax.dynamic_update_slice(k_buf, new_k, (0, 0, update_slot, 0))
+            nxt_v_buf = lax.dynamic_update_slice(v_buf, new_v, (0, 0, update_slot, 0))
 
             return (nxt_s.astype(target_dtype), nxt_t, nxt_p.astype(target_dtype), nxt_thought, nxt_k_buf, nxt_v_buf), logits
 
@@ -1035,7 +1146,13 @@ def training_rollout(
         def _parallel_cross_resonance(ms_all):
             q_all = jnp.matmul(ms_all, params["motor.q_proj.weight"].T).reshape(B, T, num_heads, head_dim)
             q_all = jnp.swapaxes(q_all, 1, 2)  # [B, H, T, head_dim]
-            scores_all = jnp.matmul(q_all, keys_t) / math.sqrt(head_dim)
+            if config.use_rope:
+                q_all = apply_rope(q_all, total_prompt_L + jnp.arange(T), theta=config.rope_theta)
+                keys_att = apply_rope(causal_keys, jnp.arange(total_len), theta=config.rope_theta)
+                keys_att_t = jnp.swapaxes(keys_att, -1, -2)
+            else:
+                keys_att_t = keys_t
+            scores_all = jnp.matmul(q_all, keys_att_t) / math.sqrt(head_dim)
             pos = jnp.arange(total_len)[None, :]
             step_pos = (total_prompt_L + jnp.arange(T))[:, None]
             step_mask_all = all_valid & ((pos <= step_pos)[None, None, :, :])
@@ -1440,9 +1557,16 @@ def generate_tri_stream_jax(
     fin_act = not emit_act
     fin_ans = not emit_ans
 
-    causal_keys = sensory_keys
-    causal_values = sensory_values
-    all_valid = (prompts_arr != pad_id)[:, None, None, :]
+    # Keep an autoregressive KV cache with silence/BOS slot 0 prepended
+    # to match teacher-forcing layout (masked out from attention).
+    dummy_pad = jnp.zeros((B, 1), dtype=jnp.int32)
+    _, (sil_k, sil_v) = encode_sensory(params, dummy_pad, config=config, pos_offset=total_prompt_L, is_causal=True)
+    causal_keys = jnp.concatenate([sensory_keys, sil_k], axis=2)
+    causal_values = jnp.concatenate([sensory_values, sil_v], axis=2)
+    all_valid = jnp.concatenate([
+        (prompts_arr != pad_id)[:, None, None, :],
+        jnp.zeros((B, 1, 1, 1), dtype=bool)
+    ], axis=-1)
 
     def _sample_from_logits(lg: jnp.ndarray, prev_toks: List[int]) -> int:
         lg_np = np.array(lg[0], dtype=np.float32)
@@ -1458,9 +1582,10 @@ def generate_tri_stream_jax(
         return int(np.random.choice(len(probs), p=probs))
 
     for t in range(max_new_tokens):
-        pos = jnp.arange(total_prompt_L)
-        causal_mask = (pos <= (total_prompt_L + t))[None, None, None, :]
-        step_mask = all_valid & causal_mask
+        # The cache contains the prompt plus *previous* generated tokens.
+        # Every valid cached key is causal at this point; the newly sampled
+        # token is appended only after this emission step.
+        step_mask = all_valid
 
         last_tok = None
         if not fin_ans and tokens_ans:
@@ -1484,6 +1609,7 @@ def generate_tri_stream_jax(
             repetition_penalty=repetition_penalty,
             attn_mask=step_mask,
             return_hidden=True,
+            query_position=total_prompt_L + t,
         )
 
         l_th, l_ac, l_an = emit_tri_head_logits_jax(params, h, temp=temperature)
@@ -1511,6 +1637,24 @@ def generate_tri_stream_jax(
 
         if fin_think and fin_act and fin_ans:
             break
+
+        # The recurrent manifold is shared by the three display streams.  Its
+        # next-step feedback prioritizes answer, then action, then thought;
+        # cache exactly that same token so attention and feedback describe one
+        # coherent autoregressive trajectory.
+        emitted_tok = tok_an if not fin_ans else (tok_ac if not fin_act else tok_th)
+        _, (new_k, new_v) = encode_sensory(
+            params,
+            jnp.asarray([[emitted_tok]], dtype=jnp.int32),
+            config=config,
+            pos_offset=total_prompt_L + t + 1,
+            is_causal=True,
+        )
+        causal_keys = jnp.concatenate([causal_keys, new_k], axis=2)
+        causal_values = jnp.concatenate([causal_values, new_v], axis=2)
+        all_valid = jnp.concatenate(
+            [all_valid, jnp.ones((B, 1, 1, 1), dtype=bool)], axis=-1
+        )
 
         state = next_state
 
