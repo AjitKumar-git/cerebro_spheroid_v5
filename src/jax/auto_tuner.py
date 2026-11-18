@@ -148,6 +148,8 @@ def auto_tune_environment(
         objective=tune_objective,
         cache_manager=cache_mgr,
         benchmark_fn=benchmark_config,
+        hardware_info=get_hardware_info(),
+        get_hardware_info_fn=get_hardware_info,
         use_cached_config=use_cached_config,
         upload_winner=upload_winner,
         cloud_url=cloud_url,

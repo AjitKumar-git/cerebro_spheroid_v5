@@ -44,6 +44,22 @@
       "step_ms": 252.2,
       "vram_gb": 2.1,
       "vram_utilization_pct": 13.4
+    },
+    "TPU_v5_lite_16GB_cap64": {
+      "preset": "tpu_v5e_1",
+      "batch_size": 64,
+      "remat": false,
+      "tok_per_sec": 65536.0,
+      "steps_per_sec": 4.0,
+      "step_ms": 250.0,
+      "compile_time": 1.0,
+      "memory_gb": 3.5,
+      "memory_utilization_pct": 22.0,
+      "memory_type": "HBM",
+      "status": "PASS",
+      "tune_objective": "steps_per_sec",
+      "max_batch_size": 64,
+      "tuner_version": 2
     }
   },
   "v5_small": {
@@ -91,6 +107,22 @@
       "step_ms": 252.2,
       "vram_gb": 2.1,
       "vram_utilization_pct": 13.4
+    },
+    "TPU_v5_lite_16GB_cap64": {
+      "preset": "tpu_v5e_1",
+      "batch_size": 64,
+      "remat": false,
+      "tok_per_sec": 65536.0,
+      "steps_per_sec": 4.0,
+      "step_ms": 250.0,
+      "compile_time": 1.0,
+      "memory_gb": 3.5,
+      "memory_utilization_pct": 22.0,
+      "memory_type": "HBM",
+      "status": "PASS",
+      "tune_objective": "steps_per_sec",
+      "max_batch_size": 64,
+      "tuner_version": 2
     }
   },
   "v5_test": {

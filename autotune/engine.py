@@ -53,6 +53,8 @@ class AutoTuner:
         cloud_token: Optional[str] = None,
         verbose: bool = True,
         fast: bool = True,
+        hardware_info: Optional[Union[HardwareInfo, Dict[str, Any]]] = None,
+        get_hardware_info_fn: Optional[Callable[..., Dict[str, Any]]] = None,
     ):
         self.objective = TuneObjective.from_str(objective)
         self.cache_manager = cache_manager or HardwareConfigCache()
@@ -64,6 +66,8 @@ class AutoTuner:
         self.cloud_token = cloud_token
         self.verbose = verbose
         self.fast = fast
+        self.hardware_info = hardware_info
+        self.get_hardware_info_fn = get_hardware_info_fn or get_hardware_info
 
     def is_new_architecture(
         self,
@@ -75,7 +79,7 @@ class AutoTuner:
         """Determines if the given architecture needs auto-tuning on this hardware."""
         arch_info = extract_architecture_signature(architecture, seq_len=seq_len)
         if hardware_sig is None:
-            hw = get_hardware_info()
+            hw = self.hardware_info if self.hardware_info is not None else self.get_hardware_info_fn()
             hardware_sig = hw["hardware_signature"]
         return self.architecture_detector.is_new_architecture(
             arch_info=arch_info,
@@ -104,7 +108,7 @@ class AutoTuner:
         arch_info = extract_architecture_signature(
             architecture, seq_len=seq_len, prompt_len=prompt_len
         )
-        hw = get_hardware_info()
+        hw = self.hardware_info if self.hardware_info is not None else self.get_hardware_info_fn()
         sig = hw["hardware_signature"]
 
         is_new = force_tune or self.architecture_detector.is_new_architecture(
@@ -181,8 +185,9 @@ class AutoTuner:
         best_score = -1.0
         eval_cache: Dict[Tuple[int, bool], Dict[str, Any]] = {}
 
-        def eval_batch(b: int, r: bool) -> Dict[str, Any]:
+        def eval_batch(b: int, remat: bool = False) -> Dict[str, Any]:
             nonlocal best_config, best_score
+            r = remat
             key = (b, r)
             if key in eval_cache:
                 return eval_cache[key]
@@ -333,6 +338,7 @@ class AutoTuner:
         fast: Optional[bool] = None,
         num_steps: Optional[int] = None,
         strategy: Optional[str] = None,
+        hardware_info: Optional[Union[HardwareInfo, Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Explores candidate configurations and selects the optimal hyperparameter settings."""
         if verbose is None:
@@ -354,7 +360,7 @@ class AutoTuner:
         obj_enum = TuneObjective.from_str(tune_objective or self.objective)
         obj_name = obj_enum.value
 
-        hw = get_hardware_info()
+        hw = hardware_info or (self.hardware_info if self.hardware_info is not None else self.get_hardware_info_fn())
         dev_kind = hw["device_kind"]
         is_tpu = hw.get("is_tpu", False)
         is_gpu = hw.get("is_gpu", False)
