@@ -166,8 +166,8 @@ def parse_args(args_list=None):
         dest="tune_objective",
         type=str,
         default="balanced",
-        choices=["balanced", "steps_per_sec", "tok_per_sec"],
-        help="Auto-tuner selection objective: 'balanced' (tok/s * sqrt(steps/s)), 'steps_per_sec', or 'tok_per_sec'",
+        choices=["balanced", "steps_per_sec", "steps/s", "tok_per_sec", "tokens/sec", "loss_reduction_per_sec", "loss_reduction_sec", "loss reduction/sec"],
+        help="Auto-tuner selection objective: 'balanced', 'steps_per_sec' (steps/s), 'tok_per_sec' (tokens/sec), or 'loss_reduction_per_sec' (loss reduction/sec)",
     )
 
     # Scheduled Sampling & Deliberation Curriculum
@@ -1135,25 +1135,49 @@ def main(args=None):
     else:
         print(f"✓ XLA Compilation complete in {time.time() - t0_compile:.2f}s! Initial Loss: {init_loss_val:.4f}")
 
-    # 9. Clean Canonical Multi-Domain Held-Out Validation Split
+    # 9. Clean Multi-Domain Held-Out Validation Split
     eval_batches = []
     eval_domains = []
-    try:
-        from src.elastic_window import build_canonical_eval_split
-        eval_batches, eval_domains = build_canonical_eval_split(
-            tokenizer=tokenizer,
-            batch_size=args.batch_size,
-            prompt_len=args.prompt_len,
-            target_len=args.seq_len,
-            target_pad_id=-100,
-            pad_id=pad_id,
-        )
-        print(f"✅ Clean Benchmark Held-Out Validation: Prepared {len(eval_batches)} canonical evaluation domains:")
-        for d_name in eval_domains:
-            print(f"   ├─ Domain: {d_name}")
-    except Exception as e:
-        print(f"⚠️ Canonical validation setup notice: {e}. Falling back to active stream.")
-        eval_batches = []
+    eval_weights = []
+    is_pretrain_source = args.dataset_source in ("pretrain", "rectified", "rectified_pretrain", "clean_pretrain")
+    if is_pretrain_source:
+        try:
+            from src.elastic_window import build_pretrain_eval_split
+            eval_batches, eval_domains, eval_weights = build_pretrain_eval_split(
+                tokenizer=tokenizer,
+                batch_size=args.batch_size,
+                prompt_len=args.prompt_len,
+                target_len=args.seq_len,
+                target_pad_id=-100,
+                pad_id=pad_id,
+                return_weights=True,
+            )
+            print(f"✅ Pretrain Held-Out Validation: Prepared {len(eval_batches)} pretraining domains:")
+            for d_name, d_wt in zip(eval_domains, eval_weights):
+                print(f"   ├─ Domain: {d_name} (Weight: {d_wt*100:.0f}%)")
+        except Exception as e:
+            print(f"⚠️ Pretrain validation setup notice: {e}. Falling back to active stream.")
+            eval_batches = []
+    else:
+        try:
+            from src.elastic_window import build_canonical_eval_split
+            eval_batches, eval_domains = build_canonical_eval_split(
+                tokenizer=tokenizer,
+                batch_size=args.batch_size,
+                prompt_len=args.prompt_len,
+                target_len=args.seq_len,
+                target_pad_id=-100,
+                pad_id=pad_id,
+            )
+            eval_weights = [1.0 / len(eval_domains)] * len(eval_domains)
+            print(f"✅ Clean Benchmark Held-Out Validation: Prepared {len(eval_batches)} canonical evaluation domains:")
+            for d_name in eval_domains:
+                print(f"   ├─ Domain: {d_name}")
+        except Exception as e:
+            print(f"⚠️ Canonical validation setup notice: {e}. Falling back to active stream.")
+            eval_batches = []
+
+    if not eval_batches:
         try:
             if elastic_batcher is not None:
                 for _ in range(4):
@@ -1163,6 +1187,10 @@ def main(args=None):
                         else elastic_batcher.next_batch()
                     )
                     eval_batches.append(_unpack_batch(b_tup))
+            elif local_streamer is not None:
+                for _ in range(4):
+                    vp, vt = local_streamer.get_batch()
+                    eval_batches.append((vp, vt, None))
             elif os.path.exists("data/tokenizer"):
                 stream_val = LinguisticDataStreamer(
                     batch_size=args.batch_size,
@@ -1180,6 +1208,7 @@ def main(args=None):
                     if hasattr(stream_val, "stop"):
                         stream_val.stop()
             eval_domains = [f"Domain_{i}" for i in range(len(eval_batches))]
+            eval_weights = [1.0 / len(eval_batches)] * len(eval_batches)
             print(f"✅ Prepared {len(eval_batches)} fallback evaluation batches.")
         except Exception as e_inner:
             print(f"⚠️ Fallback validation setup notice: {e_inner}")
@@ -1607,7 +1636,10 @@ def main(args=None):
             if crossed_eval:
                 eval_p = jax.device_put(_get_host_params(), devices[0]) if use_multi_tpu_local_sgd else params
                 val_losses = [float(eval_step_loss(eval_p, vp, vt, vfb, enc_alpha=enc_alpha)) for vp, vt, vfb in eval_batches]
-                eval_loss = float(np.mean(val_losses)) if val_losses else float("inf")
+                if eval_weights and len(eval_weights) == len(val_losses):
+                    eval_loss = float(sum(w * l for w, l in zip(eval_weights, val_losses)) / sum(eval_weights))
+                else:
+                    eval_loss = float(np.mean(val_losses)) if val_losses else float("inf")
                 last_eval_loss = eval_loss
                 eval_ppl = math.exp(min(eval_loss, 20.0))
                 is_champion = eval_loss < best_eval_loss
@@ -1615,9 +1647,10 @@ def main(args=None):
                 champ_tag = "🏆 (NEW CHAMPION RECORD)" if is_champion else ""
                 print(f"📊 [Eval @ Step {step:,}] Composite Held-Out Loss: {eval_loss:.4f} | PPL: {eval_ppl:.2f} {champ_tag}")
                 if len(val_losses) == len(eval_domains):
-                    for d_name, d_val in zip(eval_domains, val_losses):
+                    for idx, (d_name, d_val) in enumerate(zip(eval_domains, val_losses)):
                         d_ppl = math.exp(min(d_val, 20.0))
-                        print(f"   ├─ {d_name:<44}: Loss {d_val:.4f} (PPL: {d_ppl:.2f})")
+                        wt_str = f" ({eval_weights[idx]*100:.0f}%)" if (eval_weights and idx < len(eval_weights)) else ""
+                        print(f"   ├─ {d_name + wt_str:<44}: Loss {d_val:.4f} (PPL: {d_ppl:.2f})")
                 if hasattr(batcher, "get_tokens_by_dataset"):
                     ds_stats = batcher.get_tokens_by_dataset()
                     if ds_stats:

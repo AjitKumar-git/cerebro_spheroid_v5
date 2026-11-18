@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autotune"
+version = "1.0.0"
+description = "High-Performance Accelerator & Architecture Auto-Tuning Engine for TPUs, GPUs, and CPUs"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+    { name = "Ajit Kumar", email = "meajitsheoran@gmail.com" }
+]
+keywords = [
+    "deep-learning", "jax", "pytorch", "tpu", "gpu", "autotune", "vram", "throughput", "pareto"
+]
+dependencies = [
+    "typing-extensions>=4.0.0; python_version<'3.10'",
+]
+
+[project.optional-dependencies]
+jax = [
+    "jax>=0.4.20",
+    "jaxlib>=0.4.20",
+]
+torch = [
+    "torch>=2.0.0",
+]
+
+[project.scripts]
+autotune = "autotune.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["autotune*", "cerebro_autotune*"]
