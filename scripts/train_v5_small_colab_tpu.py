@@ -104,6 +104,7 @@ from src.elastic_window import (
     build_online_dataset_iterator,
     get_default_elastic_buckets,
 )
+from src.rectified_streamer import RectifiedContiguousPretrainStreamer
 from src.jax.data_streamer import LinguisticDataStreamer
 
 
@@ -111,6 +112,14 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="CerebroSpheroid V5 Small: Long-Context TPU Trainer (From Scratch)"
     )
+
+    # Training Mode & Curriculum Stage
+    parser.add_argument("--mode", type=str, default="contiguous_pretrain",
+                        choices=["contiguous_pretrain", "sft"],
+                        help="Training mode: 'contiguous_pretrain' (100% loss-bearing tokens on full dataset) or 'sft'")
+    parser.add_argument("--stage", type=str, default="pretrain",
+                        choices=["pretrain", "midtrain", "balanced"],
+                        help="Curriculum stage: 'pretrain' (85% FineWeb broad web + 15% code; 10B-15B full dataset), 'midtrain' (skills, math, retrieval), or 'balanced'")
 
     # Context & Target Horizon (Longest possible 4096-token window)
     parser.add_argument("--prompt-len", "--prompt_len", type=int, default=2048,
@@ -126,9 +135,9 @@ def parse_args():
     parser.add_argument("--elastic-window", action=argparse.BooleanOptionalAction, default=True,
                         help="Use complementary sliding window buckets summing to total_window")
 
-    # Training Steps & Batching
-    parser.add_argument("--total-steps", "--steps", type=int, default=500_000,
-                        help="Total training steps (default: 500,000)")
+    # Training Steps & Batching (10x Ingestion: 60,000 steps = 15.7 Billion tokens)
+    parser.add_argument("--total-steps", "--steps", type=int, default=60_000,
+                        help="Total training steps (default: 60,000 steps = 15.7 Billion tokens)")
     parser.add_argument("--batch-size", "--batch_size", dest="batch_size", type=int, default=8,
                         help="Per-device micro-batch size (default: 8 for TPU v2-8/v3-8/v5e)")
     parser.add_argument("--grad-accum", "--grad_accum", dest="grad_accum", type=int, default=2,
@@ -373,48 +382,72 @@ def main():
     tokenizer = build_tokenizer(args.tokenizer_name)
     print(f"✓ Tokenizer ready (Vocab size: {len(tokenizer):,})")
 
-    # Set up Elastic Buckets for 4096-token sequences
-    if args.elastic_window:
-        buckets = [
-            ("balanced_long", 2048, 2048),
-            ("short_prompt_deep_target", 512, 3584),
-            ("long_context_qa", 3584, 512),
-            ("standard_cot", 1024, 3072),
-        ]
-        print(f"\n🌊 Elastic Sliding Window Active (Budget: {args.total_window} tokens):")
-        for idx, (b_name, bp, bt) in enumerate(buckets):
-            print(f"   Bucket {idx}: {b_name:<26} (Prompt: {bp:4d} tok -> Target: {bt:4d} tok)")
-    else:
-        buckets = [("static", args.prompt_len, args.seq_len)]
-        print(f"\n🔒 Static Window Active: Prompt {args.prompt_len} -> Target {args.seq_len}")
-
-    # Build online dataset iterator
-    try:
-        data_iter = build_online_dataset_iterator(
-            dataset_source=args.dataset_source,
-            step_getter=lambda: step,
-            total_steps=args.total_steps,
-        )
-        batcher = ElasticBucketBatcher(
-            tokenizer,
-            data_iter,
+    if args.mode == "contiguous_pretrain":
+        print(f"\n🌊 Rectified Contiguous Pretraining Engine Active (100% Loss-Bearing Tokens):")
+        print(f"   - Curriculum Stage:     {args.stage.upper()}")
+        if args.stage == "pretrain":
+            print(f"   - Target Token Mixture: 85% Broad Web (FineWeb 10BT) | 15% Pretraining Code")
+        elif args.stage == "midtrain":
+            print(f"   - Target Token Mixture: 45% FineWeb-Edu (>= 3.5) | 25% FineMath | 15% Code | 15% 4k Retrieval")
+        else:
+            print(f"   - Target Token Mixture: 70% Broad Web (FineWeb) | 15% Edu | 7% Code | 5% Math | 3% Retrieval")
+        print(f"   - Block Size:           {args.total_window} contiguous tokens per sequence")
+        print(f"   - Prompt Input:         1 token (BOS seed)")
+        print(f"   - Target Supervision:   {args.total_window} tokens with cross-entropy next-token loss")
+        print(f"   - Zero Prompt Slicing:  Documents packed contiguously with EOS delimiters")
+        print(f"   - Target Ingestion:     {args.total_steps:,} steps ({args.total_steps * args.batch_size * args.grad_accum * args.total_window / 1e9:.2f}B tokens)")
+        prefetched_stream = RectifiedContiguousPretrainStreamer(
+            tokenizer=tokenizer,
             batch_size=args.batch_size,
-            total_window=args.total_window,
-            buckets=buckets,
-            framework="numpy",
-            return_feedback=True,
-        )
-        prefetched_stream = PrefetchedBatcher(batcher, queue_size=16)
-        print(f"⚡ Background Asynchronous Batch Prefetcher Active (Depth: 16)")
-    except Exception as e:
-        print(f"⚠️ Online dataset init failed ({e}). Falling back to local linguistic streamer...")
-        prefetched_stream = LinguisticDataStreamer(
-            batch_size=args.batch_size,
-            prompt_len=args.prompt_len,
-            target_len=args.seq_len,
-            vocab_size=config.vocab_size,
+            block_size=args.total_window,
+            bos_token_id=1,
+            eos_token_id=2,
             queue_size=16,
+            stage=args.stage,
         )
+        print(f"⚡ Background Token-Weighted Prefetcher Active (Depth: 16)")
+    else:
+        # SFT Mode: Elastic Buckets with prompt masking
+        if args.elastic_window:
+            buckets = [
+                ("balanced_long", 2048, 2048),
+                ("short_prompt_deep_target", 512, 3584),
+                ("long_context_qa", 3584, 512),
+                ("standard_cot", 1024, 3072),
+            ]
+            print(f"\n🌊 Elastic Sliding Window Active (Budget: {args.total_window} tokens):")
+            for idx, (b_name, bp, bt) in enumerate(buckets):
+                print(f"   Bucket {idx}: {b_name:<26} (Prompt: {bp:4d} tok -> Target: {bt:4d} tok)")
+        else:
+            buckets = [("static", args.prompt_len, args.seq_len)]
+            print(f"\n🔒 Static Window Active: Prompt {args.prompt_len} -> Target {args.seq_len}")
+
+        try:
+            data_iter = build_online_dataset_iterator(
+                dataset_source=args.dataset_source,
+                step_getter=lambda: step,
+                total_steps=args.total_steps,
+            )
+            batcher = ElasticBucketBatcher(
+                tokenizer,
+                data_iter,
+                batch_size=args.batch_size,
+                total_window=args.total_window,
+                buckets=buckets,
+                framework="numpy",
+                return_feedback=True,
+            )
+            prefetched_stream = PrefetchedBatcher(batcher, queue_size=16)
+            print(f"⚡ Background Asynchronous Batch Prefetcher Active (Depth: 16)")
+        except Exception as e:
+            print(f"⚠️ Online dataset init failed ({e}). Falling back to local linguistic streamer...")
+            prefetched_stream = LinguisticDataStreamer(
+                batch_size=args.batch_size,
+                prompt_len=args.prompt_len,
+                target_len=args.seq_len,
+                vocab_size=config.vocab_size,
+                queue_size=16,
+            )
 
     # 7. Build Execution Engine
     # Multi-TPU pmap or Single-TPU JIT
@@ -520,13 +553,17 @@ def main():
             tokens_per_sec = (tokens_in_batch * args.log_every) / max(elapsed, 1e-6)
             ppl = math.exp(min(loss_scalar, 20.0))
 
+            mix_info = ""
+            if hasattr(prefetched_stream, "get_token_mix_status"):
+                mix_info = f" | {prefetched_stream.get_token_mix_status()}"
+
             print(
                 f"Step {step:7,d}/{args.total_steps:,d} | "
                 f"Loss: {loss_scalar:6.4f} | "
                 f"PPL: {ppl:7.2f} | "
-                f"LR: {cur_lr:.2e} | "
+                f"LR: {cur_lr:.2e}{mix_info} | "
                 f"Speed: {steps_per_sec:4.1f} st/s ({tokens_per_sec:7,.0f} tok/s) | "
-                f"Tok: {total_tokens_processed / 1e6:6.1f}M"
+                f"Loss-Bearing Tok: {total_tokens_processed / 1e6:6.1f}M"
             )
 
         # Periodic Generalization Probe
