@@ -348,7 +348,12 @@ class RectifiedContiguousPretrainStreamer:
         return self
 
     def __next__(self) -> Dict[str, np.ndarray]:
-        return self.batch_queue.get(block=True)
+        while self.running:
+            batch = self.batch_queue.get(block=True)
+            # If a curriculum transition occurred while a batch was in-flight, discard stale-dimension batch
+            if batch["target"].shape[1] == self.block_size and batch["target"].shape[0] == self.batch_size:
+                return batch
+        raise StopIteration
 
     def get_batch(self) -> Tuple[np.ndarray, np.ndarray]:
         """Returns (prompt, target) tuple matching JAX LinguisticDataStreamer interface."""
@@ -363,6 +368,18 @@ class RectifiedContiguousPretrainStreamer:
     def stop(self):
         """Stops background worker thread."""
         self.running = False
+
+    def update_block_size(self, new_block_size: int, new_batch_size: Optional[int] = None):
+        """Dynamically updates block size and batch size for curriculum transitions."""
+        self.block_size = int(new_block_size)
+        if new_batch_size is not None:
+            self.batch_size = int(new_batch_size)
+        # Drain any buffered old-sized batches so trainer immediately receives new-sized batches
+        while True:
+            try:
+                self.batch_queue.get_nowait()
+            except (queue.Empty, Exception):
+                break
 
     def get_token_mix_status(self) -> str:
         """Returns concise single-line breakdown of actual token percentages."""

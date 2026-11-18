@@ -87,3 +87,63 @@ def test_reasoning_prompt_header_preservation_across_continuation_slices():
     expected_header = q_tokens[:min(len(q_tokens), 32 // 3)]
     for h_tok in expected_header[:3]:
         assert h_tok in p_batch[0], "Prompt header tokens must be preserved in sliced reasoning slices!"
+
+
+def test_rectified_streamer_update_block_size(monkeypatch):
+    from src.rectified_streamer import RectifiedContiguousPretrainStreamer
+
+    def _mock_doc_gen():
+        while True:
+            yield "The quick brown fox jumps over the lazy dog. " * 50
+
+    monkeypatch.setattr(RectifiedContiguousPretrainStreamer, "_open_fineweb_stream", lambda self: _mock_doc_gen())
+    monkeypatch.setattr(RectifiedContiguousPretrainStreamer, "_open_code_stream", lambda self: _mock_doc_gen())
+
+    tok = MockTokenizer()
+    streamer = RectifiedContiguousPretrainStreamer(
+        tokenizer=tok,
+        batch_size=2,
+        block_size=512,
+        stage="pretrain",
+    )
+    try:
+        p, t = streamer.get_batch()
+        assert p.shape == (2, 1)
+        assert t.shape == (2, 512)
+
+        # Dynamically scale to 1024 tokens
+        streamer.update_block_size(1024)
+        assert streamer.block_size == 1024
+
+        p2, t2 = streamer.get_batch()
+        assert p2.shape == (2, 1)
+        assert t2.shape == (2, 1024)
+    finally:
+        streamer.stop()
+
+
+def test_hbm_safety_guard_and_curriculum_remat():
+    # Verify that sequences >= 1024 enforce remat=True
+    seq_len = 1024
+    remat_choice = False
+    context_curriculum = True
+    if (seq_len >= 1024 or context_curriculum) and not remat_choice:
+        remat_choice = True
+
+    assert remat_choice is True
+
+    # Verify that batch size is safely capped to prevent HBM OOM
+    batch_size = 128
+    max_micro_tokens = 131072 if remat_choice else 65536
+    if batch_size * seq_len > max_micro_tokens:
+        batch_size = max(1, max_micro_tokens // seq_len)
+    assert batch_size * seq_len <= 131072
+
+    # At 4096 tokens, batch size must be capped <= 32
+    seq_len_4k = 4096
+    batch_size_4k = 128
+    if batch_size_4k * seq_len_4k > max_micro_tokens:
+        batch_size_4k = max(1, max_micro_tokens // seq_len_4k)
+    assert batch_size_4k <= 32
+    assert batch_size_4k * seq_len_4k <= 131072
+

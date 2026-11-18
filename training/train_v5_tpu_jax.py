@@ -446,65 +446,7 @@ def main(args=None):
     print(f"Destination Dir : {args.checkpoint_dir}")
     print("=" * 80)
 
-    # 2. Auto-Tuning Micro-Benchmark
-    remat_choice = True if args.remat.lower() == "true" else False
-    max_bs = getattr(args, "max_batch_size", None)
-    if args.auto_tune:
-        best_cfg = run_auto_tuner(
-            preset=args.preset,
-            seq_len=args.seq_len,
-            dtype=args.dtype,
-            use_cached_config=not getattr(args, "force_tune", False),
-            force_tune=getattr(args, "force_tune", False),
-            upload_winner=True,
-            cloud_url=args.cloud_url,
-            cloud_token=args.cloud_token,
-            verbose=True,
-            tune_objective=getattr(args, "tune_objective", "balanced"),
-            prompt_len=args.prompt_len,
-            max_batch_size=max_bs,
-        )
-        if not getattr(args, "batch_size_explicit", False):
-            args.batch_size = best_cfg["batch_size"]
-        remat_choice = best_cfg["remat"]
-        print(f"\n⚡ Applying Tuned Hyperparameters: batch_size={args.batch_size}, remat={remat_choice}")
-        if "tok_per_sec" in best_cfg and best_cfg["tok_per_sec"] > 0:
-            m_type = best_cfg.get("memory_type", "HBM" if ("tpu" in dev_kind or "tpu" in backend.lower()) else "VRAM")
-            v_gb = best_cfg.get("memory_gb", best_cfg.get("vram_gb", 0))
-            v_pct = best_cfg.get("memory_utilization_pct", best_cfg.get("vram_utilization_pct", 0))
-            sps = best_cfg.get("steps_per_sec", 0.0)
-            sps_str = f"{sps:.2f} steps/s | " if sps and sps > 0 else ""
-            print(f"⚡ Target Benchmark Speed: {sps_str}{best_cfg['tok_per_sec']:,.0f} tok/s ({m_type}: {v_gb:.1f} GB, {v_pct:.1f}% utilization)")
-    elif max_bs is not None:
-        args.batch_size = min(int(args.batch_size), int(max_bs))
-
-    # Effective Batch Size & Gradient Accumulation
-    if getattr(args, "effective_batch_size_explicit", False) and args.effective_batch_size > 0:
-        eff_target = args.effective_batch_size
-        if eff_target == 126:
-            if args.batch_size > 126:
-                args.batch_size = 126
-                args.grad_accum = 1
-            elif 126 % args.batch_size == 0:
-                args.grad_accum = 126 // args.batch_size
-            else:
-                args.batch_size = 126
-                args.grad_accum = 1
-        else:
-            if args.batch_size > eff_target:
-                args.batch_size = eff_target
-            args.grad_accum = max(1, eff_target // max(1, args.batch_size))
-        eff_bs = args.batch_size * args.grad_accum
-        print(f"⚡ [Batch Scaling] Target Effective Batch Size: {eff_bs} (Micro Batch: {args.batch_size} × Grad Accum: {args.grad_accum})")
-
-    eff_batch_size = args.batch_size * getattr(args, "grad_accum", 1)
-    tokens_per_opt_step = eff_batch_size * (args.prompt_len + args.seq_len)
-    if not getattr(args, "total_steps_explicit", False) and getattr(args, "target_tokens", None) is not None and args.target_tokens > 0:
-        calculated_steps = int(math.ceil(float(args.target_tokens) / max(1.0, float(tokens_per_opt_step))))
-        args.total_steps = calculated_steps
-        print(f"🎯 [Target Token Budget] {args.target_tokens/1e9:.2f} Billion Tokens -> Scheduled for {args.total_steps:,} Steps (at {tokens_per_opt_step:,} tok/step)")
-
-    # 3. Model Configuration & Parameters
+    # 2. Model Configuration & Parameters
     config_preset = "v5_small" if args.preset in ("tpu_v5e_1", "tpu_v6e_1", "tpu_v6e") else args.preset
     if config_preset not in PRESETS_V5:
         config_preset = "v5_small"
@@ -534,7 +476,7 @@ def main(args=None):
     print(f"Active Compute  : {active_compute:,} (~{active_compute/1e6:.1f}M) ({active_compute/total_params*100:.2f}%)")
     print(f"Optimizer       : {args.optimizer.upper()} ({'Polar Newton-Schulz NS-5 + Spectral Clamp' if args.optimizer == 'spheroid' else 'Optax AdamW'})")
 
-    # 4. Tokenizer
+    # 3. Tokenizer
     tokenizer = build_tokenizer(args.tokenizer_name)
     pad_id = getattr(tokenizer, "pad_token_id", 0) or 0
 
@@ -772,9 +714,7 @@ def main(args=None):
                         initial_ema_loss = None
                         print("🌱 [Campaign Reset Active] Step counter reset to 0! Calibrating fresh schedule from adapted base weights.")
                 else:
-                    if args.total_steps <= start_step:
-                        args.total_steps = start_step + calculated_steps
-                        print(f"🎯 Resuming from Step {start_step:,} -> Extended campaign schedule to Step {args.total_steps:,} (+{calculated_steps:,} steps)")
+                    pass
             except Exception as e:
                 print(f"⚠️ Checkpoint load notice: {e}. Starting fresh.")
 
@@ -782,6 +722,117 @@ def main(args=None):
         best_eval_loss = float("inf")
         last_eval_loss = float("inf")
         print("🔄 [Benchmark Recalibration] Reset best_eval_loss tracker baseline.")
+
+    # 5. Context Stage Curriculum & Horizon Sizing
+    context_stages = [512, 1024, 2048, 4096]
+    max_curriculum_window = args.total_window
+    if max_curriculum_window is None:
+        if getattr(args, "context_curriculum", False):
+            max_curriculum_window = 4096  # Curriculum defaults to advancing through the full 4K horizon
+        else:
+            max_curriculum_window = args.prompt_len + args.seq_len
+    if getattr(args, "target_seq_len", None) is not None:
+        max_curriculum_window = max(max_curriculum_window, args.prompt_len + args.target_seq_len)
+
+    if getattr(args, "context_curriculum", False):
+        context_stages = [w for w in context_stages if w <= max_curriculum_window]
+        if not context_stages:
+            context_stages = [max_curriculum_window]
+        context_stage_steps = args.context_stage_steps
+        if context_stage_steps <= 0:
+            context_stage_steps = max(2000, args.total_steps // len(context_stages))
+        active_stage_idx = min(len(context_stages) - 1, start_step // context_stage_steps)
+        args.total_window = context_stages[active_stage_idx]
+        print(
+            f"🌊 [Context Curriculum Active] Stages: {context_stages} tokens | {context_stage_steps:,} steps/stage\n"
+            f"   Initial Stage {active_stage_idx}: Total Window = {args.total_window} tokens"
+        )
+    else:
+        context_stage_steps = max(1, args.total_steps)
+        active_stage_idx = 0
+
+    is_pretrain_source = args.dataset_source in ("pretrain", "rectified", "rectified_pretrain", "clean_pretrain")
+    if is_pretrain_source:
+        args.seq_len = args.total_window
+
+    # 6. Hardware Optimization & Auto-Tuning
+    remat_choice = True if args.remat.lower() == "true" else False
+    max_bs = getattr(args, "max_batch_size", None)
+    if args.auto_tune:
+        best_cfg = run_auto_tuner(
+            preset=args.preset,
+            seq_len=args.seq_len,
+            dtype=args.dtype,
+            use_cached_config=not getattr(args, "force_tune", False),
+            force_tune=getattr(args, "force_tune", False),
+            upload_winner=True,
+            cloud_url=args.cloud_url,
+            cloud_token=args.cloud_token,
+            verbose=True,
+            tune_objective=getattr(args, "tune_objective", "balanced"),
+            prompt_len=args.prompt_len,
+            max_batch_size=max_bs,
+        )
+        if not getattr(args, "batch_size_explicit", False):
+            args.batch_size = best_cfg["batch_size"]
+        remat_choice = best_cfg["remat"]
+        print(f"\n⚡ Applying Tuned Hyperparameters: batch_size={args.batch_size}, remat={remat_choice}")
+        if "tok_per_sec" in best_cfg and best_cfg["tok_per_sec"] > 0:
+            m_type = best_cfg.get("memory_type", "HBM" if ("tpu" in dev_kind or "tpu" in backend.lower()) else "VRAM")
+            v_gb = best_cfg.get("memory_gb", best_cfg.get("vram_gb", 0))
+            v_pct = best_cfg.get("memory_utilization_pct", best_cfg.get("vram_utilization_pct", 0))
+            sps = best_cfg.get("steps_per_sec", 0.0)
+            sps_str = f"{sps:.2f} steps/s | " if sps and sps > 0 else ""
+            print(f"⚡ Target Benchmark Speed: {sps_str}{best_cfg['tok_per_sec']:,.0f} tok/s ({m_type}: {v_gb:.1f} GB, {v_pct:.1f}% utilization)")
+    elif max_bs is not None:
+        args.batch_size = min(int(args.batch_size), int(max_bs))
+
+    # Strict HBM Safety Enforcement for Long-Context Horizons
+    if (args.seq_len >= 1024 or args.total_window >= 1024 or getattr(args, "context_curriculum", False)) and not remat_choice:
+        print(f"🛡️ [HBM Safety Guard] Sequence window {max(args.seq_len, args.total_window)} >= 1024 requires activation rematerialization to prevent HBM OOM on 16GB accelerators. Enabling remat=True.")
+        remat_choice = True
+
+    # Scale micro-batch if necessary to keep micro-batch tokens bounded
+    max_micro_tokens = 131072 if remat_choice else 65536
+    if args.batch_size * args.seq_len > max_micro_tokens:
+        old_bs = args.batch_size
+        capped_bs = max(1, max_micro_tokens // args.seq_len)
+        if capped_bs >= 16:
+            capped_bs = (capped_bs // 16) * 16
+        elif capped_bs >= 8:
+            capped_bs = (capped_bs // 8) * 8
+        args.batch_size = capped_bs
+        print(f"🛡️ [HBM Safety Guard] Scaling micro batch size {old_bs} -> {args.batch_size} for sequence length {args.seq_len} (caps micro tokens at {args.batch_size * args.seq_len:,} <= {max_micro_tokens:,})")
+
+    # 7. Effective Batch Size & Target Token Budget Scheduling
+    if getattr(args, "effective_batch_size_explicit", False) and args.effective_batch_size > 0:
+        eff_target = args.effective_batch_size
+        if eff_target == 126:
+            if args.batch_size > 126:
+                args.batch_size = 126
+                args.grad_accum = 1
+            elif 126 % args.batch_size == 0:
+                args.grad_accum = 126 // args.batch_size
+            else:
+                args.batch_size = 126
+                args.grad_accum = 1
+        else:
+            if args.batch_size > eff_target:
+                args.batch_size = eff_target
+            args.grad_accum = max(1, eff_target // max(1, args.batch_size))
+        eff_bs = args.batch_size * args.grad_accum
+        print(f"⚡ [Batch Scaling] Target Effective Batch Size: {eff_bs} (Micro Batch: {args.batch_size} × Grad Accum: {args.grad_accum})")
+
+    eff_batch_size = args.batch_size * getattr(args, "grad_accum", 1)
+    tokens_per_opt_step = eff_batch_size * (args.prompt_len + args.seq_len)
+    if not getattr(args, "total_steps_explicit", False) and getattr(args, "target_tokens", None) is not None and args.target_tokens > 0:
+        calculated_steps = int(math.ceil(float(args.target_tokens) / max(1.0, float(tokens_per_opt_step))))
+        if start_step > 0 and args.total_steps <= start_step:
+            args.total_steps = start_step + calculated_steps
+            print(f"🎯 Resuming from Step {start_step:,} -> Extended campaign schedule to Step {args.total_steps:,} (+{calculated_steps:,} steps)")
+        else:
+            args.total_steps = calculated_steps
+            print(f"🎯 [Target Token Budget] {args.target_tokens/1e9:.2f} Billion Tokens -> Scheduled for {args.total_steps:,} Steps (at {tokens_per_opt_step:,} tok/step)")
 
     # 6. Spheroid Optimizer & JIT / Multi-TPU Local-SGD Train Step Engine
     grad_accum = max(1, int(getattr(args, "grad_accum", 1)))
@@ -1037,34 +1088,7 @@ def main(args=None):
         train_step_fn_anneal = train_step_fn
         train_step_fn_frozen = train_step_fn
 
-    # 7. Context Stage Curriculum & Multi-Stream Ingestion
-    context_stages = [512, 1024, 2048, 4096]
-    max_curriculum_window = args.total_window
-    if max_curriculum_window is None:
-        if getattr(args, "context_curriculum", False):
-            max_curriculum_window = 4096  # Curriculum defaults to advancing through the full 4K horizon
-        else:
-            max_curriculum_window = args.prompt_len + args.seq_len
-    if getattr(args, "target_seq_len", None) is not None:
-        max_curriculum_window = max(max_curriculum_window, args.prompt_len + args.target_seq_len)
-
-    if getattr(args, "context_curriculum", False):
-        context_stages = [w for w in context_stages if w <= max_curriculum_window]
-        if not context_stages:
-            context_stages = [max_curriculum_window]
-        context_stage_steps = args.context_stage_steps
-        if context_stage_steps <= 0:
-            context_stage_steps = max(2000, args.total_steps // len(context_stages))
-        active_stage_idx = min(len(context_stages) - 1, start_step // context_stage_steps)
-        args.total_window = context_stages[active_stage_idx]
-        print(
-            f"🌊 [Context Curriculum Active] Stages: {context_stages} tokens | {context_stage_steps:,} steps/stage\n"
-            f"   Initial Stage {active_stage_idx}: Total Window = {args.total_window} tokens"
-        )
-    else:
-        context_stage_steps = max(1, args.total_steps)
-        active_stage_idx = 0
-
+    # 9. Multi-Stream Ingestion & Prefetched Data Stream
     current_step_holder = [start_step]
     local_streamer = None
     elastic_batcher = None
@@ -1101,15 +1125,17 @@ def main(args=None):
             return batch_tuple[0], batch_tuple[1], batch_tuple[2]
         return batch_tuple[0], batch_tuple[1], None
 
-    # 8. XLA Ahead-Of-Time Compilation (non-mutating warmup matching real feedback signature)
+    # 10. XLA Ahead-Of-Time Compilation (non-mutating warmup matching real feedback signature)
     print("\n⚡ Compiling XLA computation graph on TPU...")
     t0_compile = time.time()
+    dummy_prompt_len = 1 if is_pretrain_source else args.prompt_len
+    dummy_target_len = args.total_window if is_pretrain_source else args.seq_len
     if use_multi_tpu_local_sgd:
-        dummy_prompts = np.zeros((eff_num_devices, eff_local_steps, args.batch_size, args.prompt_len), dtype=np.int32)
-        dummy_targets = np.zeros((eff_num_devices, eff_local_steps, args.batch_size, args.seq_len), dtype=np.int32)
+        dummy_prompts = np.zeros((eff_num_devices, eff_local_steps, args.batch_size, dummy_prompt_len), dtype=np.int32)
+        dummy_targets = np.zeros((eff_num_devices, eff_local_steps, args.batch_size, dummy_target_len), dtype=np.int32)
         dummy_feedback = (
-            np.full((eff_num_devices, eff_local_steps, args.batch_size, args.seq_len), -100, dtype=np.int32)
-            if elastic_batcher is not None
+            np.full((eff_num_devices, eff_local_steps, args.batch_size, dummy_target_len), -100, dtype=np.int32)
+            if (elastic_batcher is not None or is_pretrain_source)
             else None
         )
         _warm_p, _warm_opt, initial_loss = pmap_round_fn(
@@ -1124,24 +1150,36 @@ def main(args=None):
         init_loss_val = float(initial_loss[0])
         del _warm_p, _warm_opt
     else:
-        dummy_prompts = jnp.zeros((args.batch_size, args.prompt_len), dtype=jnp.int32)
-        dummy_targets = jnp.zeros((args.batch_size, args.seq_len), dtype=jnp.int32)
+        dummy_prompts = jnp.zeros((args.batch_size, dummy_prompt_len), dtype=jnp.int32)
+        dummy_targets = jnp.zeros((args.batch_size, dummy_target_len), dtype=jnp.int32)
         dummy_feedback = (
-            jnp.full((args.batch_size, args.seq_len), -100, dtype=jnp.int32)
-            if elastic_batcher is not None
+            jnp.full((args.batch_size, dummy_target_len), -100, dtype=jnp.int32)
+            if (elastic_batcher is not None or is_pretrain_source)
             else None
         )
-        _warm_p, _warm_opt, initial_loss = train_step_fn(
-            params,
-            opt_state,
-            dummy_prompts,
-            dummy_targets,
-            args.lr,
-            feedback_tokens=dummy_feedback,
-        )
-        jax.block_until_ready(initial_loss)
-        init_loss_val = float(initial_loss)
-        del _warm_p, _warm_opt
+        if compute_grad_step is not None and grad_accum > 1:
+            _warm_loss, _warm_grads = compute_grad_step(
+                params,
+                dummy_prompts,
+                dummy_targets,
+                feedback_tokens=dummy_feedback,
+                sampling_p=args.min_sampling_p,
+            )
+            jax.block_until_ready(_warm_loss)
+            init_loss_val = float(_warm_loss)
+            del _warm_loss, _warm_grads
+        else:
+            _warm_p, _warm_opt, initial_loss = train_step_fn(
+                params,
+                opt_state,
+                dummy_prompts,
+                dummy_targets,
+                args.lr,
+                feedback_tokens=dummy_feedback,
+            )
+            jax.block_until_ready(initial_loss)
+            init_loss_val = float(initial_loss)
+            del _warm_p, _warm_opt
     if start_step > 0 and math.isfinite(best_eval_loss):
         print(f"✓ XLA Compilation complete in {time.time() - t0_compile:.2f}s! Baseline Restored Loss: {best_eval_loss:.4f} (Tracer init: {init_loss_val:.2f})")
     else:
@@ -1418,11 +1456,15 @@ def main(args=None):
                     active_stage_idx = cur_stage_idx
                     active_window = context_stages[active_stage_idx]
                     args.total_window = active_window
+                    if is_pretrain_source:
+                        args.seq_len = active_window
                     new_buckets = get_default_elastic_buckets(active_window)
                     print(
                         f"\n🔄 [Context Curriculum Transition] Step {step:,}: Advancing to Stage {active_stage_idx} ({active_window} tokens)!\n"
                         f"   Active Buckets: {new_buckets}\n"
                     )
+                    if local_streamer is not None and hasattr(local_streamer, "update_block_size"):
+                        local_streamer.update_block_size(active_window)
                     b_target = elastic_batcher
                     if b_target is not None:
                         if hasattr(b_target, "update_buckets"):
