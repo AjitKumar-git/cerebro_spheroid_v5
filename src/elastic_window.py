@@ -239,14 +239,14 @@ def extract_prompt_response_pair(row: Any) -> Tuple[str, str]:
                     return p, r
                 return "# Python source code:", raw_c
 
-        # 5. Raw Text Corpora (FineWeb-Edu, Reference Documents)
+        # 5. Raw Text Corpora (FineWeb, FineWeb-Edu, Reference Documents)
         if not q_val and "text" in row:
             raw_t = str(row["text"]).strip()
-            if "\n\n" in raw_t and len(raw_t.split("\n\n")[0]) > 40:
-                p, r = raw_t.split("\n\n", 1)
-            else:
-                p, r = "Study and comprehend the following material:", raw_t
-            return p.strip(), _normalize_3tier_response(r.strip(), p.strip())
+            # Keep the whole document loss-bearing. Splitting its first paragraph
+            # into the prompt silently excluded that text from next-token loss.
+            # Raw corpus content must also bypass chat/math response rewriting.
+            prompt = "Document:\n"
+            return prompt, raw_t
         return str(q_val or ""), _normalize_3tier_response(str(r_val or ""), str(q_val or ""))
     return "", ""
     return "", ""
@@ -258,6 +258,7 @@ _DEFAULT_DATASET_REVISIONS: Dict[str, str] = {
     # (~15+ GB per rank) and trigger host OOM SIGKILL on 2xT4 containers. The
     # auto-converted Parquet branch streams row-groups in <250 MB RSS per rank.
     "teknium/OpenHermes-2.5": "refs/convert/parquet",
+    "HuggingFaceFW/fineweb": "9bb295ddab0e05d785b879661af7260fed5140fc",
     # Pinned immutable commit SHAs to guarantee exact reproducibility and prevent upstream dataset mutation:
     "HuggingFaceFW/fineweb-edu": "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9",
     "HuggingFaceTB/cosmopedia-v2": "3ba9d605774198c5868892d7a8deda78031a781f",
@@ -268,6 +269,7 @@ _DEFAULT_DATASET_REVISIONS: Dict[str, str] = {
 }
 
 _DEFAULT_DATASET_CONFIGS: Dict[str, str] = {
+    "HuggingFaceFW/fineweb": "sample-10BT",
     "HuggingFaceTB/cosmopedia-v2": "cosmopedia-v2",
     "HuggingFaceFW/fineweb-edu": "sample-350BT",
     "openai/gsm8k": "main",
@@ -404,6 +406,8 @@ def build_online_dataset_iterator(
     step_getter: Optional[Any] = None,
     total_steps: int = 1_500_000,
     inject_retrieval: bool = True,
+    dataset_config: Optional[str] = None,
+    dataset_revision: Optional[str] = None,
 ) -> Iterator[Dict[str, Any]]:
     """
     Infinite, resilient HuggingFace multi-corpus streaming iterator shared by TPU and GPU trainers.
@@ -461,6 +465,11 @@ def build_online_dataset_iterator(
                     break
         return _wrapped()
     source = (dataset_source or "dense_edu").lower()
+    if source in ("fineweb", "fineweb_10bt", "fineweb-10bt"):
+        dataset_source = "HuggingFaceFW/fineweb"
+        source = dataset_source.lower()
+    if source == "huggingfacefw/fineweb":
+        dataset_config = dataset_config or _DEFAULT_DATASET_CONFIGS["HuggingFaceFW/fineweb"]
     if source in ("chat_thinking", "db_thinking", "specialized_trihead", "specialized_sft"):
         source = "chat_thinking"
     elif source in ("sft", "instruction_sft", "chat_sft", "alignment", "reasoning_sft", "cot_sft", "think_sft", "r1_sft", "cot", "deepseek_r1", "conversational", "conversational_sft", "layman"):
@@ -590,9 +599,20 @@ def build_online_dataset_iterator(
         custom_it: Optional[Iterator[Any]] = None
 
         def _open_custom_stream():
-            from datasets import load_dataset
-            print(f"🌐 Connecting online stream to custom Hugging Face repo: {repo_id}...")
-            return iter(load_dataset(repo_id, split="train", streaming=True))
+            config_name = dataset_config or _DEFAULT_DATASET_CONFIGS.get(repo_id)
+            revision = dataset_revision or _DEFAULT_DATASET_REVISIONS.get(repo_id)
+            print(
+                f"🌐 Connecting online stream to {repo_id}"
+                f"{('/' + config_name) if config_name else ''}"
+                f"{f' @ {revision}' if revision else ''}..."
+            )
+            return _open_hf_stream(
+                repo_id,
+                config_name,
+                rank=rank,
+                world_size=world_size,
+                revision=revision,
+            )
 
         def _custom_gen():
             nonlocal custom_it
@@ -609,6 +629,7 @@ def build_online_dataset_iterator(
                     "answer": answer if answer else text,
                     "tokens": toks,
                     "target_weights": weights,
+                    "_dataset": str(row.get("_dataset") or repo_id),
                 }
 
         return _wrap_with_retrieval_injection(_custom_gen())

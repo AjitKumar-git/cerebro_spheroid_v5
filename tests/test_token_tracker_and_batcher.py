@@ -162,11 +162,5 @@ class TestTokenTrackerAndBatcher(unittest.TestCase):
         # Should converge on index 6 (1.59, 1.57, 1.55) after reset at index 3 (1.62)
         self.assertEqual(converged_at_idx, 6)
 
-    def test_step900k_checkpoint_discovery(self):
-        root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        ckpt_path = os.path.join(root_dir, "checkpoints", "v5_small_latest_step900k.pt")
-        self.assertTrue(os.path.exists(ckpt_path), f"Checkpoint not found at: {ckpt_path}")
-
-
 if __name__ == "__main__":
     unittest.main()

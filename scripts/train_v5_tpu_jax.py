@@ -189,7 +189,10 @@ def parse_args(args_list=None):
 
     # Data Source & Tokenizer
     parser.add_argument("--dataset_source", "--dataset-source", dest="dataset_source", type=str, default="autonomous",
-                        help="Data stream: 'autonomous', custom Hugging Face repo (e.g. 'AjitKumar-Bio/cosmopedia-v2-digested'), 'reasoning_anneal', 'dense_edu', 'conversation_sft', 'consolidation'")
+                        help="Data stream: 'autonomous', 'fineweb' (sample-10BT), or a Hugging Face dataset repo")
+    parser.add_argument("--dataset-config", type=str, default=None, help="Optional Hugging Face dataset config (FineWeb defaults to sample-10BT)")
+    parser.add_argument("--dataset-revision", type=str, default=None, help="Optional immutable Hugging Face commit/revision override")
+    parser.add_argument("--retrieval-injection", action=argparse.BooleanOptionalAction, default=True, help="Mix curated retrieval examples into online streams (disable for a clean general-text baseline)")
     parser.add_argument("--tokenizer_name", type=str, default="llama", help="Tokenizer model name or path (default: 'llama' -> data/tokenizer)")
 
     # Checkpoint & Cloud Sync
@@ -254,6 +257,9 @@ def build_data_stream(
     step_getter: Optional[Any] = None,
     total_steps: int = 1_500_000,
     prefetch: bool = True,
+    dataset_config: Optional[str] = None,
+    dataset_revision: Optional[str] = None,
+    retrieval_injection: bool = True,
 ):
     """Initializes multi-corpus streaming engine with background prefetching and offline fallback."""
     # Check if HuggingFace datasets library is available for online streaming
@@ -287,6 +293,9 @@ def build_data_stream(
             dataset_source=dataset_source,
             step_getter=step_getter,
             total_steps=total_steps,
+            inject_retrieval=retrieval_injection,
+            dataset_config=dataset_config,
+            dataset_revision=dataset_revision,
         )
         first_row = next(raw_iter)
         data_iter = itertools.chain([first_row], raw_iter)
@@ -1045,6 +1054,9 @@ def main(args=None):
         step_getter=lambda: current_step_holder[0],
         total_steps=args.total_steps,
         prefetch=not use_multi_tpu_local_sgd,
+        dataset_config=args.dataset_config,
+        dataset_revision=args.dataset_revision,
+        retrieval_injection=args.retrieval_injection,
     )
     batcher = elastic_batcher
 

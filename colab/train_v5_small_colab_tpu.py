@@ -91,6 +91,17 @@ from src.jax.checkpoint import (
     load_torch_pt_to_jax,
     discover_latest_checkpoint,
 )
+from src.cloud_sync import (
+    DEFAULT_URL,
+    DEFAULT_TOKEN,
+    check_remote_manifest,
+    pull_checkpoint,
+    push_checkpoint_async,
+    push_remote_token_tracker,
+    push_remote_loss_history,
+    detect_source_environment,
+    wait_for_in_flight_uploads,
+)
 from src.corpus import (
     build_tokenizer,
     format_stimulus_prompt,
@@ -176,29 +187,30 @@ def parse_args():
     parser.add_argument("--tokenizer-name", type=str, default="llama",
                         help="Tokenizer name or local directory (default: 'llama')")
 
-    # Checkpointing & Colab / Google Drive Paths
+    # Checkpointing & Cloud Sync (bioflo.in)
     parser.add_argument("--checkpoint-dir", type=str,
-                        default="/content/drive/MyDrive/cerebro_v5_small_scratch"
-                        if os.path.exists("/content/drive/MyDrive")
-                        else ("/content/checkpoints/v5_small_scratch" if os.path.exists("/content") else "checkpoints/v5_small_scratch"),
-                        help="Primary checkpoint directory (defaults to Google Drive if mounted)")
-    parser.add_argument("--backup-checkpoint-dir", type=str,
-                        default="/content/checkpoints/v5_small_scratch" if os.path.exists("/content") else None,
-                        help="Secondary local fast-disk staging directory")
+                        default="/content/checkpoints/v5_small_scratch" if os.path.exists("/content") else "checkpoints/v5_small_scratch",
+                        help="Local staging checkpoint directory")
+    parser.add_argument("--cloud-sync", action=argparse.BooleanOptionalAction, default=True,
+                        help="Enable live two-way synchronization with bioflo.in")
+    parser.add_argument("--cloud-url", type=str, default="https://bioflo.in/api/cerebro/sync.php",
+                        help="Remote sync hub endpoint (bioflo.in)")
+    parser.add_argument("--cloud-token", type=str, default="CerebroSpheroid_Sync_Secure_2026",
+                        help="Remote sync authentication token")
     parser.add_argument("--save-every", type=int, default=250,
                         help="Steps between checkpoint saves (default: 250)")
     parser.add_argument("--milestone-every", type=int, default=1000,
                         help="Steps between permanent milestone checkpoint archives (default: 1000)")
     parser.add_argument("--eval-every", type=int, default=100,
                         help="Steps between held-out evaluation passes (default: 100)")
-    parser.add_argument("--probe-every", type=int, default=250,
-                        help="Steps between live generalization probes (default: 250)")
+    parser.add_argument("--probe-every", type=int, default=500,
+                        help="Steps between live generalization probes (default: 500)")
     parser.add_argument("--log-every", type=int, default=10,
                         help="Steps between progress log lines (default: 10)")
     parser.add_argument("--from-scratch", action="store_true", default=True,
                         help="Strictly start from Step 0 without loading legacy weights (default: True)")
     parser.add_argument("--resume", action="store_true", default=False,
-                        help="Resume from existing checkpoint if found in checkpoint-dir")
+                        help="Resume from existing checkpoint (local or pulled from bioflo.in)")
 
     return parser.parse_args()
 
@@ -334,17 +346,14 @@ def main():
     print(f"   - Total Window Budget:       {args.total_window} tokens")
     print(f"   - Default Prompt / Target:   {args.prompt_len} / {args.seq_len}")
 
-    # 3. Setup Checkpoint Directories (Primary Google Drive + Secondary Fast Staging)
+    # 3. Setup Checkpoint Directory & Cloud Sync Hub (bioflo.in)
     primary_ckpt_dir = os.path.abspath(args.checkpoint_dir)
     os.makedirs(primary_ckpt_dir, exist_ok=True)
-    print(f"\n💾 Checkpoint Storage:")
-    print(f"   - Primary Directory:         {primary_ckpt_dir}")
-    if args.backup_checkpoint_dir:
-        backup_ckpt_dir = os.path.abspath(args.backup_checkpoint_dir)
-        os.makedirs(backup_ckpt_dir, exist_ok=True)
-        print(f"   - Local Fast Staging:        {backup_ckpt_dir}")
-    else:
-        backup_ckpt_dir = None
+    print(f"\n💾 Checkpoint Storage & Cloud Hub:")
+    print(f"   - Local Directory:           {primary_ckpt_dir}")
+    if args.cloud_sync:
+        print(f"   - Sync Hub Endpoint:         {args.cloud_url} (bioflo.in)")
+        print(f"   - Sync Model Tier:           v5_small")
 
     # 4. Clean Scratch Initialization
     init_seed = 42
@@ -366,14 +375,26 @@ def main():
     # Resume check if explicitly requested
     if args.resume:
         latest_pt = discover_latest_checkpoint(primary_ckpt_dir)
+        if not latest_pt and args.cloud_sync:
+            # Check bioflo.in and pull latest.pt if available
+            print(f"🌐 [cloud_sync] Checking bioflo.in for remote v5_small checkpoint...")
+            try:
+                manifest_resp = check_remote_manifest("v5_small", url=args.cloud_url, token=args.cloud_token)
+                if manifest_resp.get("has_latest", False):
+                    remote_dest = os.path.join(primary_ckpt_dir, "v5_small_scratch_latest.pt")
+                    if pull_checkpoint(remote_dest, target_type="latest", model="v5_small", url=args.cloud_url, token=args.cloud_token):
+                        latest_pt = remote_dest
+            except Exception as e_pull:
+                print(f"⚠️ [cloud_sync] Could not pull from bioflo.in: {e_pull}")
+
         if latest_pt and os.path.exists(latest_pt):
-            print(f"🔄 Resuming from discovered checkpoint: {latest_pt}")
+            print(f"🔄 Resuming from checkpoint: {latest_pt}")
             params, buffers, meta = load_torch_pt_to_jax(latest_pt, config, target_dtype=target_dtype)
             step = meta.get("step", 0)
             best_eval_loss = meta.get("eval_loss", float("inf"))
             print(f"✓ Resumed at Step {step:,} (Best Eval Loss: {best_eval_loss:.4f})")
         else:
-            print(f"ℹ️  No checkpoint found in {primary_ckpt_dir}. Starting clean from Step 0.")
+            print(f"ℹ️  No checkpoint found locally or on bioflo.in. Starting clean from Step 0.")
     else:
         print("🌱 Training strictly FROM SCRATCH (Step 0) as requested.")
 
@@ -566,6 +587,24 @@ def main():
                 f"Loss-Bearing Tok: {total_tokens_processed / 1e6:6.1f}M"
             )
 
+            # Sync real-time progress to website (bioflo.in)
+            if args.cloud_sync and step % 50 == 0:
+                try:
+                    push_remote_token_tracker(
+                        model="v5_small",
+                        cumulative_tokens=total_tokens_processed,
+                        target_tokens=int(args.total_steps * tokens_in_batch),
+                        tokens_by_dataset=prefetched_stream.quota_mgr.counts if hasattr(prefetched_stream, "quota_mgr") else {},
+                        effective_batch_size=args.batch_size * args.grad_accum,
+                        step=step,
+                        loss=loss_scalar,
+                        tok_per_sec=tokens_per_sec,
+                        url=args.cloud_url,
+                        token=args.cloud_token,
+                    )
+                except Exception:
+                    pass
+
         # Periodic Generalization Probe
         if step % args.probe_every == 0 or step == 50:
             active_params = jax.device_get(jax.tree_util.tree_map(lambda x: x[0], rep_params)) if use_multi_tpu else params
@@ -583,33 +622,56 @@ def main():
                 "timestamp": time.time(),
             }
 
-            # 1. Save to Primary Checkpoint Directory (Google Drive)
+            # 1. Save local latest checkpoint
             save_path = os.path.join(primary_ckpt_dir, "v5_small_scratch_latest.pt")
             save_jax_to_torch_pt(active_params, buffers, save_path, meta=meta)
             json_path = save_path.replace(".pt", ".json")
             with open(json_path, "w") as f:
                 json.dump(meta, f, indent=2)
 
-            # 2. Check if Best Eval Loss
+            # 2. Async Cloud Upload to bioflo.in
+            if args.cloud_sync:
+                try:
+                    push_checkpoint_async(
+                        save_path,
+                        step=step,
+                        loss=loss_scalar,
+                        target_type="latest",
+                        model="v5_small",
+                        url=args.cloud_url,
+                        token=args.cloud_token,
+                    )
+                    print(f"☁️ [cloud_sync] Uploaded latest.pt to bioflo.in (Step {step:,})")
+                except Exception as e_cloud:
+                    print(f"⚠️ [cloud_sync] Upload notice: {e_cloud}")
+
+            # 3. Check if Best Eval Loss
             if loss_scalar < best_eval_loss:
                 best_eval_loss = loss_scalar
                 best_path = os.path.join(primary_ckpt_dir, "v5_small_scratch_best.pt")
                 shutil.copy2(save_path, best_path)
                 shutil.copy2(json_path, best_path.replace(".pt", ".json"))
+                if args.cloud_sync:
+                    try:
+                        push_checkpoint_async(
+                            best_path,
+                            step=step,
+                            loss=loss_scalar,
+                            target_type="best",
+                            model="v5_small",
+                            url=args.cloud_url,
+                            token=args.cloud_token,
+                        )
+                        print(f"🏆 [cloud_sync] Uploaded new best.pt to bioflo.in (Loss: {loss_scalar:.4f})")
+                    except Exception:
+                        pass
 
-            # 3. Save Milestone Archive
+            # 4. Save Milestone Archive
             if step % args.milestone_every == 0:
                 milestone_path = os.path.join(primary_ckpt_dir, f"v5_small_scratch_step_{step:07d}.pt")
                 shutil.copy2(save_path, milestone_path)
                 shutil.copy2(json_path, milestone_path.replace(".pt", ".json"))
                 print(f"📦 [Milestone] Saved permanent archive: {milestone_path}")
-
-            # 4. Mirror to Local Backup Directory if configured
-            if backup_ckpt_dir and backup_ckpt_dir != primary_ckpt_dir:
-                try:
-                    shutil.copy2(save_path, os.path.join(backup_ckpt_dir, "v5_small_scratch_latest.pt"))
-                except Exception:
-                    pass
 
             print(f"💾 [Checkpoint] Saved Step {step:,} (Loss: {loss_scalar:.4f}) -> {save_path}")
 
