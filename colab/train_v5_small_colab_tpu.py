@@ -119,7 +119,7 @@ from src.rectified_streamer import RectifiedContiguousPretrainStreamer
 from src.jax.data_streamer import LinguisticDataStreamer
 
 
-def parse_args():
+def parse_args(args_list: Optional[List[str]] = None):
     parser = argparse.ArgumentParser(
         description="CerebroSpheroid V5 Small: Long-Context TPU Trainer (From Scratch)"
     )
@@ -212,7 +212,7 @@ def parse_args():
     parser.add_argument("--resume", action="store_true", default=False,
                         help="Resume from existing checkpoint (local or pulled from bioflo.in)")
 
-    return parser.parse_args()
+    return parser.parse_args(args_list)
 
 
 # ---------------------------------------------------------------------------
@@ -313,8 +313,9 @@ def compute_cosine_lr(step: int, total_steps: int, warmup_steps: int, lr: float,
     return float(min_lr + (lr - min_lr) * cosine_decay)
 
 
-def main():
-    args = parse_args()
+def main(args=None):
+    if args is None:
+        args = parse_args()
 
     print("\n" + "=" * 80)
     print("  🧠 CerebroSpheroid V5 Small: Long-Context TPU Scratch Trainer")
@@ -678,6 +679,22 @@ def main():
     print("\n" + "=" * 80)
     print(f"🎉 Training Complete! Finished {step:,} steps. Processed {total_tokens_processed / 1e9:.2f}B tokens.")
     print("=" * 80 + "\n")
+
+
+def run_training(**kwargs):
+    """Programmatic in-process entrypoint for Google Colab notebooks.
+    
+    Runs training inside the active Python kernel process to prevent Cloud TPU
+    lock conflicts ('ABORTED: The TPU is already in use by process with pid XXX').
+    """
+    args = parse_args([])
+    for k, v in kwargs.items():
+        attr = k.replace("-", "_")
+        if hasattr(args, attr):
+            setattr(args, attr, v)
+        elif hasattr(args, k):
+            setattr(args, k, v)
+    return main(args)
 
 
 if __name__ == "__main__":
