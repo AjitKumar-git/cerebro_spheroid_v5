@@ -1,0 +1,468 @@
+"""
+Core AutoTuner Engine & Execution Coordinator.
+==============================================
+
+Orchestrates accelerator discovery, architecture fingerprinting,
+memory-ladder candidate exploration, safe OOM branch pruning, and
+Pareto-optimal parameter selection.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from typing import Any, Callable, Dict, List, Optional, Union
+
+from .objectives import TuneObjective
+from .hardware import get_hardware_info, resolve_jax_compute_dtype
+from .architecture import (
+    ArchitectureDetector,
+    ArchitectureInfo,
+    extract_architecture_signature,
+)
+from .scoring import score_benchmark_result
+from .search import generate_vram_maximizing_candidates, CandidateLadder
+from .cache import (
+    HardwareConfigCache,
+    load_local_hardware_config,
+    save_local_hardware_config,
+)
+from .benchmark import BenchmarkRunner
+
+
+class AutoTuner:
+    """
+    Modular Accelerator and Architecture Auto-Tuner.
+
+    Features:
+    - Zero-overhead cached retrieval for previously analyzed architectures.
+    - Automatic detection when a new model architecture or hardware topology is introduced.
+    - Memory-maximizing exploration across TPU and GPU tiers.
+    - Multi-objective optimization: tokens/sec, steps/s, loss reduction/sec, balanced.
+    """
+
+    def __init__(
+        self,
+        objective: Union[str, TuneObjective] = TuneObjective.BALANCED,
+        cache_manager: Optional[HardwareConfigCache] = None,
+        benchmark_fn: Optional[Callable[..., Dict[str, Any]]] = None,
+        use_cached_config: bool = True,
+        upload_winner: bool = True,
+        cloud_url: Optional[str] = None,
+        cloud_token: Optional[str] = None,
+        verbose: bool = True,
+    ):
+        self.objective = TuneObjective.from_str(objective)
+        self.cache_manager = cache_manager or HardwareConfigCache()
+        self.benchmark_runner = BenchmarkRunner(benchmark_fn)
+        self.architecture_detector = ArchitectureDetector(self.cache_manager)
+        self.use_cached_config = use_cached_config
+        self.upload_winner = upload_winner
+        self.cloud_url = cloud_url
+        self.cloud_token = cloud_token
+        self.verbose = verbose
+
+    def is_new_architecture(
+        self,
+        architecture: Any,
+        hardware_sig: Optional[str] = None,
+        seq_len: int = 256,
+        max_batch_size: Optional[int] = None,
+    ) -> bool:
+        """Determines if the given architecture needs auto-tuning on this hardware."""
+        arch_info = extract_architecture_signature(architecture, seq_len=seq_len)
+        if hardware_sig is None:
+            hw = get_hardware_info()
+            hardware_sig = hw["hardware_signature"]
+        return self.architecture_detector.is_new_architecture(
+            arch_info=arch_info,
+            hardware_sig=hardware_sig,
+            seq_len=seq_len,
+            max_batch_size=max_batch_size,
+            tune_objective=self.objective.value,
+        )
+
+    def tune_if_new(
+        self,
+        architecture: Any,
+        benchmark_fn: Optional[Callable[..., Dict[str, Any]]] = None,
+        seq_len: int = 256,
+        prompt_len: int = 256,
+        dtype: str = "auto",
+        max_batch_size: Optional[int] = None,
+        candidates: Optional[List[Dict[str, Any]]] = None,
+        force_tune: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Executes auto-tuning ONLY when a new architecture or unknown accelerator
+        is detected. If already benchmarked and cached, returns optimal config in 0ms.
+        """
+        arch_info = extract_architecture_signature(
+            architecture, seq_len=seq_len, prompt_len=prompt_len
+        )
+        hw = get_hardware_info()
+        sig = hw["hardware_signature"]
+
+        is_new = force_tune or self.architecture_detector.is_new_architecture(
+            arch_info=arch_info,
+            hardware_sig=sig,
+            seq_len=seq_len,
+            max_batch_size=max_batch_size,
+            tune_objective=self.objective.value,
+        )
+
+        if not is_new and self.use_cached_config:
+            seq_suffix = f"_seq{seq_len}" if seq_len != 256 else ""
+            cap_suffix = f"_cap{int(max_batch_size)}" if max_batch_size is not None else ""
+            cache_sig = f"{sig}{seq_suffix}{cap_suffix}"
+
+            cached = self.cache_manager.load(arch_info.architecture_name, cache_sig)
+            if cached is None and cache_sig != sig and max_batch_size is None:
+                cached = self.cache_manager.load(arch_info.architecture_name, sig)
+
+            if cached and cached.get("tok_per_sec", 0) > 0:
+                if self.verbose:
+                    print("=" * 80)
+                    print(
+                        f"⚡ [AutoTuner] Architecture [{arch_info.architecture_name}] already verified on [{cache_sig}]."
+                    )
+                    print(f"   • Batch Size   : {cached['batch_size']}")
+                    print(f"   • Remat Scan   : {cached['remat']}")
+                    print(f"   • Peak Speed   : {cached.get('tok_per_sec', 0):,.0f} tok/s")
+                    print(
+                        f"⏩ Skipping micro-benchmarks and adopting verified parameters!\n"
+                        + "=" * 80
+                    )
+                return cached
+
+        if self.verbose:
+            print(f"🔍 [AutoTuner] New architecture or altered configuration detected: [{arch_info.architecture_name}]")
+            print(f"   Initiating smart memory and throughput auto-tuning...")
+
+        return self.tune(
+            preset=arch_info.architecture_name,
+            candidates=candidates,
+            seq_len=seq_len,
+            dtype=dtype,
+            use_cached_config=self.use_cached_config,
+            force_tune=force_tune,
+            tune_objective=self.objective.value,
+            prompt_len=prompt_len,
+            max_batch_size=max_batch_size,
+            benchmark_fn=benchmark_fn,
+        )
+
+    def tune(
+        self,
+        preset: str = "v5_small",
+        candidates: Optional[List[Dict[str, Any]]] = None,
+        seq_len: int = 256,
+        dtype: str = "auto",
+        use_cached_config: bool = True,
+        force_tune: bool = False,
+        upload_winner: Optional[bool] = None,
+        cloud_url: Optional[str] = None,
+        cloud_token: Optional[str] = None,
+        verbose: Optional[bool] = None,
+        tune_objective: Optional[str] = None,
+        prompt_len: int = 256,
+        max_batch_size: Optional[int] = None,
+        benchmark_fn: Optional[Callable[..., Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Explores candidate configurations and selects the optimal hyperparameter settings."""
+        if verbose is None:
+            verbose = self.verbose
+        if upload_winner is None:
+            upload_winner = self.upload_winner
+        if cloud_url is None:
+            cloud_url = self.cloud_url
+        if cloud_token is None:
+            cloud_token = self.cloud_token
+
+        obj_enum = TuneObjective.from_str(tune_objective or self.objective)
+        obj_name = obj_enum.value
+
+        hw = get_hardware_info()
+        dev_kind = hw["device_kind"]
+        is_tpu = hw.get("is_tpu", False)
+        is_gpu = hw.get("is_gpu", False)
+        total_gb = hw["total_gb"]
+        sig = hw["hardware_signature"]
+        seq_suffix = f"_seq{seq_len}" if seq_len != 256 else ""
+        cap_suffix = f"_cap{int(max_batch_size)}" if max_batch_size is not None else ""
+        cache_sig = f"{sig}{seq_suffix}{cap_suffix}"
+        mem_type = hw.get("memory_type", "HBM" if is_tpu else ("VRAM" if is_gpu else "RAM"))
+
+        runner = BenchmarkRunner(benchmark_fn) if benchmark_fn else self.benchmark_runner
+
+        # 1. First Priority: Check cached configs if caching is enabled
+        if use_cached_config and not force_tune and candidates is None:
+            cached_local = self.cache_manager.load(preset, cache_sig)
+            if cached_local is None and cache_sig != sig and max_batch_size is None:
+                fallback_local = self.cache_manager.load(preset, sig)
+                if fallback_local and fallback_local.get("seq_len") == seq_len:
+                    cached_local = fallback_local
+
+            local_seq_match = (cached_local.get("seq_len", 256) == seq_len) if cached_local else False
+            local_obj = cached_local.get("tune_objective") if cached_local else None
+            local_within_cap = (
+                (max_batch_size is None)
+                or (int(cached_local.get("batch_size", 0)) <= int(max_batch_size))
+                if cached_local
+                else False
+            )
+
+            if (
+                cached_local
+                and local_seq_match
+                and local_within_cap
+                and cached_local.get("tok_per_sec", 0) > 0
+                and (local_obj is None or local_obj == obj_name)
+            ):
+                if verbose:
+                    steps_s = cached_local.get("steps_per_sec") or (
+                        1000.0 / cached_local["step_ms"] if cached_local.get("step_ms") else 0.0
+                    )
+                    print("=" * 80)
+                    print(f"⚡ [AutoTuner] Loaded verified local config for [{preset}] on [{cache_sig}]:")
+                    print(f"   • Batch Size  : {cached_local['batch_size']}")
+                    print(f"   • Remat Scan  : {cached_local['remat']}")
+                    print(f"   • Step Rate   : {steps_s:.2f} steps/s ({cached_local.get('step_ms', 0):.1f} ms)")
+                    print(f"   • Peak Speed  : {cached_local.get('tok_per_sec', 0):,.0f} tok/s")
+                    m_gb = cached_local.get("memory_gb", cached_local.get("vram_gb", 0))
+                    m_pct = cached_local.get("memory_utilization_pct", cached_local.get("vram_utilization_pct", 0))
+                    print(f"   • {mem_type} Util   : {m_gb:.1f} GB ({m_pct:.1f}%)")
+                    print(f"⏩ Skipping micro-benchmarks and adopting verified parameters!\n" + "=" * 80)
+                return cached_local
+
+            # Optional remote sync (bioflo.in)
+            try:
+                from src.cloud_sync import fetch_remote_hardware_config
+                cached_remote = fetch_remote_hardware_config(
+                    model=preset, device_signature=cache_sig, url=cloud_url, token=cloud_token
+                )
+                if cached_remote is None and cache_sig != sig and max_batch_size is None:
+                    fallback_remote = fetch_remote_hardware_config(
+                        model=preset, device_signature=sig, url=cloud_url, token=cloud_token
+                    )
+                    if fallback_remote and fallback_remote.get("seq_len") == seq_len:
+                        cached_remote = fallback_remote
+
+                remote_seq_match = (cached_remote.get("seq_len", 256) == seq_len) if cached_remote else False
+                remote_obj = cached_remote.get("tune_objective") if cached_remote else None
+                remote_within_cap = (
+                    (max_batch_size is None)
+                    or (int(cached_remote.get("batch_size", 0)) <= int(max_batch_size))
+                    if cached_remote
+                    else False
+                )
+
+                if (
+                    cached_remote
+                    and remote_seq_match
+                    and remote_within_cap
+                    and cached_remote.get("tok_per_sec", 0) > 0
+                    and (remote_obj is None or remote_obj == obj_name)
+                ):
+                    if verbose:
+                        print("=" * 80)
+                        print(f"🌐 [AutoTuner] Retrieved verified optimal config from bioflo.in for [{preset}] on [{cache_sig}]:")
+                        print(f"   • Batch Size  : {cached_remote['batch_size']}")
+                        print(f"   • Remat Scan  : {cached_remote['remat']}")
+                        print(f"   • Peak Speed  : {cached_remote.get('tok_per_sec', 0):,.0f} tok/s")
+                        m_gb = cached_remote.get("memory_gb", cached_remote.get("vram_gb", 0))
+                        m_pct = cached_remote.get("memory_utilization_pct", cached_remote.get("vram_utilization_pct", 0))
+                        print(f"   • {mem_type} Util   : {m_gb:.1f} GB ({m_pct:.1f}%)")
+                        print(f"⏩ Skipping micro-benchmarks and adopting verified parameters from website!\n" + "=" * 80)
+                    self.cache_manager.save(preset, cache_sig, cached_remote)
+                    return cached_remote
+            except Exception as e:
+                if verbose:
+                    print(f"ℹ️ [AutoTuner] Remote config check notice: {e}")
+
+        # 2. Benchmarking execution
+        if verbose:
+            print("=" * 80)
+            print(f"🚀 AUTOTUNER: AUTOMATIC {obj_enum.label.upper()} & {mem_type} OPTIMIZATION")
+            print("=" * 80)
+            print(f"Hardware Platform  : {hw.get('device_count', 1)} x {dev_kind} ({sig})")
+            print(f"Detected Memory    : {total_gb:.1f} GB Available {mem_type}")
+            cap_str = f", MaxBatch: {max_batch_size}" if max_batch_size is not None else ""
+            print(f"Target Preset/Arch : {preset} (PromptLen: {prompt_len}, SeqLen: {seq_len}{cap_str})")
+            print(f"Tune Objective     : {obj_enum.label}")
+            print("-" * 80)
+
+        if candidates is None:
+            candidates = generate_vram_maximizing_candidates(
+                preset=preset,
+                total_gb=total_gb,
+                seq_len=seq_len,
+                max_batch_size=max_batch_size,
+            )
+
+        ladder = CandidateLadder(candidates)
+        results = []
+        best_config = None
+        best_score = -1.0
+
+        for idx, c in enumerate(candidates, 1):
+            b = c["batch_size"]
+            r = c.get("remat", True)
+
+            # Smart branch pruning
+            if ladder.should_skip(b, r):
+                continue
+
+            if verbose:
+                print(f"[{idx}/{len(candidates)}] Testing: Batch {b:3d} | Remat: {str(r):5s} ... ", end="", flush=True)
+
+            res = runner.run(
+                preset=preset,
+                batch_size=b,
+                remat=r,
+                seq_len=seq_len,
+                num_steps=4 if (is_tpu or is_gpu) else 2,
+                dtype=dtype,
+                prompt_len=prompt_len,
+            )
+            results.append(res)
+            ladder.record_result(b, r, res.get("status", "FAIL"))
+
+            if res.get("status") == "PASS":
+                tok_s = res.get("tok_per_sec", 0.0)
+                steps_s = res.get("steps_per_sec", 0.0)
+                m_gb = res.get("memory_gb", res.get("vram_gb", 0))
+                m_pct = res.get("memory_utilization_pct", res.get("vram_utilization_pct", 0))
+                loss_v = res.get("loss_reduction_per_sec", 0.0)
+                loss_str = f" | dLoss/s: {loss_v:6.4f}" if loss_v > 0 else ""
+
+                if verbose:
+                    print(
+                        f"✓ {steps_s:5.2f} steps/s | {tok_s:8,.0f} tok/s | "
+                        f"{mem_type}: {m_gb:4.1f} GB ({m_pct:4.1f}%){loss_str} | Latency: {res.get('step_ms', 0):6.1f}ms"
+                    )
+                score = score_benchmark_result(res, obj_name)
+                if score > best_score:
+                    best_score = score
+                    best_config = res
+            else:
+                if verbose:
+                    print(f"❌ {res.get('status')}")
+
+        if verbose:
+            print("\n" + "=" * 92)
+            print(f"📊 AUTO-TUNING {mem_type}, STEPS/S & THROUGHPUT BENCHMARK RESULTS")
+            print("=" * 92)
+            mem_hdr = f"{mem_type} Util"
+            print(f"{'Preset':<10} | {'Batch':<5} | {'Remat':<5} | {'Compile':<8} | {'Step':<8} | {'Steps/s':<7} | {mem_hdr:<13} | {'Throughput':<14} | {'Status'}")
+            print("-" * 92)
+            for r in results:
+                c_str = f"{r['compile_time']:.1f}s" if r.get('compile_time') is not None else "-"
+                s_str = f"{r['step_ms']:.1f}ms" if r.get('step_ms') is not None else "-"
+                st_s = f"{r.get('steps_per_sec', 0.0):.2f}/s" if r.get('steps_per_sec', 0.0) > 0 else "-"
+                m_g = r.get('memory_gb', r.get('vram_gb', 0))
+                m_p = r.get('memory_utilization_pct', r.get('vram_utilization_pct', 0))
+                v_str = f"{m_g:.1f}GB ({m_p:.0f}%)" if m_g > 0 else "-"
+                t_str = f"{r.get('tok_per_sec', 0):,.0f} tok/s" if r.get('tok_per_sec', 0) > 0 else "-"
+                winner_mark = " 🏆 (WINNER)" if (best_config and r == best_config) else ""
+                print(f"{r['preset']:<10} | {r['batch_size']:<5} | {str(r['remat']):<5} | {c_str:<8} | {s_str:<8} | {st_s:<7} | {v_str:<13} | {t_str:<14} | {r['status'] + winner_mark}")
+            print("=" * 92)
+
+        if best_config is None:
+            fb_dtype, _ = resolve_jax_compute_dtype(dtype)
+            best_config = {
+                "preset": preset,
+                "batch_size": 16 if (is_tpu or is_gpu) else 2,
+                "remat": True,
+                "seq_len": seq_len,
+                "prompt_len": prompt_len,
+                "dtype": "bf16" if str(fb_dtype).endswith("bfloat16") else "fp32",
+                "steps_per_sec": 0.0,
+                "tok_per_sec": 0.0,
+                "vram_gb": 0.0,
+                "vram_utilization_pct": 0.0,
+                "tune_objective": obj_name,
+                "tuner_version": 2,
+                "status": "DEFAULT_FALLBACK",
+            }
+            if verbose:
+                print("⚠️ All benchmark candidates failed. Falling back to conservative defaults.")
+        else:
+            best_config["tune_objective"] = obj_name
+            best_config["max_batch_size"] = max_batch_size
+            best_config["tuner_version"] = 2
+            if verbose:
+                print(f"🏆 OPTIMAL CONFIGURATION SELECTED ({obj_name.upper()}):")
+                print(f"   • Batch Size  : {best_config['batch_size']}")
+                print(f"   • Remat Scan  : {best_config['remat']}")
+                print(f"   • Step Rate   : {best_config.get('steps_per_sec', 0.0):.2f} steps/second ({best_config.get('step_ms', 0):.1f} ms)")
+                print(f"   • Peak Speed  : {best_config.get('tok_per_sec', 0):,.0f} tokens/second")
+                m_gb = best_config.get("memory_gb", best_config.get("vram_gb", 0))
+                m_pct = best_config.get("memory_utilization_pct", best_config.get("vram_utilization_pct", 0))
+                print(f"   • {mem_type} Util   : {m_gb:.1f} GB ({m_pct:.1f}% of {total_gb:.1f} GB)")
+                if best_config.get("loss_reduction_per_sec", 0) > 0:
+                    print(f"   • dLoss/sec   : {best_config['loss_reduction_per_sec']:.6f}")
+                print("=" * 92)
+
+            # Save locally
+            self.cache_manager.save(preset, cache_sig, best_config)
+
+            # Push remote if configured
+            if upload_winner:
+                try:
+                    from src.cloud_sync import push_remote_hardware_config
+                    ok = push_remote_hardware_config(
+                        model=preset,
+                        device_signature=cache_sig,
+                        config=best_config,
+                        url=cloud_url,
+                        token=cloud_token,
+                    )
+                    if ok and verbose:
+                        print(f"🌐 [AutoTuner] Winning configuration saved to website bioflo.in!\n")
+                except Exception as e:
+                    if verbose:
+                        print(f"ℹ️ [AutoTuner] Website sync notice: {e}\n")
+
+        return best_config
+
+
+def auto_tune_environment(
+    preset: str = "v5_small",
+    candidates: Optional[List[Dict[str, Any]]] = None,
+    seq_len: int = 256,
+    dtype: str = "auto",
+    use_cached_config: bool = True,
+    force_tune: bool = False,
+    upload_winner: bool = True,
+    cloud_url: Optional[str] = None,
+    cloud_token: Optional[str] = None,
+    verbose: bool = True,
+    tune_objective: str = "balanced",
+    prompt_len: int = 256,
+    max_batch_size: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Functional convenience entrypoint matching legacy CerebroSpheroid auto_tune_environment."""
+    tuner = AutoTuner(
+        objective=tune_objective,
+        use_cached_config=use_cached_config,
+        upload_winner=upload_winner,
+        cloud_url=cloud_url,
+        cloud_token=cloud_token,
+        verbose=verbose,
+    )
+    return tuner.tune(
+        preset=preset,
+        candidates=candidates,
+        seq_len=seq_len,
+        dtype=dtype,
+        use_cached_config=use_cached_config,
+        force_tune=force_tune,
+        tune_objective=tune_objective,
+        prompt_len=prompt_len,
+        max_batch_size=max_batch_size,
+    )
+
+
+# Backward-compatible alias
+run_auto_tuner = auto_tune_environment
