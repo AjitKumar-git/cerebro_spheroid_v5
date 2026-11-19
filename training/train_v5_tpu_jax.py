@@ -633,6 +633,13 @@ def main(args=None):
                                 )
                                 if alt_ok and os.path.exists(alt_dest):
                                     local_latest = alt_dest
+                                    dest_latest = os.path.join(args.checkpoint_dir, f"{args.preset}_latest.pt")
+                                    if os.path.abspath(alt_dest) != os.path.abspath(dest_latest):
+                                        try:
+                                            shutil.copyfile(alt_dest, dest_latest)
+                                            local_latest = dest_latest
+                                        except Exception:
+                                            pass
                                     print(f"✓ Restored alternative candidate checkpoint from cloud hub: {alt_dest}")
                     else:
                         print(f"ℹ️ [cloud_sync] No existing checkpoint on bioflo.in for {args.preset} (Step 0). Ready for clean training.")

@@ -178,6 +178,23 @@ class TestAuditRemediations(unittest.TestCase):
             if os.path.exists(test_path):
                 os.remove(test_path)
 
+    def test_finding_8_push_checkpoint_rejects_corrupted_archive_and_snapshot_staging(self):
+        """Verifies push_checkpoint refuses to upload corrupt zip checkpoints and cleans staging files."""
+        from src.cloud_sync import push_checkpoint
+        with tempfile.NamedTemporaryFile(suffix=".upload.12345.pt", delete=False) as tmp:
+            bad_path = tmp.name
+            tmp.write(b"corrupted_non_zip_binary_payload_here")
+
+        try:
+            # Must reject invalid zip without attempting chunk upload
+            res = push_checkpoint(bad_path, step=100, loss=4.5, target_type="latest", model="v5_small")
+            self.assertFalse(res, "push_checkpoint must reject non-zip archives before uploading!")
+            # Staging snapshot must be cleaned up
+            self.assertFalse(os.path.exists(bad_path), "Staging snapshot file must be cleaned up on rejection!")
+        finally:
+            if os.path.exists(bad_path):
+                os.remove(bad_path)
+
 
 if __name__ == "__main__":
     unittest.main()

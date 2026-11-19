@@ -597,8 +597,12 @@ class AsyncCheckpointManager:
                         loss_f = float(raw_loss) if raw_loss is not None else 0.0
                         loss_val = loss_f if (loss_f == loss_f and abs(loss_f) < 1e30) else 0.0
                         sync_model = meta_dict.get("sync_model") if meta_dict else None
+                        # Snapshot isolation: stage to a dedicated temporary file so ongoing TPU training
+                        # steps never mutate or overwrite the checkpoint file while the async upload streams chunks
+                        upload_stage = f"{local_path}.upload.{os.getpid()}.{time.time_ns()}.pt"
+                        shutil.copyfile(local_path, upload_stage)
                         push_checkpoint_async(
-                            local_path,
+                            upload_stage,
                             step=step_val,
                             loss=loss_val,
                             target_type=target_type,

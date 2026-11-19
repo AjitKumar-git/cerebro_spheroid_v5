@@ -1305,6 +1305,34 @@ if ($action === 'upload_chunk') {
 
     // If final chunk, atomically replace the target checkpoint
     if ($chunk_index === $total_chunks - 1) {
+        // Integrity check: verify zip archive is not truncated/corrupted before replacing target
+        $is_valid_zip = false;
+        if (class_exists('ZipArchive')) {
+            $za = new ZipArchive();
+            $res = $za->open($part_file, ZipArchive::CHECKCONS);
+            if ($res === true) {
+                $is_valid_zip = true;
+                $za->close();
+            }
+        } else {
+            $fh = fopen($part_file, 'rb');
+            if ($fh) {
+                $head = fread($fh, 4);
+                fseek($fh, -65536, SEEK_END);
+                $tail = fread($fh, 65536);
+                fclose($fh);
+                if ($head === "PK\x03\x04" && strpos($tail, "PK\x05\x06") !== false) {
+                    $is_valid_zip = true;
+                }
+            }
+        }
+        if (!$is_valid_zip) {
+            @unlink($part_file);
+            http_response_code(400);
+            echo json_encode(['error' => 'Corrupted checkpoint upload: failed zip integrity check']);
+            exit;
+        }
+
         if (!rename($part_file, $final_file)) {
             http_response_code(500);
             echo json_encode(['error' => 'Failed to finalize atomic checkpoint write']);

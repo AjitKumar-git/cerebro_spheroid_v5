@@ -375,9 +375,14 @@ def _ensure_bfloat16_checkpoint(file_path: str) -> None:
 
         tmp_out = f"{file_path}.bf16.{os.getpid()}"
         torch.save(ckpt, tmp_out)
-        os.replace(tmp_out, file_path)
-        new_mb = os.path.getsize(file_path) / 1e6
-        print(f"✅ [cloud_sync] Converted {converted_count} float32 tensors to bfloat16 ({new_mb:.1f} MB) in {os.path.basename(file_path)}")
+        if zipfile.is_zipfile(tmp_out):
+            os.replace(tmp_out, file_path)
+            new_mb = os.path.getsize(file_path) / 1e6
+            print(f"✅ [cloud_sync] Converted {converted_count} float32 tensors to bfloat16 ({new_mb:.1f} MB) in {os.path.basename(file_path)}")
+        else:
+            if os.path.exists(tmp_out):
+                os.remove(tmp_out)
+            print(f"⚠️ [cloud_sync] Bfloat16 conversion produced invalid zip archive; keeping original {file_path}")
     except Exception as e:
         print(f"⚠️ [cloud_sync] Warning during bfloat16 check: {e}")
 
@@ -403,6 +408,16 @@ def push_checkpoint(
 
     # Ensure any float32 tensors are converted to bfloat16 before chunking and uploading
     _ensure_bfloat16_checkpoint(file_path)
+
+    # Pre-upload archive verification: never push a corrupted or truncated archive
+    if not zipfile.is_zipfile(file_path):
+        print(f"⚠️ [cloud_sync] Pre-upload verification failed: {file_path} is not a valid zip archive. Aborting push.")
+        if ".upload." in file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
+        return False
 
     model = normalize_model_name(model)
     slot_key = f"{model}_{target_type}" if model else target_type
@@ -519,6 +534,11 @@ def push_checkpoint(
         with _UPLOAD_LOCK:
             _IN_FLIGHT_UPLOADS.pop(slot_key, None)
             _IN_FLIGHT_UPLOAD_TIMES.pop(slot_key, None)
+        if ".upload." in file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
 
 
 def push_checkpoint_async(
