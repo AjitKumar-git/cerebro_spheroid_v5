@@ -866,8 +866,11 @@ def main(args=None):
     )
     multi_mode = getattr(args, "multi_tpu", "auto")
     use_multi_tpu_local_sgd = (num_devices > 1) and (args.optimizer == "spheroid") and (multi_mode != "single")
+    if num_devices > 1 and args.optimizer != "spheroid":
+        print(f"ℹ️ [Multi-Device Dispatch] Multi-device pmap Local-SGD is specialized for the SPHEROID optimizer (polar NS-5 + spectral clamp). Running {args.optimizer.upper()} in standard single-accelerator JIT mode.")
     eff_num_devices = num_devices if use_multi_tpu_local_sgd else 1
-    eff_local_steps = max(1, int(getattr(args, "local_steps", 4))) if use_multi_tpu_local_sgd else 1
+    base_local_steps = max(1, int(getattr(args, "local_steps", 4)))
+    eff_local_steps = max(1, base_local_steps * grad_accum) if use_multi_tpu_local_sgd else 1
     step_stride = eff_num_devices * eff_local_steps
 
     # Multi-TPU rounds select a single elastic bucket and bypass the async
@@ -1426,7 +1429,7 @@ def main(args=None):
         if bucket_batcher is not None and hasattr(bucket_batcher, "buckets"):
             bucket_idx = _round_bucket_idx % len(bucket_batcher.buckets)
             _round_bucket_idx += 1
-        qs, rs, fbs = [], [], []
+        qs, rs, fbs, wts = [], [], [], []
         for _ in range(total_shards):
             if bucket_idx is not None:
                 batch_tuple = bucket_batcher.next_batch(bucket_idx=bucket_idx)
@@ -1435,10 +1438,13 @@ def main(args=None):
                 b_unpack = _next_batch()
             pb, tb = b_unpack[0], b_unpack[1]
             fb = b_unpack[2] if len(b_unpack) > 2 else None
+            wb = b_unpack[3] if len(b_unpack) > 3 else None
             qs.append(np.asarray(pb, dtype=np.int32))
             rs.append(np.asarray(tb, dtype=np.int32))
             if fb is not None:
                 fbs.append(np.asarray(fb, dtype=np.int32))
+            if wb is not None:
+                wts.append(np.asarray(wb, dtype=np.float32))
         b_p, l_p = qs[0].shape
         b_t, l_t = rs[0].shape
         q_arr = np.stack(qs, axis=0).reshape(eff_num_devices, eff_local_steps, b_p, l_p)
@@ -1448,7 +1454,12 @@ def main(args=None):
             if len(fbs) == total_shards
             else None
         )
-        return q_arr, r_arr, fb_arr
+        wt_arr = (
+            np.stack(wts, axis=0).reshape(eff_num_devices, eff_local_steps, b_t)
+            if len(wts) == total_shards
+            else None
+        )
+        return q_arr, r_arr, fb_arr, wt_arr
 
     def _get_host_params():
         if use_multi_tpu_local_sgd:
@@ -1606,24 +1617,26 @@ def main(args=None):
                     anneal_factor = 0.5 * (1.0 + math.cos(math.pi * anneal_prog))
                     cur_lr = 2e-6 + (cur_lr - 2e-6) * anneal_factor
 
-            if use_multi_tpu_local_sgd:
-                q_shard, r_shard, fb_shard = _next_multi_tpu_round()
-                rep_params, rep_opt_state, loss_rep = pmap_round_fn(
-                    rep_params,
-                    rep_opt_state,
-                    q_shard,
-                    r_shard,
-                    cur_lr,
-                    feedback_micro=fb_shard,
-                    sampling_p=cur_sampling_p,
-                )
-                loss = float(loss_rep[0])
-                step_tokens, step_prompt, step_loss, step_pad = _count_real_tokens(q_shard, r_shard)
-            else:
-                step_executed = False
-                while not step_executed:
-                    prompt_b, target_b, feedback_b, weights_b = None, None, None, None
-                    try:
+            step_executed = False
+            while not step_executed:
+                prompt_b, target_b, feedback_b, weights_b = None, None, None, None
+                try:
+                    if use_multi_tpu_local_sgd:
+                        q_shard, r_shard, fb_shard, wt_shard = _next_multi_tpu_round()
+                        rep_params, rep_opt_state, loss_rep = pmap_round_fn(
+                            rep_params,
+                            rep_opt_state,
+                            q_shard,
+                            r_shard,
+                            cur_lr,
+                            feedback_micro=fb_shard,
+                            sampling_p=cur_sampling_p,
+                            target_weights_micro=wt_shard,
+                        )
+                        loss = float(loss_rep[0])
+                        step_tokens, step_prompt, step_loss, step_pad = _count_real_tokens(q_shard, r_shard)
+                        step_executed = True
+                    else:
                         if compute_grad_step is not None and grad_accum > 1:
                             acc_grads = None
                             loss_acc = 0.0
@@ -1675,37 +1688,55 @@ def main(args=None):
                             )
                             step_tokens, step_prompt, step_loss, step_pad = _count_real_tokens(prompt_b, target_b)
                         step_executed = True
-                    except Exception as e_step:
-                        if not is_oom_error(e_step) or (args.batch_size <= 1 and remat_choice):
-                            raise
-                        failed_tup = (prompt_b, target_b, feedback_b, weights_b) if weights_b is not None else ((prompt_b, target_b, feedback_b) if prompt_b is not None else None)
-                        args.batch_size, grad_accum = oom_handler.handle_oom(
-                            e_step, step=step, failed_batch=failed_tup, current_remat=remat_choice
+                except Exception as e_step:
+                    if not is_oom_error(e_step) or (args.batch_size <= 1 and remat_choice):
+                        raise
+                    failed_tup = (prompt_b, target_b, feedback_b, weights_b) if weights_b is not None else ((prompt_b, target_b, feedback_b) if prompt_b is not None else None)
+                    args.batch_size, grad_accum = oom_handler.handle_oom(
+                        e_step, step=step, failed_batch=failed_tup, current_remat=remat_choice
+                    )
+                    remat_changed = (oom_handler.remat != remat_choice)
+                    remat_choice = oom_handler.remat
+                    oom_handler.update_streamer(elastic_batcher or local_streamer)
+                    if use_multi_tpu_local_sgd:
+                        eff_local_steps = max(1, int(getattr(args, "local_steps", 4)) * grad_accum)
+                        step_stride = eff_num_devices * eff_local_steps
+                        pmap_round_fn = build_pmap_local_sgd_step_spheroid(
+                            config,
+                            buffers,
+                            pad_id=pad_id,
+                            weight_decay=args.weight_decay,
+                            repetition_penalty=args.repetition_penalty,
+                            remat=remat_choice,
+                            local_steps=eff_local_steps,
+                            devices=devices,
                         )
-                        remat_changed = (oom_handler.remat != remat_choice)
-                        remat_choice = oom_handler.remat
-                        oom_handler.update_streamer(elastic_batcher or local_streamer)
-                        if compute_grad_step is None or remat_changed:
-                            compute_grad_step, apply_opt_step_anneal = build_spheroid_train_engine(
-                                config, buffers, pad_id=pad_id, weight_decay=args.weight_decay,
-                                repetition_penalty=args.repetition_penalty, remat=remat_choice,
-                                deliberation_mode=args.deliberation_mode, param_masks=None,
-                            )
-                            _, apply_opt_step_frozen = build_spheroid_train_engine(
-                                config, buffers, pad_id=pad_id, weight_decay=args.weight_decay,
-                                repetition_penalty=args.repetition_penalty, remat=remat_choice,
-                                deliberation_mode=args.deliberation_mode, param_masks=param_masks,
-                            ) if param_masks is not None else (None, apply_opt_step_anneal)
-                            train_step_fn_anneal = build_train_step_spheroid(
-                                config, buffers, pad_id=pad_id, weight_decay=args.weight_decay,
-                                repetition_penalty=args.repetition_penalty, remat=remat_choice,
-                                deliberation_mode=args.deliberation_mode, param_masks=None,
-                            )
-                            train_step_fn_frozen = build_train_step_spheroid(
-                                config, buffers, pad_id=pad_id, weight_decay=args.weight_decay,
-                                repetition_penalty=args.repetition_penalty, remat=remat_choice,
-                                deliberation_mode=args.deliberation_mode, param_masks=param_masks,
-                            ) if param_masks is not None else train_step_fn_anneal
+                        host_p = _get_host_params()
+                        host_opt = _get_host_opt_state()
+                        rep_params = replicate_for_pmap(host_p, devices)
+                        if host_opt is not None:
+                            rep_opt_state = replicate_for_pmap(host_opt, devices)
+                    elif compute_grad_step is None or remat_changed:
+                        compute_grad_step, apply_opt_step_anneal = build_spheroid_train_engine(
+                            config, buffers, pad_id=pad_id, weight_decay=args.weight_decay,
+                            repetition_penalty=args.repetition_penalty, remat=remat_choice,
+                            deliberation_mode=args.deliberation_mode, param_masks=None,
+                        )
+                        _, apply_opt_step_frozen = build_spheroid_train_engine(
+                            config, buffers, pad_id=pad_id, weight_decay=args.weight_decay,
+                            repetition_penalty=args.repetition_penalty, remat=remat_choice,
+                            deliberation_mode=args.deliberation_mode, param_masks=param_masks,
+                        ) if param_masks is not None else (None, apply_opt_step_anneal)
+                        train_step_fn_anneal = build_train_step_spheroid(
+                            config, buffers, pad_id=pad_id, weight_decay=args.weight_decay,
+                            repetition_penalty=args.repetition_penalty, remat=remat_choice,
+                            deliberation_mode=args.deliberation_mode, param_masks=None,
+                        )
+                        train_step_fn_frozen = build_train_step_spheroid(
+                            config, buffers, pad_id=pad_id, weight_decay=args.weight_decay,
+                            repetition_penalty=args.repetition_penalty, remat=remat_choice,
+                            deliberation_mode=args.deliberation_mode, param_masks=param_masks,
+                        ) if param_masks is not None else train_step_fn_anneal
 
             loss_val = float(loss)
             if math.isfinite(loss_val):

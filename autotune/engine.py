@@ -28,6 +28,7 @@ from .cache import (
     save_local_hardware_config,
 )
 from .benchmark import BenchmarkRunner
+from .memory import estimate_peak_hbm
 
 
 class AutoTuner:
@@ -381,37 +382,57 @@ class AutoTuner:
         is_gpu = hw.get("is_gpu", False)
         total_gb = hw["total_gb"]
         sig = hw["hardware_signature"]
+        eff_devs = int(num_devices) if num_devices and num_devices > 0 else int(hw.get("device_count", 1))
+        dev_suffix = f"_dev{eff_devs}" if eff_devs > 1 else ""
         seq_suffix = f"_seq{seq_len}" if seq_len != 256 else ""
         cap_suffix = f"_cap{int(max_batch_size)}" if max_batch_size is not None else ""
-        cache_sig = f"{sig}{seq_suffix}{cap_suffix}"
+        cache_sig = f"{sig}{seq_suffix}{cap_suffix}{dev_suffix}"
         mem_type = hw.get("memory_type", "HBM" if is_tpu else ("VRAM" if is_gpu else "RAM"))
 
         runner = BenchmarkRunner(benchmark_fn) if benchmark_fn else self.benchmark_runner
 
+        def _is_cache_safe(cfg: Optional[Dict[str, Any]]) -> bool:
+            if not cfg or cfg.get("tok_per_sec", 0) <= 0:
+                return False
+            if cfg.get("seq_len", 256) != seq_len:
+                return False
+            if max_batch_size is not None and int(cfg.get("batch_size", 0)) > int(max_batch_size):
+                return False
+            if cfg.get("num_devices", 1) != eff_devs:
+                return False
+            cfg_obj = cfg.get("tune_objective")
+            if cfg_obj is not None and cfg_obj != obj_name:
+                return False
+            if worst_case_seq_len and worst_case_seq_len > seq_len:
+                est = estimate_peak_hbm(
+                    param_bytes=212_000_000,
+                    batch_size=cfg["batch_size"],
+                    seq_len=worst_case_seq_len,
+                    prompt_len=prompt_len,
+                    remat=cfg.get("remat", True),
+                    total_memory_bytes=hw.get("total_memory_bytes"),
+                    num_devices=eff_devs,
+                    vocab_size=getattr(model_config, "vocab_size", 32000),
+                )
+                if est.predicted_oom:
+                    if verbose:
+                        print(f"⚠️ [AutoTuner Cache Guard] Cached candidate (B={cfg['batch_size']}, remat={cfg.get('remat')}) predicts OOM at worst_case_seq_len={worst_case_seq_len}. Re-benchmarking safe ladder.")
+                    return False
+            return True
+
         # 1. First Priority: Check cached configs if caching is enabled
         if use_cached_config and not force_tune and candidates is None:
             cached_local = self.cache_manager.load(preset, cache_sig)
-            if cached_local is None and cache_sig != sig and max_batch_size is None:
+            if cached_local is None and cap_suffix:
+                fallback_local = self.cache_manager.load(preset, f"{sig}{seq_suffix}{dev_suffix}")
+                if fallback_local and _is_cache_safe(fallback_local):
+                    cached_local = fallback_local
+            if cached_local is None and cache_sig != sig and max_batch_size is None and eff_devs == 1:
                 fallback_local = self.cache_manager.load(preset, sig)
-                if fallback_local and fallback_local.get("seq_len") == seq_len:
+                if fallback_local and _is_cache_safe(fallback_local):
                     cached_local = fallback_local
 
-            local_seq_match = (cached_local.get("seq_len", 256) == seq_len) if cached_local else False
-            local_obj = cached_local.get("tune_objective") if cached_local else None
-            local_within_cap = (
-                (max_batch_size is None)
-                or (int(cached_local.get("batch_size", 0)) <= int(max_batch_size))
-                if cached_local
-                else False
-            )
-
-            if (
-                cached_local
-                and local_seq_match
-                and local_within_cap
-                and cached_local.get("tok_per_sec", 0) > 0
-                and (local_obj is None or local_obj == obj_name)
-            ):
+            if _is_cache_safe(cached_local):
                 if verbose:
                     steps_s = cached_local.get("steps_per_sec") or (
                         1000.0 / cached_local["step_ms"] if cached_local.get("step_ms") else 0.0
@@ -436,31 +457,16 @@ class AutoTuner:
                 )
                 if cached_remote is None and cap_suffix:
                     cached_remote = fetch_remote_hardware_config(
-                        model=preset, device_signature=f"{sig}{seq_suffix}", url=cloud_url, token=cloud_token
+                        model=preset, device_signature=f"{sig}{seq_suffix}{dev_suffix}", url=cloud_url, token=cloud_token
                     )
-                if cached_remote is None and cache_sig != sig:
+                if cached_remote is None and cache_sig != sig and eff_devs == 1:
                     fallback_remote = fetch_remote_hardware_config(
                         model=preset, device_signature=sig, url=cloud_url, token=cloud_token
                     )
-                    if fallback_remote and fallback_remote.get("seq_len") == seq_len:
+                    if fallback_remote and _is_cache_safe(fallback_remote):
                         cached_remote = fallback_remote
 
-                remote_seq_match = (cached_remote.get("seq_len", 256) == seq_len) if cached_remote else False
-                remote_obj = cached_remote.get("tune_objective") if cached_remote else None
-                remote_within_cap = (
-                    (max_batch_size is None)
-                    or (int(cached_remote.get("batch_size", 0)) <= int(max_batch_size))
-                    if cached_remote
-                    else False
-                )
-
-                if (
-                    cached_remote
-                    and remote_seq_match
-                    and remote_within_cap
-                    and cached_remote.get("tok_per_sec", 0) > 0
-                    and (remote_obj is None or remote_obj == obj_name)
-                ):
+                if _is_cache_safe(cached_remote):
                     if verbose:
                         print("=" * 80)
                         print(f"🌐 [AutoTuner] Retrieved verified optimal config from bioflo.in for [{preset}] on [{cache_sig}]:")
@@ -651,6 +657,9 @@ class AutoTuner:
                 print("=" * 92)
 
             # Save locally
+            best_config["num_devices"] = eff_devs
+            if worst_case_seq_len:
+                best_config["worst_case_seq_len"] = worst_case_seq_len
             self.cache_manager.save(preset, cache_sig, best_config)
 
             # Push remote if configured

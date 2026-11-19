@@ -64,7 +64,7 @@ def estimate_peak_hbm(
     surface_dim: int = 768,
     remat: bool = False,
     bytes_per_tok: int = 2,
-    opt_multiplier: float = 2.0,
+    opt_multiplier: float = 4.5,
     total_memory_bytes: Optional[int] = None,
     safety_margin: float = 0.90,
     vocab_size: int = 0,
@@ -77,7 +77,8 @@ def estimate_peak_hbm(
        W_bytes = sum(size * itemsize)
 
     2. Optimizer State:
-       O_bytes = W_bytes * opt_multiplier (typically 2x for AdamW/Spheroid first & second moments)
+       O_bytes = W_bytes * opt_multiplier (typically 4.5x for Spheroid in BF16:
+       stores FP32 master weights (2x), FP32 first moments (2x), plus second moments (0.5x))
 
     3. Activation Footprint:
        - remat=False: all shell intermediate activations held simultaneously:
@@ -88,9 +89,12 @@ def estimate_peak_hbm(
     4. Distributed Collective & Replica Buffers:
        - num_devices > 1: reserves cross-device pmean / all-reduce buffer capacity
     """
-    # 1. Static weights and optimizer state
+    # 1. Static weights and optimizer state (calibrated for FP32 master weights + moments in Spheroid)
     static_bytes = int(param_bytes)
-    opt_bytes = int(static_bytes * opt_multiplier)
+    effective_opt_multiplier = float(opt_multiplier)
+    if bytes_per_tok <= 2 and effective_opt_multiplier < 4.0:
+        effective_opt_multiplier = 4.5
+    opt_bytes = int(static_bytes * effective_opt_multiplier)
 
     # 2. Total sequence tokens per batch element
     total_tokens = max(1, prompt_len + seq_len)

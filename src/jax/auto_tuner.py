@@ -105,6 +105,11 @@ def benchmark_config(
     num_steps: int = 3,
     dtype: str = "auto",
     prompt_len: int = 256,
+    worst_case_seq_len: Optional[int] = None,
+    model_config: Optional[Any] = None,
+    config_overrides: Optional[Dict[str, Any]] = None,
+    num_devices: int = 1,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """Benchmarks a single training configuration using CerebroSpheroid V5 adapter."""
     return benchmark_v5_model(
@@ -115,6 +120,11 @@ def benchmark_config(
         num_steps=num_steps,
         dtype=dtype,
         prompt_len=prompt_len,
+        worst_case_seq_len=worst_case_seq_len,
+        model_config=model_config,
+        config_overrides=config_overrides,
+        num_devices=num_devices,
+        **kwargs,
     )
 
 

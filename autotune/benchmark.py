@@ -84,16 +84,25 @@ class BenchmarkRunner:
         **kwargs,
     ) -> Dict[str, Any]:
         if self.step_executor is not None:
-            return self.step_executor(
-                preset=preset,
-                batch_size=batch_size,
-                remat=remat,
-                seq_len=seq_len,
-                num_steps=num_steps,
-                dtype=dtype,
-                prompt_len=prompt_len,
-                **kwargs,
-            )
+            import inspect
+            sig = inspect.signature(self.step_executor)
+            has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            call_kwargs = {
+                "preset": preset,
+                "batch_size": batch_size,
+                "remat": remat,
+                "seq_len": seq_len,
+                "num_steps": num_steps,
+                "dtype": dtype,
+                "prompt_len": prompt_len,
+            }
+            if has_var_kw:
+                call_kwargs.update(kwargs)
+            else:
+                for k, v in kwargs.items():
+                    if k in sig.parameters:
+                        call_kwargs[k] = v
+            return self.step_executor(**call_kwargs)
 
         # Default fallback to the registered adapter
         from .adapters.v5 import benchmark_v5_model

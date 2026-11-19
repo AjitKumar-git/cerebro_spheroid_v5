@@ -40,6 +40,7 @@ def benchmark_v5_model(
     config_overrides: Optional[Dict[str, Any]] = None,
     worst_case_seq_len: Optional[int] = None,
     num_devices: int = 1,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """
     Benchmarks a single training configuration and returns step latency, steps/s,
@@ -76,7 +77,12 @@ def benchmark_v5_model(
 
     try:
         # 1. Parameter & Step Function Retrieval / Initialization (with warm template caching)
-        cache_key = (preset, dtype_str)
+        cfg_sig = (
+            tuple(sorted((k, str(v)) for k, v in config.__dict__.items()))
+            if hasattr(config, "__dict__")
+            else str(config)
+        )
+        cache_key = (preset, dtype_str, cfg_sig)
         if cache_key in _V5_PARAM_TEMPLATE_CACHE:
             params, buffers, opt_state = _V5_PARAM_TEMPLATE_CACHE[cache_key]
         else:
@@ -91,7 +97,7 @@ def benchmark_v5_model(
             opt_state = init_spheroid_opt_state(params)
             _V5_PARAM_TEMPLATE_CACHE[cache_key] = (params, buffers, opt_state)
 
-        step_fn_key = (preset, remat)
+        step_fn_key = (preset, remat, dtype_str, cfg_sig)
         if step_fn_key in _V5_TRAIN_STEP_CACHE:
             train_step_fn = _V5_TRAIN_STEP_CACHE[step_fn_key]
         else:
