@@ -647,18 +647,26 @@ def main(args=None):
                 print(f"⚠️ [cloud_sync] Notice: {e}")
 
         # Check if an existing checkpoint for THIS preset is already present (local or restored from cloud)
+        # Priority: Always pick the checkpoint with the highest step number in checkpoint_dir
         discovered_ckpt = None
         existing_preset_step = 0
+        found_ckpt, found_step, found_loss = discover_latest_checkpoint(args.checkpoint_dir, preset=args.preset)
+        if found_ckpt and found_step > 0:
+            discovered_ckpt = found_ckpt
+            existing_preset_step = found_step
+
         target_local = local_latest if os.path.exists(local_latest) else (fallback_latest if os.path.exists(fallback_latest) else None)
         if target_local and os.path.exists(target_local):
             try:
                 chk_test = safe_torch_load(target_local, map_location="cpu", weights_only=True)
-                existing_preset_step = int(chk_test.get("step", 0))
+                step_t = int(chk_test.get("step", 0))
+                if step_t > existing_preset_step:
+                    existing_preset_step = step_t
+                    discovered_ckpt = target_local
             except Exception:
-                existing_preset_step = 0
+                pass
 
         if existing_preset_step > 0:
-            discovered_ckpt = target_local
             print(
                 f"✓ Found existing training checkpoint for {args.preset} at Step {existing_preset_step:,} ({discovered_ckpt}).\n"
                 f"   Resuming directly (foundation core re-copying completely bypassed to preserve trained weights)."

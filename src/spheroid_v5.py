@@ -2258,6 +2258,7 @@ class CerebroSpheroidV5(nn.Module):
             # Lightweight O(1) bounded efference copy propagation
             state = self.volumetric_core.step_efference_fast(state, efference)
 
+        self.current_spheroid_state = state
         return torch.cat(generated_tokens, dim=1)
 
     @torch.no_grad()

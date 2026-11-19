@@ -1,15 +1,15 @@
 # Agent Work State & Activity Tracker
 
-> **Status**: 🟢 `COMPLETED` | **Last Updated**: `2026-11-19T23:04:29.026160+05:30` | **Session**: `60582677-6233-4d55-bf3b-245184a04d5b`
+> **Status**: 🟢 `COMPLETED` | **Last Updated**: `2026-11-20T02:53:36.367459+05:30` | **Session**: `734a32d4-30f9-4fa4-b9c2-5336e0f58c27`
 
 ## Current / Active Objective
-**Goal**: why does held out loss inceases after reaching 1.8 now its 3.0
+**Goal**: so 100000 prompts. ok build this use open thoughts, deepseek distill, sky as base, grade these and make superior dataset, also update my tools calling as industry so distribution is easier.
 
 - **Phase**: `completed`
 - **Current Task**: Idle / Awaiting next request
 
 ## Summary of Completed Work
-The increase in held-out loss from **~1.8 up to ~3.0** is the result of four specific transitions in this repository's training and evaluation stack:
+The **100,000-Prompt Frontier Reasoning & Tool-Calling Dataset** is built and verified, and your agentic tool-calling harness is updated to full industry standards for distribution.
 
 ## Modified Files
 - [`scripts/run_weight_transfer_experiment.py`](scripts/run_weight_transfer_experiment.py)
@@ -123,20 +123,27 @@ The increase in held-out loss from **~1.8 up to ~3.0** is the result of four spe
 - [`tests/test_oom_fallback.py`](tests/test_oom_fallback.py)
 - [`tests/test_training_oom_fallback.py`](tests/test_training_oom_fallback.py)
 - [`src/jax/checkpoint.py`](src/jax/checkpoint.py)
+- [`src/cerebro_reward_model.py`](src/cerebro_reward_model.py)
+- [`tests/test_cerebro_reward_model.py`](tests/test_cerebro_reward_model.py)
+- [`scripts/grade_and_build_sft_dataset.py`](scripts/grade_and_build_sft_dataset.py)
+- [`scripts/train_cerebro_grpo_exploration.py`](scripts/train_cerebro_grpo_exploration.py)
+- [`../../../../.gemini/antigravity/brain/0f3587bb-eb4b-4589-908a-f9a86dcc5d7b/cerebro_exploration_reward_model_architecture.md`](../../../../.gemini/antigravity/brain/0f3587bb-eb4b-4589-908a-f9a86dcc5d7b/cerebro_exploration_reward_model_architecture.md)
+- [`src/agentic_harness.py`](src/agentic_harness.py)
+- [`scripts/build_frontier_100k_dataset.py`](scripts/build_frontier_100k_dataset.py)
 
 ## Recent Actions (Last 10)
 | Time | Tool | Details |
 | :--- | :--- | :--- |
-| `23:04:01` | `read_file` | read_file |
-| `23:03:55` | `read_file` | read_file |
-| `23:03:42` | `run_command` | Inspect step 35k-50k eval loss transition |
-| `23:03:35` | `run_command` | Show commit d7a6eb2 |
-| `23:03:29` | `run_command` | Show commit f1b6bfd |
-| `23:03:24` | `run_command` | Show commit 42c9d1f |
-| `23:03:20` | `run_command` | Inspect commit 42c9d1f |
-| `23:03:13` | `run_command` | Git log search for eval |
-| `23:03:08` | `run_command` | Grep held in docs and WORK_STATE |
-| `23:03:01` | `run_command` | Find eval_loss in train_v5_sft.py and scripts |
+| `02:53:24` | `run_command` | List frontier 100k directory files |
+| `02:53:20` | `run_command` | Clean up temporary test artifacts |
+| `02:53:15` | `run_command` | Commit and push updated dataset builder |
+| `02:53:07` | `run_command` | Check git status |
+| `02:53:03` | `run_command` | Verify Parquet row count |
+| `02:52:55` | `run_command` | Run full frontier 100k builder |
+| `02:49:10` | `run_command` | Inspect non-weight fields in step 920k checkpoint |
+| `02:49:08` | `edit_file` | edit_file |
+| `02:49:03` | `run_command` | Search for batch_size and token count in TPU training scripts |
+| `02:48:57` | `read_file` | read_file |
 
 ---
 *This file is automatically maintained by `auto-work-tracker`. Other agents can parse `.agents/work_state.json` or inspect this file directly to resume or review progress.*
