@@ -517,13 +517,30 @@ class RectifiedContiguousPretrainStreamer:
             from datasets import load_dataset
             from src.hf_utils import get_hf_token
             hf_tok = get_hf_token()
-            print("💻 [Streamer] Connecting to clean code stream (bigcode/the-stack-dedup or Python)...")
-            kw = {"data_dir": "data/python", "split": "train", "streaming": True}
             if hf_tok:
-                kw["token"] = hf_tok
-            ds = load_dataset("bigcode/the-stack-dedup", **kw)
+                print("💻 [Streamer] Connecting to clean code stream (bigcode/the-stack-dedup)...")
+                kw = {"data_dir": "data/python", "split": "train", "streaming": True, "token": hf_tok}
+                ds = load_dataset("bigcode/the-stack-dedup", **kw)
+                for row in ds:
+                    c = row.get("content", "")
+                    if c and len(c) > 100:
+                        yield c
+                return
+        except Exception:
+            pass
+
+        # Third priority: public open-access Python stream (no token / anonymous friendly)
+        try:
+            from datasets import load_dataset
+            print("💻 [Streamer] Connecting to open-access Python code stream (ajibawa-2023/Python-Code-Large)...")
+            ds = load_dataset("ajibawa-2023/Python-Code-Large", split="train", streaming=True)
             for row in ds:
-                c = row.get("content", "")
+                c = (
+                    row.get("text", "")
+                    or row.get("content", "")
+                    or row.get("code", "")
+                    or row.get("python", "")
+                )
                 if c and len(c) > 100:
                     yield c
             return
