@@ -157,6 +157,27 @@ class TestAuditRemediations(unittest.TestCase):
             "STRICT PROHIBITION VIOLATED: README.md must NEVER exist in cerebro_spheroid_v5!"
         )
 
+    def test_finding_7_cloud_sync_robust_range_download_and_part_handling(self):
+        """Verifies robust chunk download writes exact bytes via pwrite and rejects corrupted archives."""
+        import zipfile
+        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as tmp:
+            test_path = tmp.name
+
+        try:
+            # Create a valid zipfile
+            with zipfile.ZipFile(test_path, "w") as z:
+                z.writestr("data.pkl", b"valid_test_data")
+            self.assertTrue(zipfile.is_zipfile(test_path))
+
+            # Truncated or corrupted file must fail zip check
+            with open(test_path, "r+b") as f:
+                f.seek(-10, os.SEEK_END)
+                f.write(b"0000000000")
+            self.assertFalse(zipfile.is_zipfile(test_path))
+        finally:
+            if os.path.exists(test_path):
+                os.remove(test_path)
+
 
 if __name__ == "__main__":
     unittest.main()

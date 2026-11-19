@@ -1267,7 +1267,8 @@ if ($action === 'upload_chunk') {
     $loss = isset($_POST['loss']) ? floatval($_POST['loss']) : 0.0;
     $source = isset($_POST['source']) ? preg_replace('/[^a-zA-Z0-9_\-]/', '', $_POST['source']) : 'unknown';
 
-    $part_file = $storage_dir . '/' . $target_filename . '.part';
+    $upload_id = isset($_POST['upload_id']) ? preg_replace('/[^a-zA-Z0-9_\-]/', '', $_POST['upload_id']) : (isset($_GET['upload_id']) ? preg_replace('/[^a-zA-Z0-9_\-]/', '', $_GET['upload_id']) : '');
+    $part_file = !empty($upload_id) ? ($storage_dir . '/' . $target_filename . '.' . $upload_id . '.part') : ($storage_dir . '/' . $target_filename . '.part');
     $final_file = $storage_dir . '/' . $target_filename;
 
     // Retrieve binary chunk payload

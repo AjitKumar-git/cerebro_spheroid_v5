@@ -172,28 +172,27 @@ def select_highest_step_slot(
     return max(candidates, key=lambda item: item[1])
 
 
-def _download_range_chunk(url: str, token: str, start: int, end: int, filepath: str, chunk_idx: int) -> int:
+import uuid
+def _download_range_chunk(url: str, token: str, start: int, end: int, fd: int, chunk_idx: int) -> int:
     headers = {
         "Authorization": f"Bearer {token}",
         "Range": f"bytes={start}-{end}",
         "User-Agent": "CerebroV5CloudSync/1.0",
     }
     req = urllib.request.Request(url, headers=headers)
-    for attempt in range(5):
+    for attempt in range(6):
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=90) as resp:
                 data = resp.read()
                 expected = end - start + 1
                 if len(data) != expected:
                     raise ValueError(f"Chunk {chunk_idx}: expected {expected} bytes, got {len(data)}")
-                with open(filepath, "r+b") as f:
-                    f.seek(start)
-                    f.write(data)
+                os.pwrite(fd, data, start)
                 return len(data)
         except Exception as e:
-            if attempt == 4:
+            if attempt == 5:
                 raise e
-            time.sleep(1.0 + attempt)
+            time.sleep(1.0 * (1.5 ** attempt))
     return 0
 
 
@@ -204,7 +203,7 @@ def pull_checkpoint(
     url: Optional[str] = None,
     token: Optional[str] = None,
     show_progress: bool = True,
-    num_workers: int = 8,
+    num_workers: int = 4,
 ) -> bool:
     """
     Downloads latest.pt or best.pt for the specified model tier from bioflo.in.
@@ -240,7 +239,7 @@ def pull_checkpoint(
             pass
 
         if total_bytes > 5 * 1024 * 1024:
-            chunk_size = 2 * 1024 * 1024  # 2 MB chunks
+            chunk_size = 8 * 1024 * 1024  # 8 MB chunks to minimize TLS connection churn & avoid SSL reset drops
             ranges = []
             start = 0
             while start < total_bytes:
@@ -248,22 +247,24 @@ def pull_checkpoint(
                 ranges.append((start, end))
                 start = end + 1
 
-            with open(tmp_dest, "wb") as f:
-                f.truncate(total_bytes)
-
-            completed_bytes = 0
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                futures = [
-                    executor.submit(_download_range_chunk, download_url, sync_token, r[0], r[1], tmp_dest, idx)
-                    for idx, r in enumerate(ranges)
-                ]
-                for fut in as_completed(futures):
-                    completed_bytes += fut.result()
-                    if show_progress:
-                        pct = (completed_bytes / total_bytes) * 100
-                        speed = (completed_bytes / 1e6) / max(time.time() - t0, 0.1)
-                        print(f"\r  Downloading ({num_workers} threads): {completed_bytes / 1e6:.1f} / {total_bytes / 1e6:.1f} MB "
-                              f"({pct:.1f}%) | {speed:.1f} MB/s", end="", flush=True)
+            fd = os.open(tmp_dest, os.O_CREAT | os.O_RDWR | os.O_TRUNC)
+            try:
+                os.ftruncate(fd, total_bytes)
+                completed_bytes = 0
+                with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                    futures = [
+                        executor.submit(_download_range_chunk, download_url, sync_token, r[0], r[1], fd, idx)
+                        for idx, r in enumerate(ranges)
+                    ]
+                    for fut in as_completed(futures):
+                        completed_bytes += fut.result()
+                        if show_progress:
+                            pct = (completed_bytes / total_bytes) * 100
+                            speed = (completed_bytes / 1e6) / max(time.time() - t0, 0.1)
+                            print(f"\r  Downloading ({num_workers} threads): {completed_bytes / 1e6:.1f} / {total_bytes / 1e6:.1f} MB "
+                                  f"({pct:.1f}%) | {speed:.1f} MB/s", end="", flush=True)
+            finally:
+                os.close(fd)
         else:
             downloaded = 0
             req = urllib.request.Request(download_url, headers={"Authorization": f"Bearer {sync_token}", "User-Agent": "CerebroV5CloudSync/1.0"})
@@ -286,10 +287,18 @@ def pull_checkpoint(
             actual_sz = os.path.getsize(tmp_dest)
             if total_bytes > 0 and actual_sz < total_bytes:
                 print(f"\n❌ [cloud_sync] Incomplete download ({actual_sz:,} of {total_bytes:,} bytes).")
+                if os.path.exists(tmp_dest):
+                    os.remove(tmp_dest)
                 return False
 
             if not zipfile.is_zipfile(tmp_dest):
-                print(f"\n⚠️ [cloud_sync] Checkpoint failed zip archive check. Discarding.")
+                z_diag = ""
+                try:
+                    with zipfile.ZipFile(tmp_dest) as z_check:
+                        z_check.testzip()
+                except Exception as z_ex:
+                    z_diag = f" ({z_ex})"
+                print(f"\n⚠️ [cloud_sync] Checkpoint failed zip archive check{z_diag}. Discarding.")
                 os.remove(tmp_dest)
                 return False
 
@@ -314,13 +323,18 @@ def _ensure_bfloat16_checkpoint(file_path: str) -> None:
         return
 
     try:
-        ckpt = torch.load(file_path, map_location="cpu", weights_only=True)
+        try:
+            ckpt = torch.load(file_path, map_location="cpu", weights_only=True)
+        except Exception:
+            ckpt = torch.load(file_path, map_location="cpu", weights_only=False)
         if not isinstance(ckpt, dict):
             return
 
         def _has_fp32(d: dict) -> bool:
             for v in d.values():
                 if isinstance(v, torch.Tensor) and v.is_floating_point() and v.dtype in (torch.float32, torch.float64):
+                    return True
+                if isinstance(v, dict) and _has_fp32(v):
                     return True
             return False
 
@@ -330,10 +344,12 @@ def _ensure_bfloat16_checkpoint(file_path: str) -> None:
                 if isinstance(v, torch.Tensor) and v.is_floating_point() and v.dtype in (torch.float32, torch.float64):
                     d[k] = v.to(torch.bfloat16)
                     count += 1
+                elif isinstance(v, dict):
+                    count += _convert_dict_to_bf16(v)
             return count
 
         has_fp = False
-        target_keys = ["model_state", "state_dict", "action_head_state", "action_head_state_dict"]
+        target_keys = ["model_state", "state_dict", "action_head_state", "action_head_state_dict", "opt_state"]
         is_nested = any(k in ckpt for k in target_keys)
 
         if is_nested:
@@ -422,6 +438,8 @@ def push_checkpoint(
     print(f"\n🌐 [cloud_sync] Mirroring {model_label}{target_type}.pt (Step {step:,}, Loss {loss:.4f}) "
           f"to {sync_url} across {total_chunks} chunk(s)...")
 
+    upload_id = uuid.uuid4().hex[:12]
+    upload_url = f"{sync_url}?action=upload_chunk"
     t0 = time.time()
     try:
         with open(file_path, "rb") as f:
@@ -435,6 +453,7 @@ def push_checkpoint(
 
                 form_fields = [
                     ("action", "upload_chunk"),
+                    ("upload_id", upload_id),
                     ("type", target_type),
                     ("chunk_index", str(idx)),
                     ("total_chunks", str(total_chunks)),
@@ -457,7 +476,7 @@ def push_checkpoint(
 
                 payload = b"".join(body)
                 req = urllib.request.Request(
-                    sync_url,
+                    upload_url,
                     data=payload,
                     headers={
                         "Authorization": f"Bearer {sync_token}",
@@ -475,6 +494,15 @@ def push_checkpoint(
                             if status not in ("chunk_saved", "complete", "completed", "in_progress"):
                                 raise RuntimeError(f"Server rejected chunk: {res_data}")
                             break
+                    except urllib.error.HTTPError as he:
+                        err_detail = ""
+                        try:
+                            err_detail = f": {he.read().decode('utf-8', errors='ignore')}"
+                        except Exception:
+                            pass
+                        if attempt == 2:
+                            raise RuntimeError(f"HTTP {he.code} {he.reason}{err_detail}") from he
+                        time.sleep(2.0)
                     except Exception as e:
                         if attempt == 2:
                             raise e

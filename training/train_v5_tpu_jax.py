@@ -612,6 +612,28 @@ def main(args=None):
                         if pulled_ok and os.path.exists(target_dest):
                             local_latest = target_dest
                             print(f"✓ Restored latest checkpoint from cloud hub: {target_dest}")
+                        else:
+                            # Autonomous Fallback: If primary target fails or is corrupted, try the alternative slot ('best' vs 'latest')
+                            alt_target = "best" if args.resume_target == "latest" else "latest"
+                            alt_slot_model, alt_step, alt_loss = select_highest_step_slot(
+                                remote_manifest, sync_model_name, alt_target
+                            )
+                            if alt_step > 0:
+                                print(
+                                    f"⚠️ [cloud_sync] Primary slot '{args.resume_target}.pt' failed verification. "
+                                    f"Falling back to candidate '{alt_target}.pt' (Step {alt_step:,}, Loss {alt_loss:.4f})..."
+                                )
+                                alt_dest = os.path.join(args.checkpoint_dir, f"{args.preset}_{alt_target}.pt")
+                                alt_ok = pull_checkpoint(
+                                    alt_dest,
+                                    target_type=alt_target,
+                                    model=alt_slot_model,
+                                    url=args.cloud_url,
+                                    token=args.cloud_token,
+                                )
+                                if alt_ok and os.path.exists(alt_dest):
+                                    local_latest = alt_dest
+                                    print(f"✓ Restored alternative candidate checkpoint from cloud hub: {alt_dest}")
                     else:
                         print(f"ℹ️ [cloud_sync] No existing checkpoint on bioflo.in for {args.preset} (Step 0). Ready for clean training.")
             except Exception as e:

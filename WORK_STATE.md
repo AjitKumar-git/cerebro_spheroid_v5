@@ -1,15 +1,15 @@
 # Agent Work State & Activity Tracker
 
-> **Status**: 🟡 `IN_PROGRESS` | **Last Updated**: `2026-11-19T14:10:14.709187+05:30` | **Session**: `60582677-6233-4d55-bf3b-245184a04d5b`
+> **Status**: 🟢 `COMPLETED` | **Last Updated**: `2026-11-19T23:04:29.026160+05:30` | **Session**: `60582677-6233-4d55-bf3b-245184a04d5b`
 
 ## Current / Active Objective
-**Goal**: make this library rigourous and extremely greedy in optimsation, make this a envelope which always prevent oom while still training the model
+**Goal**: why does held out loss inceases after reaching 1.8 now its 3.0
 
-- **Phase**: `executing`
-- **Current Task**: Executed run_command: Git diff summary
+- **Phase**: `completed`
+- **Current Task**: Idle / Awaiting next request
 
 ## Summary of Completed Work
-I have run `test_autotune_library.py`, `test_oom_fallback.py`, and `test_training_oom_fallback.py` to ensure the full Zero-OOM Envelope and autotuner test suites pass.
+The increase in held-out loss from **~1.8 up to ~3.0** is the result of four specific transitions in this repository's training and evaluation stack:
 
 ## Modified Files
 - [`scripts/run_weight_transfer_experiment.py`](scripts/run_weight_transfer_experiment.py)
@@ -127,16 +127,16 @@ I have run `test_autotune_library.py`, `test_oom_fallback.py`, and `test_trainin
 ## Recent Actions (Last 10)
 | Time | Tool | Details |
 | :--- | :--- | :--- |
-| `14:10:14` | `run_command` | Git diff summary |
-| `14:10:11` | `run_command` | Git status |
-| `14:10:07` | `run_command` | Run autotune and OOM tests |
-| `14:09:44` | `run_command` | Run test_vram_tuner_and_sync.py |
-| `14:09:44` | `manage_task` | manage_task |
-| `14:09:40` | `manage_task` | manage_task |
-| `14:09:21` | `edit_file` | edit_file |
-| `14:09:13` | `run_command` | Show cached_local in ecc80342 |
-| `14:09:08` | `run_command` | Git log -S cache_sig |
-| `14:09:04` | `run_command` | Find cached_local before autotune library |
+| `23:04:01` | `read_file` | read_file |
+| `23:03:55` | `read_file` | read_file |
+| `23:03:42` | `run_command` | Inspect step 35k-50k eval loss transition |
+| `23:03:35` | `run_command` | Show commit d7a6eb2 |
+| `23:03:29` | `run_command` | Show commit f1b6bfd |
+| `23:03:24` | `run_command` | Show commit 42c9d1f |
+| `23:03:20` | `run_command` | Inspect commit 42c9d1f |
+| `23:03:13` | `run_command` | Git log search for eval |
+| `23:03:08` | `run_command` | Grep held in docs and WORK_STATE |
+| `23:03:01` | `run_command` | Find eval_loss in train_v5_sft.py and scripts |
 
 ---
 *This file is automatically maintained by `auto-work-tracker`. Other agents can parse `.agents/work_state.json` or inspect this file directly to resume or review progress.*
