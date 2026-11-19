@@ -195,6 +195,59 @@ class TestAuditRemediations(unittest.TestCase):
             if os.path.exists(bad_path):
                 os.remove(bad_path)
 
+    def test_finding_9_cloud_weights_only_option_a(self):
+        """Verifies Option A: cloud_weights_only=True uploads pure weights while keeping local checkpoints intact."""
+        from src.jax.checkpoint import AsyncCheckpointManager, restore_spheroid_opt_state
+
+        with tempfile.TemporaryDirectory() as local_dir, tempfile.TemporaryDirectory() as target_dir:
+            uploaded_files = []
+
+            def mock_push(file_path, **kwargs):
+                self.assertTrue(os.path.exists(file_path))
+                # Check contents of staged upload file
+                ckpt = torch.load(file_path, map_location="cpu", weights_only=False)
+                # Cloud upload must NOT contain bloated opt_state when cloud_weights_only=True
+                self.assertNotIn("opt_state", ckpt, "Cloud upload should be weights-only under Option A!")
+                self.assertIn("model_state", ckpt)
+                uploaded_files.append(file_path)
+                return True
+
+            mgr = AsyncCheckpointManager(
+                local_dir=local_dir,
+                target_dir=target_dir,
+                cloud_sync=True,
+                cloud_weights_only=True,
+                save_optimizer_state=True,
+            )
+
+            dummy_params = {"layer.weight": np.ones((4, 4), dtype=np.float32)}
+            dummy_buffers = (np.array([0]), np.array([1]))
+            dummy_opt_state = {
+                "step": 1234,
+                "m": {"layer.weight": np.ones((4, 4), dtype=np.float32)},
+                "v": {"layer.weight": np.ones((4, 4), dtype=np.float32)},
+                "master_p": {"layer.weight": np.ones((4, 4), dtype=np.float32)},
+                "power_v": {"layer.weight": np.ones((4, 4), dtype=np.float32)},
+            }
+
+            with patch("src.cloud_sync.push_checkpoint_async", side_effect=mock_push):
+                # Worker save
+                mgr._worker(
+                    dummy_params,
+                    dummy_buffers,
+                    "test_latest.pt",
+                    meta_dict={"step": 1234, "loss": 3.14},
+                    force_cloud=True,
+                    opt_state_cpu=dummy_opt_state,
+                )
+
+            # Local checkpoint MUST have preserved opt_state
+            local_ckpt_path = os.path.join(local_dir, "test_latest.pt")
+            self.assertTrue(os.path.exists(local_ckpt_path))
+            local_ckpt = torch.load(local_ckpt_path, map_location="cpu", weights_only=False)
+            self.assertIn("opt_state", local_ckpt, "Local checkpoint should preserve opt_state!")
+            self.assertEqual(len(uploaded_files), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

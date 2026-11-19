@@ -536,6 +536,8 @@ class AsyncCheckpointManager:
         cloud_url: str = "https://bioflo.in/api/cerebro/sync.php",
         cloud_token: Optional[str] = None,
         min_cloud_upload_interval_sec: float = 0.0,
+        cloud_weights_only: bool = True,
+        save_optimizer_state: bool = True,
     ):
         self.local_dir = local_dir
         self.target_dir = target_dir
@@ -547,6 +549,8 @@ class AsyncCheckpointManager:
         else:
             self.cloud_token = cloud_token
         self.min_cloud_upload_interval_sec = max(0.0, float(min_cloud_upload_interval_sec))
+        self.cloud_weights_only = cloud_weights_only
+        self.save_optimizer_state = save_optimizer_state
         self._last_cloud_upload_at: Dict[str, float] = {}
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="ckpt_async")
         self._last_future: Optional[concurrent.futures.Future] = None
@@ -564,7 +568,8 @@ class AsyncCheckpointManager:
     ):
         try:
             local_path = os.path.join(self.local_dir, filename)
-            save_jax_to_torch_pt(params_cpu, buffers_cpu, local_path, meta=meta_dict, opt_state=opt_state_cpu)
+            save_opt = opt_state_cpu if self.save_optimizer_state else None
+            save_jax_to_torch_pt(params_cpu, buffers_cpu, local_path, meta=meta_dict, opt_state=save_opt)
 
             # Atomically mirror to target_dir if different
             target_path = os.path.join(self.target_dir, filename)
@@ -600,7 +605,11 @@ class AsyncCheckpointManager:
                         # Snapshot isolation: stage to a dedicated temporary file so ongoing TPU training
                         # steps never mutate or overwrite the checkpoint file while the async upload streams chunks
                         upload_stage = f"{local_path}.upload.{os.getpid()}.{time.time_ns()}.pt"
-                        shutil.copyfile(local_path, upload_stage)
+                        if self.cloud_weights_only:
+                            # Option A: Save lightweight weights-only checkpoint (~229 MB) for rapid, non-blocking cloud upload
+                            save_jax_to_torch_pt(params_cpu, buffers_cpu, upload_stage, meta=meta_dict, opt_state=None)
+                        else:
+                            shutil.copyfile(local_path, upload_stage)
                         push_checkpoint_async(
                             upload_stage,
                             step=step_val,

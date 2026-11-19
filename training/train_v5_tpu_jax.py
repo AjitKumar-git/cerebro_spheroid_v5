@@ -213,7 +213,23 @@ def parse_args(args_list=None):
     parser.add_argument("--eval_interval", type=int, default=100, help="Steps between held-out validation evaluations (default: 100)")
     parser.add_argument("--cloud-sync", "--cloud_sync", dest="cloud_sync", action="store_true", default=True, help="Enable live sync with bioflo.in")
     parser.add_argument("--no-cloud-sync", "--no_cloud_sync", dest="cloud_sync", action="store_false", help="Disable live sync with bioflo.in")
-    parser.add_argument("--cloud-sync-interval", type=int, default=100, help="Steps between cloud sync uploads")
+    parser.add_argument("--cloud_sync_interval", "--cloud-sync-interval", dest="cloud_sync_interval", type=int, default=100, help="Steps between cloud sync uploads")
+    parser.add_argument(
+        "--cloud_weights_only",
+        "--cloud-weights-only",
+        dest="cloud_weights_only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Upload lightweight weights-only checkpoints (~229 MB) to cloud for rapid, non-blocking transfer (default: True)",
+    )
+    parser.add_argument(
+        "--save_optimizer_state",
+        "--save-optimizer-state",
+        dest="save_optimizer_state",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save Spheroid optimizer moments (m, v, master_p) in local checkpoints (default: True)",
+    )
     parser.add_argument("--cloud_url", type=str, default="https://bioflo.in/api/cerebro/sync.php", help="bioflo.in sync endpoint")
     parser.add_argument(
         "--cloud_token",
@@ -508,6 +524,8 @@ def main(args=None):
         cloud_url=args.cloud_url,
         cloud_token=args.cloud_token,
         min_cloud_upload_interval_sec=120.0,
+        cloud_weights_only=args.cloud_weights_only,
+        save_optimizer_state=args.save_optimizer_state,
     )
 
     start_step = 0
@@ -556,8 +574,10 @@ def main(args=None):
 
         if args.cloud_sync:
             try:
+                step0_stage = f"{local_latest}.upload.{os.getpid()}.{time.time_ns()}.pt"
+                shutil.copyfile(local_latest, step0_stage)
                 push_checkpoint_async(
-                    local_latest,
+                    step0_stage,
                     step=0,
                     loss=9.9999,
                     target_type="latest",
