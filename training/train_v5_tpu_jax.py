@@ -89,6 +89,7 @@ from src.jax.spheroid_optimizer import (
 from src.jax.checkpoint import (
     save_jax_to_torch_pt,
     load_torch_pt_to_jax,
+    safe_torch_load,
     adapt_and_load_checkpoint_weights,
     discover_latest_checkpoint,
     AsyncCheckpointManager,
@@ -214,7 +215,12 @@ def parse_args(args_list=None):
     parser.add_argument("--no-cloud-sync", "--no_cloud_sync", dest="cloud_sync", action="store_false", help="Disable live sync with bioflo.in")
     parser.add_argument("--cloud-sync-interval", type=int, default=100, help="Steps between cloud sync uploads")
     parser.add_argument("--cloud_url", type=str, default="https://bioflo.in/api/cerebro/sync.php", help="bioflo.in sync endpoint")
-    parser.add_argument("--cloud_token", type=str, default="CerebroSpheroid_Sync_Secure_2026", help="Secret sync token")
+    parser.add_argument(
+        "--cloud_token",
+        type=str,
+        default=os.environ.get("BIOFLO_SYNC_TOKEN", os.environ.get("CEREBRO_SYNC_TOKEN", "")),
+        help="Secret sync token (defaults to BIOFLO_SYNC_TOKEN environment variable)",
+    )
     parser.add_argument("--resume_target", type=str, default="latest", choices=["latest", "best"], help="Target checkpoint to pull from cloud ('latest' or 'best')")
     parser.add_argument("--reset_best", action="store_true", default=False, help="Reset best validation loss tracker")
     parser.add_argument("--from-scratch", "--from_scratch", dest="from_scratch", action="store_true", default=False, help="Start clean from Step 0 without loading any checkpoint")
@@ -617,7 +623,7 @@ def main(args=None):
         target_local = local_latest if os.path.exists(local_latest) else (fallback_latest if os.path.exists(fallback_latest) else None)
         if target_local and os.path.exists(target_local):
             try:
-                chk_test = torch.load(target_local, map_location="cpu", weights_only=False)
+                chk_test = safe_torch_load(target_local, map_location="cpu", weights_only=True)
                 existing_preset_step = int(chk_test.get("step", 0))
             except Exception:
                 existing_preset_step = 0
@@ -689,7 +695,7 @@ def main(args=None):
 
         if discovered_ckpt and os.path.exists(discovered_ckpt):
             try:
-                ckpt = torch.load(discovered_ckpt, map_location="cpu", weights_only=False)
+                ckpt = safe_torch_load(discovered_ckpt, map_location="cpu", weights_only=True)
                 start_step = int(ckpt.get("step", 0))
                 saved_eval = float(ckpt.get("eval_loss", float("inf")))
                 saved_train_loss = float(ckpt.get("loss", float("inf")))
@@ -1637,6 +1643,7 @@ def main(args=None):
                         step_tokens, step_prompt, step_loss, step_pad = _count_real_tokens(q_shard, r_shard)
                         step_executed = True
                     else:
+                        consumed_micro_batches: List[Tuple[Any, ...]] = []
                         if compute_grad_step is not None and grad_accum > 1:
                             acc_grads = None
                             loss_acc = 0.0
@@ -1644,6 +1651,7 @@ def main(args=None):
                             inv_accum = 1.0 / float(grad_accum)
                             for _ in range(grad_accum):
                                 batch_data = oom_handler.slicer.get_micro_batch(args.batch_size, _next_batch)
+                                consumed_micro_batches.append(batch_data)
                                 if len(batch_data) == 4:
                                     prompt_b, target_b, feedback_b, weights_b = batch_data
                                 else:
@@ -1669,6 +1677,7 @@ def main(args=None):
                             params, opt_state = cur_apply_opt(params, opt_state, acc_grads, cur_lr)
                         else:
                             batch_data = oom_handler.slicer.get_micro_batch(args.batch_size, _next_batch)
+                            consumed_micro_batches.append(batch_data)
                             if len(batch_data) == 4:
                                 prompt_b, target_b, feedback_b, weights_b = batch_data
                             else:
@@ -1687,13 +1696,17 @@ def main(args=None):
                                 target_weights=weights_b,
                             )
                             step_tokens, step_prompt, step_loss, step_pad = _count_real_tokens(prompt_b, target_b)
+                        # Explicitly synchronize device execution inside try block so asynchronous OOMs are caught
+                        loss_val = float(loss)
                         step_executed = True
                 except Exception as e_step:
                     if not is_oom_error(e_step) or (args.batch_size <= 1 and remat_choice):
                         raise
-                    failed_tup = (prompt_b, target_b, feedback_b, weights_b) if weights_b is not None else ((prompt_b, target_b, feedback_b) if prompt_b is not None else None)
+                    failed_batches_to_stash = consumed_micro_batches if consumed_micro_batches else (
+                        [(prompt_b, target_b, feedback_b, weights_b)] if weights_b is not None else ([(prompt_b, target_b, feedback_b)] if prompt_b is not None else None)
+                    )
                     args.batch_size, grad_accum = oom_handler.handle_oom(
-                        e_step, step=step, failed_batch=failed_tup, current_remat=remat_choice
+                        e_step, step=step, failed_batch=failed_batches_to_stash, current_remat=remat_choice
                     )
                     remat_changed = (oom_handler.remat != remat_choice)
                     remat_choice = oom_handler.remat

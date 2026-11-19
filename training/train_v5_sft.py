@@ -73,7 +73,7 @@ from src.jax.v5_model import (
     encode_sensory,
     rms_norm,
 )
-from src.jax.checkpoint import adapt_and_load_checkpoint_weights, discover_latest_checkpoint, AsyncCheckpointManager
+from src.jax.checkpoint import safe_torch_load, adapt_and_load_checkpoint_weights, discover_latest_checkpoint, AsyncCheckpointManager
 from autotune import (
     resolve_jax_compute_dtype,
     run_auto_tuner,
@@ -122,7 +122,13 @@ def parse_sft_args(args_list: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--scratch_dir", dest="scratch_dir", type=str, default="/tmp/cerebro_v5_sft", help="Fast local disk for staging")
     parser.add_argument("--cloud_sync", "--cloud-sync", dest="cloud_sync", action=argparse.BooleanOptionalAction, default=True, help="Live bi-directional sync with bioflo.in")
     parser.add_argument("--cloud_url", dest="cloud_url", type=str, default="https://bioflo.in/api/cerebro/sync.php", help="bioflo.in sync endpoint")
-    parser.add_argument("--cloud_token", dest="cloud_token", type=str, default="CerebroSpheroid_Sync_Secure_2026", help="Sync token")
+    parser.add_argument(
+        "--cloud_token",
+        dest="cloud_token",
+        type=str,
+        default=os.environ.get("BIOFLO_SYNC_TOKEN", os.environ.get("CEREBRO_SYNC_TOKEN", "")),
+        help="Sync token (defaults to BIOFLO_SYNC_TOKEN environment variable)",
+    )
     parser.add_argument("--sampling_p", "--sampling-p", dest="sampling_p", type=float, default=1.0, help="Sampling probability for deliberation (1.0 for teacher forcing, 0.5 for scheduled deliberation)")
     parser.add_argument("--deliberation_mode", dest="deliberation_mode", type=str, default="teacher_forcing", choices=["teacher_forcing", "scheduled", "pitfall_recovery", "internal"], help="Deliberation mode")
     parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bf16", "fp16", "fp32"], help="Matrix compute dtype")
@@ -429,7 +435,7 @@ def main(args=None):
 
     if args.resume_sft and sft_resume_path:
         print(f"\n🔄 [SFT Resume] Resuming in-progress SFT from: {sft_resume_path}")
-        ckpt = torch.load(sft_resume_path, map_location="cpu", weights_only=False)
+        ckpt = safe_torch_load(sft_resume_path, map_location="cpu", weights_only=True)
         start_step = int(ckpt.get("step", 0))
         best_eval_loss = float(ckpt.get("eval_loss", float("inf")))
         restored, buffers = adapt_and_load_checkpoint_weights(ckpt, params, target_dtype, config, buffers=buffers)
@@ -485,7 +491,7 @@ def main(args=None):
 
         if base_ckpt_path and os.path.exists(base_ckpt_path):
             print(f"\n🚀 Loading base pre-trained foundation weights from: {os.path.basename(base_ckpt_path)}...")
-            ckpt = torch.load(base_ckpt_path, map_location="cpu", weights_only=False)
+            ckpt = safe_torch_load(base_ckpt_path, map_location="cpu", weights_only=True)
             pretrain_step = int(ckpt.get("step", 0))
             pretrain_loss = float(ckpt.get("loss", ckpt.get("eval_loss", 0.0)))
             restored, buffers = adapt_and_load_checkpoint_weights(ckpt, params, target_dtype, config, buffers=buffers)

@@ -57,6 +57,32 @@ def _safe_torch_tensor(arr):
     return torch.from_numpy(np_arr)
 
 
+def safe_torch_load(
+    ckpt_path_or_file: Any,
+    map_location: str = "cpu",
+    weights_only: bool = True,
+) -> Dict[str, Any]:
+    """Safely loads a PyTorch checkpoint with tensor-only loading (weights_only=True)
+    and validates checkpoint structure to protect against arbitrary code execution.
+    """
+    if not HAS_TORCH:
+        raise RuntimeError(f"PyTorch is required to load .pt checkpoint: {_TORCH_ERR}")
+    if isinstance(ckpt_path_or_file, str) and not os.path.exists(ckpt_path_or_file):
+        raise FileNotFoundError(f"Checkpoint not found at: {ckpt_path_or_file}")
+
+    try:
+        ckpt = torch.load(ckpt_path_or_file, map_location=map_location, weights_only=weights_only)
+    except Exception as e:
+        raise ValueError(f"Safe tensor-only checkpoint loading failed for {ckpt_path_or_file}: {e}") from e
+
+    if not isinstance(ckpt, dict):
+        raise ValueError(
+            f"Invalid checkpoint format in {ckpt_path_or_file}: expected dictionary, got {type(ckpt).__name__}"
+        )
+
+    return ckpt
+
+
 def save_jax_to_torch_pt(
     params: Dict[str, jnp.ndarray],
     buffers: Tuple[jnp.ndarray, jnp.ndarray],
@@ -137,7 +163,7 @@ def restore_spheroid_opt_state(
         if not HAS_TORCH or not os.path.exists(ckpt_or_path):
             return init_spheroid_opt_state(params, key=key)
         try:
-            ckpt = torch.load(ckpt_or_path, map_location="cpu", weights_only=False)
+            ckpt = safe_torch_load(ckpt_or_path, map_location="cpu", weights_only=True)
         except Exception:
             return init_spheroid_opt_state(params, key=key)
     else:
@@ -430,7 +456,7 @@ def load_torch_pt_to_jax(
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found at: {ckpt_path}")
 
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    ckpt = safe_torch_load(ckpt_path, map_location="cpu", weights_only=True)
     params, buffers = init_params_v5(jax.random.PRNGKey(seed), config)
     restored, buffers = adapt_and_load_checkpoint_weights(ckpt, params, target_dtype, config, buffers=buffers)
     print(f"✓ Restored & adapted {restored}/{len(params)} parameter arrays into JAX V5 engine")
@@ -508,14 +534,18 @@ class AsyncCheckpointManager:
         target_dir: str,
         cloud_sync: bool = False,
         cloud_url: str = "https://bioflo.in/api/cerebro/sync.php",
-        cloud_token: str = "CerebroSpheroid_Sync_Secure_2026",
+        cloud_token: Optional[str] = None,
         min_cloud_upload_interval_sec: float = 0.0,
     ):
         self.local_dir = local_dir
         self.target_dir = target_dir
         self.cloud_sync = cloud_sync
         self.cloud_url = cloud_url
-        self.cloud_token = cloud_token
+        if cloud_token is None:
+            from src.cloud_sync import get_sync_token
+            self.cloud_token = get_sync_token()
+        else:
+            self.cloud_token = cloud_token
         self.min_cloud_upload_interval_sec = max(0.0, float(min_cloud_upload_interval_sec))
         self._last_cloud_upload_at: Dict[str, float] = {}
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="ckpt_async")

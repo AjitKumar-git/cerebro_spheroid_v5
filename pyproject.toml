@@ -6,7 +6,6 @@ build-backend = "setuptools.build_meta"
 name = "autotune"
 version = "1.0.0"
 description = "High-Performance Accelerator & Architecture Auto-Tuning Engine for TPUs, GPUs, and CPUs"
-readme = "README.md"
 requires-python = ">=3.9"
 authors = [
     { name = "Ajit Kumar", email = "meajitsheoran@gmail.com" }

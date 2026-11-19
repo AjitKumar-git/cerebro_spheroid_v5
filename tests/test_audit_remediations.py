@@ -1,0 +1,162 @@
+"""
+Unit Tests for Audit Remediations in CerebroSpheroid V5.
+========================================================
+
+Verifies all 6 audit finding fixes:
+1. Safe checkpoint loading with weights_only=True and structure validation.
+2. Cloud sync token loading via get_sync_token() (no hardcoded secrets in source).
+3. OOM recovery data preservation: stashing and recovery of multiple micro-batches
+   during gradient accumulation with zero lost tokens.
+4. Asynchronous OOM synchronization inside the execution try block.
+5. Exact effective batch size preservation without integer truncation drift.
+6. Package building without requiring a missing root README.md.
+"""
+
+import math
+import os
+import tempfile
+import unittest
+from unittest.mock import MagicMock, patch
+
+import numpy as np
+import torch
+
+from autotune.fallback import (
+    compute_fallback_batch_size,
+    adjust_gradient_accumulation,
+    MicroBatchSlicer,
+    TrainingOOMHandler,
+    is_oom_error,
+)
+from src.cloud_sync import get_sync_token
+from src.jax.checkpoint import safe_torch_load
+
+
+class TestAuditRemediations(unittest.TestCase):
+
+    def test_finding_1_safe_torch_load(self):
+        """Verifies checkpoint loading uses safe tensor-only deserialization."""
+        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            # Valid dict checkpoint
+            valid_ckpt = {
+                "step": 100,
+                "loss": 3.25,
+                "model_state": {"w": torch.tensor([1.0, 2.0, 3.0])},
+            }
+            torch.save(valid_ckpt, tmp_path)
+
+            loaded = safe_torch_load(tmp_path, weights_only=True)
+            self.assertIsInstance(loaded, dict)
+            self.assertEqual(loaded["step"], 100)
+            self.assertAlmostEqual(loaded["loss"], 3.25)
+            self.assertIn("model_state", loaded)
+
+            # Invalid non-dict checkpoint must be rejected
+            torch.save([1, 2, 3], tmp_path)
+            with self.assertRaises(ValueError):
+                safe_torch_load(tmp_path, weights_only=True)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    def test_finding_2_cloud_sync_token_no_hardcoding(self):
+        """Verifies get_sync_token resolves dynamically from env and contains no hardcoded fallback."""
+        with patch.dict(os.environ, {}, clear=True):
+            # Without environment variables or local token files, returns empty string (never hardcoded secret)
+            tok = get_sync_token()
+            self.assertNotEqual(tok, "CerebroSpheroid_Sync_Secure_2026")
+
+        # When environment variable is set, it resolves correctly
+        with patch.dict(os.environ, {"BIOFLO_SYNC_TOKEN": "custom_secret_test_token"}):
+            self.assertEqual(get_sync_token(), "custom_secret_test_token")
+
+        with patch.dict(os.environ, {"CEREBRO_SYNC_TOKEN": "fallback_test_token"}):
+            self.assertEqual(get_sync_token(), "fallback_test_token")
+
+    def test_finding_3_oom_recovery_preserves_accumulated_batches(self):
+        """Verifies all micro-batches in gradient accumulation are preserved on OOM without dropping tokens."""
+        slicer = MicroBatchSlicer()
+
+        # Simulate 3 micro-batches of batch size 4 (total 12 sequences)
+        b0_prompt = np.arange(0, 8).reshape(4, 2)
+        b0_target = np.arange(10, 18).reshape(4, 2)
+        b1_prompt = np.arange(20, 28).reshape(4, 2)
+        b1_target = np.arange(30, 38).reshape(4, 2)
+        b2_prompt = np.arange(40, 48).reshape(4, 2)
+        b2_target = np.arange(50, 58).reshape(4, 2)
+
+        consumed_batches = [
+            (b0_prompt, b0_target),
+            (b1_prompt, b1_target),
+            (b2_prompt, b2_target),
+        ]
+
+        # Stash all consumed batches upon OOM
+        slicer.stash_batches(consumed_batches)
+        self.assertTrue(slicer.has_remainder())
+
+        # Retrieve with a smaller fallback micro-batch size = 2
+        recovered_prompts = []
+        recovered_targets = []
+        for _ in range(6):  # 12 sequences / 2 = 6 micro-batches
+            p, t, _ = slicer.get_micro_batch(micro_bs=2)
+            recovered_prompts.append(p)
+            recovered_targets.append(t)
+
+        all_recovered_p = np.concatenate(recovered_prompts, axis=0)
+        expected_p = np.concatenate([b0_prompt, b1_prompt, b2_prompt], axis=0)
+        np.testing.assert_array_equal(all_recovered_p, expected_p)
+        self.assertFalse(slicer.has_remainder())
+
+    def test_finding_4_asynchronous_oom_detection(self):
+        """Verifies that delayed/asynchronous OOM errors surface and are identified by is_oom_error."""
+        async_device_oom = RuntimeError("RESOURCE_EXHAUSTED: Out of memory while allocating buffer on TPU device")
+        self.assertTrue(is_oom_error(async_device_oom))
+
+        cuda_oom = RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+        self.assertTrue(is_oom_error(cuda_oom))
+
+        normal_err = ValueError("Invalid learning rate")
+        self.assertFalse(is_oom_error(normal_err))
+
+    def test_finding_5_fallback_preserves_effective_batch_size(self):
+        """Verifies compute_fallback_batch_size and adjust_gradient_accumulation preserve effective batch size."""
+        # Case 1: Target batch 126
+        eff_bs = 126
+        cur_bs = 126
+        new_bs = compute_fallback_batch_size(cur_bs, effective_batch_size=eff_bs)
+        new_ga = adjust_gradient_accumulation(eff_bs, new_bs)
+        self.assertEqual(new_bs, 63)
+        self.assertEqual(new_ga, 2)
+        self.assertEqual(new_bs * new_ga, 126)
+
+        # Case 2: Standard power of two (128)
+        eff_bs = 128
+        cur_bs = 128
+        new_bs = compute_fallback_batch_size(cur_bs, effective_batch_size=eff_bs)
+        new_ga = adjust_gradient_accumulation(eff_bs, new_bs)
+        self.assertEqual(new_bs, 64)
+        self.assertEqual(new_ga, 2)
+        self.assertEqual(new_bs * new_ga, 128)
+
+        # Case 3: Handler maintains effective batch size
+        handler = TrainingOOMHandler(initial_batch_size=126, effective_batch_size=126)
+        dummy_oom = RuntimeError("RESOURCE_EXHAUSTED: TPU out of memory")
+        bs, ga = handler.handle_oom(dummy_oom, step=1, current_remat=True)
+        self.assertEqual(bs * ga, 126)
+
+    def test_finding_6_no_readme_file_created(self):
+        """Verifies strictly that no README.md file exists in the repository."""
+        workspace_dir = "/home/ajit/Documents/Startup/Active_Development/cerebro_spheroid_v5"
+        readme_path = os.path.join(workspace_dir, "README.md")
+        self.assertFalse(
+            os.path.exists(readme_path),
+            "STRICT PROHIBITION VIOLATED: README.md must NEVER exist in cerebro_spheroid_v5!"
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

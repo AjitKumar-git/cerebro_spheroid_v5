@@ -50,10 +50,14 @@ def compute_fallback_batch_size(
     current_batch_size: int,
     min_batch_size: int = 1,
     factor: float = 0.5,
+    effective_batch_size: Optional[int] = None,
 ) -> int:
     """
     Computes a reduced micro-batch size when an OOM occurs.
     Guarantees strictly decreasing batch size down to min_batch_size.
+    When effective_batch_size is provided, attempts to select an exact divisor
+    of effective_batch_size closest to factor * current_batch_size to preserve
+    the global effective batch size without integer truncation drift.
     """
     if current_batch_size <= min_batch_size:
         raise RuntimeError(
@@ -61,7 +65,19 @@ def compute_fallback_batch_size(
             f"minimum allowable batch size ({min_batch_size})."
         )
 
-    new_bs = int(math.floor(current_batch_size * factor))
+    target_bs = max(min_batch_size, int(math.floor(current_batch_size * factor)))
+
+    # If effective_batch_size is specified, search for exact divisor near target_bs
+    if effective_batch_size and effective_batch_size > 0:
+        divisor_candidate = None
+        for cand in range(min(target_bs, current_batch_size - 1), max(0, min_batch_size - 1), -1):
+            if effective_batch_size % cand == 0:
+                divisor_candidate = cand
+                break
+        if divisor_candidate is not None:
+            return divisor_candidate
+
+    new_bs = target_bs
 
     # Keep power-of-two alignment if previous was an even multiple
     if current_batch_size >= 4 and current_batch_size % 2 == 0 and new_bs % 2 != 0:
@@ -82,12 +98,21 @@ def adjust_gradient_accumulation(
     """
     Calculates the adjusted gradient accumulation steps needed to preserve
     the global effective batch size when the micro-batch size is reduced.
+    Minimizes deviation from effective_batch_size when not evenly divisible.
     """
     if effective_batch_size <= 0:
         return max(1, current_grad_accum * 2)
 
-    new_grad_accum = max(1, effective_batch_size // max(1, new_micro_batch_size))
-    return new_grad_accum
+    micro_bs = max(1, new_micro_batch_size)
+    if effective_batch_size % micro_bs == 0:
+        return effective_batch_size // micro_bs
+
+    accum_floor = max(1, effective_batch_size // micro_bs)
+    accum_ceil = accum_floor + 1
+    drift_floor = abs((accum_floor * micro_bs) - effective_batch_size)
+    drift_ceil = abs((accum_ceil * micro_bs) - effective_batch_size)
+
+    return accum_ceil if drift_ceil < drift_floor else accum_floor
 
 
 class MicroBatchSlicer:
@@ -111,11 +136,51 @@ class MicroBatchSlicer:
         feedback: Optional[Any] = None,
         weights: Optional[Any] = None,
     ) -> None:
-        """Stashes an uncompleted or failed batch to be sliced in subsequent steps."""
-        self.remainder_prompt = prompt
-        self.remainder_target = target
-        self.remainder_feedback = feedback
-        self.remainder_weights = weights
+        """Stashes an uncompleted or failed batch to be sliced in subsequent steps.
+        If a remainder already exists, concatenates along axis 0 so zero tokens are lost."""
+        if not self.has_remainder():
+            self.remainder_prompt = prompt
+            self.remainder_target = target
+            self.remainder_feedback = feedback
+            self.remainder_weights = weights
+            return
+
+        def _concat(existing, new_data):
+            if existing is None and new_data is None:
+                return None
+            if existing is None:
+                return new_data
+            if new_data is None:
+                return existing
+            try:
+                import numpy as np
+                e_np = np.asarray(existing)
+                n_np = np.asarray(new_data)
+                return np.concatenate([e_np, n_np], axis=0)
+            except Exception:
+                if isinstance(existing, list) and isinstance(new_data, list):
+                    return existing + new_data
+                return new_data
+
+        self.remainder_prompt = _concat(self.remainder_prompt, prompt)
+        self.remainder_target = _concat(self.remainder_target, target)
+        self.remainder_feedback = _concat(self.remainder_feedback, feedback)
+        self.remainder_weights = _concat(self.remainder_weights, weights)
+
+    def stash_batches(
+        self,
+        batches: Sequence[Tuple[Any, ...]],
+    ) -> None:
+        """Stashes multiple consumed micro-batches (e.g. from an interrupted gradient accumulation
+        step) into remainder storage so no tokens are dropped across OOM recoveries."""
+        for b in batches:
+            if not b:
+                continue
+            p = b[0]
+            t = b[1]
+            fb = b[2] if len(b) > 2 else None
+            w = b[3] if len(b) > 3 else None
+            self.stash_remainder(p, t, fb, w)
 
     def has_remainder(self) -> bool:
         if self.remainder_prompt is None:
@@ -228,7 +293,7 @@ class TrainingOOMHandler:
         self,
         exc: BaseException,
         step: Optional[int] = None,
-        failed_batch: Optional[Tuple[Any, ...]] = None,
+        failed_batch: Optional[Union[Tuple[Any, ...], Sequence[Tuple[Any, ...]]]] = None,
         current_remat: Optional[bool] = None,
     ) -> Tuple[int, int]:
         """
@@ -254,8 +319,12 @@ class TrainingOOMHandler:
             new_ga = old_ga
             action = "ENGAGE_REMAT"
         else:
-            # Stage 2: Halve batch size and double grad_accum
-            new_bs = compute_fallback_batch_size(old_bs, min_batch_size=self.min_batch_size)
+            # Stage 2: Halve batch size and adjust grad_accum preserving effective batch
+            new_bs = compute_fallback_batch_size(
+                old_bs,
+                min_batch_size=self.min_batch_size,
+                effective_batch_size=self.effective_batch_size,
+            )
             new_ga = adjust_gradient_accumulation(self.effective_batch_size, new_bs, old_ga)
             self.batch_size = new_bs
             self.grad_accum = new_ga
@@ -264,11 +333,14 @@ class TrainingOOMHandler:
         self.fallback_count += 1
 
         if failed_batch is not None:
-            p = failed_batch[0]
-            t = failed_batch[1]
-            fb = failed_batch[2] if len(failed_batch) > 2 else None
-            w = failed_batch[3] if len(failed_batch) > 3 else None
-            self.slicer.stash_remainder(p, t, fb, w)
+            if isinstance(failed_batch, (list, tuple)) and len(failed_batch) > 0 and isinstance(failed_batch[0], (tuple, list)):
+                self.slicer.stash_batches(failed_batch)
+            elif isinstance(failed_batch, tuple):
+                p = failed_batch[0]
+                t = failed_batch[1]
+                fb = failed_batch[2] if len(failed_batch) > 2 else None
+                w = failed_batch[3] if len(failed_batch) > 3 else None
+                self.slicer.stash_remainder(p, t, fb, w)
 
         self.clean_memory()
 

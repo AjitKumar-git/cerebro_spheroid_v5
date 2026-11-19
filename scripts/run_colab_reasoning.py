@@ -248,7 +248,7 @@ def check_remote_status(preset: str):
         req = urllib.request.Request(
             url,
             headers={
-                "Authorization": "Bearer CerebroSpheroid_Sync_Secure_2026",
+                "Authorization": f"Bearer {os.environ.get('BIOFLO_SYNC_TOKEN', os.environ.get('CEREBRO_SYNC_TOKEN', ''))}",
                 "User-Agent": "CerebroCloudSync/1.0",
             },
         )

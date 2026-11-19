@@ -40,8 +40,27 @@ def _preferred_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
     return _orig_getaddrinfo(host, port, family, type, proto, flags)
 socket.getaddrinfo = _preferred_getaddrinfo
 
+def get_sync_token(token: Optional[str] = None) -> str:
+    """Retrieves sync token from argument, environment variables, or local secret store."""
+    if token:
+        return token
+    tok = os.environ.get("BIOFLO_SYNC_TOKEN", os.environ.get("CEREBRO_SYNC_TOKEN", ""))
+    if tok:
+        return tok
+    for p in (os.path.expanduser("~/.bioflo_token"), os.path.expanduser("~/.cerebro_token")):
+        if os.path.exists(p):
+            try:
+                with open(p, "r") as f:
+                    t = f.read().strip()
+                    if t:
+                        return t
+            except Exception:
+                pass
+    return ""
+
+
 DEFAULT_URL = os.environ.get("BIOFLO_SYNC_URL", "https://bioflo.in/api/cerebro/sync.php")
-DEFAULT_TOKEN = os.environ.get("BIOFLO_SYNC_TOKEN", "CerebroSpheroid_Sync_Secure_2026")
+DEFAULT_TOKEN = get_sync_token()
 TPU_PRESET_ALIASES = ("tpu_v5e_1", "tpu_v6e_1", "tpu_v6e", "tpu", "v5_tpu")
 
 
@@ -295,7 +314,7 @@ def _ensure_bfloat16_checkpoint(file_path: str) -> None:
         return
 
     try:
-        ckpt = torch.load(file_path, map_location="cpu", weights_only=False)
+        ckpt = torch.load(file_path, map_location="cpu", weights_only=True)
         if not isinstance(ckpt, dict):
             return
 

@@ -203,8 +203,12 @@ def parse_args(args_list: Optional[List[str]] = None):
                         help="Enable live two-way synchronization with bioflo.in")
     parser.add_argument("--cloud-url", type=str, default="https://bioflo.in/api/cerebro/sync.php",
                         help="Remote sync hub endpoint (bioflo.in)")
-    parser.add_argument("--cloud-token", type=str, default="CerebroSpheroid_Sync_Secure_2026",
-                        help="Remote sync authentication token")
+    parser.add_argument(
+        "--cloud-token",
+        type=str,
+        default=os.environ.get("BIOFLO_SYNC_TOKEN", os.environ.get("CEREBRO_SYNC_TOKEN", "")),
+        help="Remote sync authentication token (defaults to BIOFLO_SYNC_TOKEN environment variable)",
+    )
     parser.add_argument("--save-every", type=int, default=250,
                         help="Steps between checkpoint saves (default: 250)")
     parser.add_argument("--milestone-every", type=int, default=1000,
