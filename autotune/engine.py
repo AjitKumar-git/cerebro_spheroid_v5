@@ -690,6 +690,12 @@ def auto_tune_environment(
     fast: bool = True,
     num_steps: Optional[int] = None,
     strategy: Optional[str] = None,
+    hardware_info: Optional[Union[HardwareInfo, Dict[str, Any]]] = None,
+    worst_case_seq_len: Optional[int] = None,
+    model_config: Optional[Any] = None,
+    config_overrides: Optional[Dict[str, Any]] = None,
+    num_devices: Optional[int] = None,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """Functional convenience entrypoint matching legacy CerebroSpheroid auto_tune_environment."""
     tuner = AutoTuner(
@@ -714,6 +720,12 @@ def auto_tune_environment(
         fast=fast,
         num_steps=num_steps,
         strategy=strategy,
+        hardware_info=hardware_info,
+        worst_case_seq_len=worst_case_seq_len,
+        model_config=model_config,
+        config_overrides=config_overrides,
+        num_devices=num_devices,
+        **kwargs,
     )
 
 
