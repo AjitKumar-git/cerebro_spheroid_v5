@@ -804,7 +804,9 @@ def main(args=None):
         remat_choice = True
 
     # Scale micro-batch if necessary to keep micro-batch tokens bounded
-    max_micro_tokens = 131072 if remat_choice else 65536
+    # On 16GB accelerators (TPU v5e-1), 65,536 tokens per microbatch fits comfortably in HBM (4.5GB / 28.9%).
+    # 131,072 tokens per microbatch at seq >= 1024 causes OOM due to 32k-vocab logit tensors and optimizer states.
+    max_micro_tokens = 65536
     if args.batch_size * args.seq_len > max_micro_tokens:
         old_bs = args.batch_size
         capped_bs = max(1, max_micro_tokens // args.seq_len)
@@ -2068,6 +2070,8 @@ def run_training(**kwargs):
     args = parse_args([])
     for k, v in kwargs.items():
         attr = k.replace("-", "_")
+        if attr in ("effective_batch_size", "effective_batch"):
+            args.effective_batch_size_explicit = True
         if hasattr(args, attr):
             setattr(args, attr, v)
         elif hasattr(args, k):

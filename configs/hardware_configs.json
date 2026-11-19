@@ -10,13 +10,13 @@
       "vram_utilization_pct": 13.4
     },
     "TPU_v5_lite_16GB_seq1024": {
-      "batch_size": 128,
+      "batch_size": 64,
       "remat": true,
       "seq_len": 1024,
-      "tok_per_sec": 364000.0,
-      "step_ms": 360.0,
-      "vram_gb": 4.2,
-      "vram_utilization_pct": 26.7
+      "tok_per_sec": 249305.0,
+      "step_ms": 328.6,
+      "vram_gb": 4.5,
+      "vram_utilization_pct": 28.9
     },
     "TPU_v5_lite_16GB_seq2048": {
       "batch_size": 64,
@@ -73,13 +73,13 @@
       "vram_utilization_pct": 13.4
     },
     "TPU_v5_lite_16GB_seq1024": {
-      "batch_size": 128,
+      "batch_size": 64,
       "remat": true,
       "seq_len": 1024,
-      "tok_per_sec": 364000.0,
-      "step_ms": 360.0,
-      "vram_gb": 4.2,
-      "vram_utilization_pct": 26.7
+      "tok_per_sec": 249305.0,
+      "step_ms": 328.6,
+      "vram_gb": 4.5,
+      "vram_utilization_pct": 28.9
     },
     "TPU_v5_lite_16GB_seq2048": {
       "batch_size": 64,

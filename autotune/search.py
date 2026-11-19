@@ -46,15 +46,27 @@ def generate_vram_maximizing_candidates(
     elif total_gb >= 12.0:
         # Standard datacenter accelerator: TPU v5e-1 (16GB), T4 (16GB), V100 (16GB), L4 (24GB), RTX 3090/4090 (24GB)
         if is_small_tier:
-            if seq_len >= 512:
-                base_ladder = [16, 32, 64, 128, 192, 256]
+            if seq_len >= 4096:
+                base_ladder = [4, 8, 16]
+            elif seq_len >= 2048:
+                base_ladder = [8, 16, 32]
+            elif seq_len >= 1024:
+                base_ladder = [16, 32, 64]
+            elif seq_len >= 512:
+                base_ladder = [16, 32, 64, 128]
             elif max_batch_size is not None and max_batch_size <= 64:
                 base_ladder = [16, 32, 64]
             else:
                 base_ladder = [32, 64, 128, 192, 256, 384, 512, 768, 1024]
         elif is_compact_tier:
-            if seq_len >= 512:
-                base_ladder = [8, 16, 32, 64, 96, 128]
+            if seq_len >= 4096:
+                base_ladder = [2, 4, 8]
+            elif seq_len >= 2048:
+                base_ladder = [4, 8, 16]
+            elif seq_len >= 1024:
+                base_ladder = [8, 16, 32]
+            elif seq_len >= 512:
+                base_ladder = [8, 16, 32, 64]
             else:
                 base_ladder = [8, 16, 32, 64, 96, 128, 192, 256, 384]
         elif preset == "v5_test":
@@ -121,8 +133,14 @@ def generate_vram_maximizing_candidates(
 
     candidates = []
     for b in base_ladder:
-        # Evaluate remat=False first so large batches without OOM skip redundant remat recomputation
-        candidates.append({"batch_size": b, "remat": False})
+        # Long context (>= 1024) on <= 24GB accelerator requires activation remat to prevent HBM OOM
+        skip_non_remat = (
+            (total_gb <= 24.0 and seq_len >= 1024 and b >= 64)
+            or (total_gb <= 24.0 and seq_len >= 2048 and b >= 32)
+            or (total_gb <= 24.0 and seq_len >= 4096 and b >= 16)
+        )
+        if not skip_non_remat:
+            candidates.append({"batch_size": b, "remat": False})
         candidates.append({"batch_size": b, "remat": True})
 
     return candidates

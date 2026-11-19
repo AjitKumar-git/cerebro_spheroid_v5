@@ -376,7 +376,9 @@ class AutoTuner:
         # 1. First Priority: Check cached configs if caching is enabled
         if use_cached_config and not force_tune and candidates is None:
             cached_local = self.cache_manager.load(preset, cache_sig)
-            if cached_local is None and cache_sig != sig and max_batch_size is None:
+            if cached_local is None and cap_suffix:
+                cached_local = self.cache_manager.load(preset, f"{sig}{seq_suffix}")
+            if cached_local is None and cache_sig != sig:
                 fallback_local = self.cache_manager.load(preset, sig)
                 if fallback_local and fallback_local.get("seq_len") == seq_len:
                     cached_local = fallback_local
@@ -419,7 +421,11 @@ class AutoTuner:
                 cached_remote = fetch_remote_hardware_config(
                     model=preset, device_signature=cache_sig, url=cloud_url, token=cloud_token
                 )
-                if cached_remote is None and cache_sig != sig and max_batch_size is None:
+                if cached_remote is None and cap_suffix:
+                    cached_remote = fetch_remote_hardware_config(
+                        model=preset, device_signature=f"{sig}{seq_suffix}", url=cloud_url, token=cloud_token
+                    )
+                if cached_remote is None and cache_sig != sig:
                     fallback_remote = fetch_remote_hardware_config(
                         model=preset, device_signature=sig, url=cloud_url, token=cloud_token
                     )
