@@ -20,6 +20,7 @@ import json
 import os
 import random
 import re
+import time
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 import pyarrow as pa
@@ -697,16 +698,32 @@ def extract_strict_act_payload(
 
 
 def is_valid_tool_call(tc: str) -> bool:
-    """Checks whether a string is an authentic tool execution invocation."""
+    """Checks whether a string is an authentic tool execution invocation (functional or JSON schema)."""
     s = str(tc or "").strip()
     if not s:
         return False
-    tool_prefixes = ("calc(", "calc:", "calculator:", "python(", "python:", "sql:", "search(", "search:", "bash(", "bash:")
+
+    # 1. Functional prefix or identifier invocation
+    tool_prefixes = ("calc(", "calc:", "calculator:", "python(", "python:", "sql:", "search(", "search:", "bash(", "bash:", "file_read(", "file_write(")
     if any(s.lower().startswith(p) for p in tool_prefixes):
         return True
-    # Generic tool invocation signature: identifier(args)
     if re.match(r"^[a-zA-Z_]\w*\s*\(.*?\)$", s, re.DOTALL):
         return True
+
+    # 2. Industry standard JSON tool call: {"name": "...", "arguments": {...}}
+    if ("{" in s and "}" in s) and ("\"name\"" in s or "'name'" in s):
+        try:
+            clean_s = s
+            if "```" in clean_s:
+                m_code = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", clean_s, re.DOTALL)
+                if m_code:
+                    clean_s = m_code.group(1).strip()
+            obj = json.loads(clean_s)
+            if isinstance(obj, dict) and ("name" in obj or "function" in obj):
+                return True
+        except Exception:
+            pass
+
     return False
 
 
@@ -714,7 +731,7 @@ def parse_model_output(text: str) -> Dict[str, Any]:
     """
     Parses CerebroSpheroid output following the 3-tier cognitive protocol:
     1. Thinking           : <think> ... </think> -> Private scratchpad (hidden or collapsible)
-    2. Non-Conversational : <act> ... </act>     -> External Tool actions ONLY (calc, python, etc.)
+    2. Non-Conversational : <act> ... </act> OR <tool_call> ... </tool_call> -> External Tool actions ONLY
     3. Talking / Answering: Unbounded Plain Text -> Normal output outside <act>
     """
     raw = str(text or "").strip()
@@ -725,17 +742,20 @@ def parse_model_output(text: str) -> Dict[str, Any]:
     if think_m:
         thinking = think_m.group(1).strip()
 
-    # 2. Extract <act> ... </act> non-conversational actions
+    # 2. Extract <act> ... </act> and <tool_call> ... </tool_call> non-conversational actions
     raw_tools = []
     for m in re.finditer(r"<act>(.*?)(?:</act>|$)", raw, re.DOTALL):
+        raw_tools.append(m.group(1).strip())
+    for m in re.finditer(r"<tool_call>(.*?)(?:</tool_call>|$)", raw, re.DOTALL):
         raw_tools.append(m.group(1).strip())
 
     # 3. Extract plain talking/answering text (outside thinking & action blocks)
     clean_text = re.sub(r"<think>.*?(?:</think>|$)", "", raw, flags=re.DOTALL)
     clean_text = re.sub(r"<act>.*?(?:</act>|$)", "", clean_text, flags=re.DOTALL)
+    clean_text = re.sub(r"<tool_call>.*?(?:</tool_call>|$)", "", clean_text, flags=re.DOTALL)
 
     # Strip any stray ChatML or turn boundary tokens
-    for stray in ("<|im_end|>", "<|im_start|>", "</s>", "<s>", "<stim>", "</stim>", "</act>", "</think>"):
+    for stray in ("<|im_end|>", "<|im_start|>", "</s>", "<s>", "<stim>", "</stim>", "</act>", "</think>", "</tool_call>", "</tool_response>", "<obs>", "</obs>"):
         clean_text = clean_text.replace(stray, "")
     answer = clean_text.strip()
 
@@ -743,7 +763,7 @@ def parse_model_output(text: str) -> Dict[str, Any]:
     tool_calls = []
     for tc in raw_tools:
         tc_clean = re.sub(r"<think>.*?(?:</think>|$)", "", tc, flags=re.DOTALL).strip()
-        for stray in ("<|im_end|>", "<|im_start|>", "</s>", "<s>", "<stim>", "</stim>", "</act>", "</think>"):
+        for stray in ("<|im_end|>", "<|im_start|>", "</s>", "<s>", "<stim>", "</stim>", "</act>", "</think>", "</tool_call>"):
             tc_clean = tc_clean.replace(stray, "")
         tc_clean = tc_clean.strip()
         if not tc_clean:
@@ -762,6 +782,60 @@ def parse_model_output(text: str) -> Dict[str, Any]:
         "tool_calls": tool_calls,
         "raw": raw,
     }
+
+
+def to_openai_tool_chat(
+    prompt: str,
+    thinking: str = "",
+    tool_call_name: Optional[str] = None,
+    tool_call_args: Optional[Dict[str, Any]] = None,
+    observation: Optional[str] = None,
+    final_answer: str = "",
+    system_prompt: str = "You are a helpful assistant with access to verified tools.",
+) -> List[Dict[str, Any]]:
+    """Converts a reasoning & tool interaction into standard OpenAI / HuggingFace chat format."""
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": prompt.strip()},
+    ]
+
+    if tool_call_name and tool_call_args is not None:
+        call_id = f"call_{int(time.time_ns()) % 1000000:06d}"
+        assistant_turn: Dict[str, Any] = {
+            "role": "assistant",
+            "content": f"<think>\n{thinking}\n</think>" if thinking else None,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_call_name,
+                        "arguments": json.dumps(tool_call_args, ensure_ascii=False)
+                    }
+                }
+            ]
+        }
+        messages.append(assistant_turn)
+
+        if observation is not None:
+            tool_msg = {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": tool_call_name,
+                "content": str(observation).strip()
+            }
+            messages.append(tool_msg)
+
+            if final_answer:
+                messages.append({
+                    "role": "assistant",
+                    "content": final_answer.strip()
+                })
+    else:
+        full_content = f"<think>\n{thinking}\n</think>\n{final_answer}".strip() if thinking else final_answer.strip()
+        messages.append({"role": "assistant", "content": full_content})
+
+    return messages
 
 
 def encode_no_special(tokenizer, text: str, max_length: Optional[int] = None) -> List[int]:
