@@ -217,11 +217,39 @@ class ComputationalGraphNode:
         for node in reversed(topo):
             node._backward()
 """,
+        """import heapq
+from typing import Any, Generic, List, Optional, Tuple, TypeVar
+
+T = TypeVar("T")
+
+class PrioritizedTaskQueue(Generic[T]):
+    \"\"\"Thread-safe binary heap priority queue with O(log N) push and pop.\"\"\"
+    def __init__(self):
+        self._heap: List[Tuple[float, int, T]] = []
+        self._counter: int = 0
+
+    def push(self, item: T, priority: float) -> None:
+        heapq.heappush(self._heap, (priority, self._counter, item))
+        self._counter += 1
+
+    def pop(self) -> T:
+        if not self._heap:
+            raise IndexError("pop from empty priority queue")
+        priority, _, item = heapq.heappop(self._heap)
+        return item
+
+    def peek(self) -> Optional[T]:
+        return self._heap[0][2] if self._heap else None
+
+    def __len__(self) -> int:
+        return len(self._heap)
+""",
     ],
     "math": [
         "Let V and W be vector spaces over field F with V finite-dimensional. The Rank-Nullity Theorem states that for any linear map T: V -> W, dim(V) = dim(ker(T)) + dim(im(T)). Proof: Let {u_1, ..., u_k} be a basis for ker(T), so nullity(T) = k. By the basis extension theorem, extend this to a basis of V: {u_1, ..., u_k, v_1, ..., v_r}, so dim(V) = k + r. We claim {T(v_1), ..., T(v_r)} is a basis for im(T). First, any w in im(T) has w = T(v) for v in V. Writing v = sum a_i u_i + sum b_j v_j, T(v) = sum a_i T(u_i) + sum b_j T(v_j) = sum b_j T(v_j), spanning im(T). Second, if sum c_j T(v_j) = 0, then T(sum c_j v_j) = 0, so sum c_j v_j is in ker(T), implying all c_j = 0 by linear independence of the extended basis. Thus rank(T) = r, completing the proof.",
         "Taylor's Theorem with Lagrange remainder: Let f be (n+1) times continuously differentiable on [a, b]. Then f(b) = sum_{k=0}^n (f^(k)(a)/k!) (b-a)^k + R_n(b), where R_n(b) = (f^(n+1)(xi)/(n+1)!) (b-a)^(n+1) for some xi in (a, b). The proof constructs an auxiliary function g(t) = f(b) - sum_{k=0}^n (f^(k)(t)/k!) (b-t)^k - M (b-t)^(n+1), choosing M such that g(a) = 0. Since g(b) = 0 as well, Rolle's Theorem guarantees a point xi in (a, b) where g'(xi) = 0. Differentiating g(t) via product rule causes telescoping cancellation of all intermediate derivatives, leaving - (f^(n+1)(xi)/n!) (b-xi)^n + (n+1)M (b-xi)^n = 0, yielding the exact Lagrange form for M.",
         "Bayes' Theorem formalizes rational belief updating under uncertain evidence: P(A|B) = P(B|A) P(A) / P(B). By definition of conditional probability, P(A and B) = P(A|B) P(B) = P(B|A) P(A). Dividing by P(B) produces the identity. By the law of total probability across mutually exclusive exhaustive partitions {A_i}, the marginal evidence is P(B) = sum_i P(B|A_i) P(A_i). In statistical inference, P(A) represents the prior distribution, P(B|A) is the likelihood function, and P(A|B) is the posterior distribution.",
+        "The Cauchy-Schwarz Inequality states that for any vectors u, v in an inner product space, |<u, v>|^2 <= <u, u> <v, v>. Proof: If v = 0, the inequality trivially holds as 0 <= 0. For v != 0, consider the scalar projection lambda = <u, v> / <v, v> and the orthogonal component z = u - lambda v. By non-negativity of inner products, 0 <= <z, z> = <u - lambda v, u - lambda v> = <u, u> - conj(lambda) <u, v> - lambda <v, u> + |lambda|^2 <v, v>. Substituting lambda yields 0 <= <u, u> - |<u, v>|^2 / <v, v>. Multiplying both sides by the positive scalar <v, v> directly establishes |<u, v>|^2 <= <u, u> <v, v>, with equality holding if and only if u and v are linearly dependent.",
     ],
 }
 
