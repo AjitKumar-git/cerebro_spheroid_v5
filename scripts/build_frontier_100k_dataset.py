@@ -357,6 +357,47 @@ def build_frontier_dataset(
             f_ind.flush()
             print(f"✓ Completed {source_name}: {source_count:,} samples ({time.time() - t0_source:.1f}s)\n")
 
+        # Top-up phase: reach exact target_total from OpenThoughts if any source was constrained
+        if total_written < target_total:
+            deficit = target_total - total_written
+            print(f"▶️ Top-up phase: streaming {deficit:,} additional fresh samples from OpenThoughts...")
+            topup_stream = stream_open_thoughts(target_count=deficit, seen_hashes=seen_hashes)
+            for item in topup_stream:
+                prompt = item["prompt"]
+                response = item["response"]
+                sph_record = {
+                    "prompt": prompt,
+                    "response": response,
+                    "category": item["category"],
+                    "domain": item["domain"],
+                    "source": item["source"]
+                }
+                f_sph.write(json.dumps(sph_record, ensure_ascii=False) + "\n")
+
+                parsed = parse_model_output(response)
+                open_ai_msgs = to_openai_tool_chat(
+                    prompt=prompt,
+                    thinking=parsed.get("thinking", ""),
+                    tool_call_name=parsed["tool_calls"][0] if parsed.get("tool_calls") else None,
+                    tool_call_args={"call": parsed["tool_calls"][0]} if parsed.get("tool_calls") else None,
+                    final_answer=parsed.get("answer", "")
+                )
+                ind_record = {
+                    "messages": open_ai_msgs,
+                    "category": item["category"],
+                    "source": item["source"]
+                }
+                f_ind.write(json.dumps(ind_record, ensure_ascii=False) + "\n")
+
+                if export_parquet and total_written < target_total:
+                    all_records.append(sph_record)
+
+                total_written += 1
+                if total_written >= target_total:
+                    break
+            f_sph.flush()
+            f_ind.flush()
+
     # Export Parquet
     if export_parquet and all_records:
         print(f"📦 Exporting {len(all_records):,} records to Apache Parquet: {parquet_path}...")
