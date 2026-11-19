@@ -1,15 +1,15 @@
 # Agent Work State & Activity Tracker
 
-> **Status**: 🟢 `COMPLETED` | **Last Updated**: `2026-11-20T02:53:36.367459+05:30` | **Session**: `734a32d4-30f9-4fa4-b9c2-5336e0f58c27`
+> **Status**: 🟡 `IN_PROGRESS` | **Last Updated**: `2026-11-20T04:38:25.149394+05:30` | **Session**: `734a32d4-30f9-4fa4-b9c2-5336e0f58c27`
 
 ## Current / Active Objective
-**Goal**: so 100000 prompts. ok build this use open thoughts, deepseek distill, sky as base, grade these and make superior dataset, also update my tools calling as industry so distribution is easier.
+**Goal**: push to my hf
 
-- **Phase**: `completed`
-- **Current Task**: Idle / Awaiting next request
+- **Phase**: `executing`
+- **Current Task**: Executed run_command: Check git status
 
 ## Summary of Completed Work
-The **100,000-Prompt Frontier Reasoning & Tool-Calling Dataset** is built and verified, and your agentic tool-calling harness is updated to full industry standards for distribution.
+I have initiated the upload of the 100,000 frontier reasoning and tool-calling dataset to your Hugging Face account at [`AjitKumar-Bio/cerebro-spheroid-v5-frontier-reasoning-tools-100k`](https://huggingface.co/datasets/AjitKumar-Bio/cerebro-spheroid-v5-frontier-reasoning-tools-100k).
 
 ## Modified Files
 - [`scripts/run_weight_transfer_experiment.py`](scripts/run_weight_transfer_experiment.py)
@@ -130,20 +130,21 @@ The **100,000-Prompt Frontier Reasoning & Tool-Calling Dataset** is built and ve
 - [`../../../../.gemini/antigravity/brain/0f3587bb-eb4b-4589-908a-f9a86dcc5d7b/cerebro_exploration_reward_model_architecture.md`](../../../../.gemini/antigravity/brain/0f3587bb-eb4b-4589-908a-f9a86dcc5d7b/cerebro_exploration_reward_model_architecture.md)
 - [`src/agentic_harness.py`](src/agentic_harness.py)
 - [`scripts/build_frontier_100k_dataset.py`](scripts/build_frontier_100k_dataset.py)
+- [`scripts/upload_frontier_100k_to_hf.py`](scripts/upload_frontier_100k_to_hf.py)
 
 ## Recent Actions (Last 10)
 | Time | Tool | Details |
 | :--- | :--- | :--- |
-| `02:53:24` | `run_command` | List frontier 100k directory files |
-| `02:53:20` | `run_command` | Clean up temporary test artifacts |
-| `02:53:15` | `run_command` | Commit and push updated dataset builder |
-| `02:53:07` | `run_command` | Check git status |
-| `02:53:03` | `run_command` | Verify Parquet row count |
-| `02:52:55` | `run_command` | Run full frontier 100k builder |
-| `02:49:10` | `run_command` | Inspect non-weight fields in step 920k checkpoint |
-| `02:49:08` | `edit_file` | edit_file |
-| `02:49:03` | `run_command` | Search for batch_size and token count in TPU training scripts |
-| `02:48:57` | `read_file` | read_file |
+| `04:38:25` | `run_command` | Check git status |
+| `04:38:04` | `run_command` | Upload 100k dataset to Hugging Face |
+| `04:10:48` | `run_command` | Compile upload_frontier_100k_to_hf.py |
+| `04:10:42` | `write_file` | write_file |
+| `04:10:14` | `run_command` | List user's existing HF datasets |
+| `04:10:04` | `read_file` | read_file |
+| `04:09:59` | `run_command` | Check HF token and whoami |
+| `04:09:52` | `read_file` | read_file |
+| `04:09:44` | `read_file` | read_file |
+| `04:09:39` | `run_command` | Find HF upload scripts and utils |
 
 ---
 *This file is automatically maintained by `auto-work-tracker`. Other agents can parse `.agents/work_state.json` or inspect this file directly to resume or review progress.*
