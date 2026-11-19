@@ -134,10 +134,16 @@ def auto_tune_environment(
     max_batch_size: Optional[int] = None,
     fast: bool = True,
     num_steps: Optional[int] = None,
+    worst_case_seq_len: Optional[int] = None,
+    model_config: Optional[Any] = None,
+    config_overrides: Optional[Dict[str, Any]] = None,
+    num_devices: Optional[int] = None,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """
     Explores candidate execution configurations and identifies the setting that
     optimizes optimizer steps/sec, token throughput, or loss reduction/sec without OOM.
+    Enforces a strict zero-OOM execution envelope across worst-case sequence lengths and devices.
     """
     # Create cache manager delegating to current module's load/save (supports monkeypatching)
     cache_mgr = HardwareConfigCache()
@@ -170,6 +176,11 @@ def auto_tune_environment(
         benchmark_fn=benchmark_config,
         fast=fast,
         num_steps=num_steps,
+        worst_case_seq_len=worst_case_seq_len,
+        model_config=model_config,
+        config_overrides=config_overrides,
+        num_devices=num_devices,
+        **kwargs,
     )
 
 

@@ -183,8 +183,9 @@ class MicroBatchSlicer:
 
 class TrainingOOMHandler:
     """
-    Stateful controller managing dynamic batch-size reduction and gradient accumulation
-    adjustment during training when Out-Of-Memory (OOM) exceptions are triggered.
+    Stateful controller managing dynamic batch-size reduction, gradient accumulation
+    adjustment, and activation rematerialization cascades during training when
+    Out-Of-Memory (OOM) exceptions are triggered.
     """
 
     def __init__(
@@ -192,54 +193,94 @@ class TrainingOOMHandler:
         initial_batch_size: int,
         effective_batch_size: Optional[int] = None,
         initial_grad_accum: int = 1,
+        remat: bool = True,
         min_batch_size: int = 1,
         next_batch_fn: Optional[Callable[[], Tuple[Any, ...]]] = None,
         verbose: bool = True,
+        auto_engage_remat: bool = True,
     ):
         self.batch_size = int(initial_batch_size)
         self.effective_batch_size = int(effective_batch_size) if effective_batch_size else (self.batch_size * initial_grad_accum)
         self.grad_accum = int(initial_grad_accum)
+        self.remat = bool(remat)
         self.min_batch_size = int(min_batch_size)
         self.slicer = MicroBatchSlicer(next_batch_fn)
         self.verbose = verbose
+        self.auto_engage_remat = auto_engage_remat
         self.fallback_count = 0
         self.history: List[Dict[str, Any]] = []
+
+    def clean_memory(self) -> None:
+        """Flushes JAX compiled dispatch caches and triggers Python garbage collection."""
+        try:
+            import jax
+            if hasattr(jax, "clear_caches"):
+                jax.clear_caches()
+        except Exception:
+            pass
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
 
     def handle_oom(
         self,
         exc: BaseException,
         step: Optional[int] = None,
         failed_batch: Optional[Tuple[Any, ...]] = None,
+        current_remat: Optional[bool] = None,
     ) -> Tuple[int, int]:
         """
-        Processes an OOM error: computes smaller batch size, adjusts grad_accum,
-        stashes the failed batch for micro-slicing, and returns (new_batch_size, new_grad_accum).
+        Processes an OOM error through a multi-stage defense envelope:
+        1. If remat is currently False and auto_engage_remat is True:
+           Dynamically engages remat=True (reclaiming 50-70% activation memory while keeping batch size).
+        2. If remat is already True:
+           Halves micro-batch size and scales gradient accumulation to keep effective batch size invariant.
+        3. Stashes failed batch in MicroBatchSlicer so zero tokens are lost.
+        4. Cleans allocator slabs and cache memory.
         """
         if not is_oom_error(exc):
             raise exc
 
         old_bs = self.batch_size
         old_ga = self.grad_accum
+        old_remat = current_remat if current_remat is not None else self.remat
 
-        new_bs = compute_fallback_batch_size(old_bs, min_batch_size=self.min_batch_size)
-        new_ga = adjust_gradient_accumulation(self.effective_batch_size, new_bs, old_ga)
+        # Stage 1: Engage remat if it was inactive
+        if (not old_remat) and self.auto_engage_remat:
+            self.remat = True
+            new_bs = old_bs
+            new_ga = old_ga
+            action = "ENGAGE_REMAT"
+        else:
+            # Stage 2: Halve batch size and double grad_accum
+            new_bs = compute_fallback_batch_size(old_bs, min_batch_size=self.min_batch_size)
+            new_ga = adjust_gradient_accumulation(self.effective_batch_size, new_bs, old_ga)
+            self.batch_size = new_bs
+            self.grad_accum = new_ga
+            action = "HALVE_BATCH"
 
-        self.batch_size = new_bs
-        self.grad_accum = new_ga
         self.fallback_count += 1
 
         if failed_batch is not None:
             p = failed_batch[0]
             t = failed_batch[1]
             fb = failed_batch[2] if len(failed_batch) > 2 else None
-            self.slicer.stash_remainder(p, t, fb)
+            w = failed_batch[3] if len(failed_batch) > 3 else None
+            self.slicer.stash_remainder(p, t, fb, w)
+
+        self.clean_memory()
 
         record = {
             "step": step,
+            "action": action,
             "old_batch_size": old_bs,
             "new_batch_size": new_bs,
             "old_grad_accum": old_ga,
             "new_grad_accum": new_ga,
+            "old_remat": old_remat,
+            "new_remat": self.remat,
             "effective_batch_size": self.effective_batch_size,
         }
         self.history.append(record)
@@ -247,9 +288,13 @@ class TrainingOOMHandler:
         if self.verbose:
             step_str = f" at Step {step:,}" if step is not None else ""
             print("\n" + "=" * 80)
-            print(f"⚠️ [HBM/VRAM OOM Guard] Out-Of-Memory detected{step_str} with batch_size={old_bs}!")
-            print(f"   📉 Dynamic Fallback Triggered: micro-batch {old_bs} -> {new_bs}")
-            print(f"   ⚡ Gradient Accumulation Adjusted: {old_ga} -> {new_ga} (Preserving effective batch: {new_bs * new_ga})")
+            print(f"⚠️ [HBM/VRAM OOM Guard] Out-Of-Memory detected{step_str} (batch={old_bs}, remat={old_remat})!")
+            if action == "ENGAGE_REMAT":
+                print(f"   🛡️ Action: Engaged dynamic activation rematerialization (remat: False -> True)!")
+                print(f"   ⚡ Batch size preserved at {new_bs} (grad_accum={new_ga}) while reclaiming ~60% activation HBM.")
+            else:
+                print(f"   📉 Action: Scaled micro-batch {old_bs} -> {new_bs} (remat={self.remat})")
+                print(f"   ⚡ Gradient Accumulation Adjusted: {old_ga} -> {new_ga} (Preserving effective batch: {new_bs * new_ga})")
             print("=" * 80 + "\n")
 
         return new_bs, new_ga

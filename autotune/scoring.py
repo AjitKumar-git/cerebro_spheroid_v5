@@ -57,9 +57,12 @@ def calculate_loss_reduction_velocity(
 def score_benchmark_result(
     res: Dict[str, Any],
     tune_objective: str = "balanced",
+    greedy: bool = True,
 ) -> float:
     """
     Scores a passing benchmark result based on the requested optimization objective.
+    When `greedy=True`, applies a hardware saturation bonus for safely utilizing
+    60% to 92% of accelerator HBM/VRAM and prioritizing remat=False when memory permits.
 
     Objectives:
     - "tok_per_sec" / "tokens/sec": Raw throughput maximization.
@@ -78,17 +81,15 @@ def score_benchmark_result(
     obj = TuneObjective.from_str(tune_objective)
 
     if obj == TuneObjective.TOKENS_PER_SEC:
-        return tok_s
-
-    if obj == TuneObjective.STEPS_PER_SEC:
-        return (tok_s ** 0.25) * steps_s
-
-    if obj == TuneObjective.LOSS_REDUCTION_PER_SEC:
+        base_score = tok_s
+    elif obj == TuneObjective.STEPS_PER_SEC:
+        base_score = (tok_s ** 0.25) * steps_s
+    elif obj == TuneObjective.LOSS_REDUCTION_PER_SEC:
         init_loss = res.get("initial_loss")
         fin_loss = res.get("final_loss")
         num_steps = res.get("num_steps", 4)
         b = res.get("batch_size", 32)
-        return calculate_loss_reduction_velocity(
+        base_score = calculate_loss_reduction_velocity(
             initial_loss=init_loss,
             final_loss=fin_loss,
             num_steps=num_steps,
@@ -96,9 +97,26 @@ def score_benchmark_result(
             batch_size=b,
             tok_per_sec=tok_s,
         )
+    else:
+        # "balanced": Pareto efficiency balancing token throughput and optimizer updates/sec
+        base_score = tok_s * (steps_s ** 0.25)
 
-    # "balanced": Pareto efficiency balancing token throughput and optimizer updates/sec
-    return tok_s * (steps_s ** 0.25)
+    if not greedy:
+        return base_score
+
+    # Greedy accelerator saturation bonus:
+    # 1. Incentivize utilizing 65% to 92% of hardware capacity
+    mem_pct = float(res.get("memory_utilization_pct", res.get("vram_utilization_pct", 0.0)))
+    sat_mult = 1.0
+    if 65.0 <= mem_pct <= 92.0:
+        sat_mult += 0.08 * ((mem_pct - 65.0) / 27.0)
+    elif mem_pct > 95.0:
+        sat_mult *= 0.85  # Penalize precarious boundary allocations exceeding 95%
+
+    # 2. Prefer remat=False when memory permits (avoids ~30% forward recomputation overhead)
+    remat_bonus = 1.05 if not res.get("remat", False) else 1.0
+
+    return base_score * sat_mult * remat_bonus
 
 
 # Backward-compatible alias

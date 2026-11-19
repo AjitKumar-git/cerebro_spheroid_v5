@@ -31,6 +31,10 @@ class MemoryBreakdown:
     peak_hbm_gb: float
     hbm_utilization_pct: float
     predicted_oom: bool
+    collective_bytes: int = 0
+    collective_gb: float = 0.0
+    headroom_gb: float = 0.0
+    is_greedy_safe: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -40,10 +44,14 @@ class MemoryBreakdown:
             "opt_state_gb": self.opt_state_gb,
             "activation_bytes": self.activation_bytes,
             "activation_gb": self.activation_gb,
+            "collective_bytes": self.collective_bytes,
+            "collective_gb": self.collective_gb,
             "peak_hbm_bytes": self.peak_hbm_bytes,
             "peak_hbm_gb": self.peak_hbm_gb,
+            "headroom_gb": self.headroom_gb,
             "hbm_utilization_pct": self.hbm_utilization_pct,
             "predicted_oom": self.predicted_oom,
+            "is_greedy_safe": self.is_greedy_safe,
         }
 
 
@@ -58,8 +66,9 @@ def estimate_peak_hbm(
     bytes_per_tok: int = 2,
     opt_multiplier: float = 2.0,
     total_memory_bytes: Optional[int] = None,
-    safety_margin: float = 0.95,
+    safety_margin: float = 0.90,
     vocab_size: int = 0,
+    num_devices: int = 1,
 ) -> MemoryBreakdown:
     """
     Computes exact theoretical peak accelerator memory based on tensor shapes:
@@ -75,6 +84,9 @@ def estimate_peak_hbm(
          A_bytes = Batch × (PromptLen + SeqLen) × SurfaceDim × BytesPerTok × (NumShells × 2)
        - remat=True: only shell boundary checkpoints stored; intermediate layers recomputed:
          A_bytes = Batch × (PromptLen + SeqLen) × SurfaceDim × BytesPerTok × 4
+
+    4. Distributed Collective & Replica Buffers:
+       - num_devices > 1: reserves cross-device pmean / all-reduce buffer capacity
     """
     # 1. Static weights and optimizer state
     static_bytes = int(param_bytes)
@@ -84,9 +96,6 @@ def estimate_peak_hbm(
     total_tokens = max(1, prompt_len + seq_len)
 
     # 3. Activation multiplier:
-    # If remat=True, activations inside shells are recomputed during backward pass,
-    # so peak activation memory is bounded by boundary checkpoints (~4x surface slice).
-    # If remat=False, activations across all shells are preserved in memory (~2 * num_shells).
     if remat:
         act_factor = 4
     else:
@@ -98,14 +107,23 @@ def estimate_peak_hbm(
         batch_size * total_tokens * surface_dim * bytes_per_tok * act_factor + logits_bytes
     )
 
-    peak_bytes = static_bytes + opt_bytes + activation_bytes
+    # 5. Distributed collective communication headroom (cross-replica pmean / all-reduce buffers)
+    collective_bytes = int(static_bytes) if num_devices > 1 else 0
+
+    peak_bytes = static_bytes + opt_bytes + activation_bytes + collective_bytes
     peak_gb = peak_bytes / (1024**3)
 
     util_pct = 0.0
     predicted_oom = False
+    headroom_gb = 0.0
+    is_greedy_safe = False
     if total_memory_bytes and total_memory_bytes > 0:
         util_pct = min(100.0, (peak_bytes / total_memory_bytes) * 100.0)
         predicted_oom = peak_bytes > (total_memory_bytes * safety_margin)
+        headroom_bytes = max(0, total_memory_bytes - peak_bytes)
+        headroom_gb = headroom_bytes / (1024**3)
+        # Optimal greedy saturation envelope: 60% to 90% utilization
+        is_greedy_safe = (util_pct >= 60.0) and (not predicted_oom)
 
     return MemoryBreakdown(
         static_weights_bytes=static_bytes,
@@ -114,10 +132,14 @@ def estimate_peak_hbm(
         opt_state_gb=opt_bytes / (1024**3),
         activation_bytes=activation_bytes,
         activation_gb=activation_bytes / (1024**3),
+        collective_bytes=collective_bytes,
+        collective_gb=collective_bytes / (1024**3),
         peak_hbm_bytes=peak_bytes,
         peak_hbm_gb=peak_gb,
+        headroom_gb=headroom_gb,
         hbm_utilization_pct=util_pct,
         predicted_oom=predicted_oom,
+        is_greedy_safe=is_greedy_safe,
     )
 
 
@@ -130,6 +152,8 @@ def estimate_v5_peak_hbm(
     remat: bool = False,
     dtype: str = "bfloat16",
     total_memory_bytes: Optional[int] = None,
+    num_devices: int = 1,
+    worst_case_seq_len: Optional[int] = None,
 ) -> MemoryBreakdown:
     """Convenience wrapper tailored for CerebroSpheroid V5 configurations."""
     # Determine bytes per token / element
@@ -139,24 +163,23 @@ def estimate_v5_peak_hbm(
     # Extract model structural hyperparameters
     num_shells = getattr(config, "num_shells", 12)
     surface_dim = getattr(config, "surface_dim", getattr(config, "hidden_dim", 768))
-
     vocab = getattr(config, "vocab_size", 32000)
 
     # Calculate parameter bytes
     if params:
         param_bytes = sum(p.size * p.itemsize for p in params.values())
     else:
-        # Theoretical parameter estimation from config if params not instantiated
-        # Embedding: vocab * surface_dim
-        # Shells: num_shells * (~4 * surface_dim^2)
-        # Heads / Motor: ~2 * surface_dim * vocab
         est_params = (vocab * surface_dim) + (num_shells * 4 * surface_dim * surface_dim) + (surface_dim * vocab)
         param_bytes = est_params * bytes_per_tok
+
+    target_seq = seq_len
+    if worst_case_seq_len is not None and worst_case_seq_len > seq_len:
+        target_seq = worst_case_seq_len
 
     return estimate_peak_hbm(
         param_bytes=param_bytes,
         batch_size=batch_size,
-        seq_len=seq_len,
+        seq_len=target_seq,
         prompt_len=prompt_len,
         num_shells=num_shells,
         surface_dim=surface_dim,
@@ -165,4 +188,5 @@ def estimate_v5_peak_hbm(
         opt_multiplier=2.0,
         total_memory_bytes=total_memory_bytes,
         vocab_size=vocab,
+        num_devices=num_devices,
     )

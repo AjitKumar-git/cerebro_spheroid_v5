@@ -135,6 +135,34 @@ class TestOOMFallback(unittest.TestCase):
         self.assertEqual(p_micro2.shape[0], 32)
         self.assertFalse(handler.slicer.has_remainder())
 
+    def test_dynamic_remat_cascade(self):
+        """Verifies multi-stage cascade: remat toggle first, then batch halving."""
+        handler = TrainingOOMHandler(
+            initial_batch_size=64,
+            effective_batch_size=128,
+            initial_grad_accum=2,
+            remat=False,  # Initially running without remat
+            auto_engage_remat=True,
+            min_batch_size=1,
+            verbose=False,
+        )
+
+        oom_exc = RuntimeError("RESOURCE_EXHAUSTED: HbmOom")
+
+        # Stage 1: First OOM engages remat=True without reducing batch size!
+        bs1, ga1 = handler.handle_oom(oom_exc, step=10, current_remat=False)
+        self.assertEqual(bs1, 64)  # Preserved batch size!
+        self.assertEqual(ga1, 2)
+        self.assertTrue(handler.remat)
+        self.assertEqual(handler.history[-1]["action"], "ENGAGE_REMAT")
+
+        # Stage 2: Second OOM (now with remat=True) halves batch size to 32
+        bs2, ga2 = handler.handle_oom(oom_exc, step=11, current_remat=True)
+        self.assertEqual(bs2, 32)  # Halved!
+        self.assertEqual(ga2, 4)
+        self.assertTrue(handler.remat)
+        self.assertEqual(handler.history[-1]["action"], "HALVE_BATCH")
+
 
 if __name__ == "__main__":
     unittest.main()

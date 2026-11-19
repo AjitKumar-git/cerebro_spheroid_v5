@@ -36,10 +36,15 @@ def benchmark_v5_model(
     num_steps: int = 2,
     dtype: str = "auto",
     prompt_len: int = 256,
+    model_config: Optional[Any] = None,
+    config_overrides: Optional[Dict[str, Any]] = None,
+    worst_case_seq_len: Optional[int] = None,
+    num_devices: int = 1,
 ) -> Dict[str, Any]:
     """
     Benchmarks a single training configuration and returns step latency, steps/s,
     token throughput, loss reduction velocity, and memory metrics. Gracefully catches OOM.
+    Enforces the worst-case envelope across distributed devices and elastic bucket sizes.
     """
     import jax
     import jax.numpy as jnp
@@ -56,8 +61,13 @@ def benchmark_v5_model(
     target_dtype, _ = resolve_jax_compute_dtype(dtype)
     dtype_str = str(target_dtype).replace("jax.numpy.", "")
 
-    cfg_dict = PRESETS_V5.get(preset, PRESETS_V5.get("v5_small", {}))
-    config = ModelConfigV5(**cfg_dict)
+    if model_config is not None:
+        config = model_config
+    else:
+        cfg_dict = dict(PRESETS_V5.get(preset, PRESETS_V5.get("v5_small", {})))
+        if config_overrides:
+            cfg_dict.update(config_overrides)
+        config = ModelConfigV5(**cfg_dict)
 
     params = opt_state = train_step_fn = None
     init_loss_val: Optional[float] = None
@@ -105,6 +115,8 @@ def benchmark_v5_model(
             remat=remat,
             dtype=target_dtype,
             total_memory_bytes=total_mem_bytes,
+            num_devices=num_devices,
+            worst_case_seq_len=worst_case_seq_len,
         )
 
         mem_label = "HBM" if is_tpu else ("VRAM" if is_gpu else "RAM")

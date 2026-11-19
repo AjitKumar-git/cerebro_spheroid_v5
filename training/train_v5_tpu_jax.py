@@ -769,6 +769,10 @@ def main(args=None):
     # 6. Hardware Optimization & Auto-Tuning
     remat_choice = True if args.remat.lower() == "true" else False
     max_bs = getattr(args, "max_batch_size", None)
+    worst_case_seq = max(args.seq_len, args.total_window, getattr(args, "target_seq_len", 0) or 0)
+    if getattr(args, "context_curriculum", False) and "context_stages" in locals():
+        worst_case_seq = max(worst_case_seq, max(context_stages))
+
     if args.auto_tune:
         best_cfg = run_auto_tuner(
             preset=args.preset,
@@ -783,6 +787,9 @@ def main(args=None):
             tune_objective=getattr(args, "tune_objective", "balanced"),
             prompt_len=args.prompt_len,
             max_batch_size=max_bs,
+            worst_case_seq_len=worst_case_seq,
+            model_config=config,
+            num_devices=num_devices,
         )
         if not getattr(args, "batch_size_explicit", False):
             args.batch_size = best_cfg["batch_size"]
@@ -853,6 +860,7 @@ def main(args=None):
         initial_batch_size=args.batch_size,
         effective_batch_size=eff_batch_size,
         initial_grad_accum=grad_accum,
+        remat=remat_choice,
         min_batch_size=1,
         verbose=True,
     )
@@ -1668,14 +1676,16 @@ def main(args=None):
                             step_tokens, step_prompt, step_loss, step_pad = _count_real_tokens(prompt_b, target_b)
                         step_executed = True
                     except Exception as e_step:
-                        if not is_oom_error(e_step) or args.batch_size <= 1:
+                        if not is_oom_error(e_step) or (args.batch_size <= 1 and remat_choice):
                             raise
                         failed_tup = (prompt_b, target_b, feedback_b, weights_b) if weights_b is not None else ((prompt_b, target_b, feedback_b) if prompt_b is not None else None)
                         args.batch_size, grad_accum = oom_handler.handle_oom(
-                            e_step, step=step, failed_batch=failed_tup
+                            e_step, step=step, failed_batch=failed_tup, current_remat=remat_choice
                         )
+                        remat_changed = (oom_handler.remat != remat_choice)
+                        remat_choice = oom_handler.remat
                         oom_handler.update_streamer(elastic_batcher or local_streamer)
-                        if compute_grad_step is None:
+                        if compute_grad_step is None or remat_changed:
                             compute_grad_step, apply_opt_step_anneal = build_spheroid_train_engine(
                                 config, buffers, pad_id=pad_id, weight_decay=args.weight_decay,
                                 repetition_penalty=args.repetition_penalty, remat=remat_choice,
@@ -1686,6 +1696,16 @@ def main(args=None):
                                 repetition_penalty=args.repetition_penalty, remat=remat_choice,
                                 deliberation_mode=args.deliberation_mode, param_masks=param_masks,
                             ) if param_masks is not None else (None, apply_opt_step_anneal)
+                            train_step_fn_anneal = build_train_step_spheroid(
+                                config, buffers, pad_id=pad_id, weight_decay=args.weight_decay,
+                                repetition_penalty=args.repetition_penalty, remat=remat_choice,
+                                deliberation_mode=args.deliberation_mode, param_masks=None,
+                            )
+                            train_step_fn_frozen = build_train_step_spheroid(
+                                config, buffers, pad_id=pad_id, weight_decay=args.weight_decay,
+                                repetition_penalty=args.repetition_penalty, remat=remat_choice,
+                                deliberation_mode=args.deliberation_mode, param_masks=param_masks,
+                            ) if param_masks is not None else train_step_fn_anneal
 
             loss_val = float(loss)
             if math.isfinite(loss_val):

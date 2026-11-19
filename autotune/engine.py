@@ -174,6 +174,7 @@ class AutoTuner:
         obj_name: str,
         verbose: bool,
         mem_type: str,
+        **runner_kwargs,
     ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
         """
         Executes fast logarithmic geometric bisection search across candidate batch sizes.
@@ -219,6 +220,7 @@ class AutoTuner:
                 num_steps=benchmark_steps,
                 dtype=dtype,
                 prompt_len=prompt_len,
+                **runner_kwargs,
             )
             results.append(res)
             eval_cache[key] = res
@@ -339,6 +341,11 @@ class AutoTuner:
         num_steps: Optional[int] = None,
         strategy: Optional[str] = None,
         hardware_info: Optional[Union[HardwareInfo, Dict[str, Any]]] = None,
+        worst_case_seq_len: Optional[int] = None,
+        model_config: Optional[Any] = None,
+        config_overrides: Optional[Dict[str, Any]] = None,
+        num_devices: Optional[int] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
         """Explores candidate configurations and selects the optimal hyperparameter settings."""
         if verbose is None:
@@ -356,6 +363,14 @@ class AutoTuner:
             fast = self.fast if not is_custom_candidates else False
         if strategy is None:
             strategy = "bisection" if (fast and not is_custom_candidates) else "linear"
+
+        runner_kwargs = {
+            "worst_case_seq_len": worst_case_seq_len,
+            "model_config": model_config,
+            "config_overrides": config_overrides,
+            "num_devices": num_devices or 1,
+            **kwargs,
+        }
 
         obj_enum = TuneObjective.from_str(tune_objective or self.objective)
         obj_name = obj_enum.value
@@ -376,9 +391,7 @@ class AutoTuner:
         # 1. First Priority: Check cached configs if caching is enabled
         if use_cached_config and not force_tune and candidates is None:
             cached_local = self.cache_manager.load(preset, cache_sig)
-            if cached_local is None and cap_suffix:
-                cached_local = self.cache_manager.load(preset, f"{sig}{seq_suffix}")
-            if cached_local is None and cache_sig != sig:
+            if cached_local is None and cache_sig != sig and max_batch_size is None:
                 fallback_local = self.cache_manager.load(preset, sig)
                 if fallback_local and fallback_local.get("seq_len") == seq_len:
                     cached_local = fallback_local
@@ -485,10 +498,11 @@ class AutoTuner:
             min_batch = 16
 
         if candidates is None:
+            target_ladder_seq = worst_case_seq_len if (worst_case_seq_len and worst_case_seq_len > seq_len) else seq_len
             candidates = generate_vram_maximizing_candidates(
                 preset=preset,
                 total_gb=total_gb,
-                seq_len=seq_len,
+                seq_len=target_ladder_seq,
                 max_batch_size=max_batch_size,
                 min_batch_size=min_batch,
                 fast=fast,
@@ -518,6 +532,7 @@ class AutoTuner:
                 obj_name=obj_name,
                 verbose=verbose,
                 mem_type=mem_type,
+                **runner_kwargs,
             )
         else:
             results = []
@@ -543,6 +558,7 @@ class AutoTuner:
                     num_steps=benchmark_steps,
                     dtype=dtype,
                     prompt_len=prompt_len,
+                    **runner_kwargs,
                 )
                 results.append(res)
                 ladder.record_result(
@@ -618,6 +634,8 @@ class AutoTuner:
         else:
             best_config["tune_objective"] = obj_name
             best_config["max_batch_size"] = max_batch_size
+            if worst_case_seq_len is not None:
+                best_config["worst_case_seq_len"] = worst_case_seq_len
             best_config["tuner_version"] = 2
             if verbose:
                 print(f"🏆 OPTIMAL CONFIGURATION SELECTED ({obj_name.upper()}):")
