@@ -62,8 +62,9 @@ def save_jax_to_torch_pt(
     buffers: Tuple[jnp.ndarray, jnp.ndarray],
     save_path: str,
     meta: Optional[dict] = None,
+    opt_state: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Converts JAX PyTree into PyTorch state_dict and saves to .pt format."""
+    """Converts JAX PyTree into PyTorch state_dict and saves to .pt format (including Spheroid optimizer moments)."""
     if not HAS_TORCH:
         raise RuntimeError(
             f"PyTorch is required to save .pt checkpoints: {_TORCH_ERR}."
@@ -89,6 +90,22 @@ def save_jax_to_torch_pt(
             if mk not in checkpoint:
                 checkpoint[mk] = mv
 
+    # Persist optimizer state (moments, master weights, and spectral vectors) to prevent cold restarts
+    if opt_state is not None and isinstance(opt_state, dict):
+        try:
+            torch_opt: Dict[str, Any] = {}
+            if "step" in opt_state:
+                step_val = opt_state["step"]
+                torch_opt["step"] = int(np.asarray(jax.device_get(step_val))) if hasattr(step_val, "__len__") or hasattr(step_val, "item") else int(step_val)
+            for sub_name in ["m", "v", "master_p", "power_v"]:
+                if sub_name in opt_state and isinstance(opt_state[sub_name], dict):
+                    torch_opt[sub_name] = {
+                        k: _safe_torch_tensor(v) for k, v in opt_state[sub_name].items()
+                    }
+            checkpoint["opt_state"] = torch_opt
+        except Exception as e_opt:
+            print(f"⚠️ [save_checkpoint] Could not serialize optimizer state: {e_opt}")
+
     tmp_path = f"{save_path}.tmp.{os.getpid()}.{time.time_ns()}"
     torch.save(checkpoint, tmp_path)
     os.replace(tmp_path, save_path)
@@ -102,6 +119,50 @@ def save_jax_to_torch_pt(
 
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2, default=_json_default)
+
+
+def restore_spheroid_opt_state(
+    ckpt_or_path: Union[Dict[str, Any], str],
+    params: Dict[str, jnp.ndarray],
+    key: Optional[jax.Array] = None,
+) -> Dict[str, Any]:
+    """
+    Restores full Spheroid optimizer moments (m, v, master_p, power_v) from checkpoint if present,
+    guaranteeing continuous momentum across training session restarts.
+    Falls back gracefully to init_spheroid_opt_state if opt_state is absent.
+    """
+    from src.jax.spheroid_optimizer import init_spheroid_opt_state
+
+    if isinstance(ckpt_or_path, str):
+        if not HAS_TORCH or not os.path.exists(ckpt_or_path):
+            return init_spheroid_opt_state(params, key=key)
+        try:
+            ckpt = torch.load(ckpt_or_path, map_location="cpu", weights_only=False)
+        except Exception:
+            return init_spheroid_opt_state(params, key=key)
+    else:
+        ckpt = ckpt_or_path
+
+    raw_opt = ckpt.get("opt_state") if isinstance(ckpt, dict) else None
+    if not raw_opt or not isinstance(raw_opt, dict):
+        return init_spheroid_opt_state(params, key=key)
+
+    opt_state = init_spheroid_opt_state(params, key=key)
+    if "step" in raw_opt:
+        raw_s = raw_opt["step"]
+        opt_state["step"] = int(raw_s.item()) if hasattr(raw_s, "item") else int(raw_s)
+
+    restored_components = 0
+    for sub_dict in ["m", "v", "master_p", "power_v"]:
+        if sub_dict in raw_opt and isinstance(raw_opt[sub_dict], dict):
+            for k, val in raw_opt[sub_dict].items():
+                if k in opt_state[sub_dict]:
+                    np_arr = _to_numpy(val)
+                    opt_state[sub_dict][k] = jnp.asarray(np_arr, dtype=opt_state[sub_dict][k].dtype)
+                    restored_components += 1
+
+    print(f"✓ Restored Spheroid optimizer state ({restored_components} moment/master tensors, step {opt_state['step']}) from checkpoint")
+    return opt_state
 
 
 def _to_numpy(t):
@@ -469,10 +530,11 @@ class AsyncCheckpointManager:
         filename: str,
         meta_dict: Optional[dict],
         force_cloud: bool = False,
+        opt_state_cpu: Optional[Dict[str, Any]] = None,
     ):
         try:
             local_path = os.path.join(self.local_dir, filename)
-            save_jax_to_torch_pt(params_cpu, buffers_cpu, local_path, meta=meta_dict)
+            save_jax_to_torch_pt(params_cpu, buffers_cpu, local_path, meta=meta_dict, opt_state=opt_state_cpu)
 
             # Atomically mirror to target_dir if different
             target_path = os.path.join(self.target_dir, filename)
@@ -543,6 +605,7 @@ class AsyncCheckpointManager:
         filename: str,
         meta_dict: Optional[dict] = None,
         block_if_busy: bool = False,
+        opt_state: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Dispatches an asynchronous save job. Returns True if job was queued."""
         is_critical = ("best" in filename) or ("step_" in filename) or block_if_busy
@@ -551,7 +614,8 @@ class AsyncCheckpointManager:
 
         params_cpu = jax.device_get(params)
         buffers_cpu = jax.device_get(buffers)
-        self._last_future = self.executor.submit(self._worker, params_cpu, buffers_cpu, filename, meta_dict, False)
+        opt_state_cpu = jax.device_get(opt_state) if opt_state is not None else None
+        self._last_future = self.executor.submit(self._worker, params_cpu, buffers_cpu, filename, meta_dict, False, opt_state_cpu)
         return True
 
     def flush(
@@ -560,11 +624,13 @@ class AsyncCheckpointManager:
         buffers: Tuple[jnp.ndarray, jnp.ndarray],
         filename: str,
         meta_dict: Optional[dict] = None,
+        opt_state: Optional[Dict[str, Any]] = None,
     ):
         """Synchronously flushes state (used on shutdown / emergency exit)."""
         params_cpu = jax.device_get(params)
         buffers_cpu = jax.device_get(buffers)
-        self._worker(params_cpu, buffers_cpu, filename, meta_dict, True)
+        opt_state_cpu = jax.device_get(opt_state) if opt_state is not None else None
+        self._worker(params_cpu, buffers_cpu, filename, meta_dict, True, opt_state_cpu)
         if self.cloud_sync:
             try:
                 from src.cloud_sync import wait_for_in_flight_uploads

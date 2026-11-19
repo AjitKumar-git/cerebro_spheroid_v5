@@ -176,6 +176,11 @@ def parse_args(args_list: Optional[List[str]] = None):
                         help="Motor refractory repetition penalty (default: 1.15)")
     parser.add_argument("--thinking-cycles", "--thinking_cycles", dest="thinking_cycles", type=int, default=8,
                         help="Subconscious deliberation iterations per token (default: 8)")
+    parser.add_argument("--use-adaptive-thinking", "--use_adaptive_thinking", dest="use_adaptive_thinking",
+                        action=argparse.BooleanOptionalAction, default=False,
+                        help="Enable dynamic adaptive thinking depth (default: False)")
+    parser.add_argument("--no-adaptive-thinking", "--no_adaptive_thinking", dest="use_adaptive_thinking",
+                        action="store_false", help="Disable adaptive thinking (use fast fixed cycles)")
     parser.add_argument("--deliberation-mode", type=str, default="teacher_forcing",
                         choices=["teacher_forcing", "scheduled", "dual_pass"],
                         help="Deliberation mode (default: teacher_forcing for maximum throughput)")
@@ -339,6 +344,8 @@ def main(args=None):
     cfg_dict["rope_theta"] = 500000.0
     if getattr(args, "thinking_cycles", None) is not None:
         cfg_dict["thinking_cycles"] = args.thinking_cycles
+    if getattr(args, "use_adaptive_thinking", None) is not None:
+        cfg_dict["use_adaptive_thinking"] = bool(args.use_adaptive_thinking)
 
     config = ModelConfigV5(**cfg_dict)
     print(f"\n📐 Model Architecture (V5 Small - Clean Scratch Init):")
@@ -346,6 +353,7 @@ def main(args=None):
     print(f"   - Surface Dim (d):           {config.surface_dim}")
     print(f"   - Radial Dim (r):            {config.radial_dim}")
     print(f"   - Thinking Cycles:           {config.thinking_cycles}")
+    print(f"   - Adaptive Thinking:         {config.use_adaptive_thinking}")
     print(f"   - Shortcut Tracts:           {config.num_shortcut_tracts}")
     print(f"   - Attention Heads:           {config.num_heads}")
     print(f"   - Sensory Pos Steps:         {config.sensory_position_steps} (Full 4k learned table + RoPE)")
@@ -400,6 +408,8 @@ def main(args=None):
             params, buffers, meta = load_torch_pt_to_jax(latest_pt, config, target_dtype=target_dtype)
             step = meta.get("step", 0)
             best_eval_loss = meta.get("eval_loss", float("inf"))
+            from src.jax.checkpoint import restore_spheroid_opt_state
+            opt_state = restore_spheroid_opt_state(latest_pt, params)
             print(f"✓ Resumed at Step {step:,} (Best Eval Loss: {best_eval_loss:.4f})")
         else:
             print(f"ℹ️  No checkpoint found locally or on bioflo.in. Starting clean from Step 0.")
@@ -533,12 +543,14 @@ def main(args=None):
             prompts = batch["prompt"]
             targets = batch["target"]
             fb_tokens = batch.get("feedback_tokens", None)
+            weights = batch.get("weights", None)
         elif isinstance(batch, (tuple, list)):
             prompts = batch[0]
             targets = batch[1]
             fb_tokens = batch[2] if len(batch) > 2 else None
+            weights = batch[3] if len(batch) > 3 else None
         else:
-            prompts, targets, fb_tokens = batch, batch, None
+            prompts, targets, fb_tokens, weights = batch, batch, None, None
 
         # Execute training step
         if use_multi_tpu:
@@ -560,14 +572,14 @@ def main(args=None):
                         weight_decay=args.weight_decay, remat=args.remat,
                     )
                 params, opt_state, loss_val = train_step_fn(
-                    params, opt_state, prompts, targets, cur_lr, fb_tokens, 1.0
+                    params, opt_state, prompts, targets, cur_lr, fb_tokens, 1.0, target_weights=weights
                 )
                 loss_scalar = float(loss_val)
         else:
             tokens_in_batch = prompts.shape[0] * (prompts.shape[1] + targets.shape[1])
             try:
                 params, opt_state, loss_val = train_step_fn(
-                    params, opt_state, prompts, targets, cur_lr, fb_tokens, 1.0
+                    params, opt_state, prompts, targets, cur_lr, fb_tokens, 1.0, target_weights=weights
                 )
                 loss_scalar = float(loss_val)
             except Exception as e_train:
@@ -582,8 +594,9 @@ def main(args=None):
                     c_p = prompts[c_idx * new_bs : (c_idx + 1) * new_bs]
                     c_t = targets[c_idx * new_bs : (c_idx + 1) * new_bs]
                     c_fb = fb_tokens[c_idx * new_bs : (c_idx + 1) * new_bs] if fb_tokens is not None else None
+                    c_w = weights[c_idx * new_bs : (c_idx + 1) * new_bs] if weights is not None else None
                     params, opt_state, loss_c = train_step_fn(
-                        params, opt_state, c_p, c_t, cur_lr, c_fb, 1.0
+                        params, opt_state, c_p, c_t, cur_lr, c_fb, 1.0, target_weights=c_w
                     )
                     losses.append(float(loss_c))
                 loss_scalar = float(np.mean(losses))
@@ -639,6 +652,7 @@ def main(args=None):
         # Periodic Checkpoint Saving
         if step % args.save_every == 0 or step == args.total_steps:
             active_params = jax.device_get(jax.tree_util.tree_map(lambda x: x[0], rep_params)) if use_multi_tpu else params
+            active_opt_state = jax.device_get(jax.tree_util.tree_map(lambda x: x[0], rep_opt_state)) if use_multi_tpu else opt_state
             meta = {
                 "step": step,
                 "loss": loss_scalar,
@@ -650,7 +664,7 @@ def main(args=None):
 
             # 1. Save local latest checkpoint
             save_path = os.path.join(primary_ckpt_dir, "v5_small_scratch_latest.pt")
-            save_jax_to_torch_pt(active_params, buffers, save_path, meta=meta)
+            save_jax_to_torch_pt(active_params, buffers, save_path, meta=meta, opt_state=active_opt_state)
             json_path = save_path.replace(".pt", ".json")
             with open(json_path, "w") as f:
                 json.dump(meta, f, indent=2)

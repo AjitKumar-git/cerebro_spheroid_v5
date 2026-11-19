@@ -886,7 +886,11 @@ def main(args=None):
     train_step_fn_anneal = None
 
     if args.optimizer == "spheroid":
-        opt_state = init_spheroid_opt_state(params)
+        if start_step > 0 and "discovered_ckpt" in locals() and discovered_ckpt and os.path.exists(discovered_ckpt):
+            from src.jax.checkpoint import restore_spheroid_opt_state
+            opt_state = restore_spheroid_opt_state(discovered_ckpt, params)
+        else:
+            opt_state = init_spheroid_opt_state(params)
         if use_multi_tpu_local_sgd:
             pmap_round_fn = build_pmap_local_sgd_step_spheroid(
                 config,
@@ -1390,8 +1394,15 @@ def main(args=None):
                 else elastic_batcher.next_batch()
             )
             return _unpack_batch(batch_tuple)
+        if hasattr(local_streamer, "get_batch"):
+            try:
+                prompt_b, target_b, weights_b = local_streamer.get_batch(return_weights=True)
+                return prompt_b, target_b, None, weights_b
+            except Exception:
+                prompt_b, target_b = local_streamer.get_batch()
+                return prompt_b, target_b, None, None
         prompt_b, target_b = local_streamer.get_batch()
-        return prompt_b, target_b, None
+        return prompt_b, target_b, None, None
 
     _round_bucket_idx = 0
 
@@ -1409,9 +1420,11 @@ def main(args=None):
         for _ in range(total_shards):
             if bucket_idx is not None:
                 batch_tuple = bucket_batcher.next_batch(bucket_idx=bucket_idx)
-                pb, tb, fb = _unpack_batch(batch_tuple)
+                b_unpack = _unpack_batch(batch_tuple)
             else:
-                pb, tb, fb = _next_batch()
+                b_unpack = _next_batch()
+            pb, tb = b_unpack[0], b_unpack[1]
+            fb = b_unpack[2] if len(b_unpack) > 2 else None
             qs.append(np.asarray(pb, dtype=np.int32))
             rs.append(np.asarray(tb, dtype=np.int32))
             if fb is not None:
@@ -1431,6 +1444,11 @@ def main(args=None):
         if use_multi_tpu_local_sgd:
             return jax.tree_util.tree_map(lambda x: jax.device_get(x[0]), rep_params)
         return params
+
+    def _get_host_opt_state():
+        if use_multi_tpu_local_sgd and rep_opt_state is not None:
+            return jax.tree_util.tree_map(lambda x: jax.device_get(x[0]), rep_opt_state)
+        return opt_state
 
     def _count_real_tokens(prompts: Any, targets: Any) -> Tuple[int, int, int, int]:
         """Count non-padding input and loss-bearing target tokens separately.
@@ -1772,7 +1790,10 @@ def main(args=None):
             crossed_eval = bool(eval_batches) and ((step // max(1, args.eval_interval)) > (prev_step // max(1, args.eval_interval)))
             if crossed_eval:
                 eval_p = jax.device_put(_get_host_params(), devices[0]) if use_multi_tpu_local_sgd else params
-                val_losses = [float(eval_step_loss(eval_p, vp, vt, vfb, enc_alpha=enc_alpha)) for vp, vt, vfb in eval_batches]
+                val_losses = [
+                    float(eval_step_loss(eval_p, b[0], b[1], b[2] if len(b) > 2 else None, enc_alpha=enc_alpha))
+                    for b in eval_batches
+                ]
                 if eval_weights and len(eval_weights) == len(val_losses):
                     eval_loss = float(sum(w * l for w, l in zip(eval_weights, val_losses)) / sum(eval_weights))
                 else:
@@ -1849,10 +1870,10 @@ def main(args=None):
                         "converged": bool(converged_target_met),
                         "timestamp": time.time(),
                     }
-                    ckpt_mgr.dispatch(_get_host_params(), buffers, best_fname, meta_dict=meta_best, block_if_busy=True)
+                    ckpt_mgr.dispatch(_get_host_params(), buffers, best_fname, meta_dict=meta_best, block_if_busy=True, opt_state=_get_host_opt_state())
                     if converged_target_met:
                         converged_fname = f"{args.preset}_converged_1.6.pt"
-                        ckpt_mgr.dispatch(_get_host_params(), buffers, converged_fname, meta_dict=meta_best, block_if_busy=True)
+                        ckpt_mgr.dispatch(_get_host_params(), buffers, converged_fname, meta_dict=meta_best, block_if_busy=True, opt_state=_get_host_opt_state())
 
                     if args.cloud_sync:
                         try:
@@ -1911,7 +1932,7 @@ def main(args=None):
                     "tokens_by_dataset": batcher.get_tokens_by_dataset() if hasattr(batcher, "get_tokens_by_dataset") else {},
                     "timestamp": time.time(),
                 }
-                ckpt_mgr.dispatch(_get_host_params(), buffers, latest_fname, meta_dict=meta_latest)
+                ckpt_mgr.dispatch(_get_host_params(), buffers, latest_fname, meta_dict=meta_latest, opt_state=_get_host_opt_state())
 
                 if args.cloud_sync:
                     try:
@@ -1967,6 +1988,7 @@ def main(args=None):
                         "eval_loss": last_eval_loss if math.isfinite(last_eval_loss) else float(loss),
                         "sync_model": sync_model_name,
                     },
+                    opt_state=_get_host_opt_state(),
                 )
 
             # Sentinel file pause check
@@ -2012,7 +2034,7 @@ def main(args=None):
             "timestamp": time.time(),
         }
         if "ckpt_mgr" in locals() and ckpt_mgr is not None:
-            ckpt_mgr.flush(_get_host_params(), buffers, final_fname, meta_dict=final_meta)
+            ckpt_mgr.flush(_get_host_params(), buffers, final_fname, meta_dict=final_meta, opt_state=_get_host_opt_state())
             ckpt_mgr.shutdown(wait=True)
 
         if args.cloud_sync:
