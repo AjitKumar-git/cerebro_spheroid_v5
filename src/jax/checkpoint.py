@@ -18,6 +18,7 @@ import glob
 import json
 import shutil
 import time
+import math
 import dataclasses
 from typing import Dict, Tuple, Optional, Any, List, Union
 import concurrent.futures
@@ -306,14 +307,56 @@ def adapt_and_load_checkpoint_weights(
                 and all(t_shape[i] >= v.shape[i] for i in range(len(t_shape)))
                 and any(t_shape[i] > v.shape[i] for i in range(len(t_shape)))
             ):
-                # Concentric shell / tract expansion (e.g. 16 -> 32 shells, 40 -> 96 shortcut tracts)
+                # Function-preserving structural expansion (shells, tracts, surface_dim, radial_dim)
                 buf = np.array(target_params[target_k])
-                if len(t_shape) == 1:
-                    buf[: v.shape[0]] = v
-                elif len(t_shape) == 2:
-                    buf[: v.shape[0], : v.shape[1]] = v
-                elif len(t_shape) == 3:
+
+                # 1. Normalization layers: RMSNorm scale compensation factor sqrt(D_tgt / D_src)
+                if ("norm" in target_k or target_k.endswith(".weight") and "norm" in target_k) and t_shape[-1] > v.shape[-1]:
+                    norm_scale = math.sqrt(float(t_shape[-1]) / float(v.shape[-1]))
+                    if len(t_shape) == 1:
+                        buf[: v.shape[0]] = v * norm_scale
+                        buf[v.shape[0] :] = 1.0
+                    elif len(t_shape) == 2:
+                        buf[: v.shape[0], : v.shape[1]] = v * norm_scale
+                        buf[: v.shape[0], v.shape[1] :] = 1.0
+                        buf[v.shape[0] :, :] = 1.0
+                # 2. Radial wave routing matrices: block-diagonal orthonormal expansion
+                elif target_k in ("core.w_radial_in", "core.w_radial_out") and len(t_shape) == 3:
                     buf[: v.shape[0], : v.shape[1], : v.shape[2]] = v
+                    if t_shape[1] > v.shape[1] and t_shape[2] > v.shape[2]:
+                        r_extra = min(t_shape[1] - v.shape[1], t_shape[2] - v.shape[2])
+                        eye_block = np.eye(r_extra, dtype=buf.dtype)
+                        for tr_idx in range(v.shape[0]):
+                            buf[tr_idx, v.shape[1] : v.shape[1] + r_extra, v.shape[2] : v.shape[2] + r_extra] = eye_block
+                    if t_shape[0] > v.shape[0]:
+                        buf[v.shape[0] :] = 0.0
+                # 3. SwiGLU down-projections: zero-residual outer channels
+                elif target_k == "core.intra_swiglu.w_down" and len(t_shape) == 3:
+                    buf[: v.shape[0], : v.shape[1], : v.shape[2]] = v
+                    buf[: v.shape[0], v.shape[1] :, :] = 0.0
+                    buf[: v.shape[0], :, v.shape[2] :] = 0.0
+                    buf[v.shape[0] :, :, :] = 0.0
+                # 4. Shortcut weights: zero out outer channels and outer tracts
+                elif target_k == "core.shortcut_weight" and len(t_shape) == 3:
+                    buf[: v.shape[0], : v.shape[1], : v.shape[2]] = v
+                    buf[: v.shape[0], v.shape[1] :, :] = 0.0
+                    buf[: v.shape[0], :, v.shape[2] :] = 0.0
+                    buf[v.shape[0] :, :, :] = 0.0
+                elif target_k == "core.shortcut_gate" and len(t_shape) == 1:
+                    buf[: v.shape[0]] = v
+                    buf[v.shape[0] :] = -10.0
+                # 5. Token embeddings: zero-pad new surface channels
+                elif target_k in ("sensory.embedding.weight", "motor.head.weight") and len(t_shape) == 2:
+                    buf[: v.shape[0], : v.shape[1]] = v
+                    buf[: v.shape[0], v.shape[1] :] = 0.0
+                else:
+                    if len(t_shape) == 1:
+                        buf[: v.shape[0]] = v
+                    elif len(t_shape) == 2:
+                        buf[: v.shape[0], : v.shape[1]] = v
+                    elif len(t_shape) == 3:
+                        buf[: v.shape[0], : v.shape[1], : v.shape[2]] = v
+
                 target_params[target_k] = jnp.asarray(buf, dtype=target_dtype)
                 restored_keys.add(target_k)
 

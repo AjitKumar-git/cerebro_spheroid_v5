@@ -177,3 +177,50 @@ def test_zero_regression_step_0_equivalence():
     tok32 = int(jnp.argmax(logits32, axis=-1)[0])
     assert tok16 == tok32, f"Token mismatch at step 0: 16-shell={tok16}, 32-shell={tok32}"
 
+
+def test_full_v5_compact_width_and_depth_transplantation():
+    """Verifies direct transplantation from v5_small into full v5_compact (768 surface, 512 radial, 32 shells, 96 tracts)."""
+    import math
+
+    cfg_small = ModelConfigV5(**PRESETS_V5["v5_small"])
+    params_small, bufs_small = init_params_v5(jax.random.PRNGKey(123), cfg_small)
+
+    cfg_compact = ModelConfigV5(**PRESETS_V5["v5_compact"])
+    params_compact, bufs_compact = init_params_v5(jax.random.PRNGKey(456), cfg_compact)
+
+    # Wrap params_small as checkpoint dict
+    ckpt = {"model_state": {k: np.array(v) for k, v in params_small.items()}}
+    ckpt["model_state"]["core.src_indices"] = np.array(bufs_small[0])
+    ckpt["model_state"]["core.dst_indices"] = np.array(bufs_small[1])
+
+    restored_count, bufs_compact = adapt_and_load_checkpoint_weights(
+        ckpt, params_compact, jnp.float32, cfg_compact, buffers=bufs_compact, apply_net2net=True
+    )
+
+    # 1. Total parameter count matches full v5_compact (247M)
+    total_p = sum(x.size for x in jax.tree_util.tree_leaves(params_compact))
+    assert total_p > 240_000_000
+    assert total_p < 250_000_000
+
+    # 2. RMSNorm scaling compensation verified: scale_norm = sqrt(768 / 640)
+    scale_norm = math.sqrt(768.0 / 640.0)
+    orig_norm = float(params_small["core.intra_norms.weight"][0, 0])
+    trans_norm = float(params_compact["core.intra_norms.weight"][0, 0])
+    assert math.isclose(trans_norm, orig_norm * scale_norm, rel_tol=1e-5)
+
+    # 3. Block-diagonal orthonormal radial expansion verified
+    w_rad_in = np.array(params_compact["core.w_radial_in"])
+    for tr in range(15):
+        eye_block = w_rad_in[tr, 256:512, 256:512]
+        assert np.allclose(eye_block, np.eye(256), atol=1e-5)
+
+    # 4. SwiGLU down-projection outer channels are zero-initialized
+    w_down = np.array(params_compact["core.intra_swiglu.w_down"])
+    assert np.all(w_down[:, :, 1280:] == 0.0)
+    assert np.all(w_down[16:, :, :] == 0.0)
+
+    # 5. Shortcut tracts wired and silenced
+    assert len(bufs_compact[0]) == 96
+    assert np.all(np.array(params_compact["core.shortcut_weight"][40:]) == 0.0)
+    assert np.all(np.array(params_compact["core.shortcut_gate"][40:]) <= -10.0)
+
