@@ -349,4 +349,46 @@ def test_jax_to_torch_state_dict_bidirectional_adaptation():
     assert "motor_decoder.motor_swiglu.fc_gate.weight" in pt_state
 
 
+def test_context_curriculum_stages_and_step_progression():
+    """Verifies that 512 context is preserved as Stage 0 and stages advance every 100k steps."""
+    from training.train_v5_tpu_jax import parse_args
+
+    args = parse_args([])
+    assert args.min_context_window == 512
+    assert args.context_stage_steps == 100000
+
+    min_curriculum_window = int(getattr(args, "min_context_window", 512) or 512)
+    max_curriculum_window = 4096
+    context_stages = [w for w in [512, 1024, 2048, 4096] if w >= min_curriculum_window and w <= max_curriculum_window]
+    assert context_stages == [512, 1024, 2048, 4096]
+
+    context_stage_steps = args.context_stage_steps
+
+    # Step 0: Stage 0 (512 tokens)
+    idx_step0 = min(len(context_stages) - 1, 0 // context_stage_steps)
+    assert idx_step0 == 0
+    assert context_stages[idx_step0] == 512
+
+    # Step 50,000: Stage 0 (512 tokens)
+    idx_step50k = min(len(context_stages) - 1, 50000 // context_stage_steps)
+    assert idx_step50k == 0
+    assert context_stages[idx_step50k] == 512
+
+    # Step 110,250: Stage 1 (1024 tokens) - active now upon resume!
+    idx_step110k = min(len(context_stages) - 1, 110250 // context_stage_steps)
+    assert idx_step110k == 1
+    assert context_stages[idx_step110k] == 1024
+
+    # Step 200,000: Stage 2 (2048 tokens)
+    idx_step200k = min(len(context_stages) - 1, 200000 // context_stage_steps)
+    assert idx_step200k == 2
+    assert context_stages[idx_step200k] == 2048
+
+    # Step 300,000: Stage 3 (4096 tokens)
+    idx_step300k = min(len(context_stages) - 1, 300000 // context_stage_steps)
+    assert idx_step300k == 3
+    assert context_stages[idx_step300k] == 4096
+
+
+
 

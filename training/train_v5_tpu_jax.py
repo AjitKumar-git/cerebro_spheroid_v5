@@ -143,7 +143,7 @@ def parse_args(args_list=None):
     parser.add_argument("--total_window", type=int, default=None, help="Total sequence budget for elastic sliding window (default: prompt_len + seq_len)")
     parser.add_argument("--elastic_window", action=argparse.BooleanOptionalAction, default=True, help="Enable complementary context/target buckets")
     parser.add_argument("--context-curriculum", action=argparse.BooleanOptionalAction, default=True, help="Grow context window through 512, 1024, 2048, and 4096 token stages")
-    parser.add_argument("--context-stage-steps", type=int, default=0, help="Steps per context stage (0 divides the run evenly among stages)")
+    parser.add_argument("--context-stage-steps", type=int, default=100000, help="Steps per context stage (default: 100,000 steps/stage across 512, 1024, 2048, 4096)")
     parser.add_argument("--min-context-window", "--min_context_window", dest="min_context_window", type=int, default=512, help="Minimum context window stage for curriculum (default: 512, set 1024 to start at 1024)")
     parser.add_argument("--use-rope", "--use_rope", dest="use_rope", action=argparse.BooleanOptionalAction, default=True, help="Use rotary Q/K positions for new long-context training runs (default: True)")
     parser.add_argument("--max-phase-steps", "--max_phase_steps", dest="max_phase_steps", type=int, default=4096, help="Learned output phase-clock horizon for new runs (default: 4096)")
@@ -750,13 +750,7 @@ def main(args=None):
         context_stages = [max_curriculum_window]
 
     if getattr(args, "context_curriculum", False):
-        context_stage_steps = args.context_stage_steps
-        if context_stage_steps <= 0:
-            effective_total_steps = args.total_steps
-            if not getattr(args, "total_steps_explicit", False) and getattr(args, "target_tokens", None) is not None and args.target_tokens > 0:
-                est_tok_per_step = max(1, (getattr(args, "effective_batch_size", 16) or 16) * context_stages[0])
-                effective_total_steps = int(math.ceil(float(args.target_tokens) / float(est_tok_per_step)))
-            context_stage_steps = max(2000, effective_total_steps // len(context_stages))
+        context_stage_steps = args.context_stage_steps if (getattr(args, "context_stage_steps", 0) and args.context_stage_steps > 0) else 100_000
         active_stage_idx = min(len(context_stages) - 1, start_step // context_stage_steps)
         args.total_window = context_stages[active_stage_idx]
         print(
