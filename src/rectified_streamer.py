@@ -149,6 +149,7 @@ class RectifiedContiguousPretrainStreamer:
         queue_size: int = 16,
         stage: str = "pretrain",
         target_shares: Optional[Dict[str, float]] = None,
+        min_edu_score: float = 4.0,
     ):
         self.tokenizer = tokenizer
         self.batch_size = batch_size
@@ -156,6 +157,7 @@ class RectifiedContiguousPretrainStreamer:
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self.stage = stage.lower()
+        self.min_edu_score = float(min_edu_score)
         self.running = True
 
         if target_shares is not None:
@@ -169,7 +171,7 @@ class RectifiedContiguousPretrainStreamer:
         elif self.stage == "midtrain":
             # Stage 2: Targeted skills, mathematics, and 4k associative retrieval
             self.shares = {
-                "edu_academic": 0.45,   # FineWeb-Edu (>= 3.5)
+                "edu_academic": 0.45,   # FineWeb-Edu (> 4.0)
                 "math": 0.25,           # FineMath / OpenWebMath
                 "code": 0.15,           # Algorithmic code & proofs
                 "retrieval": 0.15,      # 4k multi-position key-value retrieval
@@ -222,11 +224,11 @@ class RectifiedContiguousPretrainStreamer:
             kw = {"name": "sample-10BT", "split": "train", "streaming": True}
             if hf_tok:
                 kw["token"] = hf_tok
-            print("📚 [Streamer] Connecting to HuggingFaceFW/fineweb-edu (sample-10BT)...")
+            print(f"📚 [Streamer] Connecting to HuggingFaceFW/fineweb-edu (sample-10BT, score > {self.min_edu_score})...")
             ds = load_dataset("HuggingFaceFW/fineweb-edu", **kw)
             for row in ds:
                 score = float(row.get("score", 0.0) or 0.0)
-                if score >= 3.0:
+                if score > self.min_edu_score:
                     text = row.get("text", "")
                     if text and len(text) > 200:
                         yield text

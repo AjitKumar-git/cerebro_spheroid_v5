@@ -614,7 +614,7 @@ def deliberate_step(params: Dict[str, jnp.ndarray], state: jnp.ndarray, buffers:
 
     # Return unnormalized residual state to preserve genuine radial shell amplitude hierarchy
     state_next = state_radial.at[:, dst_idx, :].add(s_mix * shortcut_flux)
-    return state_next
+    return state_next.astype(st_dtype)
 
 
 def deliberate_cycles_jax(

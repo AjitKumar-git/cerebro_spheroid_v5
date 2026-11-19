@@ -481,7 +481,7 @@ def main(args=None):
 
     total_params = sum(p.size for p in params.values())
     active_compute = sum(p.size for k, p in params.items() if "embedding" not in k)
-    print(f"\nModel Config    : {args.preset} | Shells: {config.num_shells} | Surface Dim: {config.surface_dim} | Radial Dim: {config.radial_dim}")
+    print(f"\nModel Config    : {args.preset} | Shells: {config.num_shells} | Surface Dim: {config.surface_dim} | Radial Dim: {config.radial_dim} | Thinking Cycles: {config.thinking_cycles}")
     print(f"Total Parameters: {total_params:,} (~{total_params/1e6:.1f}M)")
     print(f"Active Compute  : {active_compute:,} (~{active_compute/1e6:.1f}M) ({active_compute/total_params*100:.2f}%)")
     print(f"Optimizer       : {args.optimizer.upper()} ({'Polar Newton-Schulz NS-5 + Spectral Clamp' if args.optimizer == 'spheroid' else 'Optax AdamW'})")

@@ -174,6 +174,8 @@ def parse_args(args_list: Optional[List[str]] = None):
                         help="Optimizer choice (default: spheroid NS-5)")
     parser.add_argument("--repetition-penalty", type=float, default=1.15,
                         help="Motor refractory repetition penalty (default: 1.15)")
+    parser.add_argument("--thinking-cycles", "--thinking_cycles", dest="thinking_cycles", type=int, default=8,
+                        help="Subconscious deliberation iterations per token (default: 8)")
     parser.add_argument("--deliberation-mode", type=str, default="teacher_forcing",
                         choices=["teacher_forcing", "scheduled", "dual_pass"],
                         help="Deliberation mode (default: teacher_forcing for maximum throughput)")
@@ -335,12 +337,15 @@ def main(args=None):
     cfg_dict["max_seq_len"] = max(args.total_window, 4096)
     cfg_dict["use_rope"] = True
     cfg_dict["rope_theta"] = 500000.0
+    if getattr(args, "thinking_cycles", None) is not None:
+        cfg_dict["thinking_cycles"] = args.thinking_cycles
 
     config = ModelConfigV5(**cfg_dict)
     print(f"\n📐 Model Architecture (V5 Small - Clean Scratch Init):")
     print(f"   - Concentric Shells:         {config.num_shells}")
     print(f"   - Surface Dim (d):           {config.surface_dim}")
     print(f"   - Radial Dim (r):            {config.radial_dim}")
+    print(f"   - Thinking Cycles:           {config.thinking_cycles}")
     print(f"   - Shortcut Tracts:           {config.num_shortcut_tracts}")
     print(f"   - Attention Heads:           {config.num_heads}")
     print(f"   - Sensory Pos Steps:         {config.sensory_position_steps} (Full 4k learned table + RoPE)")
