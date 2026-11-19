@@ -62,6 +62,7 @@ def benchmark_v5_model(
     params = opt_state = train_step_fn = None
     init_loss_val: Optional[float] = None
     final_loss_val: Optional[float] = None
+    dummy_prompts = dummy_targets = prompt_b = target_b = None
 
     try:
         # 1. Parameter & Step Function Retrieval / Initialization (with warm template caching)
@@ -258,5 +259,8 @@ def benchmark_v5_model(
             "status": status_desc,
         }
     finally:
-        del dummy_prompts, dummy_targets, prompt_b, target_b
+        dummy_prompts = None
+        dummy_targets = None
+        prompt_b = None
+        target_b = None
         gc.collect()

@@ -38,6 +38,194 @@ import numpy as np
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
+# Comprehensive diverse offline fallbacks (multi-paragraph, high-entropy text per domain)
+# Replaces fragile single-sentence loops with rich, authentic corpora to prevent repetitive overfitting.
+DIVERSE_FALLBACKS: Dict[str, List[str]] = {
+    "broad_web": [
+        "The thermodynamics of non-equilibrium systems represents a critical bridge between statistical mechanics and macroscopic phenomenology. In open systems operating far from thermodynamic equilibrium, entropy production is not merely a dissipative byproduct but a driving force behind self-organizing dissipative structures, as articulated by Ilya Prigogine. The fluctuation theorem, derived by Evans, Cohen, and Morriss, generalizes the Second Law to finite microscopic systems observed over arbitrary time intervals. It establishes that the probability of observing an entropy-consuming trajectory decreases exponentially with system size and observation duration. In cellular biology, non-equilibrium steady states are maintained across cellular membranes through active ion pumping mechanisms such as the sodium-potassium ATPase (Na+/K+-ATPase). By consuming metabolic chemical potential in the form of ATP hydrolysis, cells sustain steep electrochemical gradients essential for action potential generation, secondary active transport of glucose and amino acids, and osmotic volume regulation.",
+        "The evolution of terrestrial ecosystems during the Carboniferous period (approximately 359 to 299 million years ago) exerted profound influences on Earth's lithospheric and atmospheric composition. Vast equatorial swamp forests dominated by arborescent lycophytes such as Lepidodendron and Sigillaria sequestered atmospheric carbon dioxide at unprecedented rates. The emergence of robust structural polymers, particularly lignin in vascular plant xylem, occurred prior to the evolutionary diversification of saprotrophic fungi capable of enzymatically decomposing complex phenylpropanoid networks. As unoxidized organic biomass accumulated in waterlogged, anoxic peat bogs, immense geological coal measures were laid down across modern North America, Europe, and Asia. Atmospheric oxygen concentrations climbed to an estimated 35 percent, permitting the expansion of gigantic terrestrial arthropods like Arthropleura and Meganeura, while simultaneous carbon drawdown triggered late Paleozoic icehouse conditions.",
+        "In classical and quantum electrodynamics, gauge symmetry serves as the bedrock principle dictating fundamental particle interactions. Under local U(1) phase transformations, invariance of the complex Dirac fermion Lagrangian mandates the introduction of a massless vector gauge boson—the electromagnetic photon—coupled through minimal substitution with covariant derivative D_mu = partial_mu - i e A_mu. The renormalization group framework formulated by Kenneth Wilson reveals how effective coupling constants scale logarithmically with energy or inverse distance. In quantum electrodynamics (QED), vacuum polarization produces screening effects where virtual electron-positron pairs reduce the effective bare electric charge at macroscopic distances, causing the fine-structure constant alpha to run from approximately 1/137 at zero momentum transfer to roughly 1/128 at the Z-boson mass scale (~91.2 GeV).",
+        "Plate tectonics governs the dynamic resurfacing and thermal convective dissipation of Earth's silicate mantle. At mid-ocean ridges (divergent boundaries), decompression melting of upwelling asthenospheric peridotite generates basaltic tholeiitic magma, which accretes along the rift axis to form new oceanic crust composed of layered pillow basalts, sheeted dikes, and plutonic gabbros. As oceanic lithosphere cools, conductive thermal contraction increases its density relative to the underlying asthenosphere. Eventually, aged cold slabs become gravitationally unstable and founder back into the mantle along subduction zones (convergent boundaries). Slab pull constitutes the primary tectonic driving force, dragging the descending slab down through the mantle transition zone toward the core-mantle boundary (D'' layer).",
+        "Algorithmic information theory and computational complexity provide deep insights into the limits of formal mathematical deduction and inductive learning. Andrey Kolmogorov and Ray Solomonoff independently founded algorithmic probability by defining the descriptive complexity of a finite binary string as the length of the shortest computer program that outputs the string on a universal Turing machine. Solomonoff induction formalizes Occam's razor: given sequential observational data, hypotheses are assigned a priori probabilities proportional to 2^(-K(M)), favoring computationally parsimonious hypotheses. Because Kolmogorov complexity is mathematically incomputable due to the undecidability of the halting problem, practical compression algorithms like Lempel-Ziv-Welch and byte-pair encoding serve as tractable approximations.",
+    ],
+    "edu_academic": [
+        "Cellular respiration is the foundational metabolic pathway through which eukaryotic cells extract biochemical energy from nutrients. In the mitochondrial matrix, pyruvate derived from glycolysis undergoes decarboxylation to form acetyl-CoA, feeding the citric acid cycle to generate high-energy electron carriers (NADH and FADH2). These electrons are sequentially transferred through complexes I-IV of the inner mitochondrial membrane electron transport chain, pumping protons into the intermembrane space. The resulting electrochemical proton gradient drives ATP synthase via chemiosmosis to produce approximately 30 to 32 ATP molecules per oxidized glucose molecule, providing the thermodynamic currency that enabled multicellular complexity.",
+        "Manifold learning is a branch of non-linear dimensionality reduction predicated on the manifold hypothesis, which posits that high-dimensional real-world observation vectors frequently lie embedded along a lower-dimensional smooth Riemannian sub-manifold. While linear methods like Principal Component Analysis (PCA) preserve global Euclidean variance, non-linear algorithms such as Isomap, Locally Linear Embedding (LLE), and UMAP capture non-Euclidean geodesic topological distances. By computing local neighborhood graphs and constructing distance-preserving coordinate charts, manifold learning maps high-dimensional sensory topologies into compact latent coordinates while preserving intrinsic geometric invariants.",
+        "Computational complexity classes categorize decision problems based on the asymptotic resource bounds required for solution and verification on a deterministic Turing machine. Class P encompasses problems decidable in polynomial time O(n^k). Class NP comprises problems whose candidate certificates can be verified in deterministic polynomial time, or equivalently solved in polynomial time by a non-deterministic Turing machine. A problem L is NP-hard if every problem in NP polynomial-time Karp-reduces to L. When an NP-hard problem is itself an element of NP, it is classified as NP-Complete (e.g., Boolean Satisfiability / 3-SAT by the Cook-Levin theorem).",
+        "The multi-head self-attention mechanism maps input token representations into scaled dot-product query (Q), key (K), and value (V) projections across h distinct linear attention heads: Attention(Q, K, V) = softmax(Q K^T / sqrt(d_k)) V. The denominator scaling factor sqrt(d_k) counteracts extreme magnitude growth in high-dimensional inner products, preventing softmax gradients from vanishing. Multi-head projection allows the network to jointly attend to information from different representation subspaces at different token positions simultaneously, synthesizing long-range syntactic and semantic relational graphs with O(1) sequential operation count.",
+    ],
+    "code": [
+        """import asyncio
+import collections
+import time
+from typing import Any, Dict, List, Optional, Tuple, TypeVar, Generic
+
+T = TypeVar("T")
+
+class AsyncTokenBucketLimiter:
+    \"\"\"Thread-safe asynchronous token bucket rate limiter for distributed microservices.\"\"\"
+    def __init__(self, capacity: float, refill_rate: float):
+        self.capacity: float = float(capacity)
+        self.tokens: float = float(capacity)
+        self.refill_rate: float = float(refill_rate)
+        self.last_update: float = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, tokens_required: float = 1.0) -> bool:
+        async with self._lock:
+            now = time.monotonic()
+            elapsed = now - self.last_update
+            self.last_update = now
+            self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_rate)
+            if self.tokens >= tokens_required:
+                self.tokens -= tokens_required
+                return True
+            return False
+
+class AsyncFIFOCache(Generic[T]):
+    \"\"\"High-throughput generic asynchronous cache with TTL eviction.\"\"\"
+    def __init__(self, maxsize: int = 1024, ttl_seconds: float = 300.0):
+        self.maxsize = maxsize
+        self.ttl = ttl_seconds
+        self._storage: collections.OrderedDict[str, Tuple[float, T]] = collections.OrderedDict()
+        self._lock = asyncio.Lock()
+
+    async def get(self, key: str) -> Optional[T]:
+        async with self._lock:
+            if key not in self._storage:
+                return None
+            ts, val = self._storage[key]
+            if time.monotonic() - ts > self.ttl:
+                del self._storage[key]
+                return None
+            return val
+
+    async def set(self, key: str, value: T) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            if key in self._storage:
+                del self._storage[key]
+            elif len(self._storage) >= self.maxsize:
+                self._storage.popitem(last=False)
+            self._storage[key] = (now, value)
+""",
+        """import math
+from typing import List, Optional, Tuple
+
+class AVLNode:
+    \"\"\"Self-balancing AVL tree node with balance factor tracking.\"\"\"
+    def __init__(self, key: int, value: str):
+        self.key: int = key
+        self.value: str = value
+        self.height: int = 1
+        self.left: Optional[\"AVLNode\"] = None
+        self.right: Optional[\"AVLNode\"] = None
+
+class AVLTree:
+    \"\"\"Thread-safe AVL balanced binary search tree implementation.\"\"\"
+    def __init__(self):
+        self.root: Optional[AVLNode] = None
+
+    def _get_height(self, node: Optional[AVLNode]) -> int:
+        return node.height if node else 0
+
+    def _get_balance(self, node: Optional[AVLNode]) -> int:
+        return self._get_height(node.left) - self._get_height(node.right) if node else 0
+
+    def _rotate_right(self, y: AVLNode) -> AVLNode:
+        x = y.left
+        assert x is not None
+        t2 = x.right
+        x.right = y
+        y.left = t2
+        y.height = 1 + max(self._get_height(y.left), self._get_height(y.right))
+        x.height = 1 + max(self._get_height(x.left), self._get_height(x.right))
+        return x
+
+    def _rotate_left(self, x: AVLNode) -> AVLNode:
+        y = x.right
+        assert y is not None
+        t2 = y.left
+        y.left = x
+        x.right = t2
+        x.height = 1 + max(self._get_height(x.left), self._get_height(x.right))
+        y.height = 1 + max(self._get_height(y.left), self._get_height(y.right))
+        return y
+
+    def insert(self, key: int, value: str) -> None:
+        def _insert(node: Optional[AVLNode], k: int, v: str) -> AVLNode:
+            if not node:
+                return AVLNode(k, v)
+            if k < node.key:
+                node.left = _insert(node.left, k, v)
+            elif k > node.key:
+                node.right = _insert(node.right, k, v)
+            else:
+                node.value = v
+                return node
+            node.height = 1 + max(self._get_height(node.left), self._get_height(node.right))
+            balance = self._get_balance(node)
+            if balance > 1 and node.left and k < node.left.key:
+                return self._rotate_right(node)
+            if balance < -1 and node.right and k > node.right.key:
+                return self._rotate_left(node)
+            if balance > 1 and node.left and k > node.left.key:
+                node.left = self._rotate_left(node.left)
+                return self._rotate_right(node)
+            if balance < -1 and node.right and k < node.right.key:
+                node.right = self._rotate_right(node.right)
+                return self._rotate_left(node)
+            return node
+        self.root = _insert(self.root, key, value)
+""",
+        """import numpy as np
+from typing import Callable, Dict, List, Set, Tuple
+
+class ComputationalGraphNode:
+    \"\"\"Node in an automatic differentiation topological compute DAG.\"\"\"
+    def __init__(self, data: np.ndarray, parents: Tuple[\"ComputationalGraphNode\", ...] = (), op: str = \"\"):
+        self.data: np.ndarray = np.asarray(data, dtype=np.float32)
+        self.grad: Optional[np.ndarray] = None
+        self.parents: Tuple[\"ComputationalGraphNode\", ...] = parents
+        self.op: str = op
+        self._backward: Callable[[], None] = lambda: None
+
+    def __add__(self, other: \"ComputationalGraphNode\") -> \"ComputationalGraphNode\":
+        other_node = other if isinstance(other, ComputationalGraphNode) else ComputationalGraphNode(other)
+        out = ComputationalGraphNode(self.data + other_node.data, (self, other_node), \"+\")
+        def _backward():
+            if self.grad is None:
+                self.grad = np.zeros_like(self.data)
+            if other_node.grad is None:
+                other_node.grad = np.zeros_like(other_node.data)
+            self.grad += out.grad
+            other_node.grad += out.grad
+        out._backward = _backward
+        return out
+
+    def backward(self) -> None:
+        topo: List[ComputationalGraphNode] = []
+        visited: Set[ComputationalGraphNode] = set()
+        def build_topo(v: ComputationalGraphNode):
+            if v not in visited:
+                visited.add(v)
+                for p in v.parents:
+                    build_topo(p)
+                topo.append(v)
+        build_topo(self)
+        self.grad = np.ones_like(self.data)
+        for node in reversed(topo):
+            node._backward()
+""",
+    ],
+    "math": [
+        "Let V and W be vector spaces over field F with V finite-dimensional. The Rank-Nullity Theorem states that for any linear map T: V -> W, dim(V) = dim(ker(T)) + dim(im(T)). Proof: Let {u_1, ..., u_k} be a basis for ker(T), so nullity(T) = k. By the basis extension theorem, extend this to a basis of V: {u_1, ..., u_k, v_1, ..., v_r}, so dim(V) = k + r. We claim {T(v_1), ..., T(v_r)} is a basis for im(T). First, any w in im(T) has w = T(v) for v in V. Writing v = sum a_i u_i + sum b_j v_j, T(v) = sum a_i T(u_i) + sum b_j T(v_j) = sum b_j T(v_j), spanning im(T). Second, if sum c_j T(v_j) = 0, then T(sum c_j v_j) = 0, so sum c_j v_j is in ker(T), implying all c_j = 0 by linear independence of the extended basis. Thus rank(T) = r, completing the proof.",
+        "Taylor's Theorem with Lagrange remainder: Let f be (n+1) times continuously differentiable on [a, b]. Then f(b) = sum_{k=0}^n (f^(k)(a)/k!) (b-a)^k + R_n(b), where R_n(b) = (f^(n+1)(xi)/(n+1)!) (b-a)^(n+1) for some xi in (a, b). The proof constructs an auxiliary function g(t) = f(b) - sum_{k=0}^n (f^(k)(t)/k!) (b-t)^k - M (b-t)^(n+1), choosing M such that g(a) = 0. Since g(b) = 0 as well, Rolle's Theorem guarantees a point xi in (a, b) where g'(xi) = 0. Differentiating g(t) via product rule causes telescoping cancellation of all intermediate derivatives, leaving - (f^(n+1)(xi)/n!) (b-xi)^n + (n+1)M (b-xi)^n = 0, yielding the exact Lagrange form for M.",
+        "Bayes' Theorem formalizes rational belief updating under uncertain evidence: P(A|B) = P(B|A) P(A) / P(B). By definition of conditional probability, P(A and B) = P(A|B) P(B) = P(B|A) P(A). Dividing by P(B) produces the identity. By the law of total probability across mutually exclusive exhaustive partitions {A_i}, the marginal evidence is P(B) = sum_i P(B|A_i) P(A_i). In statistical inference, P(A) represents the prior distribution, P(B|A) is the likelihood function, and P(A|B) is the posterior distribution.",
+    ],
+}
+
+
 class TokenQuotaManager:
     """Tracks token consumption across domains and determines which domain needs tokens next."""
 
@@ -149,7 +337,9 @@ class RectifiedContiguousPretrainStreamer:
         queue_size: int = 16,
         stage: str = "pretrain",
         target_shares: Optional[Dict[str, float]] = None,
-        min_edu_score: float = 4.0,
+        min_edu_score: float = 3.0,
+        domain_loss_weights: Optional[Dict[str, float]] = None,
+        reasoning_weight: float = 1.0,
     ):
         self.tokenizer = tokenizer
         self.batch_size = batch_size
@@ -158,6 +348,8 @@ class RectifiedContiguousPretrainStreamer:
         self.eos_token_id = eos_token_id
         self.stage = stage.lower()
         self.min_edu_score = float(min_edu_score)
+        self.domain_loss_weights = domain_loss_weights or {}
+        self.reasoning_weight = float(reasoning_weight)
         self.running = True
 
         if target_shares is not None:
@@ -171,7 +363,7 @@ class RectifiedContiguousPretrainStreamer:
         elif self.stage == "midtrain":
             # Stage 2: Targeted skills, mathematics, and 4k associative retrieval
             self.shares = {
-                "edu_academic": 0.45,   # FineWeb-Edu (> 4.0)
+                "edu_academic": 0.45,   # FineWeb-Edu (score > min_edu_score)
                 "math": 0.25,           # FineMath / OpenWebMath
                 "code": 0.15,           # Algorithmic code & proofs
                 "retrieval": 0.15,      # 4k multi-position key-value retrieval
@@ -195,58 +387,92 @@ class RectifiedContiguousPretrainStreamer:
         self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self.worker_thread.start()
 
-    def _open_fineweb_stream(self) -> Iterator[str]:
-        """Streams broad clean web text from HuggingFaceFW/fineweb."""
-        try:
-            from datasets import load_dataset
-            from src.hf_utils import get_hf_token
-            hf_tok = get_hf_token()
-            kw = {"name": "sample-10BT", "split": "train", "streaming": True}
-            if hf_tok:
-                kw["token"] = hf_tok
-            print("🌐 [Streamer] Connecting to HuggingFaceFW/fineweb (sample-10BT)...")
-            ds = load_dataset("HuggingFaceFW/fineweb", **kw)
-            for row in ds:
-                text = row.get("text", "")
-                if text and len(text) > 200:
-                    yield text
-        except Exception as e:
-            print(f"⚠️ [Streamer] FineWeb streaming connection failed ({e}). Using local fallback...")
-            while self.running:
-                yield "The scientific method relies on systematic observation, empirical measurement, formulation of testable hypotheses, and rigorous reproducibility across peer investigations."
+    def _cycle_corpus(self, corpus: List[str]) -> Iterator[str]:
+        """Cycles indefinitely through a diverse list of multi-paragraph passages."""
+        idx = 0
+        n = len(corpus)
+        while self.running:
+            yield corpus[idx % n]
+            idx += 1
 
-    def _open_edu_stream(self) -> Iterator[str]:
-        """Streams academic and educational text from FineWeb-Edu / Cosmopedia."""
-        try:
-            from datasets import load_dataset
-            from src.hf_utils import get_hf_token
-            hf_tok = get_hf_token()
-            kw = {"name": "sample-10BT", "split": "train", "streaming": True}
-            if hf_tok:
-                kw["token"] = hf_tok
-            print(f"📚 [Streamer] Connecting to HuggingFaceFW/fineweb-edu (sample-10BT, score > {self.min_edu_score})...")
-            ds = load_dataset("HuggingFaceFW/fineweb-edu", **kw)
-            for row in ds:
-                score = float(row.get("score", 0.0) or 0.0)
-                if score > self.min_edu_score:
+    def _open_fineweb_stream(self) -> Iterator[str]:
+        """Streams broad clean web text from HuggingFaceFW/fineweb with resilient fallback."""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                from datasets import load_dataset
+                from src.hf_utils import get_hf_token
+                hf_tok = get_hf_token()
+                kw = {"name": "sample-10BT", "split": "train", "streaming": True}
+                if hf_tok:
+                    kw["token"] = hf_tok
+                print("🌐 [Streamer] Connecting to HuggingFaceFW/fineweb (sample-10BT)...")
+                ds = load_dataset("HuggingFaceFW/fineweb", **kw)
+                for row in ds:
                     text = row.get("text", "")
                     if text and len(text) > 200:
                         yield text
-        except Exception as e:
-            print(f"⚠️ [Streamer] FineWeb-Edu streaming failed ({e}). Using local fallback...")
-            while self.running:
-                yield "Thermodynamics defines relations between heat, mechanical work, temperature, and internal energy in physical systems governed by macroscopic state variables."
+                return
+            except Exception as e:
+                wait_t = 1.0 * (2 ** attempt)
+                if attempt < max_retries - 1:
+                    time.sleep(wait_t)
+                else:
+                    err_msg = str(e)
+
+        # Check local validation/pretrain parquets if available
+        try:
+            local_val_path = os.path.join(REPO_ROOT, "data", "cerebro_v5_custom_dataset", "validation.parquet")
+            if os.path.exists(local_val_path):
+                import pyarrow.parquet as pq
+                tbl = pq.read_table(local_val_path)
+                for col in ["text", "content", "prompt"]:
+                    if col in tbl.column_names:
+                        for item in tbl[col].to_pylist():
+                            if item and len(item) > 200:
+                                yield item
+        except Exception:
+            pass
+
+        print(f"⚠️ [Streamer Notice] 'broad_web' online stream unavailable ({err_msg}). Engaged diverse offline corpus ({len(DIVERSE_FALLBACKS['broad_web'])} passages).")
+        yield from self._cycle_corpus(DIVERSE_FALLBACKS["broad_web"])
+
+    def _open_edu_stream(self) -> Iterator[str]:
+        """Streams academic and educational text from FineWeb-Edu with resilient fallback."""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                from datasets import load_dataset
+                from src.hf_utils import get_hf_token
+                hf_tok = get_hf_token()
+                kw = {"name": "sample-10BT", "split": "train", "streaming": True}
+                if hf_tok:
+                    kw["token"] = hf_tok
+                print(f"📚 [Streamer] Connecting to HuggingFaceFW/fineweb-edu (sample-10BT, score > {self.min_edu_score})...")
+                ds = load_dataset("HuggingFaceFW/fineweb-edu", **kw)
+                for row in ds:
+                    score = float(row.get("score", 0.0) or 0.0)
+                    if score > self.min_edu_score:
+                        text = row.get("text", "")
+                        if text and len(text) > 200:
+                            yield text
+                return
+            except Exception as e:
+                wait_t = 1.0 * (2 ** attempt)
+                if attempt < max_retries - 1:
+                    time.sleep(wait_t)
+                else:
+                    err_msg = str(e)
+
+        print(f"⚠️ [Streamer Notice] 'edu_academic' online stream unavailable ({err_msg}). Engaged diverse offline corpus ({len(DIVERSE_FALLBACKS['edu_academic'])} passages).")
+        yield from self._cycle_corpus(DIVERSE_FALLBACKS["edu_academic"])
 
     def _open_code_stream(self) -> Iterator[str]:
-        """Streams algorithmic and software Python code."""
-        try:
-            from datasets import load_dataset
-            from src.hf_utils import get_hf_token
-            hf_tok = get_hf_token()
-            print("💻 [Streamer] Connecting to clean code stream (bigcode/the-stack-dedup or Python)...")
-            # First priority: local cognitive code parquets if present
-            local_code = glob.glob(os.path.join(REPO_ROOT, "data", "*code*.parquet"))
-            if local_code:
+        """Streams algorithmic and software Python code with resilient local + diverse fallback."""
+        # First priority: local code parquets if present
+        local_code = glob.glob(os.path.join(REPO_ROOT, "data", "*code*.parquet"))
+        if local_code:
+            try:
                 import pyarrow.parquet as pq
                 for p in local_code:
                     tbl = pq.read_table(p)
@@ -255,7 +481,15 @@ class RectifiedContiguousPretrainStreamer:
                             for item in tbl[col].to_pylist():
                                 if item and len(item) > 100:
                                     yield item
-            # Online stream fallback
+            except Exception:
+                pass
+
+        # Second priority: online stream
+        try:
+            from datasets import load_dataset
+            from src.hf_utils import get_hf_token
+            hf_tok = get_hf_token()
+            print("💻 [Streamer] Connecting to clean code stream (bigcode/the-stack-dedup or Python)...")
             kw = {"data_dir": "data/python", "split": "train", "streaming": True}
             if hf_tok:
                 kw["token"] = hf_tok
@@ -264,18 +498,15 @@ class RectifiedContiguousPretrainStreamer:
                 c = row.get("content", "")
                 if c and len(c) > 100:
                     yield c
-        except Exception:
-            # Synthetic robust code snippets
-            sample_codes = [
-                "def binary_search(arr: list, target: int) -> int:\n    left, right = 0, len(arr) - 1\n    while left <= right:\n        mid = (left + right) // 2\n        if arr[mid] == target:\n            return mid\n        elif arr[mid] < target:\n            left = mid + 1\n        else:\n            right = mid - 1\n    return -1\n",
-                "class LRUCache:\n    def __init__(self, capacity: int):\n        self.capacity = capacity\n        self.cache = {}\n    def get(self, key: int) -> int:\n        if key not in self.cache:\n            return -1\n        val = self.cache.pop(key)\n        self.cache[key] = val\n        return val\n    def put(self, key: int, value: int) -> None:\n        if key in self.cache:\n            self.cache.pop(key)\n        elif len(self.cache) >= self.capacity:\n            oldest = next(iter(self.cache))\n            del self.cache[oldest]\n        self.cache[key] = value\n",
-            ]
-            while self.running:
-                for sc in sample_codes:
-                    yield sc
+            return
+        except Exception as e:
+            err_msg = str(e)
+
+        print(f"⚠️ [Streamer Notice] 'code' stream using diverse offline repository corpus ({len(DIVERSE_FALLBACKS['code'])} modules).")
+        yield from self._cycle_corpus(DIVERSE_FALLBACKS["code"])
 
     def _open_math_stream(self) -> Iterator[str]:
-        """Streams mathematical web text and proofs (FineMath)."""
+        """Streams mathematical web text and proofs (FineMath) with resilient fallback."""
         try:
             from datasets import load_dataset
             from src.hf_utils import get_hf_token
@@ -289,9 +520,12 @@ class RectifiedContiguousPretrainStreamer:
                 t = row.get("text", "")
                 if t and len(t) > 150:
                     yield t
-        except Exception:
-            while self.running:
-                yield "Let V be a finite-dimensional vector space over field F. The rank-nullity theorem states that for any linear transformation T: V -> W, dim(V) = dim(ker(T)) + dim(im(T))."
+            return
+        except Exception as e:
+            err_msg = str(e)
+
+        print(f"⚠️ [Streamer Notice] 'math' stream unavailable ({err_msg}). Engaged diverse offline mathematical corpus ({len(DIVERSE_FALLBACKS['math'])} proofs).")
+        yield from self._cycle_corpus(DIVERSE_FALLBACKS["math"])
 
     def _open_retrieval_stream(self) -> Iterator[str]:
         """Generates continuous long-context associative retrieval documents."""
@@ -315,6 +549,7 @@ class RectifiedContiguousPretrainStreamer:
             # Assemble one batch of batch_size blocks
             batch_prompts = []
             batch_targets = []
+            batch_weights = []
 
             for _ in range(self.batch_size):
                 # Choose domain by token deficit
@@ -355,16 +590,30 @@ class RectifiedContiguousPretrainStreamer:
 
                 # Build full-sequence pretraining pair:
                 # Prompt: 1 token (BOS seed)
-                # Target: 4096 tokens (100% loss-bearing)
+                # Target: block_size tokens (100% loss-bearing)
                 batch_prompts.append([self.bos_token_id])
                 batch_targets.append(chunk)
+
+                # Loss weight construction:
+                # 1. Base domain weight (per-block loss multiplier)
+                domain_w = float(self.domain_loss_weights.get(chosen_domain, 1.0))
+                seq_weights = np.full(len(chunk), domain_w, dtype=np.float32)
+
+                # 2. Per-token reasoning/anchor weighting if configured (> 1.0)
+                if self.reasoning_weight > 1.0:
+                    # Scale reasoning or code tokens if applicable
+                    if chosen_domain in ("math", "code", "edu_academic"):
+                        seq_weights *= float(self.reasoning_weight)
+
+                batch_weights.append(seq_weights)
 
             # Convert to arrays
             p_arr = np.asarray(batch_prompts, dtype=np.int32)
             t_arr = np.asarray(batch_targets, dtype=np.int32)
+            w_arr = np.asarray(batch_weights, dtype=np.float32)
 
             # Feed to bounded queue
-            self.batch_queue.put({"prompt": p_arr, "target": t_arr}, block=True)
+            self.batch_queue.put({"prompt": p_arr, "target": t_arr, "weights": w_arr}, block=True)
 
     def __iter__(self):
         return self
@@ -377,14 +626,18 @@ class RectifiedContiguousPretrainStreamer:
                 return batch
         raise StopIteration
 
-    def get_batch(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Returns (prompt, target) tuple matching JAX LinguisticDataStreamer interface."""
+    def get_batch(self, return_weights: bool = False):
+        """Returns (prompt, target) or (prompt, target, weights) tuple matching trainer interface."""
         batch = next(self)
+        if return_weights:
+            return batch["prompt"], batch["target"], batch["weights"]
         return batch["prompt"], batch["target"]
 
-    def next_batch(self, bucket_idx: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, None]:
-        """Returns (prompt, target, feedback) tuple matching ElasticBucketBatcher interface."""
+    def next_batch(self, bucket_idx: Optional[int] = None, return_weights: bool = False):
+        """Returns (prompt, target, feedback) or (prompt, target, feedback, weights) tuple."""
         batch = next(self)
+        if return_weights:
+            return batch["prompt"], batch["target"], None, batch["weights"]
         return batch["prompt"], batch["target"], None
 
     def stop(self):

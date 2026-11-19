@@ -59,6 +59,7 @@ def estimate_peak_hbm(
     opt_multiplier: float = 2.0,
     total_memory_bytes: Optional[int] = None,
     safety_margin: float = 0.95,
+    vocab_size: int = 0,
 ) -> MemoryBreakdown:
     """
     Computes exact theoretical peak accelerator memory based on tensor shapes:
@@ -91,8 +92,10 @@ def estimate_peak_hbm(
     else:
         act_factor = max(4, num_shells * 2)
 
+    # 4. Activation bytes & materialized logits cross-entropy projection
+    logits_bytes = int(batch_size * seq_len * vocab_size * bytes_per_tok) if vocab_size > 0 else 0
     activation_bytes = int(
-        batch_size * total_tokens * surface_dim * bytes_per_tok * act_factor
+        batch_size * total_tokens * surface_dim * bytes_per_tok * act_factor + logits_bytes
     )
 
     peak_bytes = static_bytes + opt_bytes + activation_bytes
@@ -137,12 +140,13 @@ def estimate_v5_peak_hbm(
     num_shells = getattr(config, "num_shells", 12)
     surface_dim = getattr(config, "surface_dim", getattr(config, "hidden_dim", 768))
 
+    vocab = getattr(config, "vocab_size", 32000)
+
     # Calculate parameter bytes
     if params:
         param_bytes = sum(p.size * p.itemsize for p in params.values())
     else:
         # Theoretical parameter estimation from config if params not instantiated
-        vocab = getattr(config, "vocab_size", 32000)
         # Embedding: vocab * surface_dim
         # Shells: num_shells * (~4 * surface_dim^2)
         # Heads / Motor: ~2 * surface_dim * vocab
@@ -160,4 +164,5 @@ def estimate_v5_peak_hbm(
         bytes_per_tok=bytes_per_tok,
         opt_multiplier=2.0,
         total_memory_bytes=total_memory_bytes,
+        vocab_size=vocab,
     )

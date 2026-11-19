@@ -374,6 +374,25 @@ class TestAutotuneLibrary(unittest.TestCase):
         self.assertIn(128, fast_batches)
         self.assertIn(256, fast_batches)
 
+    def test_v5_benchmark_adapter_graceful_oom_cleanup(self):
+        """Verifies benchmark_v5_model catches OOM without raising UnboundLocalError on prompt_b."""
+        from autotune.adapters.v5 import benchmark_v5_model, _V5_TRAIN_STEP_CACHE
+        with patch("src.jax.spheroid_optimizer.build_train_step_spheroid") as mock_build:
+            mock_step = MagicMock(side_effect=RuntimeError("RESOURCE_EXHAUSTED: out of memory on TPU"))
+            mock_build.return_value = mock_step
+            _V5_TRAIN_STEP_CACHE.clear()
+
+            res = benchmark_v5_model(
+                preset="v5_small",
+                batch_size=256,
+                remat=False,
+                seq_len=1024,
+                num_steps=1,
+            )
+            self.assertIn("OOM", res["status"])
+            self.assertEqual(res["steps_per_sec"], 0.0)
+
+
 
 if __name__ == "__main__":
     unittest.main()
