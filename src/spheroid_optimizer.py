@@ -29,6 +29,7 @@ import math
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
+import torch.nn as nn
 from torch.optim.optimizer import Optimizer
 
 

@@ -748,8 +748,8 @@ def is_valid_tool_call(tc: str) -> bool:
     if re.match(r"^[a-zA-Z_]\w*\s*\(.*?\)$", s, re.DOTALL):
         return True
 
-    # 2. Industry standard JSON tool call: {"name": "...", "arguments": {...}}
-    if ("{" in s and "}" in s) and ("\"name\"" in s or "'name'" in s):
+    # 2. Industry standard JSON tool call: {"name": "...", "arguments": {...}} or {"tool": "...", "args": {...}}
+    if ("{" in s and "}" in s) and any(k in s for k in ("\"name\"", "'name'", "\"tool\"", "'tool'")):
         try:
             clean_s = s
             if "```" in clean_s:
@@ -757,7 +757,7 @@ def is_valid_tool_call(tc: str) -> bool:
                 if m_code:
                     clean_s = m_code.group(1).strip()
             obj = json.loads(clean_s)
-            if isinstance(obj, dict) and ("name" in obj or "function" in obj):
+            if isinstance(obj, dict) and ("name" in obj or "function" in obj or "tool" in obj):
                 return True
         except Exception:
             pass
@@ -786,11 +786,19 @@ def parse_model_output(text: str) -> Dict[str, Any]:
         raw_tools.append(m.group(1).strip())
     for m in re.finditer(r"<tool_call>(.*?)(?:</tool_call>|$)", raw, re.DOTALL):
         raw_tools.append(m.group(1).strip())
+    matched_raw_json = None
+    if not raw_tools and ("{" in raw and "}" in raw):
+        m_json = re.search(r"(\{\s*\"(?:tool|name|function)\"\s*:.*\})", raw, re.DOTALL)
+        if m_json and is_valid_tool_call(m_json.group(1).strip()):
+            matched_raw_json = m_json.group(1).strip()
+            raw_tools.append(matched_raw_json)
 
     # 3. Extract plain talking/answering text (outside thinking & action blocks)
     clean_text = re.sub(r"<think>.*?(?:</think>|$)", "", raw, flags=re.DOTALL)
     clean_text = re.sub(r"<act>.*?(?:</act>|$)", "", clean_text, flags=re.DOTALL)
     clean_text = re.sub(r"<tool_call>.*?(?:</tool_call>|$)", "", clean_text, flags=re.DOTALL)
+    if matched_raw_json:
+        clean_text = clean_text.replace(matched_raw_json, "")
 
     # Strip any stray ChatML or turn boundary tokens
     for stray in ("<|im_end|>", "<|im_start|>", "</s>", "<s>", "<stim>", "</stim>", "</act>", "</think>", "</tool_call>", "</tool_response>", "<obs>", "</obs>"):

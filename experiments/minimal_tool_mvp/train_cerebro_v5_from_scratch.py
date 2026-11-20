@@ -12,6 +12,7 @@ Validates:
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import random
@@ -28,6 +29,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from src.spheroid_v5 import CerebroSpheroidV5, ModelConfigV5
+from src.spheroid_optimizer import build_scmer_optimizer
 from src.corpus import format_stimulus_prompt, parse_model_output
 from experiments.minimal_tool_mvp.dataset_generator import TraceDatasetGenerator, ToolTrace
 from experiments.minimal_tool_mvp.schema_validator import DeterministicToolExecutor, validate_tool_call
@@ -98,10 +100,10 @@ def collate_spheroid_batch(
 
 
 def train_cerebro_v5(
-    num_train_traces: int = 1200,
-    num_steps: int = 150,
-    batch_size: int = 8,
-    lr: float = 8e-4,
+    num_train_traces: int = 1500,
+    num_steps: int = 400,
+    batch_size: int = 16,
+    lr: float = 0.002,
     seed: int = 42,
 ):
     torch.manual_seed(seed)
@@ -142,7 +144,14 @@ def train_cerebro_v5(
     params = sum(p.numel() for p in model.parameters())
     print(f"Initialized CerebroSpheroid V5 architecture ({params:,} parameters).")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    optimizer = build_scmer_optimizer(
+        model=model,
+        lr=lr,
+        scmer_lambda=0.005,
+        momentum=0.95,
+        weight_decay=0.01,
+        spectral_clamp=1.0,
+    )
 
     # 4. Training Loop
     print(f"\n[3/4] Training for {num_steps} steps...")
@@ -313,4 +322,17 @@ def train_cerebro_v5(
 
 
 if __name__ == "__main__":
-    train_cerebro_v5()
+    parser = argparse.ArgumentParser(description="Train CerebroSpheroid V5 from Scratch on Minimal Tool Dataset")
+    parser.add_argument("--steps", type=int, default=400, help="Number of training steps")
+    parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
+    parser.add_argument("--lr", type=float, default=0.002, help="Learning rate for SCMER optimizer")
+    parser.add_argument("--traces", type=int, default=1500, help="Number of training traces")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    args = parser.parse_args()
+    train_cerebro_v5(
+        num_train_traces=args.traces,
+        num_steps=args.steps,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        seed=args.seed,
+    )
