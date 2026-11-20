@@ -120,13 +120,13 @@ def test_net2net_initialization_properties():
     params, buffers = init_params_v5(jax.random.PRNGKey(0), cfg)
     apply_net2net_cortical_init(params, num_frozen_shells=16, num_frozen_tracts=40)
 
-    # Net2Net invariant properties
-    assert np.all(np.asarray(params["core.intra_swiglu.w_down"][16:]) == 0.0)
-    assert np.all(np.asarray(params["core.shortcut_weight"][40:]) == 0.0)
-    assert np.all(np.asarray(params["core.shortcut_gate"][40:]) <= -10.0)
-    assert np.all(np.asarray(params["core.w_radial_in"][15:]) == 0.0)
-    assert np.all(np.asarray(params["core.w_radial_out"][15:]) == 0.0)
-    assert np.all(np.asarray(params["motor.shell_score"][16:]) <= -1e4)
+    # Receptive Outer Mantle Properties: active gradients & no softmax underflow
+    assert np.all(np.asarray(params["motor.shell_score"][16:]) > -10.0), "Shell scores must not underflow softmax!"
+    assert np.all(np.asarray(params["core.shortcut_gate"][40:]) > -3.0), "Shortcut gates must conduct flux!"
+    assert float(np.sqrt(np.mean(np.asarray(params["core.intra_swiglu.w_down"][16:]) ** 2))) > 1e-5
+    assert float(np.sqrt(np.mean(np.asarray(params["core.shortcut_weight"][40:]) ** 2))) > 1e-5
+    assert float(np.sqrt(np.mean(np.asarray(params["core.w_radial_in"][15:]) ** 2))) > 1e-5
+    assert float(np.sqrt(np.mean(np.asarray(params["core.w_radial_out"][15:]) ** 2))) > 1e-5
 
 
 def test_zero_regression_step_0_equivalence():
@@ -214,13 +214,13 @@ def test_full_v5_compact_width_and_depth_transplantation():
         eye_block = w_rad_in[tr, 256:512, 256:512]
         assert np.allclose(eye_block, np.eye(256), atol=1e-5)
 
-    # 4. SwiGLU down-projection outer channels are zero-initialized
+    # 4. SwiGLU down-projection width channels zero-padded and outer shells actively initialized
     w_down = np.array(params_compact["core.intra_swiglu.w_down"])
-    assert np.all(w_down[:, :, 1280:] == 0.0)
-    assert np.all(w_down[16:, :, :] == 0.0)
+    assert np.all(w_down[:16, :, 1280:] == 0.0)
+    assert float(np.sqrt(np.mean(w_down[16:, :, :] ** 2))) > 1e-5
 
-    # 5. Shortcut tracts wired and silenced
+    # 5. Shortcut tracts wired and receptive
     assert len(bufs_compact[0]) == 96
-    assert np.all(np.array(params_compact["core.shortcut_weight"][40:]) == 0.0)
-    assert np.all(np.array(params_compact["core.shortcut_gate"][40:]) <= -10.0)
+    assert float(np.sqrt(np.mean(np.array(params_compact["core.shortcut_weight"][40:]) ** 2))) > 1e-5
+    assert np.all(np.array(params_compact["core.shortcut_gate"][40:]) > -3.0)
 

@@ -27,27 +27,30 @@ def build_cortical_expansion_masks(
     num_frozen_shells: int = 16,
     num_frozen_tracts: int = 40,
     framework: str = "jax",
+    anneal_factor: float = 0.0,
 ) -> Dict[str, Any]:
     """
-    Constructs binary gradient masks (0.0 = frozen, 1.0 = trainable) for progressive cortical expansion.
+    Constructs gradient masks for progressive cortical expansion and consolidation annealing.
     
     Args:
         params: Dictionary of model parameters (JAX arrays, PyTorch tensors, or NumPy arrays).
-        num_frozen_shells: Number of innermost concentric shells to freeze (default: 16).
-        num_frozen_tracts: Number of primary shortcut tracts to freeze (default: 40).
+        num_frozen_shells: Number of innermost concentric shells in core (default: 16).
+        num_frozen_tracts: Number of primary shortcut tracts in core (default: 40).
         framework: 'jax', 'torch', or 'numpy' for the output mask arrays.
+        anneal_factor: Gradient multiplier for frozen core during annealing [0.0 = fully frozen, 1.0 = fully unfrozen].
     
     Returns:
         Dictionary of mask arrays matching the keys and shapes of `params`.
     """
     masks: Dict[str, Any] = {}
+    anneal = float(np.clip(anneal_factor, 0.0, 1.0))
 
     for k, v in params.items():
         shape = tuple(v.shape)
-        # Default: initialize all zeros (frozen)
-        mask_np = np.zeros(shape, dtype=np.float32)
+        # Default: initialize with anneal multiplier for core
+        mask_np = np.full(shape, anneal, dtype=np.float32)
 
-        # Core concentric shells and shortcut tracts
+        # Core concentric shells and shortcut tracts: outer mantle is 100% trainable (1.0)
         if k in ("core.intra_swiglu.w_gate", "core.intra_swiglu.w_val", "core.intra_swiglu.w_down"):
             # Shape: (num_shells, surface_dim, hidden_dim)
             if len(shape) >= 1 and shape[0] > num_frozen_shells:
@@ -73,14 +76,17 @@ def build_cortical_expansion_masks(
             frozen_trans = max(0, num_frozen_shells - 1)
             if len(shape) >= 1 and shape[0] > frozen_trans:
                 mask_np[frozen_trans:] = 1.0
+        elif k == "motor.shell_score":
+            # Shape: (num_shells,) - outer shell readout scores MUST be trainable
+            if len(shape) >= 1 and shape[0] > num_frozen_shells:
+                mask_np[num_frozen_shells:] = 1.0
         elif k.startswith("sensory.") or k.startswith("motor.") or k.startswith("perceptual.") or k.startswith("audio_stem."):
-            # All sensory encoders, positional embeddings, motor decoders, and heads remain 100% frozen
-            mask_np[...] = 0.0
+            # Core sensory encoders, positional embeddings, motor decoders, and heads scale with anneal factor
+            mask_np[...] = anneal
         elif k in ("pos_embed", "phase_embed", "affine_scale"):
-            mask_np[...] = 0.0
+            mask_np[...] = anneal
         else:
-            # Other invariant core projections remain frozen
-            mask_np[...] = 0.0
+            mask_np[...] = anneal
 
         if framework == "jax":
             import jax.numpy as jnp
@@ -92,6 +98,33 @@ def build_cortical_expansion_masks(
             masks[k] = mask_np
 
     return masks
+
+
+def compute_cortical_anneal_factor(
+    step: int,
+    warmup_steps: int = 2000,
+    anneal_steps: int = 1000,
+    cycle_length: Optional[int] = None,
+) -> float:
+    """
+    Computes the continuous unfreezing anneal factor [0.0, 1.0] for the core and interface.
+    
+    0.0: Core is strictly frozen (only outer mantle 16..31 trains).
+    0.0 -> 1.0: Interface and core smoothly unfreeze so interface representations normalize.
+    1.0: Entire mantle is fully unfrozen for global co-adaptation.
+    """
+    if cycle_length is not None and cycle_length > 0:
+        cycle_step = step % cycle_length
+        freeze_window = cycle_length - anneal_steps
+        if cycle_step < freeze_window:
+            return 0.0
+        return float((cycle_step - freeze_window) / max(1, anneal_steps))
+
+    if step < warmup_steps:
+        return 0.0
+    if step >= warmup_steps + anneal_steps:
+        return 1.0
+    return float((step - warmup_steps) / max(1, anneal_steps))
 
 
 def count_cortical_expansion_params(
@@ -196,41 +229,66 @@ def apply_net2net_cortical_init(
     params: Dict[str, Any],
     num_frozen_shells: int = 16,
     num_frozen_tracts: int = 40,
+    seed: int = 42,
 ) -> Dict[str, Any]:
     """
-    Applies Net2Net Zero-Regression initialization to newly expanded parameter slices.
+    Initializes newly expanded cortical parameter slices for progressive cortical expansion.
     
-    Guarantees mathematical invariance at Step 0:
-      1. core.intra_swiglu.w_down[num_frozen_shells:] = 0.0 (Zero non-linear distortion in outer mantle).
-      2. core.shortcut_weight[num_frozen_tracts:] = 0.0 (Zero uninitialized shortcut flux).
-      3. core.shortcut_gate[num_frozen_tracts:] = -10.0 (Sigmoid conductance ~4.5e-5).
-      4. core.w_radial_in[num_frozen_shells - 1:] = 0.0 (Zero inward radial noise into core).
-      5. core.w_radial_out[num_frozen_shells - 1:] = 0.0 (Zero outward shock from core).
-      6. motor.shell_score[num_frozen_shells:] = -1e4 (Softmax probability mass ~0 on outer shells).
+    Guarantees active representation learning and gradient receptivity in the outer mantle:
+      1. motor.shell_score[num_frozen_shells:]: Set to mean of core scores (or 0.0), ensuring
+         non-zero softmax attention mass and full gradient backpropagation from Step 0.
+      2. core.shortcut_gate[num_frozen_tracts:]: Set to receptive conductance (~0.0, sigma(0)=0.5,
+         sigma'(0)=0.25) so newly expanded axonal shortcut tracts actively conduct flux.
+      3. core.shortcut_weight[num_frozen_tracts:]: Initialized with active small Gaussian weights
+         scaled to match active tracts, preventing gradient dead-zones.
+      4. core.intra_swiglu.w_down[num_frozen_shells:]: Initialized with small Gaussian weights
+         matching active shells so error gradients pass into SwiGLU gate/val weights.
+      5. core.w_radial_in / out[num_frozen_shells - 1:]: Initialized with active radial wave
+         coupling so signals traverse smoothly across the core-mantle interface.
     """
     is_jax = any("jax" in str(type(v)) for v in params.values())
     is_torch = any("torch" in str(type(v)) for v in params.values())
+
+    rng = np.random.RandomState(seed)
 
     for k, v in params.items():
         arr = np.array(v)
         modified = False
 
         if k == "core.intra_swiglu.w_down" and arr.shape[0] > num_frozen_shells:
-            arr[num_frozen_shells:] = 0.0
-            modified = True
+            rms_outer = float(np.sqrt(np.mean(arr[num_frozen_shells:] ** 2)))
+            if rms_outer < 1e-5:
+                scale = float(np.std(arr[:num_frozen_shells])) if num_frozen_shells > 0 else 0.02
+                scale = max(scale, 0.005)
+                arr[num_frozen_shells:] = rng.normal(0.0, scale * 0.5, size=arr[num_frozen_shells:].shape)
+                modified = True
         elif k == "core.shortcut_weight" and arr.shape[0] > num_frozen_tracts:
-            arr[num_frozen_tracts:] = 0.0
-            modified = True
+            rms_outer = float(np.sqrt(np.mean(arr[num_frozen_tracts:] ** 2)))
+            if rms_outer < 1e-5:
+                scale = float(np.std(arr[:num_frozen_tracts])) if num_frozen_tracts > 0 else 0.01
+                scale = max(scale, 0.005)
+                arr[num_frozen_tracts:] = rng.normal(0.0, scale * 0.5, size=arr[num_frozen_tracts:].shape)
+                modified = True
         elif k == "core.shortcut_gate" and arr.shape[0] > num_frozen_tracts:
-            arr[num_frozen_tracts:] = -10.0
-            modified = True
+            outer_mean = float(np.mean(arr[num_frozen_tracts:]))
+            if outer_mean < -3.0 or outer_mean > 3.0:
+                core_gate = float(np.mean(arr[:num_frozen_tracts])) if num_frozen_tracts > 0 else 0.0
+                arr[num_frozen_tracts:] = float(np.clip(core_gate, -0.5, 0.5))
+                modified = True
         elif k in ("core.w_radial_in", "core.w_radial_out") and arr.shape[0] >= num_frozen_shells:
-            # Transitions >= num_frozen_shells - 1 cross or lie outside the core boundary
-            arr[num_frozen_shells - 1:] = 0.0
-            modified = True
+            trans = max(0, num_frozen_shells - 1)
+            rms_outer = float(np.sqrt(np.mean(arr[trans:] ** 2)))
+            if rms_outer < 1e-5:
+                scale = float(np.std(arr[:trans])) if trans > 0 else 0.02
+                scale = max(scale, 0.005)
+                arr[trans:] = rng.normal(0.0, scale * 0.5, size=arr[trans:].shape)
+                modified = True
         elif k == "motor.shell_score" and arr.shape[0] > num_frozen_shells:
-            arr[num_frozen_shells:] = -1e4
-            modified = True
+            outer_min = float(np.min(arr[num_frozen_shells:]))
+            if outer_min < -100.0:
+                core_score = float(np.mean(arr[:num_frozen_shells])) if num_frozen_shells > 0 else 0.0
+                arr[num_frozen_shells:] = core_score
+                modified = True
 
         if modified:
             if is_jax:
