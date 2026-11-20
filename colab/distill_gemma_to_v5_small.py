@@ -10,11 +10,12 @@ google/gemma-4-E4B-it-qat-q4_0-gguf, or Gemma 2) into CerebroSpheroid V5 Small
 (105.9M parameters, 16 shells, 40 shortcut tracts).
 
 Key Architecture & Capabilities:
-  1. Universal Model Support:
-     - Teacher: Google Gemma 4 E4B (`google/gemma-4-E4B-it`, `google/gemma-4-E4B-it-qat-q4_0-gguf`),
-       or Gemma 2. Automatically loads in 4-bit NormalFloat (via bitsandbytes) to fit
-       in < 3.0 GB VRAM, leaving over 12 GB headroom on free Google Colab T4 (15 GB) GPUs.
-     - Student: CerebroSpheroid V5 Small (105.9M params, 32,000 vocab, RMSNorm, SwiGLU).
+  1. Full Soft-Target Probability Distribution Distillation (Option B):
+     - Cross-Tokenizer Top-K Logit Projection: Projects Gemma's 262,144 softmax probability
+       spread into Cerebro's 32,000 vocabulary space via precomputed mapping table.
+     - Dual Loss Objective:
+         L_total = (1 - alpha) * L_hard + alpha * T^2 * L_soft_KL
+       where L_soft_KL matches the complete dark-knowledge probability distribution.
   2. Answer-Anchor Loss Weighting (AALW):
      - Prompt tokens: 0.0x (masked with -100).
      - Deliberative thinking (<think> ... </think>): 3.5x loss weighting.
@@ -66,7 +67,7 @@ from src.hf_utils import setup_hf_token, get_hf_token
 def setup_colab_environment() -> Tuple[str, str, torch.device, torch.dtype]:
     """Configures system hugepages, hardware device, tokens, and checkpoint directories."""
     print("=" * 80)
-    print("🧠 CEREBROSPHEROID V5: GEMMA 2 -> V5 SMALL DISTILLATION ENGINE")
+    print("🧠 CEREBROSPHEROID V5: GEMMA 4 E4B -> V5 SMALL DISTILLATION ENGINE")
     print("=" * 80)
 
     # 1. Enable Linux Transparent Hugepages (in Google Colab environments)
@@ -167,7 +168,6 @@ def load_gemma_teacher(
     print(f"\n🎓 Initializing Google Gemma 4 E4B Teacher Model: [{model_id}]...")
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    # Candidate models in case primary is gated, GGUF, or requires alternate weights
     candidate_models = [
         model_id,
         "google/gemma-4-E4B-it-qat-q4_0-gguf",
@@ -270,7 +270,127 @@ def load_v5_small_student(
 
 
 # ==============================================================================
-# 3. Deliberative Data Preparation & Answer-Anchor Weighting
+# 3. Cross-Tokenizer Top-K Soft Distribution Mapping Engine (Option B)
+# ==============================================================================
+
+def get_or_compute_gemma_to_cerebro_map(
+    teacher_tok: Any,
+    student_tok: Any,
+    cache_path: Optional[str] = None,
+    device: torch.device = torch.device("cpu"),
+) -> torch.Tensor:
+    """
+    Retrieves or computes the cross-tokenizer lookup table:
+    Maps each of Gemma's 262,144 tokens -> Corresponding Cerebro 32k token ID.
+    Precomputed lookup executes in 0.001s and enables instant full-distribution transfer.
+    """
+    default_path = os.path.join(REPO_ROOT, "data", "gemma4_to_cerebro32k_map.pt")
+    target_path = cache_path or default_path
+
+    if os.path.exists(target_path):
+        try:
+            mapping = torch.load(target_path, map_location=device, weights_only=False)
+            if mapping.shape[0] == teacher_tok.vocab_size:
+                print(f"   ⚡ Loaded Precomputed Gemma4 -> Cerebro32k Map from '{target_path}' (262,144 tokens mapped)")
+                return mapping.to(device=device)
+        except Exception as e:
+            print(f"   ℹ️ Map load notice: {e}. Recomputing cross-tokenizer table...")
+
+    # Compute on the fly
+    print(f"   ⚙️ Computing cross-tokenizer projection table for {teacher_tok.vocab_size:,} Gemma tokens...")
+    t0 = time.time()
+    v_g = teacher_tok.vocab_size
+    mapping = torch.full((v_g,), -1, dtype=torch.int32)
+    batch_size = 10000
+
+    for start in range(0, v_g, batch_size):
+        end = min(v_g, start + batch_size)
+        sub_ids = list(range(start, end))
+        sub_texts = teacher_tok.batch_decode([[i] for i in sub_ids], clean_up_tokenization_spaces=False)
+        for g_id, txt in zip(sub_ids, sub_texts):
+            c_ids = student_tok.encode(txt, add_special_tokens=False)
+            if c_ids:
+                mapping[g_id] = c_ids[0]
+
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    torch.save(mapping, target_path)
+    print(f"   ✓ Cross-Tokenizer Table Computed & Cached in {time.time() - t0:.2f}s ({mapping.shape[0]:,} tokens -> {target_path})")
+    return mapping.to(device=device)
+
+
+def compute_soft_target_distribution(
+    teacher: Any,
+    teacher_tok: Any,
+    pairs: List[Tuple[str, str]],
+    map_g_to_c: torch.Tensor,
+    target_len: int,
+    temp: float = 2.0,
+    topk: int = 64,
+    device: torch.device = torch.device("cpu"),
+) -> Optional[torch.Tensor]:
+    """
+    Computes Gemma 4 E4B soft probability distribution over Cerebro's 32k vocabulary space.
+    1. Forward-passes batch through teacher to get full 262k logits.
+    2. Interpolates sequence dimension smoothly to match student target length.
+    3. Extracts Top-K probabilities at temperature T.
+    4. Projects Top-K indices into Cerebro's 32k space and renormalizes into soft target distribution.
+    """
+    if teacher is None or teacher_tok is None:
+        return None
+
+    try:
+        # Format batch using Gemma chat template
+        teacher_texts = []
+        for q, r in pairs:
+            msgs = [{"role": "user", "content": q}, {"role": "assistant", "content": r}]
+            if hasattr(teacher_tok, "apply_chat_template"):
+                try:
+                    formatted = teacher_tok.apply_chat_template(msgs, tokenize=False)
+                except Exception:
+                    formatted = f"<start_of_turn>user\n{q}<end_of_turn>\n<start_of_turn>model\n{r}<end_of_turn>\n"
+            else:
+                formatted = f"<start_of_turn>user\n{q}<end_of_turn>\n<start_of_turn>model\n{r}<end_of_turn>\n"
+            teacher_texts.append(formatted)
+
+        inp = teacher_tok(teacher_texts, return_tensors="pt", padding=True, truncation=True, max_length=1024).to(device)
+
+        with torch.no_grad():
+            out = teacher(**inp)
+            z_teacher = out.logits  # [B, L_teacher, V_G]
+
+        B = z_teacher.shape[0]
+        V_C = 32000
+
+        # Sequence Alignment: Interpolate teacher logit manifold smoothly to student target length
+        z_aligned = F.interpolate(z_teacher.transpose(1, 2), size=target_len, mode="linear", align_corners=False).transpose(1, 2)
+
+        # Compute Top-K Softmax Probabilities over 262k vocab at temperature T
+        probs_g = F.softmax(z_aligned / temp, dim=-1)
+        topk_probs, topk_indices = torch.topk(probs_g, k=topk, dim=-1)  # [B, target_len, topk]
+
+        # Project Gemma indices to Cerebro 32k indices via cross-tokenizer table
+        mapped_c = map_g_to_c[topk_indices]  # [B, target_len, topk]
+        valid_mask = (mapped_c >= 0) & (mapped_c < V_C)
+
+        # Scatter probability mass into Cerebro 32k distribution
+        target_dist = torch.zeros(B, target_len, V_C, device=device, dtype=torch.float32)
+        target_dist.scatter_add_(
+            dim=-1,
+            index=mapped_c.clamp(0, V_C - 1) * valid_mask.long(),
+            src=(topk_probs * valid_mask.float()).to(torch.float32),
+        )
+
+        # Renormalize to ensure valid probability simplex sum(p) == 1.0
+        norm = target_dist.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        target_dist = target_dist / norm
+        return target_dist
+
+    except Exception as e_dist:
+        return None
+
+
+# ==============================================================================
+# 4. Deliberative Data Preparation & Answer-Anchor Weighting
 # ==============================================================================
 
 def format_deliberative_response(text: str, q_txt: str = "") -> str:
@@ -378,7 +498,7 @@ def prepare_distillation_batch(
 
 
 # ==============================================================================
-# 4. End-to-End Distillation Execution Engine
+# 5. End-to-End Distillation Execution Engine
 # ==============================================================================
 
 def run_distillation(
@@ -394,6 +514,10 @@ def run_distillation(
     max_prompt_len: int = 256,
     max_target_len: int = 768,
     aalw_weight: float = 4.0,
+    soft_distill: bool = True,
+    distill_temp: float = 2.0,
+    distill_alpha: float = 0.6,
+    topk: int = 64,
     save_interval: int = 250,
     eval_interval: int = 500,
     checkpoint_dir: Optional[str] = None,
@@ -403,8 +527,8 @@ def run_distillation(
 ):
     """
     Main distillation orchestrator for Google Colab.
-    Executes teacher generation / trajectory alignment, student forward-backward pass,
-    Answer-Anchor Loss Weighting, and live bioflo.in telemetry sync.
+    Executes Option B Full Soft-Target Probability Distribution Distillation
+    from Google Gemma 4 E4B into CerebroSpheroid V5 Small.
     """
     ckpt_dir, bioflo_tok, device, dtype = setup_colab_environment()
     if checkpoint_dir:
@@ -414,9 +538,9 @@ def run_distillation(
     # 1. Initialize Student Model (V5 Small)
     student, student_tok = load_v5_small_student(device=device, dtype=dtype, resume_path=resume_path)
 
-    # 2. Initialize Teacher Model (Gemma 2) if in live or hybrid mode
+    # 2. Initialize Teacher Model (Gemma 4 E4B)
     teacher, teacher_tok = None, None
-    if mode in ("live", "hybrid"):
+    if soft_distill or mode in ("live", "hybrid"):
         teacher, teacher_tok = load_gemma_teacher(
             model_id=teacher_model_id,
             device=device,
@@ -424,7 +548,16 @@ def run_distillation(
             load_in_4bit=load_in_4bit,
         )
 
-    # 3. Setup Optimizer & Cosine Learning Rate Schedule
+    # 3. Setup Cross-Tokenizer Projection Map (Option B)
+    map_g_to_c = None
+    if soft_distill and teacher_tok is not None:
+        map_g_to_c = get_or_compute_gemma_to_cerebro_map(
+            teacher_tok=teacher_tok,
+            student_tok=student_tok,
+            device=device,
+        )
+
+    # 4. Setup Optimizer & Cosine Learning Rate Schedule
     optimizer = torch.optim.AdamW(
         student.parameters(),
         lr=learning_rate,
@@ -440,15 +573,18 @@ def run_distillation(
         cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
         return float(min_learning_rate + (learning_rate - min_learning_rate) * cosine_decay)
 
-    # 4. Connect Dataset Stream (Frontier 100k Reasoning & Tools)
+    # 5. Connect Dataset Stream (Frontier 100k Reasoning & Tools)
     print(f"\n📦 Connecting Frontier Reasoning Stream for Student Guidance...")
     from src.elastic_window import build_online_dataset_iterator, extract_prompt_response_pair
     data_iter = build_online_dataset_iterator(dataset_source="dataset", total_steps=total_steps)
 
     print("\n" + "=" * 80)
-    print("🚀 LAUNCHING DISTILLATION TRAINING LOOP")
+    print("🚀 LAUNCHING DISTILLATION TRAINING LOOP [OPTION B: FULL SOFT DISTRIBUTION]")
     print(f"   • Teacher Model      : {teacher_model_id if teacher else 'Frontier 100k Golden Trajectories'}")
     print(f"   • Student Model      : CerebroSpheroid {student_preset.upper()} (105.9M Params)")
+    print(f"   • Soft Distribution  : {'ACTIVE (Top-' + str(topk) + ' Cross-Tokenizer KL)' if soft_distill else 'Disabled (Hard Only)'}")
+    print(f"   • Distill Alpha      : {distill_alpha:.2f} (Soft KL) / {1 - distill_alpha:.2f} (Hard Target CE)")
+    print(f"   • Distill Temp (T)   : {distill_temp:.1f}")
     print(f"   • Distillation Mode  : {mode.upper()}")
     print(f"   • Context Window     : {max_prompt_len + max_target_len} tokens ({max_prompt_len} Prompt + {max_target_len} Target)")
     print(f"   • Effective Batch    : {batch_size * grad_accum_steps} (Micro: {batch_size} × Accum: {grad_accum_steps})")
@@ -460,7 +596,8 @@ def run_distillation(
 
     step = 0
     running_loss = 0.0
-    accum_loss = 0.0
+    running_hard = 0.0
+    running_soft = 0.0
     t0_start = time.time()
     t0_interval = time.time()
     tokens_processed = 0
@@ -474,17 +611,19 @@ def run_distillation(
     while step < total_steps:
         optimizer.zero_grad(set_to_none=True)
         accum_loss = 0.0
+        accum_hard = 0.0
+        accum_soft = 0.0
         batch_tokens = 0
 
         for accum_idx in range(grad_accum_steps):
             pairs: List[Tuple[str, str]] = []
 
-            # Collect micro-batch of items
+            # 1. Collect micro-batch of items
             for _ in range(batch_size):
                 row = next(data_iter)
                 q_txt, r_txt = extract_prompt_response_pair(row)
 
-                # Gemma 2 Live Teacher Generation (if active)
+                # Gemma 4 Live Teacher Generation (if active)
                 use_live = (mode == "live") or (mode == "hybrid" and step % 4 == 0)
                 if use_live and teacher is not None and teacher_tok is not None:
                     try:
@@ -520,11 +659,11 @@ def run_distillation(
                         gen_tokens = out_ids[0][inp.input_ids.shape[1]:]
                         r_txt = teacher_tok.decode(gen_tokens, skip_special_tokens=True)
                     except Exception:
-                        pass  # Fall back to high-quality frontier trajectory
+                        pass
 
                 pairs.append((q_txt, r_txt))
 
-            # Vectorized Batch Preparation
+            # 2. Vectorized Batch Preparation for Student
             pb, tb, wb = prepare_distillation_batch(
                 pairs=pairs,
                 tokenizer=student_tok,
@@ -537,19 +676,52 @@ def run_distillation(
 
             batch_tokens += int(torch.count_nonzero(tb != -100).item())
 
-            # Student Forward Rollout (Teacher Forcing Next-Token Distillation)
-            loss, logits = student(
+            # 3. Student Forward Pass (Teacher Forcing Next-Token Distillation)
+            loss_hard, logits_student = student(
                 prompts=pb,
                 targets=tb,
                 target_weights=wb,
                 deliberation_mode="teacher_forcing",
             )
 
-            scaled_loss = loss / grad_accum_steps
-            scaled_loss.backward()
-            accum_loss += loss.item()
+            # 4. Soft-Target Probability Distribution Computation (Option B)
+            loss_soft_val = 0.0
+            if soft_distill and teacher is not None and map_g_to_c is not None:
+                target_dist = compute_soft_target_distribution(
+                    teacher=teacher,
+                    teacher_tok=teacher_tok,
+                    pairs=pairs,
+                    map_g_to_c=map_g_to_c,
+                    target_len=max_target_len,
+                    temp=distill_temp,
+                    topk=topk,
+                    device=device,
+                )
 
-        # Optimizer Step with Dynamic Learning Rate
+                if target_dist is not None:
+                    # Log softmax of student logits at temperature T
+                    log_probs_s = F.log_softmax(logits_student / distill_temp, dim=-1)
+                    # Cross-entropy with soft distribution
+                    soft_ce = -(target_dist * log_probs_s).sum(dim=-1)  # [B, L]
+                    mask = (tb != -100).float()
+                    loss_soft = (soft_ce * wb * mask).sum() / mask.sum().clamp(min=1.0)
+                    loss_soft_val = loss_soft.item()
+
+                    # Combined Dual Loss (Hinton Formulation)
+                    total_step_loss = (1.0 - distill_alpha) * loss_hard + distill_alpha * (distill_temp ** 2) * loss_soft
+                else:
+                    total_step_loss = loss_hard
+            else:
+                total_step_loss = loss_hard
+
+            scaled_loss = total_step_loss / grad_accum_steps
+            scaled_loss.backward()
+
+            accum_loss += total_step_loss.item()
+            accum_hard += loss_hard.item()
+            accum_soft += loss_soft_val
+
+        # 5. Optimizer Step with Dynamic Learning Rate
         cur_lr = get_lr(step)
         for pg in optimizer.param_groups:
             pg["lr"] = cur_lr
@@ -558,6 +730,8 @@ def run_distillation(
         optimizer.step()
 
         running_loss += accum_loss / grad_accum_steps
+        running_hard += accum_hard / grad_accum_steps
+        running_soft += accum_soft / grad_accum_steps
         tokens_processed += batch_tokens
         step += 1
 
@@ -566,22 +740,27 @@ def run_distillation(
             elapsed = time.time() - t0_interval
             tok_s = (batch_tokens * 25) / max(0.01, elapsed)
             avg_loss = running_loss / 25
-            ppl = math.exp(min(12.0, avg_loss))
+            avg_hard = running_hard / 25
+            avg_soft = running_soft / 25
+            ppl = math.exp(min(12.0, avg_hard))
 
             vram_str = ""
             if device.type == "cuda":
                 alloc_gb = torch.cuda.memory_allocated(0) / (1024 ** 3)
                 vram_str = f" | VRAM: {alloc_gb:.1f} GB"
 
+            soft_str = f" (Hard: {avg_hard:.3f} | Soft: {avg_soft:.3f})" if soft_distill else ""
             print(
                 f"Step {step:6d}/{total_steps} | "
-                f"Loss: {avg_loss:.4f} | "
+                f"Loss: {avg_loss:.4f}{soft_str} | "
                 f"PPL: {ppl:.2f} | "
                 f"LR: {cur_lr:.2e} | "
                 f"Speed: {tok_s:,.0f} tok/s"
                 f"{vram_str}"
             )
             running_loss = 0.0
+            running_hard = 0.0
+            running_soft = 0.0
             t0_interval = time.time()
 
         # ── Periodic Checkpoint & Cloud Sync ──────────────────────────────────
@@ -589,7 +768,6 @@ def run_distillation(
             ckpt_name = "latest.pt" if step < total_steps else "best.pt"
             local_ckpt = os.path.join(ckpt_dir, ckpt_name)
 
-            # Option A: Lightweight Weights-Only State (~229 MB)
             save_payload = {
                 "step": step,
                 "model_state": student.state_dict(),
@@ -601,7 +779,6 @@ def run_distillation(
             torch.save(save_payload, local_ckpt)
             print(f"💾 Checkpoint Saved: {local_ckpt} (Step {step:,})")
 
-            # Non-blocking cloud upload to bioflo.in
             if cloud_sync and bioflo_tok:
                 try:
                     from src.cloud_sync import push_checkpoint_async
@@ -660,7 +837,7 @@ def run_distillation(
 
 
 # ==============================================================================
-# 5. CLI Argument Parsing
+# 6. CLI Argument Parsing
 # ==============================================================================
 
 def parse_args():
@@ -674,6 +851,11 @@ def parse_args():
     parser.add_argument("--lr", "--learning-rate", dest="learning_rate", type=float, default=3e-4, help="Peak learning rate")
     parser.add_argument("--min-lr", dest="min_learning_rate", type=float, default=3e-5, help="Minimum learning rate after cosine decay")
     parser.add_argument("--aalw-weight", dest="aalw_weight", type=float, default=4.0, help="Answer-Anchor Loss Weight for deliberation and answer tokens")
+    parser.add_argument("--soft-distill", dest="soft_distill", action="store_true", default=True, help="Enable Option B: Full Soft-Target Probability Distribution Distillation (default: True)")
+    parser.add_argument("--no-soft-distill", dest="soft_distill", action="store_false", help="Disable soft distribution distillation (use hard targets only)")
+    parser.add_argument("--distill-temp", "--temp", dest="distill_temp", type=float, default=2.0, help="Soft distillation temperature T (default: 2.0)")
+    parser.add_argument("--distill-alpha", "--alpha", dest="distill_alpha", type=float, default=0.6, help="Weighting factor for soft target distribution loss (default: 0.6)")
+    parser.add_argument("--topk", dest="topk", type=int, default=64, help="Number of Top-K logits projected from teacher to student (default: 64)")
     parser.add_argument("--checkpoint-dir", dest="checkpoint_dir", type=str, default=None, help="Directory to save weights (mirrors to Google Drive if mounted)")
     parser.add_argument("--no-cloud-sync", dest="cloud_sync", action="store_false", help="Disable bioflo.in remote telemetry and checkpoint upload")
     parser.add_argument("--no-4bit", dest="load_in_4bit", action="store_false", help="Disable 4-bit quantization for teacher")
@@ -693,6 +875,10 @@ def main():
         learning_rate=args.learning_rate,
         min_learning_rate=args.min_learning_rate,
         aalw_weight=args.aalw_weight,
+        soft_distill=args.soft_distill,
+        distill_temp=args.distill_temp,
+        distill_alpha=args.distill_alpha,
+        topk=args.topk,
         checkpoint_dir=args.checkpoint_dir,
         cloud_sync=args.cloud_sync,
         load_in_4bit=args.load_in_4bit,

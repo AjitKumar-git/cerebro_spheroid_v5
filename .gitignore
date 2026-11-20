@@ -21,6 +21,7 @@ data/*
 !data/factual_tables/**
 !data/tokenizer/
 !data/tokenizer/**
+!data/gemma4_to_cerebro32k_map.pt
 !data/chat_thinking_sft_15k.jsonl
 !data/retrieval_curriculum_data.jsonl
 archive/
