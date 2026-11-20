@@ -29,11 +29,11 @@ Key Architecture & Capabilities:
   4. True Batched Execution:
      - Fully vectorized micro-batches (shape [B, max_prompt_len], [B, max_target_len])
        with gradient accumulation across steps.
-  5. Option A Fast Cloud Mirroring:
-     - Checkpoints (~229 MB weights-only) mirrored to Google Drive (if mounted)
-       and synchronized to bioflo.in remote telemetry dashboard in non-blocking background threads.
-  6. One-Click Execution in Colab:
-     - Run `python colab/distill_gemma_to_v5_small.py` or call `run_distillation()` from a notebook.
+  5. Direct Website Cloud Mirroring:
+     - Checkpoints (~229 MB weights-only) saved locally as `gemma2cerebro.pt` and synchronized
+       directly to bioflo.in (`gemma2cerebro.pt`) in non-blocking background threads. Zero Google Drive dependency.
+  6. Universal Kaggle & Colab Execution:
+     - Run in Kaggle, Google Colab, or local GPU seamlessly with automatic environment resolution.
 """
 
 from __future__ import annotations
@@ -134,19 +134,15 @@ def setup_colab_environment() -> Tuple[str, str, torch.device, torch.dtype]:
     else:
         print("ℹ️ Hugging Face Hub    : Running in anonymous mode (ungated Gemma models will load seamlessly).")
 
-    # 5. Resolve Persistent Checkpoint Directory (Google Drive preferred)
-    drive_dir = "/content/drive/MyDrive/cerebro_checkpoints/distill_gemma_v5_small"
-    local_dir = "/content/checkpoints/distill_gemma_v5_small"
-    repo_dir = os.path.join(REPO_ROOT, "checkpoints", "distill_gemma_v5_small")
-
-    if os.path.exists("/content/drive/MyDrive"):
-        ckpt_dir = drive_dir
-        print(f"📁 Checkpoint Storage  : Google Drive Persistent Storage ({ckpt_dir})")
+    # 5. Resolve Local Checkpoint Directory (Zero Google Drive dependency, Kaggle & Colab ready)
+    if os.path.exists("/kaggle/working"):
+        ckpt_dir = "/kaggle/working/checkpoints"
+        print(f"📁 Checkpoint Storage  : Kaggle Scratch Storage ({ckpt_dir})")
     elif os.path.exists("/content"):
-        ckpt_dir = local_dir
+        ckpt_dir = "/content/checkpoints"
         print(f"📁 Checkpoint Storage  : Colab Local Scratch Storage ({ckpt_dir})")
     else:
-        ckpt_dir = repo_dir
+        ckpt_dir = os.path.join(REPO_ROOT, "checkpoints")
         print(f"📁 Checkpoint Storage  : Local Repository Directory ({ckpt_dir})")
 
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -765,7 +761,7 @@ def run_distillation(
 
         # ── Periodic Checkpoint & Cloud Sync ──────────────────────────────────
         if step % save_interval == 0 or step == total_steps:
-            ckpt_name = "latest.pt" if step < total_steps else "best.pt"
+            ckpt_name = "gemma2cerebro.pt"
             local_ckpt = os.path.join(ckpt_dir, ckpt_name)
 
             save_payload = {
@@ -779,6 +775,7 @@ def run_distillation(
             torch.save(save_payload, local_ckpt)
             print(f"💾 Checkpoint Saved: {local_ckpt} (Step {step:,})")
 
+            # Direct Website Sync (bioflo.in) as gemma2cerebro.pt
             if cloud_sync and bioflo_tok:
                 try:
                     from src.cloud_sync import push_checkpoint_async
@@ -786,11 +783,11 @@ def run_distillation(
                         file_path=local_ckpt,
                         step=step,
                         loss=avg_loss if "avg_loss" in locals() else 0.0,
-                        target_type="latest" if step < total_steps else "best",
-                        model="v5_small",
+                        target_type="latest",
+                        model="gemma2cerebro",
                         token=bioflo_tok,
                     )
-                    print(f"☁️ [Bioflo Cloud Sync] Dispatched non-blocking upload ({ckpt_name} -> bioflo.in)")
+                    print(f"☁️ [Website Cloud Sync] Dispatched non-blocking upload ({ckpt_name} -> bioflo.in)")
                 except Exception as e_sync:
                     print(f"ℹ️ Cloud sync notice: {e_sync}")
 
@@ -856,7 +853,7 @@ def parse_args():
     parser.add_argument("--distill-temp", "--temp", dest="distill_temp", type=float, default=2.0, help="Soft distillation temperature T (default: 2.0)")
     parser.add_argument("--distill-alpha", "--alpha", dest="distill_alpha", type=float, default=0.6, help="Weighting factor for soft target distribution loss (default: 0.6)")
     parser.add_argument("--topk", dest="topk", type=int, default=64, help="Number of Top-K logits projected from teacher to student (default: 64)")
-    parser.add_argument("--checkpoint-dir", dest="checkpoint_dir", type=str, default=None, help="Directory to save weights (mirrors to Google Drive if mounted)")
+    parser.add_argument("--checkpoint-dir", dest="checkpoint_dir", type=str, default=None, help="Directory to save weights (defaults to /kaggle/working/checkpoints on Kaggle, /content/checkpoints on Colab)")
     parser.add_argument("--no-cloud-sync", dest="cloud_sync", action="store_false", help="Disable bioflo.in remote telemetry and checkpoint upload")
     parser.add_argument("--no-4bit", dest="load_in_4bit", action="store_false", help="Disable 4-bit quantization for teacher")
     parser.add_argument("--resume", dest="resume_path", type=str, default=None, help="Path to student checkpoint to resume from")

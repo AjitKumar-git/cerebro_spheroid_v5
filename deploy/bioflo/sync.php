@@ -64,6 +64,9 @@ function normalize_model_name($model) {
 }
 
 function get_model_filename($model, $type) {
+    if ($model === 'gemma2cerebro' || $type === 'gemma2cerebro') {
+        return 'gemma2cerebro.pt';
+    }
     $valid_types = ['latest', 'best'];
     $clean_type = in_array($type, $valid_types) ? $type : 'latest';
     $norm_model = normalize_model_name($model);
@@ -1180,15 +1183,19 @@ if ($action === 'download') {
     $target_file = $storage_dir . '/' . $target_filename;
 
     if (!file_exists($target_file)) {
-        // Fallback to legacy un-prefixed file if model-specific file does not exist yet
-        $fallback = $storage_dir . '/' . $type . '.pt';
-        if (file_exists($fallback)) {
-            $target_file = $fallback;
+        if ($model === 'gemma2cerebro' && file_exists($storage_dir . '/gemma2cerebro_latest.pt')) {
+            $target_file = $storage_dir . '/gemma2cerebro_latest.pt';
         } else {
-            http_response_code(404);
-            header('Content-Type: application/json');
-            echo json_encode(['error' => "Checkpoint {$target_filename} not found on server"]);
-            exit;
+            // Fallback to legacy un-prefixed file if model-specific file does not exist yet
+            $fallback = $storage_dir . '/' . $type . '.pt';
+            if (file_exists($fallback)) {
+                $target_file = $fallback;
+            } else {
+                http_response_code(404);
+                header('Content-Type: application/json');
+                echo json_encode(['error' => "Checkpoint {$target_filename} not found on server"]);
+                exit;
+            }
         }
     }
 
