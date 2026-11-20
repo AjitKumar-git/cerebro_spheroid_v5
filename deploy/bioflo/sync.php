@@ -269,6 +269,8 @@ if ($action === 'save_tokens' || $action === 'record_tokens') {
 
     $model = isset($input_data['model']) ? normalize_model_name($input_data['model']) : 'v5_small';
     if (empty($model)) $model = 'v5_small';
+    $run_id = isset($input_data['run_id']) ? preg_replace('/[^a-zA-Z0-9_\-]/', '', $input_data['run_id']) : (isset($input_data['run']) ? preg_replace('/[^a-zA-Z0-9_\-]/', '', $input_data['run']) : 'default');
+    if (empty($run_id)) $run_id = 'default';
 
     $cumulative_tokens = isset($input_data['cumulative_tokens']) ? floatval($input_data['cumulative_tokens']) : 0;
     $target_tokens = isset($input_data['target_tokens']) ? floatval($input_data['target_tokens']) : 200000000000;
@@ -279,16 +281,17 @@ if ($action === 'save_tokens' || $action === 'record_tokens') {
     $tok_per_sec = isset($input_data['tok_per_sec']) ? floatval($input_data['tok_per_sec']) : 0.0;
     $source = isset($input_data['source']) ? preg_replace('/[^a-zA-Z0-9_\-]/', '', $input_data['source']) : 'unknown';
 
-    $tracker_file = $storage_dir . '/token_tracker_' . $model . '.json';
+    $run_tracker_file = $storage_dir . '/token_tracker_' . $model . '_' . $run_id . '.json';
+    $latest_tracker_file = $storage_dir . '/token_tracker_' . $model . '.json';
 
-    // Monotonic Token Ingestion Safeguard: Prevent restarted sessions from resetting global token accounting
+    // Monotonic Token Ingestion Safeguard: Only apply within the SAME run when not force-reset
     $force_reset = isset($input_data['force_reset']) && filter_var($input_data['force_reset'], FILTER_VALIDATE_BOOLEAN);
-    if (!$force_reset && file_exists($tracker_file)) {
-        $old_tracker = json_decode(file_get_contents($tracker_file), true);
+    if (!$force_reset && file_exists($run_tracker_file)) {
+        $old_tracker = json_decode(file_get_contents($run_tracker_file), true);
         if (is_array($old_tracker)) {
             $old_cum = isset($old_tracker['cumulative_tokens']) ? floatval($old_tracker['cumulative_tokens']) : 0;
             if ($old_cum > $cumulative_tokens && $step < 10000) {
-                // Worker restarted from Step 0/scratch: accumulate new tokens on top of preserved historical baseline
+                // Same run worker restarted: accumulate on top of preserved baseline
                 $cumulative_tokens = $old_cum + $cumulative_tokens;
             }
         }
@@ -296,6 +299,7 @@ if ($action === 'save_tokens' || $action === 'record_tokens') {
 
     $tracker_data = [
         'model' => $model,
+        'run_id' => $run_id,
         'cumulative_tokens' => $cumulative_tokens,
         'target_tokens' => $target_tokens,
         'pct_complete' => ($target_tokens > 0) ? round(($cumulative_tokens / $target_tokens) * 100, 4) : 0,
@@ -309,7 +313,8 @@ if ($action === 'save_tokens' || $action === 'record_tokens') {
         'timestamp' => time()
     ];
 
-    file_put_contents($tracker_file, json_encode($tracker_data, JSON_PRETTY_PRINT));
+    file_put_contents($run_tracker_file, json_encode($tracker_data, JSON_PRETTY_PRINT));
+    file_put_contents($latest_tracker_file, json_encode($tracker_data, JSON_PRETTY_PRINT));
 
     // Update manifest
     $manifest_file = $storage_dir . '/manifest.json';
@@ -317,12 +322,14 @@ if ($action === 'save_tokens' || $action === 'record_tokens') {
     if (!is_array($manifest)) $manifest = [];
     $manifest['token_tracker_' . $model] = [
         'model' => $model,
+        'run_id' => $run_id,
         'cumulative_tokens' => $cumulative_tokens,
         'target_tokens' => $target_tokens,
         'step' => $step,
         'effective_batch_size' => $effective_batch_size,
         'updated_at' => date('c'),
     ];
+    $manifest['token_tracker_' . $model . '_' . $run_id] = $manifest['token_tracker_' . $model];
     file_put_contents($manifest_file, json_encode($manifest, JSON_PRETTY_PRINT));
 
     echo json_encode([
@@ -333,14 +340,18 @@ if ($action === 'save_tokens' || $action === 'record_tokens') {
 }
 
 // --------------------------------------------------------------------------------------------
-// Action: GET_TOKENS (Retrieve current token ingestion stats and breakdown)
+// Action: GET_TOKENS (Retrieve current token ingestion stats and breakdown for model and run)
 // --------------------------------------------------------------------------------------------
 if ($action === 'get_tokens' || $action === 'tokens') {
     header('Content-Type: application/json');
     $model = isset($_REQUEST['model']) ? normalize_model_name($_REQUEST['model']) : 'v5_small';
     if (empty($model)) $model = 'v5_small';
+    $run_id = isset($_REQUEST['run_id']) ? preg_replace('/[^a-zA-Z0-9_\-]/', '', $_REQUEST['run_id']) : (isset($_REQUEST['run']) ? preg_replace('/[^a-zA-Z0-9_\-]/', '', $_REQUEST['run']) : '');
 
-    $tracker_file = $storage_dir . '/token_tracker_' . $model . '.json';
+    $tracker_file = (!empty($run_id) && $run_id !== 'latest')
+        ? $storage_dir . '/token_tracker_' . $model . '_' . $run_id . '.json'
+        : $storage_dir . '/token_tracker_' . $model . '.json';
+
     if (file_exists($tracker_file) && filesize($tracker_file) > 2) {
         $data = json_decode(file_get_contents($tracker_file), true);
         if (is_array($data)) {
@@ -353,6 +364,7 @@ if ($action === 'get_tokens' || $action === 'tokens') {
         'success' => true,
         'data' => [
             'model' => $model,
+            'run_id' => $run_id ?: 'default',
             'cumulative_tokens' => 0,
             'target_tokens' => 200000000000,
             'pct_complete' => 0.0,
@@ -1450,6 +1462,7 @@ if ($action === 'clear' || $action === 'reset') {
     header('Content-Type: application/json');
 
     $model = isset($_REQUEST['model']) ? normalize_model_name($_REQUEST['model']) : '';
+    $run_id = isset($_REQUEST['run_id']) ? preg_replace('/[^a-zA-Z0-9_\-]/', '', $_REQUEST['run_id']) : (isset($_REQUEST['run']) ? preg_replace('/[^a-zA-Z0-9_\-]/', '', $_REQUEST['run']) : '');
     $clear_all = isset($_REQUEST['all']) && ($_REQUEST['all'] === 'true' || $_REQUEST['all'] === '1');
     $clear_checkpoints = isset($_REQUEST['checkpoints']) && ($_REQUEST['checkpoints'] === 'true' || $_REQUEST['checkpoints'] === '1');
 
@@ -1460,6 +1473,19 @@ if ($action === 'clear' || $action === 'reset') {
             $storage_dir . '/loss_history_' . $model . '.json',
             $storage_dir . '/active_session_' . $model . '.json',
         ];
+        if (!empty($run_id)) {
+            $targets[] = $storage_dir . '/token_tracker_' . $model . '_' . $run_id . '.json';
+            $targets[] = $storage_dir . '/loss_history_' . $model . '_' . $run_id . '.json';
+        } else {
+            $run_files = glob($storage_dir . '/token_tracker_' . $model . '_*.json');
+            if (is_array($run_files)) {
+                $targets = array_merge($targets, $run_files);
+            }
+            $run_loss = glob($storage_dir . '/loss_history_' . $model . '_*.json');
+            if (is_array($run_loss)) {
+                $targets = array_merge($targets, $run_loss);
+            }
+        }
         if ($clear_checkpoints) {
             $targets[] = $storage_dir . '/' . $model . '_latest.pt';
             $targets[] = $storage_dir . '/' . $model . '_best.pt';
@@ -1477,6 +1503,10 @@ if ($action === 'clear' || $action === 'reset') {
                 unset($manifest[$model . '_latest']);
                 unset($manifest[$model . '_best']);
                 unset($manifest['active_session_' . $model]);
+                unset($manifest['token_tracker_' . $model]);
+                if (!empty($run_id)) {
+                    unset($manifest['token_tracker_' . $model . '_' . $run_id]);
+                }
                 file_put_contents($manifest_file, json_encode($manifest, JSON_PRETTY_PRINT));
             }
         }

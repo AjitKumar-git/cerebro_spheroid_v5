@@ -782,11 +782,14 @@ def push_remote_token_tracker(
     step: int = 0,
     loss: float = 0.0,
     tok_per_sec: float = 0.0,
+    run_id: Optional[str] = None,
+    force_reset: bool = False,
     url: Optional[str] = None,
     token: Optional[str] = None,
 ) -> bool:
     """
-    Pushes real-time token ingestion counters and per-dataset breakdowns to bioflo.in.
+    Pushes real-time token ingestion counters and per-dataset breakdowns to bioflo.in,
+    strictly linking token telemetry to both model tier and unique run ID.
     """
     clean_model = normalize_model_name(model) or model
     sync_url = url or DEFAULT_URL
@@ -795,6 +798,7 @@ def push_remote_token_tracker(
     payload = {
         "action": "save_tokens",
         "model": clean_model,
+        "run_id": str(run_id) if run_id else "default",
         "cumulative_tokens": int(cumulative_tokens),
         "target_tokens": int(target_tokens),
         "tokens_by_dataset": tokens_by_dataset or {},
@@ -804,6 +808,7 @@ def push_remote_token_tracker(
         "tok_per_sec": float(tok_per_sec),
         "timestamp": time.time(),
         "source": detect_source_environment(),
+        "force_reset": bool(force_reset),
     }
 
     try:
@@ -827,17 +832,20 @@ def push_remote_token_tracker(
 
 def fetch_remote_token_tracker(
     model: str,
+    run_id: Optional[str] = None,
     url: Optional[str] = None,
     token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Retrieves current token ingestion metrics and per-dataset counts from bioflo.in.
+    Retrieves current token ingestion metrics and per-dataset counts from bioflo.in for a specific model and run.
     """
     clean_model = normalize_model_name(model) or model
     sync_url = url or DEFAULT_URL
     sync_token = token or DEFAULT_TOKEN
 
     req_url = f"{sync_url}?action=get_tokens&model={clean_model}"
+    if run_id:
+        req_url += f"&run_id={urllib.parse.quote(str(run_id))}"
     req = urllib.request.Request(
         req_url,
         headers={"Authorization": f"Bearer {sync_token}", "User-Agent": "CerebroV5CloudSync/1.0"},
@@ -848,3 +856,37 @@ def fetch_remote_token_tracker(
             return data.get("data", {})
     except Exception:
         return {}
+
+
+def clear_remote_tokens(
+    model: Optional[str] = None,
+    run_id: Optional[str] = None,
+    clear_checkpoints: bool = False,
+    url: Optional[str] = None,
+    token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Clears remote token counts, loss history, and optionally checkpoints for a model and run on bioflo.in."""
+    clean_model = normalize_model_name(model) if model else ""
+    sync_url = url or DEFAULT_URL
+    sync_token = token or DEFAULT_TOKEN
+
+    req_url = f"{sync_url}?action=clear"
+    if clean_model:
+        req_url += f"&model={clean_model}"
+    else:
+        req_url += "&all=true"
+    if run_id:
+        req_url += f"&run_id={urllib.parse.quote(str(run_id))}"
+    if clear_checkpoints:
+        req_url += "&checkpoints=true"
+
+    req = urllib.request.Request(
+        req_url,
+        headers={"Authorization": f"Bearer {sync_token}", "User-Agent": "CerebroV5CloudSync/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"⚠️ [cloud_sync] Could not clear tokens on {sync_url}: {e}")
+        return {"success": False, "error": str(e)}

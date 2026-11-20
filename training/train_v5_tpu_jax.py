@@ -248,6 +248,7 @@ def parse_args(args_list=None):
         default=os.environ.get("BIOFLO_SYNC_TOKEN", os.environ.get("CEREBRO_SYNC_TOKEN", "")),
         help="Secret sync token (defaults to BIOFLO_SYNC_TOKEN environment variable)",
     )
+    parser.add_argument("--run_id", "--run-id", "--run", dest="run_id", type=str, default=None, help="Unique training run identifier linking token ingestion and telemetry to this specific session")
     parser.add_argument("--resume_target", type=str, default="latest", choices=["latest", "best"], help="Target checkpoint to pull from cloud ('latest' or 'best')")
     parser.add_argument("--reset_best", action="store_true", default=False, help="Reset best validation loss tracker")
     parser.add_argument("--from-scratch", "--from_scratch", dest="from_scratch", action="store_true", default=False, help="Start clean from Step 0 without loading any checkpoint")
@@ -547,6 +548,26 @@ def main(args=None):
     local_latest = os.path.join(args.checkpoint_dir, f"{args.preset}_latest.pt")
     fallback_latest = os.path.join(args.checkpoint_dir, f"{sync_model_name}_latest.pt")
 
+    # 5.1 Run Identification (strictly link token ingestion and telemetry to model and run)
+    run_id_file = os.path.join(args.checkpoint_dir, "run_id.txt")
+    if getattr(args, "run_id", None):
+        run_id = str(args.run_id).strip()
+    elif not args.from_scratch and os.path.exists(run_id_file):
+        try:
+            with open(run_id_file, "r") as rf:
+                run_id = rf.read().strip()
+        except Exception:
+            run_id = f"run_{sync_model_name}_{int(time.time())}"
+    else:
+        run_id = f"run_{sync_model_name}_{int(time.time())}"
+
+    try:
+        with open(run_id_file, "w") as rf:
+            rf.write(run_id)
+    except Exception:
+        pass
+    print(f"Active Campaign : Model='{sync_model_name}', Run='{run_id}'")
+
     # Checkpoint Restoration or Clean Scratch Start
     if args.from_scratch:
         print("\n🌱 [from_scratch=True] Initializing clean Step 0 training with random orthogonal weights (zero foundation copying)!")
@@ -576,6 +597,7 @@ def main(args=None):
             "tokens_by_dataset": {},
             "lifetime_tokens": 0,
             "sync_model": sync_model_name,
+            "run_id": run_id,
         }
         step0_fname = f"{args.preset}_step0.pt"
         step0_path = os.path.join(args.checkpoint_dir, step0_fname)
@@ -584,6 +606,25 @@ def main(args=None):
         print(f"📦 [Starting Model Fixed] Clean base architecture saved at Step 0:\n   ├─ {local_latest}\n   └─ {step0_path}")
 
         if args.cloud_sync:
+            try:
+                # 1. Reset remote token tracker online for this model & run
+                push_remote_token_tracker(
+                    model=sync_model_name,
+                    cumulative_tokens=0,
+                    target_tokens=getattr(args, "target_tokens", 15_700_000_000),
+                    tokens_by_dataset={},
+                    effective_batch_size=args.effective_batch_size,
+                    step=0,
+                    loss=0.0,
+                    run_id=run_id,
+                    url=args.cloud_url,
+                    token=args.cloud_token,
+                    force_reset=True,
+                )
+                print(f"🌐 [cloud_sync] Online token counter reset to 0 for Model='{sync_model_name}', Run='{run_id}'")
+            except Exception as e_tok:
+                print(f"⚠️ [cloud_sync] Notice on initial token counter reset: {e_tok}")
+
             try:
                 step0_stage = f"{local_latest}.upload.{os.getpid()}.{time.time_ns()}.pt"
                 save_jax_to_torch_pt(params, buffers, step0_stage, meta=step0_meta, opt_state=None, bare_bf16=True)
@@ -1626,14 +1667,15 @@ def main(args=None):
         cumulative_padded_tokens = int(loaded_ckpt.get("cumulative_padded_tokens", 0))
         initial_lifetime_tokens = int(loaded_ckpt.get("lifetime_tokens", 0))
 
-        # Check website remote token tracker to prevent token regression on worker restart
+        # Check website remote token tracker to prevent token regression on worker restart within the same run
         if args.cloud_sync:
             try:
-                remote_tracker = fetch_remote_token_tracker(sync_model_name or args.preset, url=args.cloud_url, token=args.cloud_token)
+                remote_tracker = fetch_remote_token_tracker(sync_model_name or args.preset, run_id=run_id, url=args.cloud_url, token=args.cloud_token)
                 if remote_tracker and isinstance(remote_tracker, dict):
                     remote_cum = int(remote_tracker.get("cumulative_tokens", 0))
-                    if remote_cum > cumulative_tokens:
-                        print(f"🌐 [cloud_sync] Restored persistent cumulative tokens from bioflo.in website: {remote_cum:,} tokens")
+                    remote_run = remote_tracker.get("run_id")
+                    if (not remote_run or remote_run == run_id) and remote_cum > cumulative_tokens:
+                        print(f"🌐 [cloud_sync] Restored persistent cumulative tokens from bioflo.in website ({run_id}): {remote_cum:,} tokens")
                         cumulative_tokens = remote_cum
             except Exception:
                 pass
@@ -2173,6 +2215,7 @@ def main(args=None):
                         step=step,
                         loss=float(loss_val),
                         tok_per_sec=float(tok_per_sec) if 'tok_per_sec' in locals() else 0.0,
+                        run_id=run_id,
                         url=args.cloud_url,
                         token=args.cloud_token,
                     )
@@ -2253,6 +2296,7 @@ def main(args=None):
                     step=step_val,
                     loss=float(loss) if "loss" in locals() else 0.0,
                     tok_per_sec=float(tok_per_sec) if 'tok_per_sec' in locals() else 0.0,
+                    run_id=run_id if "run_id" in locals() else None,
                     url=args.cloud_url,
                     token=args.cloud_token,
                 )

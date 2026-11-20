@@ -147,6 +147,7 @@ def main():
         scmer_margin=0.12,                     # Cosine margin threshold m (3.04 sigma)
         scmer_subsample=512,                   # Subsampled vocabulary rows per event
         scmer_pair_samples=8192,               # Subsampled unique token pairs
+        run_id=os.environ.get("RUN_ID", None), # Explicit run identifier (or auto-generated and persistent)
         scmer_interval=8,                      # SCMER execution interval (every 8 steps)
     )
 
