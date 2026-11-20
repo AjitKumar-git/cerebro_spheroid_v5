@@ -64,8 +64,8 @@ from src.hf_utils import setup_hf_token, get_hf_token
 # 1. Environment & Credential Setup
 # ==============================================================================
 
-def setup_colab_environment() -> Tuple[str, str, torch.device, torch.dtype]:
-    """Configures system hugepages, hardware device, tokens, and checkpoint directories."""
+def setup_colab_environment() -> Tuple[str, str, torch.device, torch.device, torch.dtype]:
+    """Configures system hugepages, hardware devices (dual-GPU split), tokens, and checkpoint directories."""
     print("=" * 80)
     print("🧠 CEREBROSPHEROID V5: GEMMA 4 E4B -> V5 SMALL DISTILLATION ENGINE")
     print("=" * 80)
@@ -74,25 +74,42 @@ def setup_colab_environment() -> Tuple[str, str, torch.device, torch.dtype]:
     if os.path.exists("/content"):
         os.system("echo always | sudo -n tee /sys/kernel/mm/transparent_hugepage/enabled >/dev/null 2>&1 || true")
 
-    # 2. Hardware Device & Precision Selection
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
+    # 2. Multi-GPU Dedicated Partition & Precision Selection
+    gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if gpu_count >= 2:
+        teacher_device = torch.device("cuda:0")
+        student_device = torch.device("cuda:1")
+        dev0_name = torch.cuda.get_device_name(0)
+        dev1_name = torch.cuda.get_device_name(1)
+        vram0 = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        vram1 = torch.cuda.get_device_properties(1).total_memory / (1024 ** 3)
+        supports_bf16 = torch.cuda.is_bf16_supported() if hasattr(torch.cuda, "is_bf16_supported") else False
+        dtype = torch.bfloat16 if supports_bf16 else torch.float16
+        print(f"⚡ Dual-GPU Dedicated Partition Active:")
+        print(f"   • Teacher Model GPU (cuda:0): [{dev0_name}] ({vram0:.1f} GB VRAM) -> Gemma 4 E4B (Frozen)")
+        print(f"   • Student Model GPU (cuda:1): [{dev1_name}] ({vram1:.1f} GB VRAM) -> Cerebro V5 Small (Train)")
+        print(f"⚡ Precision Dtype             : {dtype} (Hardware accelerated)")
+    elif gpu_count == 1:
+        teacher_device = torch.device("cuda:0")
+        student_device = torch.device("cuda:0")
         dev_name = torch.cuda.get_device_name(0)
         vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
         supports_bf16 = torch.cuda.is_bf16_supported() if hasattr(torch.cuda, "is_bf16_supported") else False
         dtype = torch.bfloat16 if supports_bf16 else torch.float16
-        print(f"⚡ Compute Accelerator : CUDA GPU [{dev_name}] ({vram_gb:.1f} GB VRAM)")
-        print(f"⚡ Precision Dtype     : {dtype} (Native hardware accelerated)")
+        print(f"⚡ Single-GPU Active          : CUDA GPU [{dev_name}] ({vram_gb:.1f} GB VRAM)")
+        print(f"⚡ Precision Dtype             : {dtype} (Hardware accelerated)")
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = torch.device("mps")
+        teacher_device = torch.device("mps")
+        student_device = torch.device("mps")
         dtype = torch.float32
-        print("⚡ Compute Accelerator : Apple Silicon MPS")
-        print("⚡ Precision Dtype     : float32")
+        print("⚡ Compute Accelerator         : Apple Silicon MPS")
+        print("⚡ Precision Dtype             : float32")
     else:
-        device = torch.device("cpu")
+        teacher_device = torch.device("cpu")
+        student_device = torch.device("cpu")
         dtype = torch.float32
-        print("⚡ Compute Accelerator : CPU")
-        print("⚡ Precision Dtype     : float32")
+        print("⚡ Compute Accelerator         : CPU")
+        print("⚡ Precision Dtype             : float32")
 
     # 3. Setup Bioflo Cloud Sync Token
     bioflo_tok = os.environ.get("BIOFLO_SYNC_TOKEN", "")
@@ -128,26 +145,26 @@ def setup_colab_environment() -> Tuple[str, str, torch.device, torch.dtype]:
         try:
             from huggingface_hub import login
             login(token=hf_tok, add_to_git_credential=False)
-            print(f"🔑 Hugging Face Hub    : Authenticated (token: {hf_tok[:4]}...{hf_tok[-4:]})")
+            print(f"🔑 Hugging Face Hub            : Authenticated (token: {hf_tok[:4]}...{hf_tok[-4:]})")
         except Exception:
             pass
     else:
-        print("ℹ️ Hugging Face Hub    : Running in anonymous mode (ungated Gemma models will load seamlessly).")
+        print("ℹ️ Hugging Face Hub            : Running in anonymous mode (ungated Gemma models will load seamlessly).")
 
     # 5. Resolve Local Checkpoint Directory (Zero Google Drive dependency, Kaggle & Colab ready)
     if os.path.exists("/kaggle/working"):
         ckpt_dir = "/kaggle/working/checkpoints"
-        print(f"📁 Checkpoint Storage  : Kaggle Scratch Storage ({ckpt_dir})")
+        print(f"📁 Checkpoint Storage          : Kaggle Scratch Storage ({ckpt_dir})")
     elif os.path.exists("/content"):
         ckpt_dir = "/content/checkpoints"
-        print(f"📁 Checkpoint Storage  : Colab Local Scratch Storage ({ckpt_dir})")
+        print(f"📁 Checkpoint Storage          : Colab Local Scratch Storage ({ckpt_dir})")
     else:
         ckpt_dir = os.path.join(REPO_ROOT, "checkpoints")
-        print(f"📁 Checkpoint Storage  : Local Repository Directory ({ckpt_dir})")
+        print(f"📁 Checkpoint Storage          : Local Repository Directory ({ckpt_dir})")
 
     os.makedirs(ckpt_dir, exist_ok=True)
     print("=" * 80 + "\n")
-    return ckpt_dir, bioflo_tok, device, dtype
+    return ckpt_dir, bioflo_tok, teacher_device, student_device, dtype
 
 
 # ==============================================================================
@@ -185,7 +202,7 @@ def load_gemma_teacher(
                 "attn_implementation": "eager",
             }
 
-            # 4-bit Quantization via BitsAndBytes (fits in ~2.5 - 3.0 GB VRAM)
+            # 4-bit Quantization via BitsAndBytes locked strictly to teacher device
             if device.type == "cuda" and load_in_4bit:
                 try:
                     from transformers import BitsAndBytesConfig
@@ -196,20 +213,20 @@ def load_gemma_teacher(
                         bnb_4bit_quant_type="nf4",
                     )
                     kwargs["quantization_config"] = bnb_cfg
-                    kwargs["device_map"] = "auto"
-                    print(f"   ⚡ 4-Bit NormalFloat Quantization Active: Loading [{candidate}] in ~2.5 GB VRAM...")
+                    kwargs["device_map"] = {"": device}
+                    print(f"   ⚡ 4-Bit NormalFloat Quantization Active: Loading [{candidate}] strictly on [{device}] in ~2.5 GB VRAM...")
                 except ImportError:
                     kwargs["torch_dtype"] = dtype
-                    kwargs["device_map"] = "auto" if device.type == "cuda" else None
+                    kwargs["device_map"] = {"": device}
             elif device.type == "cuda":
                 kwargs["torch_dtype"] = dtype
-                kwargs["device_map"] = "auto"
+                kwargs["device_map"] = {"": device}
             else:
                 kwargs["torch_dtype"] = dtype
 
             teacher = AutoModelForCausalLM.from_pretrained(candidate, **kwargs)
             teacher_params = sum(p.numel() for p in teacher.parameters())
-            print(f"   ✓ Gemma 4 E4B Teacher [{candidate}] Loaded Successfully ({teacher_params/1e9:.2f}B parameters, Frozen)")
+            print(f"   ✓ Gemma 4 E4B Teacher [{candidate}] Loaded Successfully on [{device}] ({teacher_params/1e9:.2f}B parameters, Frozen)")
             break
         except Exception as e_candidate:
             last_err = e_candidate
@@ -322,14 +339,16 @@ def compute_soft_target_distribution(
     target_len: int,
     temp: float = 2.0,
     topk: int = 64,
-    device: torch.device = torch.device("cpu"),
+    teacher_device: torch.device = torch.device("cpu"),
+    student_device: torch.device = torch.device("cpu"),
 ) -> Optional[torch.Tensor]:
     """
     Computes Gemma 4 E4B soft probability distribution over Cerebro's 32k vocabulary space.
-    1. Forward-passes batch through teacher to get full 262k logits.
+    1. Forward-passes batch through teacher on teacher_device (cuda:0) to get 262k logits.
     2. Interpolates sequence dimension smoothly to match student target length.
-    3. Extracts Top-K probabilities at temperature T.
-    4. Projects Top-K indices into Cerebro's 32k space and renormalizes into soft target distribution.
+    3. Extracts Top-K probabilities at temperature T on teacher_device.
+    4. Projects Top-K indices into Cerebro's 32k space and bridges minimal Top-K mass (~786 KB)
+       to student_device (cuda:1) to scatter and renormalize into the student's probability simplex.
     """
     if teacher is None or teacher_tok is None:
         return None
@@ -348,32 +367,38 @@ def compute_soft_target_distribution(
                 formatted = f"<start_of_turn>user\n{q}<end_of_turn>\n<start_of_turn>model\n{r}<end_of_turn>\n"
             teacher_texts.append(formatted)
 
-        inp = teacher_tok(teacher_texts, return_tensors="pt", padding=True, truncation=True, max_length=1024).to(device)
+        inp = teacher_tok(teacher_texts, return_tensors="pt", padding=True, truncation=True, max_length=1024).to(teacher_device)
 
         with torch.no_grad():
             out = teacher(**inp)
-            z_teacher = out.logits  # [B, L_teacher, V_G]
+            z_teacher = out.logits  # [B, L_teacher, V_G] on teacher_device (GPU 0)
 
         B = z_teacher.shape[0]
         V_C = 32000
 
-        # Sequence Alignment: Interpolate teacher logit manifold smoothly to student target length
+        # Sequence Alignment on teacher_device
         z_aligned = F.interpolate(z_teacher.transpose(1, 2), size=target_len, mode="linear", align_corners=False).transpose(1, 2)
 
-        # Compute Top-K Softmax Probabilities over 262k vocab at temperature T
+        # Compute Top-K Softmax Probabilities over 262k vocab on teacher_device (GPU 0)
         probs_g = F.softmax(z_aligned / temp, dim=-1)
         topk_probs, topk_indices = torch.topk(probs_g, k=topk, dim=-1)  # [B, target_len, topk]
 
-        # Project Gemma indices to Cerebro 32k indices via cross-tokenizer table
-        mapped_c = map_g_to_c[topk_indices]  # [B, target_len, topk]
+        # Project Gemma indices on teacher_device
+        map_g = map_g_to_c.to(teacher_device)
+        mapped_c = map_g[topk_indices]  # [B, target_len, topk]
         valid_mask = (mapped_c >= 0) & (mapped_c < V_C)
 
-        # Scatter probability mass into Cerebro 32k distribution
-        target_dist = torch.zeros(B, target_len, V_C, device=device, dtype=torch.float32)
+        # Cross-GPU Bridge: Transfer tiny Top-K projection tensors (~786 KB) to student_device (GPU 1)
+        mapped_c_stud = mapped_c.to(student_device)
+        valid_mask_stud = valid_mask.to(student_device)
+        topk_probs_stud = topk_probs.to(student_device, dtype=torch.float32)
+
+        # Scatter probability mass into Cerebro 32k distribution on student_device (GPU 1)
+        target_dist = torch.zeros(B, target_len, V_C, device=student_device, dtype=torch.float32)
         target_dist.scatter_add_(
             dim=-1,
-            index=mapped_c.clamp(0, V_C - 1) * valid_mask.long(),
-            src=(topk_probs * valid_mask.float()).to(torch.float32),
+            index=mapped_c_stud.clamp(0, V_C - 1) * valid_mask_stud.long(),
+            src=topk_probs_stud * valid_mask_stud.float(),
         )
 
         # Renormalize to ensure valid probability simplex sum(p) == 1.0
@@ -382,6 +407,7 @@ def compute_soft_target_distribution(
         return target_dist
 
     except Exception as e_dist:
+        print(f"⚠️ Soft target distribution error: {e_dist}")
         return None
 
 
@@ -520,37 +546,42 @@ def run_distillation(
     cloud_sync: bool = True,
     load_in_4bit: bool = True,
     resume_path: Optional[str] = None,
+    teacher_device: Optional[torch.device] = None,
+    student_device: Optional[torch.device] = None,
 ):
     """
-    Main distillation orchestrator for Google Colab.
+    Main distillation orchestrator for Google Colab and Kaggle.
     Executes Option B Full Soft-Target Probability Distribution Distillation
-    from Google Gemma 4 E4B into CerebroSpheroid V5 Small.
+    from Google Gemma 4 E4B into CerebroSpheroid V5 Small using dual-GPU partition.
     """
-    ckpt_dir, bioflo_tok, device, dtype = setup_colab_environment()
+    ckpt_dir_env, bioflo_tok, def_t_dev, def_s_dev, dtype = setup_colab_environment()
+    ckpt_dir = checkpoint_dir or ckpt_dir_env
+    t_dev = teacher_device or def_t_dev
+    s_dev = student_device or def_s_dev
+
     if checkpoint_dir:
-        ckpt_dir = checkpoint_dir
         os.makedirs(ckpt_dir, exist_ok=True)
 
-    # 1. Initialize Student Model (V5 Small)
-    student, student_tok = load_v5_small_student(device=device, dtype=dtype, resume_path=resume_path)
+    # 1. Initialize Student Model (V5 Small on dedicated student GPU)
+    student, student_tok = load_v5_small_student(device=s_dev, dtype=dtype, resume_path=resume_path)
 
-    # 2. Initialize Teacher Model (Gemma 4 E4B)
+    # 2. Initialize Teacher Model (Gemma 4 E4B locked strictly to dedicated teacher GPU)
     teacher, teacher_tok = None, None
     if soft_distill or mode in ("live", "hybrid"):
         teacher, teacher_tok = load_gemma_teacher(
             model_id=teacher_model_id,
-            device=device,
+            device=t_dev,
             dtype=dtype,
             load_in_4bit=load_in_4bit,
         )
 
-    # 3. Setup Cross-Tokenizer Projection Map (Option B)
+    # 3. Setup Cross-Tokenizer Projection Map (on teacher GPU)
     map_g_to_c = None
     if soft_distill and teacher_tok is not None:
         map_g_to_c = get_or_compute_gemma_to_cerebro_map(
             teacher_tok=teacher_tok,
             student_tok=student_tok,
-            device=device,
+            device=t_dev,
         )
 
     # 4. Setup Optimizer & Cosine Learning Rate Schedule
@@ -604,6 +635,9 @@ def run_distillation(
         "Solve for x: 2x + 7 = 19. Show your reasoning inside <think>.",
     ]
 
+    print("⏳ Starting Step 1 distillation forward/backward pass...")
+    sys.stdout.flush()
+
     while step < total_steps:
         optimizer.zero_grad(set_to_none=True)
         accum_loss = 0.0
@@ -642,7 +676,7 @@ def run_distillation(
                         else:
                             formatted_q = f"<start_of_turn>user\n{messages[0]['content']}<end_of_turn>\n<start_of_turn>model\n"
 
-                        inp = teacher_tok(formatted_q, return_tensors="pt").to(device)
+                        inp = teacher_tok(formatted_q, return_tensors="pt").to(t_dev)
                         with torch.no_grad():
                             out_ids = teacher.generate(
                                 **inp,
@@ -659,7 +693,7 @@ def run_distillation(
 
                 pairs.append((q_txt, r_txt))
 
-            # 2. Vectorized Batch Preparation for Student
+            # 2. Vectorized Batch Preparation for Student (on student GPU)
             pb, tb, wb = prepare_distillation_batch(
                 pairs=pairs,
                 tokenizer=student_tok,
@@ -667,12 +701,12 @@ def run_distillation(
                 max_target_len=max_target_len,
                 aalw_weight=aalw_weight,
                 pad_id=student_tok.pad_token_id or 0,
-                device=device,
+                device=s_dev,
             )
 
             batch_tokens += int(torch.count_nonzero(tb != -100).item())
 
-            # 3. Student Forward Pass (Teacher Forcing Next-Token Distillation)
+            # 3. Student Forward Pass (Teacher Forcing Next-Token Distillation on student GPU)
             loss_hard, logits_student = student(
                 prompts=pb,
                 targets=tb,
@@ -680,7 +714,7 @@ def run_distillation(
                 deliberation_mode="teacher_forcing",
             )
 
-            # 4. Soft-Target Probability Distribution Computation (Option B)
+            # 4. Soft-Target Probability Distribution Computation (Dual-GPU Bridge)
             loss_soft_val = 0.0
             if soft_distill and teacher is not None and map_g_to_c is not None:
                 target_dist = compute_soft_target_distribution(
@@ -691,11 +725,12 @@ def run_distillation(
                     target_len=max_target_len,
                     temp=distill_temp,
                     topk=topk,
-                    device=device,
+                    teacher_device=t_dev,
+                    student_device=s_dev,
                 )
 
                 if target_dist is not None:
-                    # Log softmax of student logits at temperature T
+                    # Log softmax of student logits at temperature T on student GPU
                     log_probs_s = F.log_softmax(logits_student / distill_temp, dim=-1)
                     # Cross-entropy with soft distribution
                     soft_ce = -(target_dist * log_probs_s).sum(dim=-1)  # [B, L]
@@ -732,18 +767,22 @@ def run_distillation(
         step += 1
 
         # ── Progress Logging ──────────────────────────────────────────────────
-        if step % 25 == 0:
+        if step % 25 == 0 or step == 1 or step == total_steps:
             elapsed = time.time() - t0_interval
-            tok_s = (batch_tokens * 25) / max(0.01, elapsed)
-            avg_loss = running_loss / 25
-            avg_hard = running_hard / 25
-            avg_soft = running_soft / 25
+            tok_s = (batch_tokens * 25) / max(0.01, elapsed) if step > 1 else batch_tokens / max(0.01, elapsed)
+            avg_loss = running_loss / (25 if step > 1 else 1)
+            avg_hard = running_hard / (25 if step > 1 else 1)
+            avg_soft = running_soft / (25 if step > 1 else 1)
             ppl = math.exp(min(12.0, avg_hard))
 
             vram_str = ""
-            if device.type == "cuda":
-                alloc_gb = torch.cuda.memory_allocated(0) / (1024 ** 3)
-                vram_str = f" | VRAM: {alloc_gb:.1f} GB"
+            if s_dev.type == "cuda":
+                alloc_s = torch.cuda.memory_allocated(s_dev) / (1024 ** 3)
+                if t_dev != s_dev and t_dev.type == "cuda":
+                    alloc_t = torch.cuda.memory_allocated(t_dev) / (1024 ** 3)
+                    vram_str = f" | T-VRAM (GPU 0): {alloc_t:.1f} GB | S-VRAM (GPU 1): {alloc_s:.1f} GB"
+                else:
+                    vram_str = f" | VRAM: {alloc_s:.1f} GB"
 
             soft_str = f" (Hard: {avg_hard:.3f} | Soft: {avg_soft:.3f})" if soft_distill else ""
             print(
@@ -754,6 +793,7 @@ def run_distillation(
                 f"Speed: {tok_s:,.0f} tok/s"
                 f"{vram_str}"
             )
+            sys.stdout.flush()
             running_loss = 0.0
             running_hard = 0.0
             running_soft = 0.0
@@ -799,16 +839,16 @@ def run_distillation(
             test_q = random.choice(test_prompts)
             p_formatted = f"<stim> {test_q} </stim>"
             p_enc = student_tok.encode(p_formatted, add_special_tokens=False)
-            p_in = torch.tensor([p_enc], dtype=torch.long, device=device)
+            p_in = torch.tensor([p_enc], dtype=torch.long, device=s_dev)
 
             with torch.no_grad():
                 try:
                     out_tokens = []
                     for _ in range(64):
                         if not out_tokens:
-                            tgt_in = torch.tensor([[1]], dtype=torch.long, device=device)
+                            tgt_in = torch.tensor([[1]], dtype=torch.long, device=s_dev)
                         else:
-                            tgt_in = torch.tensor([[1] + out_tokens], dtype=torch.long, device=device)
+                            tgt_in = torch.tensor([[1] + out_tokens], dtype=torch.long, device=s_dev)
                         _, logits = student(prompts=p_in, targets=tgt_in, deliberation_mode="teacher_forcing")
                         next_tok = int(torch.argmax(logits[0, -1, :]).item())
                         if next_tok in (2, 0) or len(out_tokens) > 60:
@@ -829,7 +869,7 @@ def run_distillation(
     print(f"   • Total Steps Completed : {step:,}")
     print(f"   • Total Tokens Ingested : {tokens_processed:,}")
     print(f"   • Wall Clock Duration   : {total_time/60:.1f} minutes")
-    print(f"   • Final Model Saved At  : {os.path.join(ckpt_dir, 'latest.pt')}")
+    print(f"   • Final Model Saved At  : {os.path.join(ckpt_dir, 'gemma2cerebro.pt')}")
     print("=" * 80)
 
 
@@ -856,12 +896,16 @@ def parse_args():
     parser.add_argument("--checkpoint-dir", dest="checkpoint_dir", type=str, default=None, help="Directory to save weights (defaults to /kaggle/working/checkpoints on Kaggle, /content/checkpoints on Colab)")
     parser.add_argument("--no-cloud-sync", dest="cloud_sync", action="store_false", help="Disable bioflo.in remote telemetry and checkpoint upload")
     parser.add_argument("--no-4bit", dest="load_in_4bit", action="store_false", help="Disable 4-bit quantization for teacher")
+    parser.add_argument("--teacher-device", dest="teacher_device", type=str, default=None, help="Dedicated GPU device for teacher (e.g. cuda:0)")
+    parser.add_argument("--student-device", dest="student_device", type=str, default=None, help="Dedicated GPU device for student (e.g. cuda:1)")
     parser.add_argument("--resume", dest="resume_path", type=str, default=None, help="Path to student checkpoint to resume from")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    t_dev = torch.device(args.teacher_device) if args.teacher_device else None
+    s_dev = torch.device(args.student_device) if args.student_device else None
     run_distillation(
         teacher_model_id=args.teacher_model_id,
         student_preset=args.student_preset,
@@ -880,6 +924,8 @@ def main():
         cloud_sync=args.cloud_sync,
         load_in_4bit=args.load_in_4bit,
         resume_path=args.resume_path,
+        teacher_device=t_dev,
+        student_device=s_dev,
     )
 
 
