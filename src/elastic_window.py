@@ -459,13 +459,19 @@ def build_online_dataset_iterator(
         source = dataset_source.lower()
     if source == "huggingfacefw/fineweb":
         dataset_config = dataset_config or _DEFAULT_DATASET_CONFIGS["HuggingFaceFW/fineweb"]
-    if source in ("chat_thinking", "db_thinking", "specialized_trihead", "specialized_sft"):
+    if source in ("dataset", "frontier", "frontier_100k", "frontier_reasoning", "frontier_sft", "ajitkumar-bio/cerebro-spheroid-v5-frontier-reasoning-tools-100k"):
+        source = "frontier_100k"
+    elif os.path.exists(dataset_source) or os.path.exists(os.path.join(REPO_ROOT, dataset_source)):
+        source = "local_dataset"
+    elif "/" in dataset_source and not dataset_source.startswith("http"):
+        source = "custom_hf_dataset"
+    elif source in ("chat_thinking", "db_thinking", "specialized_trihead", "specialized_sft"):
         source = "chat_thinking"
     elif source in ("sft", "instruction_sft", "chat_sft", "alignment", "reasoning_sft", "cot_sft", "think_sft", "r1_sft", "cot", "deepseek_r1", "conversational", "conversational_sft", "layman"):
         source = "conversational_sft"
     elif source in ("foundation", "auto", "basic", "fineweb_edu"):
         source = "dense_edu"
-    elif source in ("reasoning", "frontier", "beat_smollm", "smollm_pass", "frontier_mix", "tri_pillar"):
+    elif source in ("reasoning", "beat_smollm", "smollm_pass", "frontier_mix", "tri_pillar"):
         source = "reasoning_anneal"
     elif source in ("agentic", "workflows"):
         source = "conversation_sft"
@@ -902,6 +908,76 @@ def build_online_dataset_iterator(
                 turn += 1
 
         return _wrap_with_retrieval_injection(_autonomous_gen())
+
+    if source in ("frontier_100k", "local_dataset", "custom_hf_dataset"):
+        # Premier Frontier Reasoning & Tool Dataset (100k samples) / Custom Datasets
+        # Seamlessly supports local JSONL / Parquet or streaming from Hugging Face Hub:
+        # AjitKumar-Bio/cerebro-spheroid-v5-frontier-reasoning-tools-100k
+        def _frontier_dataset_gen():
+            import json, random, time
+
+            # 1. Resolve local candidates
+            local_candidates = []
+            if source == "local_dataset":
+                local_candidates.append(
+                    dataset_source if os.path.isabs(dataset_source) else os.path.join(REPO_ROOT, dataset_source)
+                )
+
+            local_candidates.extend([
+                os.path.join(REPO_ROOT, "data", "frontier_100k", "frontier_100k_spheroid_format.jsonl"),
+                os.path.join(REPO_ROOT, "data", "frontier_100k", "frontier_100k_industry_sharegpt.jsonl"),
+                os.path.join(REPO_ROOT, "data", "frontier_100k", "frontier_100k_reasoning_tool_sft.parquet"),
+                os.path.join(REPO_ROOT, "data", "cerebro_v5_custom_dataset", "train.jsonl"),
+                os.path.join(REPO_ROOT, "data", "diverse_sft_corpus_25k.jsonl"),
+                os.path.join(REPO_ROOT, "data", "chat_thinking_sft_15k.jsonl"),
+            ])
+
+            chosen_local = None
+            for p in local_candidates:
+                if os.path.exists(p) and os.path.getsize(p) > 1024:
+                    chosen_local = p
+                    break
+
+            if chosen_local is not None:
+                print(f"📦 [Dataset Streamer] Streaming directly from local dataset: {chosen_local}")
+                while True:
+                    if chosen_local.endswith(".parquet"):
+                        import pandas as pd
+                        df = pd.read_parquet(chosen_local)
+                        records = df.to_dict(orient="records")
+                        random.shuffle(records)
+                        for r in records:
+                            r["_dataset"] = "frontier_100k"
+                            yield r
+                    else:
+                        with open(chosen_local, "r", encoding="utf-8") as f:
+                            for line in f:
+                                line = line.strip()
+                                if line:
+                                    try:
+                                        d = json.loads(line)
+                                        d["_dataset"] = "frontier_100k"
+                                        yield d
+                                    except Exception:
+                                        continue
+            else:
+                # 2. Remote Hugging Face Hub Streaming Pipeline
+                hf_repo = dataset_source if (source == "custom_hf_dataset") else "AjitKumar-Bio/cerebro-spheroid-v5-frontier-reasoning-tools-100k"
+                print(f"🌐 [Dataset Streamer] Streaming directly from Hugging Face Hub: {hf_repo}...")
+                hf_it: Optional[Iterator[Any]] = None
+                while True:
+                    try:
+                        row, hf_it = _next_or_reopen(
+                            hf_it, lambda: _open_hf_stream(hf_repo, split="train", rank=rank, world_size=world_size)
+                        )
+                        if isinstance(row, dict):
+                            row["_dataset"] = "frontier_100k"
+                        yield row
+                    except Exception as e:
+                        print(f"⚠️ [Dataset Streamer] Remote stream notice ({e}). Backing off...")
+                        time.sleep(1.0)
+
+        return _wrap_with_retrieval_injection(_frontier_dataset_gen())
 
     if source == "chat_thinking":
         # 100% Offline Database-Augmented Chat, Reasoning & Action Streamer:

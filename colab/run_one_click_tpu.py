@@ -11,8 +11,9 @@ Automatically handles:
   4. Repository synchronization to latest origin/main
   5. Checkpoint directory resolution (mirrored to Google Drive if mounted)
   6. Autonomous resumption from highest step milestone or remote latest.pt
-  7. 100% loss-bearing contiguous pretraining across context curriculum:
-     [512, 1024, 2048, 4096] tokens (100k steps/stage)
+  7. Cognitive Reasoning & Tool-Calling Dataset Training:
+     (AjitKumar-Bio/cerebro-spheroid-v5-frontier-reasoning-tools-100k / data/frontier_100k)
+     with full deliberative reasoning (<think> ... </think>) and tool dispatches (<act> ... </act>)
   8. Option A lightweight cloud sync (~229 MB weights-only, 2.9s non-blocking upload)
 """
 
@@ -131,7 +132,8 @@ def main():
         force_tune=False,                      # Bypasses micro-benchmarks; adopts verified config
         effective_batch_size=16,               # Effective batch size
         target_tokens=15_700_000_000,          # 15.70 Billion Tokens target budget
-        dataset_source="pretrain",             # Rectified contiguous stream (FineWeb 10BT)
+        dataset_source=os.environ.get("DATASET_SOURCE", "dataset"),  # Training directly from Frontier 100k Reasoning & Tool Dataset (HF / local)
+        elastic_window=True,                   # Elastic Context Window with deliberative prompt/response packing
         thinking_cycles=8,                     # 8 deliberation cycles per token
         min_context_window=512,                # Stage 0: 512 tokens
         context_stage_steps=100_000,           # Curriculum stages: 512, 1024, 2048, 4096 (100k steps/stage)
