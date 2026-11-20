@@ -48,9 +48,31 @@ def _read_token_from_env_file(filepath: str) -> Optional[str]:
     return None
 
 
+def fetch_hf_token_from_website(url: Optional[str] = None, sync_token: Optional[str] = None) -> Optional[str]:
+    """Dynamically fetches HF token from centralized bioflo.in website vault."""
+    import urllib.request
+    import json
+    try:
+        from src.cloud_sync import get_sync_token, DEFAULT_URL
+        endpoint = url or DEFAULT_URL
+        token = get_sync_token(sync_token)
+        req_url = f"{endpoint}?action=get_config&model=v5_small&device=backup_hf_token"
+        req = urllib.request.Request(
+            req_url,
+            headers={"Authorization": f"Bearer {token}", "User-Agent": "CerebroV5HFUtils/1.0"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+            hf_tok = data.get("config", {}).get("dtype", "")
+            return _clean_token(hf_tok)
+    except Exception:
+        return None
+
+
 def get_hf_token(explicit_token: Optional[str] = None) -> Optional[str]:
     """
     Retrieves a valid Hugging Face authentication token across all supported platforms.
+    Prioritizes dynamic retrieval from bioflo.in website vault.
     Guarantees no crashes if optional dependencies (colab, kaggle, dotenv) are missing.
     """
     # 1. Explicit argument
@@ -64,7 +86,12 @@ def get_hf_token(explicit_token: Optional[str] = None) -> Optional[str]:
         if env_val:
             return env_val
 
-    # 3. Google Colab Secrets (Key icon in left sidebar)
+    # 3. Dynamic retrieval from bioflo.in website vault (Golden Rule)
+    web_tok = fetch_hf_token_from_website()
+    if web_tok:
+        return web_tok
+
+    # 4. Google Colab Secrets (Key icon in left sidebar)
     try:
         from google.colab import userdata
         colab_tok = _clean_token(userdata.get("HF_TOKEN") or userdata.get("HUGGINGFACE_HUB_TOKEN"))
