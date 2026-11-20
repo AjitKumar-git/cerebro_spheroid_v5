@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🧠 CerebroSpheroid V5: Gemma 2 to V5 Small Distillation Engine (Google Colab)
-============================================================================
+🧠 CerebroSpheroid V5: Google Gemma 4 E4B to V5 Small Distillation Engine (Google Colab)
+========================================================================================
 Self-contained, high-throughput distillation script designed for Google Colab GPU/TPU.
 Transfers cognitive reasoning, step-by-step deliberation (<think> ... </think>),
-and tool-calling trajectories (<act> ... </act>) from Google Gemma 2 (google/gemma-2-2b-it,
-google/gemma-2-9b-it, or unsloth/gemma-2-2b-it) into CerebroSpheroid V5 Small
+and tool-calling trajectories (<act> ... </act>) from Google Gemma 4 E4B (google/gemma-4-E4B-it,
+google/gemma-4-E4B-it-qat-q4_0-gguf, or Gemma 2) into CerebroSpheroid V5 Small
 (105.9M parameters, 16 shells, 40 shortcut tracts).
 
 Key Architecture & Capabilities:
   1. Universal Model Support:
-     - Teacher: Google Gemma 2 2B (`google/gemma-2-2b-it`, `unsloth/gemma-2-2b-it`),
-       or Gemma 2 9B. Automatically loads in 4-bit NormalFloat (via bitsandbytes) to fit
-       in < 2.5 GB VRAM, leaving over 12 GB headroom on free Google Colab T4 (15 GB) GPUs.
+     - Teacher: Google Gemma 4 E4B (`google/gemma-4-E4B-it`, `google/gemma-4-E4B-it-qat-q4_0-gguf`),
+       or Gemma 2. Automatically loads in 4-bit NormalFloat (via bitsandbytes) to fit
+       in < 3.0 GB VRAM, leaving over 12 GB headroom on free Google Colab T4 (15 GB) GPUs.
      - Student: CerebroSpheroid V5 Small (105.9M params, 32,000 vocab, RMSNorm, SwiGLU).
   2. Answer-Anchor Loss Weighting (AALW):
      - Prompt tokens: 0.0x (masked with -100).
@@ -23,8 +23,8 @@ Key Architecture & Capabilities:
   3. Hybrid Distillation Modes:
      - "stream": High-throughput (500+ tok/s) training from frontier reasoning dataset
        (AjitKumar-Bio/cerebro-spheroid-v5-frontier-reasoning-tools-100k or data/frontier_100k).
-     - "live": Gemma 2 generates on-policy reasoning chains live using the official chat template.
-     - "hybrid": High-speed streaming interleaved with live Gemma 2 teacher verification.
+     - "live": Gemma 4 E4B generates on-policy reasoning chains live using the official chat template.
+     - "hybrid": High-speed streaming interleaved with live Gemma 4 E4B teacher verification.
   4. True Batched Execution:
      - Fully vectorized micro-batches (shape [B, max_prompt_len], [B, max_target_len])
        with gradient accumulation across steps.
@@ -158,17 +158,23 @@ def setup_colab_environment() -> Tuple[str, str, torch.device, torch.dtype]:
 # ==============================================================================
 
 def load_gemma_teacher(
-    model_id: str = "google/gemma-2-2b-it",
+    model_id: str = "google/gemma-4-E4B-it",
     device: torch.device = torch.device("cpu"),
     dtype: torch.dtype = torch.float32,
     load_in_4bit: bool = True,
 ) -> Tuple[Any, Any]:
-    """Loads Gemma 2 teacher model in 4-bit (or bfloat16) and freezes its parameters."""
-    print(f"\n🎓 Initializing Gemma 2 Teacher Model: [{model_id}]...")
+    """Loads Google Gemma 4 E4B (or Gemma 2) teacher model in 4-bit (or bfloat16) and freezes its parameters."""
+    print(f"\n🎓 Initializing Google Gemma 4 E4B Teacher Model: [{model_id}]...")
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    # Candidate models in case primary is gated or unavailable
-    candidate_models = [model_id, "unsloth/gemma-2-2b-it", "google/gemma-2b-it", "Qwen/Qwen2.5-1.5B-Instruct"]
+    # Candidate models in case primary is gated, GGUF, or requires alternate weights
+    candidate_models = [
+        model_id,
+        "google/gemma-4-E4B-it-qat-q4_0-gguf",
+        "google/gemma-2-2b-it",
+        "unsloth/gemma-2-2b-it",
+        "google/gemma-2b-it",
+    ]
     teacher, tok = None, None
     last_err = None
 
@@ -183,7 +189,7 @@ def load_gemma_teacher(
                 "attn_implementation": "eager",
             }
 
-            # 4-bit Quantization via BitsAndBytes (fits in ~2.5 GB VRAM)
+            # 4-bit Quantization via BitsAndBytes (fits in ~2.5 - 3.0 GB VRAM)
             if device.type == "cuda" and load_in_4bit:
                 try:
                     from transformers import BitsAndBytesConfig
@@ -207,14 +213,14 @@ def load_gemma_teacher(
 
             teacher = AutoModelForCausalLM.from_pretrained(candidate, **kwargs)
             teacher_params = sum(p.numel() for p in teacher.parameters())
-            print(f"   ✓ Gemma 2 Teacher [{candidate}] Loaded Successfully ({teacher_params/1e9:.2f}B parameters, Frozen)")
+            print(f"   ✓ Gemma 4 E4B Teacher [{candidate}] Loaded Successfully ({teacher_params/1e9:.2f}B parameters, Frozen)")
             break
         except Exception as e_candidate:
             last_err = e_candidate
             print(f"   ℹ️ Notice on candidate [{candidate}]: {e_candidate}. Trying alternate...")
 
     if teacher is None:
-        raise RuntimeError(f"Could not load Gemma 2 teacher model or fallbacks: {last_err}")
+        raise RuntimeError(f"Could not load Gemma 4 E4B teacher model or fallbacks: {last_err}")
 
     teacher.eval()
     for param in teacher.parameters():
@@ -376,7 +382,7 @@ def prepare_distillation_batch(
 # ==============================================================================
 
 def run_distillation(
-    teacher_model_id: str = "google/gemma-2-2b-it",
+    teacher_model_id: str = "google/gemma-4-E4B-it",
     student_preset: str = "v5_small",
     mode: str = "stream",  # 'stream', 'live', or 'hybrid'
     total_steps: int = 5000,
@@ -658,8 +664,8 @@ def run_distillation(
 # ==============================================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Gemma 2 to CerebroSpheroid V5 Small Distillation Engine")
-    parser.add_argument("--teacher", "--teacher-model", dest="teacher_model_id", type=str, default="google/gemma-2-2b-it", help="Teacher model Hugging Face ID (e.g. google/gemma-2-2b-it, unsloth/gemma-2-2b-it)")
+    parser = argparse.ArgumentParser(description="Google Gemma 4 E4B to CerebroSpheroid V5 Small Distillation Engine")
+    parser.add_argument("--teacher", "--teacher-model", dest="teacher_model_id", type=str, default="google/gemma-4-E4B-it", help="Teacher model Hugging Face ID (e.g. google/gemma-4-E4B-it, google/gemma-4-E4B-it-qat-q4_0-gguf, google/gemma-2-2b-it)")
     parser.add_argument("--student", "--student-preset", dest="student_preset", type=str, default="v5_small", help="Student model preset ('v5_small' = 105.9M params)")
     parser.add_argument("--mode", type=str, default="stream", choices=["stream", "live", "hybrid"], help="Distillation mode: 'stream' (high-throughput frontier dataset), 'live' (on-policy generation), 'hybrid'")
     parser.add_argument("--steps", "--total-steps", dest="total_steps", type=int, default=5000, help="Total distillation steps")
