@@ -1,15 +1,15 @@
 # Agent Work State & Activity Tracker
 
-> **Status**: 🟢 `COMPLETED` | **Last Updated**: `2026-11-20T19:56:55.913997+05:30` | **Session**: `1ffa7ab2-b764-480a-b597-d783c09f257d`
+> **Status**: 🟢 `COMPLETED` | **Last Updated**: `2026-11-20T22:13:32.768754+05:30` | **Session**: `1ffa7ab2-b764-480a-b597-d783c09f257d`
 
 ## Current / Active Objective
-**Goal**: yes
+**Goal**: remove v5 compact 166M preset from website not usable, and for v5 compact please check forward pass loss again from website
 
 - **Phase**: `completed`
 - **Current Task**: Idle / Awaiting next request
 
 ## Summary of Completed Work
-The 400-step training run of `CerebroSpheroidV5` from scratch using the native **`build_scmer_optimizer`** (Polar Newton-Schulz manifold orthogonalization, contractive spectral clamp $\rho(W) \le 1.0$, and SCMER negative covariance margin regularization) completed successfully.
+---
 
 ## Modified Files
 - [`AGENTS.md`](AGENTS.md)
@@ -41,20 +41,72 @@ The 400-step training run of `CerebroSpheroidV5` from scratch using the native *
 - [`experiments/minimal_tool_mvp/train_cerebro_v5_from_scratch.py`](experiments/minimal_tool_mvp/train_cerebro_v5_from_scratch.py)
 - [`src/spheroid_optimizer.py`](src/spheroid_optimizer.py)
 - [`src/corpus.py`](src/corpus.py)
+- [`scripts/build_dictionary_dataset.py`](scripts/build_dictionary_dataset.py)
+- [`scripts/upload_dictionary_to_hf.py`](scripts/upload_dictionary_to_hf.py)
+- [`../../../../.gemini/antigravity/brain/734a32d4-30f9-4fa4-b9c2-5336e0f58c27/cerebro_spheroid_v6_architecture_and_implementation_plan.md`](../../../../.gemini/antigravity/brain/734a32d4-30f9-4fa4-b9c2-5336e0f58c27/cerebro_spheroid_v6_architecture_and_implementation_plan.md)
+- [`../../../../.gemini/antigravity/brain/734a32d4-30f9-4fa4-b9c2-5336e0f58c27/human_with_a_book_architecture_and_calculator_plan.md`](../../../../.gemini/antigravity/brain/734a32d4-30f9-4fa4-b9c2-5336e0f58c27/human_with_a_book_architecture_and_calculator_plan.md)
+- [`../../../../.gemini/antigravity/brain/734a32d4-30f9-4fa4-b9c2-5336e0f58c27/scratch/test_qwen_vs_v5qwen.py`](../../../../.gemini/antigravity/brain/734a32d4-30f9-4fa4-b9c2-5336e0f58c27/scratch/test_qwen_vs_v5qwen.py)
+- [`.agents/WORK_STATE.md`](.agents/WORK_STATE.md)
+- [`WORK_STATE.md`](WORK_STATE.md)
+- [`checkpoints/archived_v5_small_runs/ARCHIVE_MANIFEST.md`](checkpoints/archived_v5_small_runs/ARCHIVE_MANIFEST.md)
+- [`colab/CerebroSpheroid_V5_Colab_Pretraining.ipynb`](colab/CerebroSpheroid_V5_Colab_Pretraining.ipynb)
+- [`colab/CerebroSpheroid_V5_Colab_TPU_JAX.ipynb`](colab/CerebroSpheroid_V5_Colab_TPU_JAX.ipynb)
+- [`colab/CerebroSpheroid_V5_Colab_TPU_Pretraining.ipynb`](colab/CerebroSpheroid_V5_Colab_TPU_Pretraining.ipynb)
+- [`colab/CerebroSpheroid_V5_Compact_Growth_SFT.ipynb`](colab/CerebroSpheroid_V5_Compact_Growth_SFT.ipynb)
+- [`colab/README.md`](colab/README.md)
+- [`deploy/bioflo/sync.php`](deploy/bioflo/sync.php)
+- [`docs/RESEARCH_NOTES.md`](docs/RESEARCH_NOTES.md)
+- [`notebooks/train_v5_small_tpu_from_scratch.ipynb`](notebooks/train_v5_small_tpu_from_scratch.ipynb)
+- [`requirements.txt`](requirements.txt)
+- [`scripts/align_tinyllama_v5_small.py`](scripts/align_tinyllama_v5_small.py)
+- [`scripts/audit_anti_sycophancy.py`](scripts/audit_anti_sycophancy.py)
+- [`scripts/audit_dataset_stream.py`](scripts/audit_dataset_stream.py)
+- [`scripts/build_anti_sycophancy_dataset.py`](scripts/build_anti_sycophancy_dataset.py)
+- [`scripts/build_cerebro_v5_custom_dataset.py`](scripts/build_cerebro_v5_custom_dataset.py)
+- [`scripts/build_frontier_100k_dataset.py`](scripts/build_frontier_100k_dataset.py)
+- [`scripts/digest_cosmopedia_v2.py`](scripts/digest_cosmopedia_v2.py)
+- [`scripts/download_gemma_e4b.py`](scripts/download_gemma_e4b.py)
+- [`scripts/grade_and_build_sft_dataset.py`](scripts/grade_and_build_sft_dataset.py)
+- [`scripts/run_refined_sft_pytorch.py`](scripts/run_refined_sft_pytorch.py)
+- [`scripts/salvage_v5_small_pretrain.py`](scripts/salvage_v5_small_pretrain.py)
+- [`scripts/train_v5_compact_growth_pretrain.py`](scripts/train_v5_compact_growth_pretrain.py)
+- [`scripts/train_v5_compact_growth_sft.py`](scripts/train_v5_compact_growth_sft.py)
+- [`scripts/train_v5_small_colab_tpu.py`](scripts/train_v5_small_colab_tpu.py)
+- [`scripts/train_v5_tpu_jax.py`](scripts/train_v5_tpu_jax.py)
+- [`scripts/update_colab_notebook.py`](scripts/update_colab_notebook.py)
+- [`scripts/upload_anti_sycophancy_to_hf.py`](scripts/upload_anti_sycophancy_to_hf.py)
+- [`scripts/upload_digested_data_to_hf.py`](scripts/upload_digested_data_to_hf.py)
+- [`scripts/upload_frontier_100k_to_hf.py`](scripts/upload_frontier_100k_to_hf.py)
+- [`src/agentic_harness.py`](src/agentic_harness.py)
+- [`src/elastic_window.py`](src/elastic_window.py)
+- [`src/factual_knowledge_engine.py`](src/factual_knowledge_engine.py)
+- [`src/jax/checkpoint.py`](src/jax/checkpoint.py)
+- [`src/jax/spheroid_optimizer.py`](src/jax/spheroid_optimizer.py)
+- [`src/jax/v5_model.py`](src/jax/v5_model.py)
+- [`src/rectified_streamer.py`](src/rectified_streamer.py)
+- [`src/spheroid_v5.py`](src/spheroid_v5.py)
+- [`src/teacher_digester.py`](src/teacher_digester.py)
+- [`tests/test_act_tool_calling_boundary.py`](tests/test_act_tool_calling_boundary.py)
+- [`tests/test_autonomous_curriculum.py`](tests/test_autonomous_curriculum.py)
+- [`tests/test_deliberation_and_seq_transition.py`](tests/test_deliberation_and_seq_transition.py)
+- [`tests/test_digest_cosmopedia_v2.py`](tests/test_digest_cosmopedia_v2.py)
+- [`tests/test_teacher_digester.py`](tests/test_teacher_digester.py)
+- [`training/train_v5_tpu_jax.py`](training/train_v5_tpu_jax.py)
+- [`../../../../.gemini/antigravity/brain/1ffa7ab2-b764-480a-b597-d783c09f257d/scratch/check_website_compact.py`](../../../../.gemini/antigravity/brain/1ffa7ab2-b764-480a-b597-d783c09f257d/scratch/check_website_compact.py)
 
 ## Recent Actions (Last 10)
 | Time | Tool | Details |
 | :--- | :--- | :--- |
-| `19:56:41` | `run_command` | Verify parse_model_output parsing |
-| `19:56:37` | `edit_file` | edit_file |
-| `19:56:28` | `run_command` | Test greedy regex |
-| `19:56:19` | `run_command` | Debug regex on tool JSON |
-| `19:56:14` | `read_file` | read_file |
-| `19:56:10` | `run_command` | Test parse_model_output on tool JSON |
-| `19:56:02` | `read_file` | read_file |
-| `19:55:58` | `run_command` | Check if leap year was in dataset_generator |
-| `19:55:50` | `run_command` | Train CerebroSpheroid V5 from Scratch with SCMER optimizer |
-| `19:27:06` | `read_file` | read_file |
+| `22:13:18` | `run_command` | Refresh v5_compact telemetry from website |
+| `22:13:00` | `run_command` | Remove v5_compact_166m.json |
+| `22:12:48` | `run_command` | Run check_website_compact.py |
+| `22:12:36` | `write_file` | write_file |
+| `22:12:27` | `run_command` | Fetch complete v5_compact training telemetry from website |
+| `22:12:18` | `run_command` | Fetch complete v5_compact training telemetry from website |
+| `22:12:02` | `run_command` | Search for bioflo.in in repo |
+| `22:11:56` | `run_command` | Check model tabs in dashboard |
+| `22:11:47` | `run_command` | Search for compact 166m and 32shells |
+| `22:11:42` | `manage_task` | manage_task |
 
 ---
 *This file is automatically maintained by `auto-work-tracker`. Other agents can parse `.agents/work_state.json` or inspect this file directly to resume or review progress.*
