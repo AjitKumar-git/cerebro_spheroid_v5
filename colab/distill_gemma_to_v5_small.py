@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🧠 CerebroSpheroid V5: Gemma E4B to V5 Small Distillation Engine (Google Colab)
-==============================================================================
+🧠 CerebroSpheroid V5: Gemma 2 to V5 Small Distillation Engine (Google Colab)
+============================================================================
 Self-contained, high-throughput distillation script designed for Google Colab GPU/TPU.
 Transfers cognitive reasoning, step-by-step deliberation (<think> ... </think>),
-and tool-calling trajectories (<act> ... </act>) from Google Gemma (Gemma 3 4B / Gemma 2 2B)
-into CerebroSpheroid V5 Small (105.9M parameters, 16 shells, 40 shortcut tracts).
+and tool-calling trajectories (<act> ... </act>) from Google Gemma 2 (google/gemma-2-2b-it,
+google/gemma-2-9b-it, or unsloth/gemma-2-2b-it) into CerebroSpheroid V5 Small
+(105.9M parameters, 16 shells, 40 shortcut tracts).
 
 Key Architecture & Capabilities:
   1. Universal Model Support:
-     - Teacher: Google Gemma 3 4B (`google/gemma-3-4b-it`), Gemma 2 2B (`google/gemma-2-2b-it`),
-       or any teacher LLM. Automatically loads in 4-bit (via bitsandbytes) to fit in < 3 GB VRAM,
-       leaving maximum headroom on free Google Colab T4 (15 GB) GPUs.
+     - Teacher: Google Gemma 2 2B (`google/gemma-2-2b-it`, `unsloth/gemma-2-2b-it`),
+       or Gemma 2 9B. Automatically loads in 4-bit NormalFloat (via bitsandbytes) to fit
+       in < 2.5 GB VRAM, leaving over 12 GB headroom on free Google Colab T4 (15 GB) GPUs.
      - Student: CerebroSpheroid V5 Small (105.9M params, 32,000 vocab, RMSNorm, SwiGLU).
   2. Answer-Anchor Loss Weighting (AALW):
      - Prompt tokens: 0.0x (masked with -100).
@@ -20,15 +21,18 @@ Key Architecture & Capabilities:
      - Tool transactions (<act> ... </act>): 4.0x loss weighting.
      - Final solution & answer: 5.0x loss weighting.
   3. Hybrid Distillation Modes:
-     - "live": Teacher generates on-policy reasoning chains live for incoming queries.
      - "stream": High-throughput (500+ tok/s) training from frontier reasoning dataset
        (AjitKumar-Bio/cerebro-spheroid-v5-frontier-reasoning-tools-100k or data/frontier_100k).
-     - "hybrid": High-speed streaming interleaved with live teacher verification.
-  4. Option A Fast Cloud Mirroring:
+     - "live": Gemma 2 generates on-policy reasoning chains live using the official chat template.
+     - "hybrid": High-speed streaming interleaved with live Gemma 2 teacher verification.
+  4. True Batched Execution:
+     - Fully vectorized micro-batches (shape [B, max_prompt_len], [B, max_target_len])
+       with gradient accumulation across steps.
+  5. Option A Fast Cloud Mirroring:
      - Checkpoints (~229 MB weights-only) mirrored to Google Drive (if mounted)
        and synchronized to bioflo.in remote telemetry dashboard in non-blocking background threads.
-  5. One-Click Execution in Colab:
-     - Simply run `python colab/distill_gemma_to_v5_small.py` or call `run_distillation()` from a notebook.
+  6. One-Click Execution in Colab:
+     - Run `python colab/distill_gemma_to_v5_small.py` or call `run_distillation()` from a notebook.
 """
 
 from __future__ import annotations
@@ -62,7 +66,7 @@ from src.hf_utils import setup_hf_token, get_hf_token
 def setup_colab_environment() -> Tuple[str, str, torch.device, torch.dtype]:
     """Configures system hugepages, hardware device, tokens, and checkpoint directories."""
     print("=" * 80)
-    print("🧠 CEREBROSPHEROID V5: GEMMA E4B -> V5 SMALL DISTILLATION ENGINE")
+    print("🧠 CEREBROSPHEROID V5: GEMMA 2 -> V5 SMALL DISTILLATION ENGINE")
     print("=" * 80)
 
     # 1. Enable Linux Transparent Hugepages (in Google Colab environments)
@@ -74,7 +78,6 @@ def setup_colab_environment() -> Tuple[str, str, torch.device, torch.dtype]:
         device = torch.device("cuda")
         dev_name = torch.cuda.get_device_name(0)
         vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-        # Check bfloat16 support (Ampere / Ada / Hopper / Turing)
         supports_bf16 = torch.cuda.is_bf16_supported() if hasattr(torch.cuda, "is_bf16_supported") else False
         dtype = torch.bfloat16 if supports_bf16 else torch.float16
         print(f"⚡ Compute Accelerator : CUDA GPU [{dev_name}] ({vram_gb:.1f} GB VRAM)")
@@ -107,7 +110,6 @@ def setup_colab_environment() -> Tuple[str, str, torch.device, torch.dtype]:
     # 4. Authenticate Hugging Face Hub Token
     hf_tok = setup_hf_token(verbose=False)
     if not hf_tok:
-        # Fallback to Bioflo secure backup vault if not in Colab secrets
         try:
             req = urllib.request.Request(
                 f"https://bioflo.in/api/cerebro/sync.php?action=get_config&model=v5_small&device=backup_hf_token",
@@ -129,7 +131,7 @@ def setup_colab_environment() -> Tuple[str, str, torch.device, torch.dtype]:
         except Exception:
             pass
     else:
-        print("ℹ️ Hugging Face Hub    : Running in anonymous mode. For gated Gemma models, set HF_TOKEN.")
+        print("ℹ️ Hugging Face Hub    : Running in anonymous mode (ungated Gemma models will load seamlessly).")
 
     # 5. Resolve Persistent Checkpoint Directory (Google Drive preferred)
     drive_dir = "/content/drive/MyDrive/cerebro_checkpoints/distill_gemma_v5_small"
@@ -156,63 +158,68 @@ def setup_colab_environment() -> Tuple[str, str, torch.device, torch.dtype]:
 # ==============================================================================
 
 def load_gemma_teacher(
-    model_id: str = "google/gemma-3-4b-it",
+    model_id: str = "google/gemma-2-2b-it",
     device: torch.device = torch.device("cpu"),
     dtype: torch.dtype = torch.float32,
     load_in_4bit: bool = True,
 ) -> Tuple[Any, Any]:
-    """Loads Gemma teacher model in 4-bit (or bfloat16) and freezes its parameters."""
-    print(f"\n🎓 Initializing Teacher Model: [{model_id}]...")
+    """Loads Gemma 2 teacher model in 4-bit (or bfloat16) and freezes its parameters."""
+    print(f"\n🎓 Initializing Gemma 2 Teacher Model: [{model_id}]...")
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
+    # Candidate models in case primary is gated or unavailable
+    candidate_models = [model_id, "unsloth/gemma-2-2b-it", "google/gemma-2b-it", "Qwen/Qwen2.5-1.5B-Instruct"]
+    teacher, tok = None, None
+    last_err = None
 
-    kwargs: Dict[str, Any] = {"trust_remote_code": True}
-
-    # 4-bit Quantization via BitsAndBytes (saves ~75% VRAM on Colab GPU)
-    if device.type == "cuda" and load_in_4bit:
+    for candidate in candidate_models:
         try:
-            from transformers import BitsAndBytesConfig
-            bnb_cfg = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=dtype,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
-            )
-            kwargs["quantization_config"] = bnb_cfg
-            kwargs["device_map"] = "auto"
-            print("   ⚡ 4-Bit NormalFloat Quantization Active (BitsAndBytes): fits in ~2.5 GB VRAM!")
-        except ImportError:
-            print("   ℹ️ bitsandbytes not found; loading in standard precision...")
-            kwargs["torch_dtype"] = dtype
-            kwargs["device_map"] = "auto" if device.type == "cuda" else None
-    elif device.type == "cuda":
-        kwargs["torch_dtype"] = dtype
-        kwargs["device_map"] = "auto"
-    else:
-        kwargs["torch_dtype"] = dtype
+            tok = AutoTokenizer.from_pretrained(candidate, trust_remote_code=True)
+            if tok.pad_token is None:
+                tok.pad_token = tok.eos_token
 
-    try:
-        teacher = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
-    except Exception as e_load:
-        # Fallback to Gemma 2 2B or Gemma 2B if primary teacher is unavailable / gated
-        fallback_models = ["google/gemma-2-2b-it", "google/gemma-2b-it", "Qwen/Qwen2.5-1.5B-Instruct"]
-        print(f"⚠️ Primary teacher '{model_id}' loading notice: {e_load}")
-        alt_id = fallback_models[0]
-        print(f"   🔄 Automatically falling back to alternate high-performance teacher: [{alt_id}]...")
-        tok = AutoTokenizer.from_pretrained(alt_id, trust_remote_code=True)
-        if tok.pad_token is None:
-            tok.pad_token = tok.eos_token
-        teacher = AutoModelForCausalLM.from_pretrained(alt_id, **kwargs)
+            kwargs: Dict[str, Any] = {
+                "trust_remote_code": True,
+                "attn_implementation": "eager",
+            }
+
+            # 4-bit Quantization via BitsAndBytes (fits in ~2.5 GB VRAM)
+            if device.type == "cuda" and load_in_4bit:
+                try:
+                    from transformers import BitsAndBytesConfig
+                    bnb_cfg = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_compute_dtype=dtype,
+                        bnb_4bit_use_double_quant=True,
+                        bnb_4bit_quant_type="nf4",
+                    )
+                    kwargs["quantization_config"] = bnb_cfg
+                    kwargs["device_map"] = "auto"
+                    print(f"   ⚡ 4-Bit NormalFloat Quantization Active: Loading [{candidate}] in ~2.5 GB VRAM...")
+                except ImportError:
+                    kwargs["torch_dtype"] = dtype
+                    kwargs["device_map"] = "auto" if device.type == "cuda" else None
+            elif device.type == "cuda":
+                kwargs["torch_dtype"] = dtype
+                kwargs["device_map"] = "auto"
+            else:
+                kwargs["torch_dtype"] = dtype
+
+            teacher = AutoModelForCausalLM.from_pretrained(candidate, **kwargs)
+            teacher_params = sum(p.numel() for p in teacher.parameters())
+            print(f"   ✓ Gemma 2 Teacher [{candidate}] Loaded Successfully ({teacher_params/1e9:.2f}B parameters, Frozen)")
+            break
+        except Exception as e_candidate:
+            last_err = e_candidate
+            print(f"   ℹ️ Notice on candidate [{candidate}]: {e_candidate}. Trying alternate...")
+
+    if teacher is None:
+        raise RuntimeError(f"Could not load Gemma 2 teacher model or fallbacks: {last_err}")
 
     teacher.eval()
     for param in teacher.parameters():
         param.requires_grad = False
 
-    teacher_params = sum(p.numel() for p in teacher.parameters())
-    print(f"   ✓ Teacher Loaded Successfully ({teacher_params/1e9:.2f}B parameters, Frozen)")
     return teacher, tok
 
 
@@ -225,21 +232,18 @@ def load_v5_small_student(
     print(f"\n🌱 Initializing Student Model: [CerebroSpheroid V5 Small]...")
     from transformers import AutoTokenizer
 
-    # 1. Load Bundled 32,000 Vocab LLaMA Tokenizer
     tok_dir = os.path.join(REPO_ROOT, "data", "tokenizer")
     if os.path.exists(os.path.join(tok_dir, "tokenizer.json")):
         tok = AutoTokenizer.from_pretrained(tok_dir)
         print(f"   ✓ Bundled 32k LLaMA Tokenizer Verified ({tok.vocab_size:,} vocab)")
     else:
-        # Fallback to local tokenizer
         tok = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
 
-    # 2. Build Student Architecture
     cfg_dict = PRESETS_V5["v5_small"]
     cfg = ModelConfigV5(**cfg_dict)
     student = CerebroSpheroidV5(cfg)
 
-    # 3. Resume from checkpoint if present
+    # Resume from checkpoint if present
     start_step = 0
     if resume_path and os.path.exists(resume_path):
         try:
@@ -255,7 +259,6 @@ def load_v5_small_student(
     student.train()
 
     total_params = sum(p.numel() for p in student.parameters())
-    trainable_params = sum(p.numel() for p in student.parameters() if p.requires_grad)
     print(f"   ✓ Student Initialized: {total_params:,} parameters ({total_params/1e6:.1f}M, 16 shells, 40 shortcut tracts)")
     return student, tok
 
@@ -270,13 +273,11 @@ def format_deliberative_response(text: str, q_txt: str = "") -> str:
     if "<think>" in clean and "</think>" in clean:
         return clean
 
-    # If thought trace was not tagged by teacher, insert reasoning structure
     if "</think>" in clean and "<think>" not in clean:
         return f"<think>\n{clean}"
     if "<think>" in clean and "</think>" not in clean:
         return f"{clean}\n</think>\n"
 
-    # Split into reasoning thought and final answer if possible
     lines = clean.split("\n")
     if len(lines) > 2 and ("step" in clean.lower() or "first" in clean.lower() or "because" in clean.lower()):
         mid = max(1, len(lines) - 2)
@@ -287,88 +288,86 @@ def format_deliberative_response(text: str, q_txt: str = "") -> str:
     return clean
 
 
-def prepare_distillation_tensors(
-    prompt: str,
-    response: str,
+def prepare_distillation_batch(
+    pairs: List[Tuple[str, str]],
     tokenizer: Any,
     max_prompt_len: int = 256,
     max_target_len: int = 768,
     aalw_weight: float = 4.0,
     pad_id: int = 0,
     device: torch.device = torch.device("cpu"),
-) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """Encodes (prompt, response) into (prompts, targets, target_weights) with AALW."""
-    # Format Sensory Input
-    if not prompt.startswith("<stim>"):
-        p_str = f"<stim> {prompt.strip()} </stim>"
-    else:
-        p_str = prompt.strip()
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Encodes a list of (prompt, response) pairs into batched [B, L_p] and [B, L_t] tensors with AALW."""
+    batch_prompts: List[List[int]] = []
+    batch_targets: List[List[int]] = []
+    batch_weights: List[List[float]] = []
 
-    r_str = format_deliberative_response(response, prompt)
-
-    p_ids = tokenizer.encode(p_str, add_special_tokens=False)
-    r_ids = tokenizer.encode(r_str, add_special_tokens=False)
-
-    if not p_ids or not r_ids:
-        return None
-
-    # Truncate prompt if needed (keep end)
-    if len(p_ids) > max_prompt_len:
-        p_ids = p_ids[-max_prompt_len:]
-    # Pad prompt to fixed max_prompt_len
-    p_pad_len = max_prompt_len - len(p_ids)
-    p_tensor_ids = [pad_id] * p_pad_len + p_ids
-
-    # Truncate response if needed (keep beginning and end)
-    if len(r_ids) > max_target_len:
-        r_ids = r_ids[:max_target_len - 1] + [r_ids[-1]]
-
-    # Construct Answer-Anchor Loss Weights
-    # 1.0x baseline, aalw_weight on <think>, <act>, and solution tokens
-    weights = [1.0] * len(r_ids)
-    in_think = False
-    in_act = False
-
-    # Token IDs for structural boundary markers
     think_start_id = tokenizer.encode("<think>", add_special_tokens=False)
     think_end_id = tokenizer.encode("</think>", add_special_tokens=False)
     act_start_id = tokenizer.encode("<act>", add_special_tokens=False)
     act_end_id = tokenizer.encode("</act>", add_special_tokens=False)
 
-    for i in range(len(r_ids)):
-        tid = r_ids[i]
-        # Weight deliberation steps heavily (3.5x)
-        if any(tid == s for s in think_start_id):
-            in_think = True
-        elif any(tid == s for s in think_end_id):
-            in_think = False
-            weights[i] = aalw_weight * 1.25  # High penalty on concluding thought correctly
-            continue
+    for prompt, response in pairs:
+        p_str = prompt if prompt.startswith("<stim>") else f"<stim> {prompt.strip()} </stim>"
+        r_str = format_deliberative_response(response, prompt)
 
-        if any(tid == s for s in act_start_id):
-            in_act = True
-        elif any(tid == s for s in act_end_id):
-            in_act = False
-            weights[i] = aalw_weight * 1.5   # Critical weight on executable tool output
-            continue
+        p_ids = tokenizer.encode(p_str, add_special_tokens=False)
+        r_ids = tokenizer.encode(r_str, add_special_tokens=False)
 
-        if in_think:
-            weights[i] = aalw_weight * 0.9
-        elif in_act:
-            weights[i] = aalw_weight * 1.2
-        elif not in_think and not in_act:
-            # Final output / answer tokens get maximum anchor weighting
-            weights[i] = aalw_weight
+        if not p_ids:
+            p_ids = [pad_id]
+        if not r_ids:
+            r_ids = [pad_id]
 
-    # Pad target to fixed max_target_len
-    t_pad_len = max_target_len - len(r_ids)
-    targets_padded = r_ids + [-100] * t_pad_len
-    weights_padded = weights + [0.0] * t_pad_len
+        # Truncate / pad prompt
+        if len(p_ids) > max_prompt_len:
+            p_ids = p_ids[-max_prompt_len:]
+        p_padded = [pad_id] * (max_prompt_len - len(p_ids)) + p_ids
 
-    prompt_t = torch.tensor([p_tensor_ids], dtype=torch.long, device=device)
-    target_t = torch.tensor([targets_padded], dtype=torch.long, device=device)
-    weight_t = torch.tensor([weights_padded], dtype=torch.float32, device=device)
+        # Truncate response
+        if len(r_ids) > max_target_len:
+            r_ids = r_ids[:max_target_len - 1] + [r_ids[-1]]
 
+        # Compute token-specific AALW weights
+        weights = [1.0] * len(r_ids)
+        in_think = False
+        in_act = False
+
+        for i in range(len(r_ids)):
+            tid = r_ids[i]
+            if any(tid == s for s in think_start_id):
+                in_think = True
+            elif any(tid == s for s in think_end_id):
+                in_think = False
+                weights[i] = aalw_weight * 1.25
+                continue
+
+            if any(tid == s for s in act_start_id):
+                in_act = True
+            elif any(tid == s for s in act_end_id):
+                in_act = False
+                weights[i] = aalw_weight * 1.5
+                continue
+
+            if in_think:
+                weights[i] = aalw_weight * 0.9
+            elif in_act:
+                weights[i] = aalw_weight * 1.2
+            else:
+                weights[i] = aalw_weight
+
+        # Pad target with -100 and weights with 0.0
+        t_pad_len = max_target_len - len(r_ids)
+        t_padded = r_ids + [-100] * t_pad_len
+        w_padded = weights + [0.0] * t_pad_len
+
+        batch_prompts.append(p_padded)
+        batch_targets.append(t_padded)
+        batch_weights.append(w_padded)
+
+    prompt_t = torch.tensor(batch_prompts, dtype=torch.long, device=device)
+    target_t = torch.tensor(batch_targets, dtype=torch.long, device=device)
+    weight_t = torch.tensor(batch_weights, dtype=torch.float32, device=device)
     return prompt_t, target_t, weight_t
 
 
@@ -377,7 +376,7 @@ def prepare_distillation_tensors(
 # ==============================================================================
 
 def run_distillation(
-    teacher_model_id: str = "google/gemma-3-4b-it",
+    teacher_model_id: str = "google/gemma-2-2b-it",
     student_preset: str = "v5_small",
     mode: str = "stream",  # 'stream', 'live', or 'hybrid'
     total_steps: int = 5000,
@@ -409,7 +408,7 @@ def run_distillation(
     # 1. Initialize Student Model (V5 Small)
     student, student_tok = load_v5_small_student(device=device, dtype=dtype, resume_path=resume_path)
 
-    # 2. Initialize Teacher Model (Gemma) if in live or hybrid mode
+    # 2. Initialize Teacher Model (Gemma 2) if in live or hybrid mode
     teacher, teacher_tok = None, None
     if mode in ("live", "hybrid"):
         teacher, teacher_tok = load_gemma_teacher(
@@ -460,13 +459,6 @@ def run_distillation(
     t0_interval = time.time()
     tokens_processed = 0
 
-    prompt_template = (
-        "You are an expert reasoning model. Solve the following question step by step.\n"
-        "Enclose your complete deliberative thinking inside <think> and </think> tags.\n"
-        "If a tool calculation or execution is required, use <act> tool(args) </act>.\n"
-        "Question: {question}"
-    )
-
     test_prompts = [
         "What is the square root of 144 plus 15 * 3?",
         "Explain how the CRISPR-Cas9 mechanism cleaves double-stranded DNA.",
@@ -479,34 +471,56 @@ def run_distillation(
         batch_tokens = 0
 
         for accum_idx in range(grad_accum_steps):
-            # 1. Fetch training sample
-            row = next(data_iter)
-            q_txt, r_txt = extract_prompt_response_pair(row)
+            pairs: List[Tuple[str, str]] = []
 
-            # 2. Live Teacher Generation (if mode is live or hybrid)
-            use_live_teacher = (mode == "live") or (mode == "hybrid" and step % 4 == 0)
-            if use_live_teacher and teacher is not None and teacher_tok is not None:
-                try:
-                    formatted_q = prompt_template.format(question=q_txt[:400])
-                    inputs = teacher_tok(formatted_q, return_tensors="pt").to(device)
-                    with torch.no_grad():
-                        out_ids = teacher.generate(
-                            **inputs,
-                            max_new_tokens=min(384, max_target_len),
-                            temperature=0.7,
-                            top_p=0.9,
-                            do_sample=True,
-                            pad_token_id=teacher_tok.pad_token_id,
-                        )
-                    gen_tokens = out_ids[0][inputs.input_ids.shape[1]:]
-                    r_txt = teacher_tok.decode(gen_tokens, skip_special_tokens=True)
-                except Exception as e_gen:
-                    pass  # Fall back to high-quality frontier trajectory in r_txt
+            # Collect micro-batch of items
+            for _ in range(batch_size):
+                row = next(data_iter)
+                q_txt, r_txt = extract_prompt_response_pair(row)
 
-            # 3. Prepare Student Tensors
-            tensors = prepare_distillation_tensors(
-                prompt=q_txt,
-                response=r_txt,
+                # Gemma 2 Live Teacher Generation (if active)
+                use_live = (mode == "live") or (mode == "hybrid" and step % 4 == 0)
+                if use_live and teacher is not None and teacher_tok is not None:
+                    try:
+                        messages = [
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Solve the following question step by step.\n"
+                                    "Enclose your complete deliberative thinking inside <think> and </think> tags.\n"
+                                    "If a tool calculation or execution is required, use <act> tool(args) </act>.\n\n"
+                                    f"Question: {q_txt.strip()[:400]}"
+                                ),
+                            }
+                        ]
+                        if hasattr(teacher_tok, "apply_chat_template"):
+                            try:
+                                formatted_q = teacher_tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                            except Exception:
+                                formatted_q = f"<start_of_turn>user\n{messages[0]['content']}<end_of_turn>\n<start_of_turn>model\n"
+                        else:
+                            formatted_q = f"<start_of_turn>user\n{messages[0]['content']}<end_of_turn>\n<start_of_turn>model\n"
+
+                        inp = teacher_tok(formatted_q, return_tensors="pt").to(device)
+                        with torch.no_grad():
+                            out_ids = teacher.generate(
+                                **inp,
+                                max_new_tokens=min(384, max_target_len),
+                                temperature=0.7,
+                                top_p=0.9,
+                                do_sample=True,
+                                pad_token_id=teacher_tok.pad_token_id or teacher_tok.eos_token_id,
+                            )
+                        gen_tokens = out_ids[0][inp.input_ids.shape[1]:]
+                        r_txt = teacher_tok.decode(gen_tokens, skip_special_tokens=True)
+                    except Exception:
+                        pass  # Fall back to high-quality frontier trajectory
+
+                pairs.append((q_txt, r_txt))
+
+            # Vectorized Batch Preparation
+            pb, tb, wb = prepare_distillation_batch(
+                pairs=pairs,
                 tokenizer=student_tok,
                 max_prompt_len=max_prompt_len,
                 max_target_len=max_target_len,
@@ -514,13 +528,10 @@ def run_distillation(
                 pad_id=student_tok.pad_token_id or 0,
                 device=device,
             )
-            if tensors is None:
-                continue
 
-            pb, tb, wb = tensors
             batch_tokens += int(torch.count_nonzero(tb != -100).item())
 
-            # 4. Student Forward Rollout (Teacher Forcing Next-Token Distillation)
+            # Student Forward Rollout (Teacher Forcing Next-Token Distillation)
             loss, logits = student(
                 prompts=pb,
                 targets=tb,
@@ -528,12 +539,11 @@ def run_distillation(
                 deliberation_mode="teacher_forcing",
             )
 
-            # Scale loss for gradient accumulation
             scaled_loss = loss / grad_accum_steps
             scaled_loss.backward()
             accum_loss += loss.item()
 
-        # 5. Optimizer Step with Dynamic Learning Rate
+        # Optimizer Step with Dynamic Learning Rate
         cur_lr = get_lr(step)
         for pg in optimizer.param_groups:
             pg["lr"] = cur_lr
@@ -614,7 +624,6 @@ def run_distillation(
             with torch.no_grad():
                 try:
                     out_tokens = []
-                    # Autoregressive sampling
                     for _ in range(64):
                         if not out_tokens:
                             tgt_in = torch.tensor([[1]], dtype=torch.long, device=device)
@@ -649,8 +658,8 @@ def run_distillation(
 # ==============================================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Gemma E4B to CerebroSpheroid V5 Small Distillation Engine")
-    parser.add_argument("--teacher", "--teacher-model", dest="teacher_model_id", type=str, default="google/gemma-3-4b-it", help="Teacher model Hugging Face ID (e.g. google/gemma-3-4b-it, google/gemma-2-2b-it)")
+    parser = argparse.ArgumentParser(description="Gemma 2 to CerebroSpheroid V5 Small Distillation Engine")
+    parser.add_argument("--teacher", "--teacher-model", dest="teacher_model_id", type=str, default="google/gemma-2-2b-it", help="Teacher model Hugging Face ID (e.g. google/gemma-2-2b-it, unsloth/gemma-2-2b-it)")
     parser.add_argument("--student", "--student-preset", dest="student_preset", type=str, default="v5_small", help="Student model preset ('v5_small' = 105.9M params)")
     parser.add_argument("--mode", type=str, default="stream", choices=["stream", "live", "hybrid"], help="Distillation mode: 'stream' (high-throughput frontier dataset), 'live' (on-policy generation), 'hybrid'")
     parser.add_argument("--steps", "--total-steps", dest="total_steps", type=int, default=5000, help="Total distillation steps")
