@@ -365,14 +365,6 @@ class AutoTuner:
         if strategy is None:
             strategy = "bisection" if (fast and not is_custom_candidates) else "linear"
 
-        runner_kwargs = {
-            "worst_case_seq_len": worst_case_seq_len,
-            "model_config": model_config,
-            "config_overrides": config_overrides,
-            "num_devices": num_devices or 1,
-            **kwargs,
-        }
-
         obj_enum = TuneObjective.from_str(tune_objective or self.objective)
         obj_name = obj_enum.value
 
@@ -383,6 +375,14 @@ class AutoTuner:
         total_gb = hw["total_gb"]
         sig = hw["hardware_signature"]
         eff_devs = int(num_devices) if num_devices and num_devices > 0 else int(hw.get("device_count", 1))
+
+        runner_kwargs = {
+            "worst_case_seq_len": worst_case_seq_len,
+            "model_config": model_config,
+            "config_overrides": config_overrides,
+            "num_devices": eff_devs,
+            **kwargs,
+        }
         dev_suffix = f"_dev{eff_devs}" if eff_devs > 1 else ""
         seq_suffix = f"_seq{seq_len}" if seq_len != 256 else ""
         cap_suffix = f"_cap{int(max_batch_size)}" if max_batch_size is not None else ""
@@ -423,10 +423,6 @@ class AutoTuner:
         # 1. First Priority: Check cached configs if caching is enabled
         if use_cached_config and not force_tune and candidates is None:
             cached_local = self.cache_manager.load(preset, cache_sig)
-            if cached_local is None and cap_suffix:
-                fallback_local = self.cache_manager.load(preset, f"{sig}{seq_suffix}{dev_suffix}")
-                if fallback_local and _is_cache_safe(fallback_local):
-                    cached_local = fallback_local
             if cached_local is None and cache_sig != sig and max_batch_size is None and eff_devs == 1:
                 fallback_local = self.cache_manager.load(preset, sig)
                 if fallback_local and _is_cache_safe(fallback_local):
