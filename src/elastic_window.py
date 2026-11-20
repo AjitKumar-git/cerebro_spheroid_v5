@@ -108,7 +108,7 @@ def _normalize_3tier_response(r_txt: str, q_txt: str = "") -> str:
     """
     Enforces the 3-Tier Cognitive Output Architecture:
       1. Thinking           : <think> ... </think> -> Private scratchpad deliberation
-      2. Non-Conversational : <act> ... </act>     -> Coding, Calculator, & Tool actions
+      2. Tool Invocations   : <tool_call> ... </tool_call> -> Structured deterministic tool calls
       3. Talking / Answering: Unbounded Plain Text -> Natural human dialogue & explanations
     """
     if not r_txt:
@@ -117,15 +117,21 @@ def _normalize_3tier_response(r_txt: str, q_txt: str = "") -> str:
     r_txt = r_txt.replace("<|begin_of_thought|>", "<think>").replace("<|end_of_thought|>", "</think>")
     r_txt = r_txt.replace("<thought>", "<think>").replace("</thought>", "</think>")
 
+    # Normalize legacy <act> to industry-standard <tool_call>
+    r_txt = r_txt.replace("<act>", "<tool_call>").replace("</act>", "</tool_call>")
+
     # 1. Arithmetic & GSM8K derivations ending in '#### <ans>'
-    # Deterministic tool call goes in <act>, final answer is normal text OUTSIDE <act>
-    if "####" in r_txt and "<act>" not in r_txt:
-        parts = r_txt.split("####", 1)
-        deriv = parts[0].strip()
-        ans_str = parts[1].strip()
-        if not deriv.startswith("<think>"):
-            deriv = f"<think>\n{deriv}\n</think>"
-        return f"{deriv}\n<act> calc({ans_str}) </act>\nAnswer: {ans_str}"
+    # Deterministic tool call goes in <tool_call>, final answer is normal text OUTSIDE <tool_call>
+    if "####" in r_txt and "<tool_call>" not in r_txt:
+        # Avoid treating markdown 4th level headings (#### Header) as GSM8K delimiters
+        m = re.search(r'(?:\s|^)####\s*([-+]?\$?[\d\.,]+(?:\s*[a-zA-Z%]*)?)\s*$', r_txt.strip())
+        if m:
+            parts = r_txt.rsplit("####", 1)
+            deriv = parts[0].strip()
+            ans_str = parts[1].strip()
+            if not deriv.startswith("<think>"):
+                deriv = f"<think>\n{deriv}\n</think>"
+            return f"{deriv}\n<tool_call> calc({ans_str}) </tool_call>\nAnswer: {ans_str}"
 
     return r_txt
 
@@ -247,6 +253,8 @@ def extract_prompt_response_pair(row: Any) -> Tuple[str, str]:
             # Raw corpus content must also bypass chat/math response rewriting.
             prompt = "Document:\n"
             return prompt, raw_t
+        if q_val == "Document:\n":
+            return q_val, str(r_val or "")
         return str(q_val or ""), _normalize_3tier_response(str(r_val or ""), str(q_val or ""))
     return "", ""
     return "", ""
@@ -389,12 +397,12 @@ def _open_hf_stream(
 
 
 def build_online_dataset_iterator(
-    dataset_source: str = "dense_edu",
+    dataset_source: str = "autonomous",
     rank: int = 0,
     world_size: int = 1,
     step_getter: Optional[Any] = None,
     total_steps: int = 1_500_000,
-    inject_retrieval: bool = True,
+    inject_retrieval: bool = False,
     dataset_config: Optional[str] = None,
     dataset_revision: Optional[str] = None,
 ) -> Iterator[Dict[str, Any]]:
@@ -453,7 +461,7 @@ def build_online_dataset_iterator(
                 except StopIteration:
                     break
         return _wrapped()
-    source = (dataset_source or "dense_edu").lower()
+    source = (dataset_source or "autonomous").lower()
     if source in ("fineweb", "fineweb_10bt", "fineweb-10bt"):
         dataset_source = "HuggingFaceFW/fineweb"
         source = dataset_source.lower()
@@ -469,7 +477,9 @@ def build_online_dataset_iterator(
         source = "chat_thinking"
     elif source in ("sft", "instruction_sft", "chat_sft", "alignment", "reasoning_sft", "cot_sft", "think_sft", "r1_sft", "cot", "deepseek_r1", "conversational", "conversational_sft", "layman"):
         source = "conversational_sft"
-    elif source in ("foundation", "auto", "basic", "fineweb_edu"):
+    elif source in ("autonomous", "autonomous_curriculum", "v5_base", "v5_base_curriculum", "v5_curriculum", "curriculum", "pretrain", "pretraining", "smollm", "smollm2", "foundation", "auto", "basic"):
+        source = "autonomous"
+    elif source in ("fineweb_edu",):
         source = "dense_edu"
     elif source in ("reasoning", "beat_smollm", "smollm_pass", "frontier_mix", "tri_pillar"):
         source = "reasoning_anneal"
@@ -477,8 +487,6 @@ def build_online_dataset_iterator(
         source = "conversation_sft"
     elif source in ("balanced_mix", "balanced", "gold"):
         source = "consolidation"
-    elif source in ("autonomous", "autonomous_curriculum", "v5_base", "v5_base_curriculum", "v5_curriculum", "curriculum"):
-        source = "autonomous"
 
     def _next_or_reopen(it: Optional[Iterator[Any]], opener, max_retries: int = 5):
         import time, random
@@ -630,54 +638,96 @@ def build_online_dataset_iterator(
         return _wrap_with_retrieval_injection(_custom_gen())
 
     if source == "autonomous":
-        # Refined 4-Phase Developmental Autonomous Curriculum for CerebroSpheroid V5
-        # Phase 1 (0 -> 15%): World Knowledge, Educational Literacy & Imprinting
-        #   (40% FineWeb-Edu >= 3.0, 25% Cosmopedia v2 Digested, 15% Math/GSM8K, 10% Python Code, 10% Everyday Commonsense)
-        # Phase 2 (15% -> 50%): Broadening, Commonsense Expansion & Algorithmic Grounding
-        #   (30% FineWeb-Edu >= 3.5, 20% Cosmopedia v2 Digested, 25% Math Proofs & CoT, 25% Indented Python)
-        # Phase 3 (50% -> 85%): Balanced Tri-Pillar Reasoning & Deep Deliberation
-        #   (33.3% Science/STEM >= 4.0, 33.3% Multi-Turn Logic/Magpie, 33.3% Math-CoT & Algorithmic Code)
-        # Phase 4 (85% -> 100%): Annealing Basin, Proof Consolidation & 3-Tier Cognitive Alignment
-        #   (30% Verified GSM8K & MetaMath, 30% FineWeb-Edu >= 4.0, 20% Python Code, 20% Magpie Ultra / 3-Tier SFT)
-        know_it: Optional[Iterator[Any]] = None
-        cosmo_it: Optional[Iterator[Any]] = None
-        everyday_it: Optional[Iterator[Any]] = None
-        openhermes_it: Optional[Iterator[Any]] = None
-        logic_it: Optional[Iterator[Any]] = None
+        # SmolLM2 11T Multi-Stage Pretraining Curriculum (arXiv:2502.02737):
+        # Stage 1 (0 -> 55% / 0 - 6T tokens in SmolLM2):
+        #   90% English Web (FineWeb sample-10BT / sample-350BT), 10% Code (StarCoderData / The Stack), 0% Math
+        # Stage 2 (55% -> 73% / 6 - 8T tokens in SmolLM2):
+        #   75% English Web, 20% Code, 5% Math (FineMath / OWM / InfiMM-WebMath)
+        # Stage 3 (73% -> 91% / 8 - 10T tokens in SmolLM2):
+        #   70% English Web, 20% Code, 10% Math
+        # Stage 4 (91% -> 100% / 10 - 11T tokens, Anneal):
+        #   58% English Web, 24% Code, 14% Math, 4% Synthetic Textbooks (Cosmopedia v2)
+        web_it: Optional[Iterator[Any]] = None
         code_it: Optional[Iterator[Any]] = None
-        pycode_it: Optional[Iterator[Any]] = None
-        gsm_it: Optional[Iterator[Any]] = None
         math_it: Optional[Iterator[Any]] = None
-        finemath_it: Optional[Iterator[Any]] = None
+        cosmo_it: Optional[Iterator[Any]] = None
 
         # Load emergency offline backup reserve to prevent worker starvation during network drops
         emergency_offline_pool: List[Dict[str, Any]] = []
         try:
-            local_train_p = os.path.join(REPO_ROOT, "data", "cerebro_v5_custom_dataset", "train.parquet")
-            if os.path.exists(local_train_p):
-                import pyarrow.parquet as pq
-                tbl = pq.read_table(local_train_p)
-                prompts = tbl["prompt"].to_pylist()
-                answers = tbl["answer"].to_pylist()
-                for p_txt, a_txt in zip(prompts[:1000], answers[:1000]):
-                    if p_txt and a_txt:
-                        emergency_offline_pool.append({
-                            "prompt": p_txt,
-                            "text": a_txt,
-                            "answer": a_txt,
-                            "_dataset": "offline_emergency_reserve",
-                        })
+            for cand_parquet in (
+                os.path.join(REPO_ROOT, "data", "cerebro_v5_custom_dataset", "train.parquet"),
+                os.path.join(REPO_ROOT, "data", "cerebro_v5_custom_dataset", "cerebro_v5_train_25k.parquet"),
+            ):
+                if os.path.exists(cand_parquet):
+                    import pyarrow.parquet as pq
+                    tbl = pq.read_table(cand_parquet)
+                    cols = tbl.column_names
+                    text_col = "text" if "text" in cols else ("answer" if "answer" in cols else ("response" if "response" in cols else None))
+                    if text_col:
+                        raw_list = tbl[text_col].to_pylist()
+                        for txt in raw_list[:2000]:
+                            if txt and len(str(txt).strip()) >= 50:
+                                emergency_offline_pool.append({
+                                    "prompt": "Document:\n",
+                                    "text": str(txt).strip(),
+                                    "answer": str(txt).strip(),
+                                    "_dataset": "offline_emergency_reserve",
+                                })
+                    if emergency_offline_pool:
+                        break
         except Exception:
             pass
 
+        def _open_english_web_stream():
+            candidates = [
+                ("HuggingFaceFW/fineweb", "sample-10BT"),
+                ("HuggingFaceFW/fineweb", "sample-350BT"),
+                ("HuggingFaceFW/fineweb", "default"),
+            ]
+            for c_repo, c_cfg in candidates:
+                try:
+                    return _open_hf_stream(c_repo, c_cfg, rank=rank, world_size=world_size)
+                except Exception:
+                    continue
+            return _open_hf_stream("HuggingFaceFW/fineweb", "sample-10BT", rank=rank, world_size=world_size)
+
+        def _open_code_stream():
+            candidates = [
+                ("bigcode/the-stack-dedup", "data/python"),
+                ("HuggingFaceTB/smollm-corpus", "starcoder"),
+                ("ajibawa-2023/Python-Code-Large", None),
+                ("bigcode/the-stack-smol", "data/python"),
+            ]
+            for c_repo, c_cfg in candidates:
+                try:
+                    return _open_hf_stream(c_repo, c_cfg, rank=rank, world_size=world_size)
+                except Exception:
+                    continue
+            return _open_hf_stream("ajibawa-2023/Python-Code-Large", None, rank=rank, world_size=world_size)
+
+        def _open_math_stream():
+            candidates = [
+                ("HuggingFaceTB/finemath", "finemath-4plus"),
+                ("HuggingFaceTB/finemath", "finemath-3plus"),
+                ("Infi-MM/InfiMM-WebMath-40B", None),
+                ("open-web-math/open-web-math", None),
+            ]
+            for c_repo, c_cfg in candidates:
+                try:
+                    return _open_hf_stream(c_repo, c_cfg, rank=rank, world_size=world_size)
+                except Exception:
+                    continue
+            return _open_hf_stream("HuggingFaceTB/finemath", "finemath-4plus", rank=rank, world_size=world_size)
+
         def _open_cosmo_stream():
-            candidate_streams = [
+            candidates = [
                 ("AjitKumar-Bio/cosmopedia-v2-digested", None),
-                ("AjitKumar-Bio/cerebro-spheroid-v5-digested-pretrain", None),
                 ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2"),
                 ("HuggingFaceTB/cosmopedia-v2", "cosmopedia-v2"),
+                ("AjitKumar-Bio/cerebro-spheroid-v5-digested-pretrain", None),
             ]
-            for c_repo, c_cfg in candidate_streams:
+            for c_repo, c_cfg in candidates:
                 try:
                     return _open_hf_stream(c_repo, c_cfg, rank=rank, world_size=world_size)
                 except Exception:
@@ -695,210 +745,103 @@ def build_online_dataset_iterator(
                 val = int(step_getter)
             return val
 
-        def _autonomous_gen():
-            nonlocal know_it, cosmo_it, everyday_it, openhermes_it, logic_it, code_it, pycode_it, gsm_it, math_it, finemath_it
-            turn = 0
+        def _extract_doc_text(row: Any) -> str:
+            if isinstance(row, str):
+                return row
+            if not isinstance(row, dict):
+                return str(row or "")
+            for field in ("text", "content", "code", "body", "doc"):
+                val = row.get(field)
+                if val and isinstance(val, str) and len(val.strip()) >= 30:
+                    return val.strip()
+            p = str(row.get("prompt", "") or "").strip()
+            a = str(row.get("answer", "") or row.get("response", "") or "").strip()
+            if p and a:
+                return f"{p}\n\n{a}".strip()
+            return (a or p or "").strip()
 
-            def _tag_yield(item: Any, ds_tag: str):
-                if isinstance(item, dict):
-                    item["_dataset"] = ds_tag
-                return item
+        def _autonomous_gen():
+            nonlocal web_it, code_it, math_it, cosmo_it
+            turn = 0
 
             while True:
                 raw_step = _get_step_val()
-                # If external step counter is not advancing or unset, progress via internal turn count
                 effective_step = raw_step if raw_step > 0 else turn
                 tau = float(effective_step) / float(max(1, total_steps))
 
                 try:
-                    if tau < 0.15:
-                        # Phase 1: Foundation & Cognitive Imprinting (Cycle mod 10)
-                        # 40% FineWeb-Edu >= 3.0, 25% Cosmopedia v2 Digested, 15% Math, 10% Python Code, 10% Everyday Commonsense
+                    if tau < 0.55:
+                        # Stage 1 (0 -> 55% / 0 - 6T tokens in SmolLM2):
+                        # 90% English Web, 10% Code, 0% Math (Cycle mod 10: 9 Web, 1 Code)
                         mod10 = turn % 10
-                        if mod10 in (0, 2, 4, 6):
-                            row, know_it = _next_filtered_fineweb(
-                                know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size), min_score=3.0
-                            )
-                            yield _tag_yield(row, "fineweb_edu")
-                        elif mod10 in (1, 5):
-                            row, cosmo_it = _next_or_reopen(cosmo_it, _open_cosmo_stream)
-                            p = (row.get("prompt") or "Explain the concept:").strip()
-                            r = (row.get("text") or row.get("answer") or "").strip()
-                            item = {
-                                "prompt": p,
-                                "text": r,
-                                "answer": r,
-                                "tokens": row.get("tokens"),
-                                "target_weights": row.get("target_weights"),
-                                "conversations": [{"from": "human", "value": p}, {"from": "gpt", "value": r}],
-                            }
-                            yield _tag_yield(item, "cosmopedia_digested" if row.get("target_weights") else "cosmopedia")
-                        elif mod10 == 3:
-                            row, everyday_it = _next_or_reopen(
-                                everyday_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "everyday-conversations", rank=rank, world_size=world_size)
-                            )
-                            yield _tag_yield(row, "smoltalk")
-                        elif mod10 in (7, 9):
-                            if (turn // 10) % 2 == 0:
-                                row, finemath_it = _next_or_reopen(
-                                    finemath_it, lambda: _open_hf_stream("HuggingFaceTB/finemath", "finemath-4plus", rank=rank, world_size=world_size)
-                                )
-                            else:
-                                row, math_it = _next_or_reopen(
-                                    math_it, lambda: _open_hf_stream("meta-math/MetaMathQA", rank=rank, world_size=world_size)
-                                )
-                            yield _tag_yield(row, "finemath")
+                        if mod10 < 9:
+                            row, web_it = _next_or_reopen(web_it, _open_english_web_stream)
+                            tag = "english_web"
                         else:
-                            if (turn // 10) % 2 == 0:
-                                row, pycode_it = _next_or_reopen(
-                                    pycode_it, lambda: _open_hf_stream("ajibawa-2023/Python-Code-Large", rank=rank, world_size=world_size)
-                                )
-                            else:
-                                row, code_it = _next_or_reopen(
-                                    code_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct", rank=rank, world_size=world_size)
-                                )
-                            yield _tag_yield(row, "python_code")
+                            row, code_it = _next_or_reopen(code_it, _open_code_stream)
+                            tag = "code"
 
-                    elif tau < 0.50:
-                        # Phase 2: Broadening, Commonsense Expansion & Algorithmic Grounding (Cycle mod 10)
-                        # 30% FineWeb-Edu >= 3.5, 20% Cosmopedia v2 Digested, 25% Math Proofs & CoT, 25% Indented Python
+                    elif tau < 0.73:
+                        # Stage 2 (55% -> 73% / 6 - 8T tokens in SmolLM2):
+                        # 75% English Web, 20% Code, 5% Math (Cycle mod 20: 15 Web, 4 Code, 1 Math)
+                        mod20 = turn % 20
+                        if mod20 < 15:
+                            row, web_it = _next_or_reopen(web_it, _open_english_web_stream)
+                            tag = "english_web"
+                        elif mod20 < 19:
+                            row, code_it = _next_or_reopen(code_it, _open_code_stream)
+                            tag = "code"
+                        else:
+                            row, math_it = _next_or_reopen(math_it, _open_math_stream)
+                            tag = "math"
+
+                    elif tau < 0.91:
+                        # Stage 3 (73% -> 91% / 8 - 10T tokens in SmolLM2):
+                        # 70% English Web, 20% Code, 10% Math (Cycle mod 10: 7 Web, 2 Code, 1 Math)
                         mod10 = turn % 10
-                        if mod10 in (0, 3, 6):
-                            row, know_it = _next_filtered_fineweb(
-                                know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size), min_score=3.5
-                            )
-                            yield _tag_yield(row, "fineweb_edu")
-                        elif mod10 in (1, 5):
-                            row, cosmo_it = _next_or_reopen(cosmo_it, _open_cosmo_stream)
-                            p = (row.get("prompt") or "Explain the concept:").strip()
-                            r = (row.get("text") or row.get("answer") or "").strip()
-                            item = {
-                                "prompt": p,
-                                "text": r,
-                                "answer": r,
-                                "tokens": row.get("tokens"),
-                                "target_weights": row.get("target_weights"),
-                                "conversations": [{"from": "human", "value": p}, {"from": "gpt", "value": r}],
-                            }
-                            yield _tag_yield(item, "cosmopedia_digested" if row.get("target_weights") else "cosmopedia")
-                        elif mod10 in (2, 7):
-                            if (turn // 10) % 2 == 0:
-                                row, pycode_it = _next_or_reopen(
-                                    pycode_it, lambda: _open_hf_stream("ajibawa-2023/Python-Code-Large", rank=rank, world_size=world_size)
-                                )
-                            else:
-                                row, code_it = _next_or_reopen(
-                                    code_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct", rank=rank, world_size=world_size)
-                                )
-                            yield _tag_yield(row, "python_code")
+                        if mod10 < 7:
+                            row, web_it = _next_or_reopen(web_it, _open_english_web_stream)
+                            tag = "english_web"
+                        elif mod10 < 9:
+                            row, code_it = _next_or_reopen(code_it, _open_code_stream)
+                            tag = "code"
                         else:
-                            mod_math = (turn // 10) % 3
-                            if mod_math == 0:
-                                row, finemath_it = _next_or_reopen(
-                                    finemath_it, lambda: _open_hf_stream("HuggingFaceTB/finemath", "finemath-4plus", rank=rank, world_size=world_size)
-                                )
-                            elif mod_math == 1:
-                                row, gsm_it = _next_or_reopen(
-                                    gsm_it, lambda: _open_hf_stream("openai/gsm8k", "main", rank=rank, world_size=world_size)
-                                )
-                            else:
-                                row, math_it = _next_or_reopen(
-                                    math_it, lambda: _open_hf_stream("meta-math/MetaMathQA", rank=rank, world_size=world_size)
-                                )
-                            yield _tag_yield(row, "finemath")
-
-                    elif tau < 0.85:
-                        # Phase 3: Deep Deliberation & 1:1:1 Tri-Pillar Reasoning (Cycle mod 6)
-                        # 33.3% STEM Science >= 4.0, 33.3% Multi-Turn Logic & Commonsense, 33.3% Math-CoT & Indented Code
-                        mod6 = turn % 6
-                        if mod6 in (0, 3):
-                            row, know_it = _next_filtered_fineweb(
-                                know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size), min_score=4.0
-                            )
-                            yield _tag_yield(row, "fineweb_edu")
-                        elif mod6 == 1:
-                            row, everyday_it = _next_or_reopen(
-                                everyday_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "everyday-conversations", rank=rank, world_size=world_size)
-                            )
-                            yield _tag_yield(row, "smoltalk")
-                        elif mod6 == 2:
-                            if (turn // 6) % 2 == 0:
-                                row, pycode_it = _next_or_reopen(
-                                    pycode_it, lambda: _open_hf_stream("ajibawa-2023/Python-Code-Large", rank=rank, world_size=world_size)
-                                )
-                            else:
-                                row, code_it = _next_or_reopen(
-                                    code_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct", rank=rank, world_size=world_size)
-                                )
-                            yield _tag_yield(row, "python_code")
-                        elif mod6 == 4:
-                            mod_math = (turn // 6) % 3
-                            if mod_math == 0:
-                                row, finemath_it = _next_or_reopen(
-                                    finemath_it, lambda: _open_hf_stream("HuggingFaceTB/finemath", "finemath-4plus", rank=rank, world_size=world_size)
-                                )
-                            elif mod_math == 1:
-                                row, gsm_it = _next_or_reopen(
-                                    gsm_it, lambda: _open_hf_stream("openai/gsm8k", "main", rank=rank, world_size=world_size)
-                                )
-                            else:
-                                row, math_it = _next_or_reopen(
-                                    math_it, lambda: _open_hf_stream("meta-math/MetaMathQA", rank=rank, world_size=world_size)
-                                )
-                            yield _tag_yield(row, "finemath")
-                        else:
-                            if (turn // 6) % 2 == 0:
-                                row, openhermes_it = _next_or_reopen(
-                                    openhermes_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "openhermes-100k", rank=rank, world_size=world_size)
-                                )
-                            else:
-                                row, logic_it = _next_or_reopen(
-                                    logic_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "smol-magpie-ultra", rank=rank, world_size=world_size)
-                                )
-                            yield _tag_yield(row, "smoltalk")
+                            row, math_it = _next_or_reopen(math_it, _open_math_stream)
+                            tag = "math"
 
                     else:
-                        # Phase 4: Annealing Basin, Proof Consolidation & 3-Tier Cognitive Alignment (Cycle mod 10)
-                        # 30% Verified GSM8K/FineMath/MetaMath, 30% FineWeb-Edu >= 4.0, 20% Indented Code with Tests, 20% Magpie Ultra Logic
-                        mod10 = turn % 10
-                        if mod10 in (0, 3, 6):
-                            row, know_it = _next_filtered_fineweb(
-                                know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size), min_score=4.0
-                            )
-                            yield _tag_yield(row, "fineweb_edu")
-                        elif mod10 in (1, 4, 7):
-                            mod_math = (turn // 10) % 3
-                            if mod_math == 0:
-                                row, finemath_it = _next_or_reopen(
-                                    finemath_it, lambda: _open_hf_stream("HuggingFaceTB/finemath", "finemath-4plus", rank=rank, world_size=world_size)
-                                )
-                            elif mod_math == 1:
-                                row, gsm_it = _next_or_reopen(
-                                    gsm_it, lambda: _open_hf_stream("openai/gsm8k", "main", rank=rank, world_size=world_size)
-                                )
-                            else:
-                                row, math_it = _next_or_reopen(
-                                    math_it, lambda: _open_hf_stream("meta-math/MetaMathQA", rank=rank, world_size=world_size)
-                                )
-                            yield _tag_yield(row, "finemath")
-                        elif mod10 in (2, 8):
-                            if (turn // 10) % 2 == 0:
-                                row, pycode_it = _next_or_reopen(
-                                    pycode_it, lambda: _open_hf_stream("ajibawa-2023/Python-Code-Large", rank=rank, world_size=world_size)
-                                )
-                            else:
-                                row, code_it = _next_or_reopen(
-                                    code_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct", rank=rank, world_size=world_size)
-                                )
-                            yield _tag_yield(row, "python_code")
-                        else:
-                            row, logic_it = _next_or_reopen(
-                                logic_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "smol-magpie-ultra", rank=rank, world_size=world_size)
-                            )
-                            yield _tag_yield(row, "smoltalk")
+                        # Stage 4 (91% -> 100% / 10 - 11T tokens in SmolLM2, Anneal Phase):
+                        # 58% English Web, 24% Code, 14% Math, 4% Synthetic Textbooks (Cosmopedia v2)
+                        # Cycle mod 50: 29 Web (58%), 12 Code (24%), 7 Math (14%), 2 Cosmopedia (4%)
+                        mod50 = turn % 50
+                        if mod50 < 29:
+                            row, web_it = _next_or_reopen(web_it, _open_english_web_stream)
+                            tag = "english_web"
+                        elif mod50 < 41:  # 29 + 12 = 41
+                            row, code_it = _next_or_reopen(code_it, _open_code_stream)
+                            tag = "code"
+                        elif mod50 < 48:  # 41 + 7 = 48
+                            row, math_it = _next_or_reopen(math_it, _open_math_stream)
+                            tag = "math"
+                        else:  # 48, 49 (2 items = 4%)
+                            row, cosmo_it = _next_or_reopen(cosmo_it, _open_cosmo_stream)
+                            tag = "cosmopedia_v2"
+
+                    doc_text = _extract_doc_text(row)
+                    if not doc_text or len(doc_text.strip()) < 50:
+                        GLOBAL_TELEMETRY.record_rejected(tag, "length_too_short")
+                        turn += 1
+                        continue
+
+                    GLOBAL_TELEMETRY.record_accepted(tag, 0, len(doc_text.split()))
+                    yield {
+                        "prompt": "Document:\n",
+                        "text": doc_text.strip(),
+                        "answer": doc_text.strip(),
+                        "_dataset": tag,
+                    }
 
                 except Exception as stream_exc:
-                    # If online streams fail, immediately draw from local emergency reserve pool without stalling
                     if emergency_offline_pool:
                         import random
                         fallback_sample = random.choice(emergency_offline_pool)
@@ -1336,7 +1279,7 @@ def sample_window(
     rng: Optional[random.Random] = None,
     tail_probability: float = 0.25,
 ) -> Tuple[Optional[int], List[int]]:
-    """Picks the scored slice of one answer and the token heard before it (V4 window algorithm).
+    """Picks the scored slice of one answer and the token heard before it (elastic window algorithm).
 
     Returns `(context_token, scored_tokens)`. The context token is fed to the auditory channel
     at step 0 and never scored, so a mid-answer window is conditioned on real text instead of
@@ -1589,22 +1532,29 @@ class ElasticBucketBatcher:
 
                 ds_name = row.get("_dataset", "corpus") if isinstance(row, dict) else "corpus"
 
-                # Biological Sensory Input Delimiters: <stim> ... </stim>
+                # Format prompt: clean prompt text without non-standard <stim> wrapping
                 try:
                     from src.corpus import format_stimulus_prompt
                     q_txt = format_stimulus_prompt(q_txt)
                 except Exception:
-                    if not q_txt.startswith("<stim>"):
-                        q_txt = f"<stim> {q_txt} </stim>"
+                    q_txt = q_txt.strip()
+                    if q_txt.startswith("<stim>"):
+                        q_txt = q_txt[6:].strip()
+                    if q_txt.endswith("</stim>"):
+                        q_txt = q_txt[:-7].strip()
 
                 # 3-Tier Cognitive Formatting for Response:
-                # 1. If response already contains <act> or <think>, preserve exact structured boundaries.
-                # 2. Tool action output: External tool calls are enclosed in <act> ... </act>.
-                # 3. Conversational dialogue & code generation: Natural fluid plain text outside <act>.
-                r_txt = _normalize_3tier_response(r_txt, q_txt)
-                if "<act>" not in r_txt:
-                    if "calculator" in ds_name.lower():
-                        r_txt = f"<act> calc({r_txt.strip()}) </act>\nAnswer: {r_txt.strip()}"
+                # 1. If response already contains <tool_call> or <think>, preserve exact structured boundaries.
+                # 2. Tool action output: External tool calls are enclosed in <tool_call> ... </tool_call>.
+                # 3. Conversational dialogue & code generation: Natural fluid plain text outside tool calls.
+                if q_txt.startswith("Document:\n") or q_txt == "Document:\n":
+                    # Pure pretraining document: keep 100% loss-bearing, bypass SFT tag injection
+                    pass
+                else:
+                    r_txt = _normalize_3tier_response(r_txt, q_txt)
+                    if "<tool_call>" not in r_txt and "<act>" not in r_txt:
+                        if "calculator" in ds_name.lower():
+                            r_txt = f"<tool_call> calc({r_txt.strip()}) </tool_call>\nAnswer: {r_txt.strip()}"
                 raw_pairs.append((q_txt, r_txt, ds_name))
 
             if not raw_pairs and stream_ended:
@@ -1845,23 +1795,23 @@ def build_canonical_eval_split(
         ],
         "finemath": [
             ("Janet’s ducks lay 16 eggs per day. She eats three for breakfast and bakes four into muffins. She sells the remaining eggs at the market for $2 each. How much does she make each day?",
-             "<think>\nJanet starts with 16 eggs.\nShe eats 3 for breakfast, leaving 16 - 3 = 13 eggs.\nShe bakes 4 into muffins, leaving 13 - 4 = 9 eggs.\nShe sells the remaining 9 eggs at $2 each.\nTotal revenue = 9 * 2 = 18 dollars.\n</think>\n<act>\ncalculator: 16 - 3 - 4 = 9, 9 * 2 = 18\n</act>\n18"),
+             "<think>\nJanet starts with 16 eggs.\nShe eats 3 for breakfast, leaving 16 - 3 = 13 eggs.\nShe bakes 4 into muffins, leaving 13 - 4 = 9 eggs.\nShe sells the remaining 9 eggs at $2 each.\nTotal revenue = 9 * 2 = 18 dollars.\n</think>\n<tool_call>\ncalculator: 16 - 3 - 4 = 9, 9 * 2 = 18\n</tool_call>\n18"),
             ("A train travels 120 miles in 2 hours, stops for 30 minutes, and then travels 150 miles in 2.5 hours. What was its average speed in miles per hour for the entire trip?",
-             "<think>\nFirst segment: distance = 120 miles, time = 2 hours.\nStop: distance = 0 miles, time = 30 minutes = 0.5 hours.\nSecond segment: distance = 150 miles, time = 2.5 hours.\nTotal distance = 120 + 0 + 150 = 270 miles.\nTotal time = 2 + 0.5 + 2.5 = 5.0 hours.\nAverage speed = Total distance / Total time = 270 / 5 = 54 mph.\n</think>\n<act>\ncalculator: (120 + 150) / (2 + 0.5 + 2.5) = 54\n</act>\n54"),
+             "<think>\nFirst segment: distance = 120 miles, time = 2 hours.\nStop: distance = 0 miles, time = 30 minutes = 0.5 hours.\nSecond segment: distance = 150 miles, time = 2.5 hours.\nTotal distance = 120 + 0 + 150 = 270 miles.\nTotal time = 2 + 0.5 + 2.5 = 5.0 hours.\nAverage speed = Total distance / Total time = 270 / 5 = 54 mph.\n</think>\n<tool_call>\ncalculator: (120 + 150) / (2 + 0.5 + 2.5) = 54\n</tool_call>\n54"),
             ("Find all real solutions to the quadratic equation 3x^2 - 12x + 9 = 0 using the quadratic formula.",
-             "<think>\nThe quadratic equation is 3x^2 - 12x + 9 = 0.\nCoefficients are a = 3, b = -12, c = 9.\nThe discriminant Delta is b^2 - 4ac = (-12)^2 - 4(3)(9) = 144 - 108 = 36.\nSince Delta = 36 > 0, there are two distinct real roots.\nRoots are x = (-b +- sqrt(Delta)) / (2a) = (12 +- 6) / 6.\nFor plus: x = (12 + 6) / 6 = 18 / 6 = 3.\nFor minus: x = (12 - 6) / 6 = 6 / 6 = 1.\n</think>\n<act>\ncalculator: (-(-12) + 6)/(2*3) = 3, (-(-12) - 6)/(2*3) = 1\n</act>\nx = 1, x = 3"),
+             "<think>\nThe quadratic equation is 3x^2 - 12x + 9 = 0.\nCoefficients are a = 3, b = -12, c = 9.\nThe discriminant Delta is b^2 - 4ac = (-12)^2 - 4(3)(9) = 144 - 108 = 36.\nSince Delta = 36 > 0, there are two distinct real roots.\nRoots are x = (-b +- sqrt(Delta)) / (2a) = (12 +- 6) / 6.\nFor plus: x = (12 + 6) / 6 = 18 / 6 = 3.\nFor minus: x = (12 - 6) / 6 = 6 / 6 = 1.\n</think>\n<tool_call>\ncalculator: (-(-12) + 6)/(2*3) = 3, (-(-12) - 6)/(2*3) = 1\n</tool_call>\nx = 1, x = 3"),
             ("Calculate the definite integral of f(x) = 4x^3 - 6x + 5 from x = 1 to x = 3.",
-             "<think>\nThe antiderivative F(x) = int (4x^3 - 6x + 5) dx = x^4 - 3x^2 + 5x.\nEvaluate at upper limit x = 3: F(3) = 3^4 - 3(3^2) + 5(3) = 81 - 27 + 15 = 69.\nEvaluate at lower limit x = 1: F(1) = 1^4 - 3(1^2) + 5(1) = 1 - 3 + 5 = 3.\nDefinite integral = F(3) - F(1) = 69 - 3 = 66.\n</think>\n<act>\ncalculator: (81 - 27 + 15) - (1 - 3 + 5) = 66\n</act>\n66"),
+             "<think>\nThe antiderivative F(x) = int (4x^3 - 6x + 5) dx = x^4 - 3x^2 + 5x.\nEvaluate at upper limit x = 3: F(3) = 3^4 - 3(3^2) + 5(3) = 81 - 27 + 15 = 69.\nEvaluate at lower limit x = 1: F(1) = 1^4 - 3(1^2) + 5(1) = 1 - 3 + 5 = 3.\nDefinite integral = F(3) - F(1) = 69 - 3 = 66.\n</think>\n<tool_call>\ncalculator: (81 - 27 + 15) - (1 - 3 + 5) = 66\n</tool_call>\n66"),
         ],
         "python_code": [
             ("Write a Python function to compute the longest increasing subsequence (LIS) of a list in O(n log n) time.",
-             "<act>\nimport bisect\nfrom typing import List\n\ndef longest_increasing_subsequence(nums: List[int]) -> int:\n    \"\"\"Calculates length of the longest strictly increasing subsequence in O(n log n).\"\"\"\n    if not nums:\n        return 0\n    tails: List[int] = []\n    for x in nums:\n        idx = bisect.bisect_left(tails, x)\n        if idx == len(tails):\n            tails.append(x)\n        else:\n            tails[idx] = x\n    return len(tails)\n</act>"),
+             "```python\nimport bisect\nfrom typing import List\n\ndef longest_increasing_subsequence(nums: List[int]) -> int:\n    \"\"\"Calculates length of the longest strictly increasing subsequence in O(n log n).\"\"\"\n    if not nums:\n        return 0\n    tails: List[int] = []\n    for x in nums:\n        idx = bisect.bisect_left(tails, x)\n        if idx == len(tails):\n            tails.append(x)\n        else:\n            tails[idx] = x\n    return len(tails)\n```"),
             ("Implement a thread-safe Least Recently Used (LRU) Cache in Python with get and put methods.",
-             "<act>\nfrom collections import OrderedDict\nimport threading\nfrom typing import Any, Optional\n\nclass LRUCache:\n    \"\"\"Thread-safe O(1) LRU Cache implementation using OrderedDict and threading.Lock.\"\"\"\n    def __init__(self, capacity: int):\n        self.capacity = capacity\n        self.cache: OrderedDict[str, Any] = OrderedDict()\n        self.lock = threading.Lock()\n\n    def get(self, key: str) -> Optional[Any]:\n        with self.lock:\n            if key not in self.cache:\n                return None\n            self.cache.move_to_end(key)\n            return self.cache[key]\n\n    def put(self, key: str, value: Any) -> None:\n        with self.lock:\n            if key in self.cache:\n                self.cache.move_to_end(key)\n            self.cache[key] = value\n            if len(self.cache) > self.capacity:\n                self.cache.popitem(last=False)\n</act>"),
+             "```python\nfrom collections import OrderedDict\nimport threading\nfrom typing import Any, Optional\n\nclass LRUCache:\n    \"\"\"Thread-safe O(1) LRU Cache implementation using OrderedDict and threading.Lock.\"\"\"\n    def __init__(self, capacity: int):\n        self.capacity = capacity\n        self.cache: OrderedDict[str, Any] = OrderedDict()\n        self.lock = threading.Lock()\n\n    def get(self, key: str) -> Optional[Any]:\n        with self.lock:\n            if key not in self.cache:\n                return None\n            self.cache.move_to_end(key)\n            return self.cache[key]\n\n    def put(self, key: str, value: Any) -> None:\n        with self.lock:\n            if key in self.cache:\n                self.cache.move_to_end(key)\n            self.cache[key] = value\n            if len(self.cache) > self.capacity:\n                self.cache.popitem(last=False)\n```"),
             ("Write a Python function to find the maximum subarray sum using Kadane's algorithm.",
-             "<act>\nfrom typing import List\n\ndef max_subarray_sum(nums: List[int]) -> int:\n    \"\"\"Computes maximum contiguous subarray sum in O(n) time and O(1) auxiliary space.\"\"\"\n    if not nums:\n        return 0\n    current_sum = max_sum = nums[0]\n    for val in nums[1:]:\n        current_sum = max(val, current_sum + val)\n        max_sum = max(max_sum, current_sum)\n    return max_sum\n</act>"),
+             "```python\nfrom typing import List\n\ndef max_subarray_sum(nums: List[int]) -> int:\n    \"\"\"Computes maximum contiguous subarray sum in O(n) time and O(1) auxiliary space.\"\"\"\n    if not nums:\n        return 0\n    current_sum = max_sum = nums[0]\n    for val in nums[1:]:\n        current_sum = max(val, current_sum + val)\n        max_sum = max(max_sum, current_sum)\n    return max_sum\n```"),
             ("Implement binary search in Python to return the index of a target in a sorted list or -1 if not found.",
-             "<act>\nfrom typing import List\n\ndef binary_search(arr: List[int], target: int) -> int:\n    \"\"\"Performs O(log n) binary search on sorted array, returning index or -1.\"\"\"\n    low, high = 0, len(arr) - 1\n    while low <= high:\n        mid = (low + high) // 2\n        if arr[mid] == target:\n            return mid\n        elif arr[mid] < target:\n            low = mid + 1\n        else:\n            high = mid - 1\n    return -1\n</act>"),
+             "```python\nfrom typing import List\n\ndef binary_search(arr: List[int], target: int) -> int:\n    \"\"\"Performs O(log n) binary search on sorted array, returning index or -1.\"\"\"\n    low, high = 0, len(arr) - 1\n    while low <= high:\n        mid = (low + high) // 2\n        if arr[mid] == target:\n            return mid\n        elif arr[mid] < target:\n            low = mid + 1\n        else:\n            high = mid - 1\n    return -1\n```"),
         ],
         "smoltalk": [
             ("Hello! Can you help me plan a weekend itinerary for exploring local hiking trails and photography spots?",
@@ -2016,9 +1966,9 @@ def build_canonical_eval_split(
         for q_txt, r_txt in rows[:batch_size]:
             q_fmt = format_stimulus_prompt(q_txt)
             r_fmt = _normalize_3tier_response(r_txt.strip(), q_txt)
-            if "<act>" not in r_fmt:
+            if "<tool_call>" not in r_fmt and "<act>" not in r_fmt:
                 if "calculator" in ds_tag.lower():
-                    r_fmt = f"<act> calc({r_fmt}) </act>\nAnswer: {r_fmt}"
+                    r_fmt = f"<tool_call> calc({r_fmt}) </tool_call>\nAnswer: {r_fmt}"
 
             if hasattr(tokenizer, "encode"):
                 q_ids = encode_no_special(tokenizer, q_fmt, max_length=prompt_len)

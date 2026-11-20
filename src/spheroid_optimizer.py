@@ -478,7 +478,7 @@ def create_spheroid_param_groups(
     wavelet_params = []
     scalar_params = []
 
-    # Recurrent keywords known in CerebroSpheroid models (V4 and V5)
+    # Recurrent keywords known in CerebroSpheroid V5 models
     recurrent_names = {"intra_shell", "reentrant_field", "shortcut_tracts", "w_radial_in", "w_radial_out", "shortcut_weight"}
     lookup_embed_names = ("pos_embed", "phase_embed", "persona_embeddings")
 

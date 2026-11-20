@@ -574,60 +574,75 @@ def build_tokenizer(name: str = "llama"):
     raise RuntimeError("Failed to load LLaMA-32k tokenizer. Ensure data/tokenizer is present.")
 
 
-# Biology-derived enclosed delimiters: <stim> ... </stim> and <act> ... </act>
-BIO_STIM_PREFIX = "<stim> "
-BIO_STIM_SUFFIX = " </stim>"
-BIO_ACT_PREFIX = "<act> "
-BIO_ACT_SUFFIX = " </act>"
+# Industry-standard structured delimiters: <tool_call> ... </tool_call> and <tool_response> ... </tool_response>
+TOOL_CALL_PREFIX = "<tool_call> "
+TOOL_CALL_SUFFIX = " </tool_call>"
+TOOL_RESPONSE_PREFIX = "<tool_response> "
+TOOL_RESPONSE_SUFFIX = " </tool_response>"
+THINK_PREFIX = "<think>\n"
+THINK_SUFFIX = "\n</think>"
+
+# Legacy aliases maintained for graceful backward compatibility during parsing
+BIO_STIM_PREFIX = ""
+BIO_STIM_SUFFIX = ""
+BIO_ACT_PREFIX = TOOL_CALL_PREFIX
+BIO_ACT_SUFFIX = TOOL_CALL_SUFFIX
 
 
 def format_stimulus_prompt(prompt: str) -> str:
-    """Encloses prompt in <stim> ... </stim> delimiters."""
-    p = prompt.strip()
+    """Returns clean prompt without non-standard <stim> wrapping."""
+    p = str(prompt or "").strip()
     if p.startswith("stim "):
         p = p[5:].strip()
-    if not p.startswith("<stim>"):
-        p = f"{BIO_STIM_PREFIX}{p}"
-    if not p.endswith("</stim>"):
-        p = f"{p}{BIO_STIM_SUFFIX}"
+    if p.startswith("<stim>"):
+        p = p[6:].strip()
+    if p.endswith("</stim>"):
+        p = p[:-7].strip()
     return p
 
 
 def format_tool_action(action: str) -> str:
-    """Encloses external tool execution in <act> ... </act> delimiters."""
+    """Encloses external tool execution in industry-standard <tool_call> ... </tool_call> delimiters."""
     a = str(action or "").strip()
     if a.startswith("act "):
         a = a[4:].strip()
-    if not a.startswith("<act>"):
-        a = f"{BIO_ACT_PREFIX}{a}"
-    if not a.endswith("</act>"):
-        a = f"{a}{BIO_ACT_SUFFIX}"
+    if a.startswith("<act>"):
+        a = a[5:].strip()
+    if a.endswith("</act>"):
+        a = a[:-6].strip()
+    if not a.startswith("<tool_call>"):
+        a = f"{TOOL_CALL_PREFIX}{a}"
+    if not a.endswith("</tool_call>"):
+        a = f"{a}{TOOL_CALL_SUFFIX}"
     return a
 
 
 def format_motor_response(answer: str) -> str:
     """
     Formats model response following the 3-Tier Cognitive Output Architecture:
-    1. Tool Calling (<act> ... </act>): Strictly for external tool invocations (calc, python, etc.).
-    2. Normal Output: Kept outside <act> in natural plain text / code blocks.
+    1. Tool Calling (<tool_call> ... </tool_call>): Strictly for external tool invocations (calc, python, etc.).
+    2. Normal Output: Kept outside <tool_call> in natural plain text / code blocks.
     """
     a = str(answer or "").strip()
-    # If already formatted with <act> or <think>, preserve exact structured boundaries
-    if "<act>" in a or "<think>" in a:
+    # If already formatted with <tool_call> or <think>, preserve exact structured boundaries
+    if "<tool_call>" in a or "<think>" in a:
         return a
-    # Only wrap in <act> if it is an explicit tool call instruction (calc:, tool:, etc.)
+    # Migrate any legacy <act> to <tool_call>
+    if "<act>" in a:
+        return a.replace("<act>", "<tool_call>").replace("</act>", "</tool_call>")
+    # Only wrap in <tool_call> if it is an explicit tool call instruction (calc:, tool:, etc.)
     tool_prefixes = ("calc:", "calc(", "calculator:", "python(", "tool:", "sql:")
     if any(a.lower().startswith(p) for p in tool_prefixes):
         return format_tool_action(a)
-    # Normal output stays OUTSIDE <act>
+    # Normal output stays OUTSIDE <tool_call>
     return a
 
 
 def clean_motor_response(text: str, strict: bool = True) -> str:
     """
-    Returns the normal output outside <think> and <act> delimiters.
-    If normal text is present outside <act>, returns that text.
-    If only <act> is present (e.g. pure tool execution), returns the payload inside <act>.
+    Returns the normal output outside <think>, <tool_call>, and legacy <act> delimiters.
+    If normal text is present outside tool calls, returns that text.
+    If only tool call is present (e.g. pure tool execution), returns the payload inside <tool_call>.
     """
     t = str(text or "").strip()
     parsed = parse_model_output(t)
@@ -637,13 +652,15 @@ def clean_motor_response(text: str, strict: bool = True) -> str:
         return parsed["tool_calls"][0]
     if parsed.get("thinking"):
         return parsed["thinking"]
-    m = re.search(r"<act>\s*(.*?)(?:\s*</act>|$)", t, re.DOTALL)
+    m = re.search(r"<(?:tool_call|act)>\s*(.*?)(?:\s*</(?:tool_call|act)>|$)", t, re.DOTALL)
     if m:
         return m.group(1).strip()
-    if t.startswith("<act>"):
-        t = t[5:].strip()
-    if t.endswith("</act>"):
-        t = t[:-6].strip()
+    for tag in ("<tool_call>", "<act>"):
+        if t.startswith(tag):
+            t = t[len(tag):].strip()
+    for end_tag in ("</tool_call>", "</act>"):
+        if t.endswith(end_tag):
+            t = t[:-len(end_tag)].strip()
     return t
 
 
@@ -653,14 +670,14 @@ def extract_strict_act_tokens(
     bio_ids: Optional[Dict[str, Optional[int]]] = None,
 ) -> List[int]:
     """
-    Extracts strictly the token IDs inside the biological delimiters <act> (33) and </act> (34).
-    Discards any tokens prior to <act>, skips the <act> token itself, and truncates
-    immediately upon encountering </act> or EOS.
+    Extracts strictly the token IDs inside tool call delimiters.
+    Discards any tokens prior to tool call, skips the delimiter token itself, and truncates
+    immediately upon encountering end delimiter or EOS.
     """
     if bio_ids is None and tokenizer is not None:
         bio_ids = get_bio_token_ids(tokenizer)
-    act_id = bio_ids.get("act", 33) if bio_ids else 33
-    act_end_id = bio_ids.get("act_end", 34) if bio_ids else 34
+    act_id = bio_ids.get("tool_call") or bio_ids.get("act", 33) if bio_ids else 33
+    act_end_id = bio_ids.get("tool_call_end") or bio_ids.get("act_end", 34) if bio_ids else 34
     eos_id = getattr(tokenizer, "eos_token_id", 2) if tokenizer is not None else 2
 
     stop_ids = {t for t in (eos_id, act_end_id) if t is not None}
@@ -685,12 +702,33 @@ def extract_strict_act_tokens(
     return token_list[start_idx:end_idx]
 
 
+def extract_strict_tool_tokens(
+    tokens: Sequence[int],
+    tokenizer: Any = None,
+    special_ids: Optional[Dict[str, Optional[int]]] = None,
+) -> List[int]:
+    """
+    Extracts strictly the token IDs inside tool call delimiters (<tool_call> / <act>).
+    """
+    return extract_strict_act_tokens(tokens, tokenizer=tokenizer, bio_ids=special_ids)
+
+
+def extract_strict_tool_payload(
+    tokens: Sequence[int],
+    tokenizer: Any,
+) -> str:
+    """
+    Extracts strictly the text payload inside tool call delimiters from token IDs.
+    """
+    return extract_strict_act_payload(tokens, tokenizer)
+
+
 def extract_strict_act_payload(
     tokens: Sequence[int],
     tokenizer: Any,
 ) -> str:
     """
-    Extracts strictly the text payload inside <act> and </act> from a sequence of token IDs.
+    Extracts strictly the text payload inside <tool_call> / <act> from a sequence of token IDs.
     """
     payload_tokens = extract_strict_act_tokens(tokens, tokenizer=tokenizer)
     decoded = tokenizer.decode(payload_tokens, skip_special_tokens=True).strip()
@@ -867,9 +905,13 @@ def encode_no_special(tokenizer, text: str, max_length: Optional[int] = None) ->
     raise TypeError(f"Unsupported tokenizer type: {type(tokenizer)}")
 
 
-def get_bio_token_ids(tokenizer, include_thinking: bool = False) -> Dict[str, Optional[int]]:
-    """Resolve single-token IDs for <stim>, </stim>, <act>, </act> (and optionally <think>, </think>)."""
+def get_special_token_ids(tokenizer, include_thinking: bool = True) -> Dict[str, Optional[int]]:
+    """Resolve single-token IDs for structured cognitive tokens (<tool_call>, <think>, etc.)."""
     tags = {
+        "tool_call": "<tool_call>",
+        "tool_call_end": "</tool_call>",
+        "tool_response": "<tool_response>",
+        "tool_response_end": "</tool_response>",
         "stim": "<stim>",
         "stim_end": "</stim>",
         "act": "<act>",
@@ -892,9 +934,14 @@ def get_bio_token_ids(tokenizer, include_thinking: bool = False) -> Dict[str, Op
     return result
 
 
+def get_bio_token_ids(tokenizer, include_thinking: bool = False) -> Dict[str, Optional[int]]:
+    """Legacy backward-compatible alias for get_special_token_ids."""
+    return get_special_token_ids(tokenizer, include_thinking=include_thinking)
+
+
 def tokenize_pair(tokenizer, prompt: str, answer: str, max_prompt_len: int = 256,
                   max_answer_tokens: int = 512) -> Tuple[List[int], List[int]]:
-    """Tokenises one record using enclosed biological delimiters ('<stim> ... </stim>' / '<act> ... </act>'), appending EOS."""
+    """Tokenises one record using clean standard formatting, appending EOS."""
     formatted_prompt = format_stimulus_prompt(prompt)
     prompt_ids = encode_no_special(tokenizer, formatted_prompt, max_length=max_prompt_len)
 

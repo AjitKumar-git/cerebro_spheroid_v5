@@ -1,0 +1,17 @@
+body_name,body_type,mass_kg_sci,radius_km,gravity_m_s2,distance_sun_10e6_km,orbital_period_days,moons_count
+Sun,Star,1.989e30,696340.0,274.0,0.0,0.0,8
+Mercury,Terrestrial Planet,3.301e23,2439.7,3.7,57.9,87.97,0
+Venus,Terrestrial Planet,4.867e24,6051.8,8.87,108.2,224.7,0
+Earth,Terrestrial Planet,5.972e24,6371.0,9.807,149.6,365.25,1
+Moon,Moon,7.342e22,1737.4,1.62,149.6,27.32,0
+Mars,Terrestrial Planet,6.417e23,3389.5,3.721,227.9,686.98,2
+Jupiter,Gas Giant,1.898e27,69911.0,24.79,778.6,4332.59,95
+Saturn,Gas Giant,5.683e26,58232.0,10.44,1433.5,10759.22,146
+Uranus,Ice Giant,8.681e25,25362.0,8.69,2872.5,30685.4,28
+Neptune,Ice Giant,1.024e26,24622.0,11.15,4495.1,60189.0,16
+Pluto,Dwarf Planet,1.303e22,1188.3,0.62,5906.4,90560.0,5
+Ceres,Dwarf Planet,9.393e20,473.0,0.27,413.7,1682.0,0
+Titan,Moon,1.345e23,2574.7,1.352,1433.5,15.95,0
+Europa,Moon,4.800e22,1560.8,1.315,778.6,3.55,0
+Ganymede,Moon,1.482e23,2634.1,1.428,778.6,7.15,0
+Enceladus,Moon,1.080e20,252.1,0.113,1433.5,1.37,0

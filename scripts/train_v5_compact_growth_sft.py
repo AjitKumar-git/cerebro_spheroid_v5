@@ -287,7 +287,7 @@ def evaluate_val_loss(model, val_entries, device, sampling_p=0.5, max_eval_batch
             max_p = max(len(e["prompt_ids"]) for e in batch)
             max_t = max(len(e["target_ids"]) for e in batch)
             p_t = torch.zeros((len(batch), max_p), dtype=torch.long, device=device)
-            t_t = torch.zeros((len(batch), max_t), dtype=torch.long, device=device)
+            t_t = torch.full((len(batch), max_t), -100, dtype=torch.long, device=device)
             for b_idx, e in enumerate(batch):
                 p_t[b_idx, : len(e["prompt_ids"])] = torch.tensor(e["prompt_ids"], dtype=torch.long, device=device)
                 t_t[b_idx, : len(e["target_ids"])] = torch.tensor(e["target_ids"], dtype=torch.long, device=device)
@@ -411,7 +411,7 @@ def run_growth_and_sft(
         max_p = max(len(e["prompt_ids"]) for e in batch)
         max_t = max(len(e["target_ids"]) for e in batch)
         p_t = torch.zeros((len(batch), max_p), dtype=torch.long, device=device)
-        t_t = torch.zeros((len(batch), max_t), dtype=torch.long, device=device)
+        t_t = torch.full((len(batch), max_t), -100, dtype=torch.long, device=device)
         for b_idx, e in enumerate(batch):
             p_t[b_idx, : len(e["prompt_ids"])] = torch.tensor(e["prompt_ids"], dtype=torch.long, device=device)
             t_t[b_idx, : len(e["target_ids"])] = torch.tensor(e["target_ids"], dtype=torch.long, device=device)

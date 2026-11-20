@@ -1,29 +1,11 @@
 {
-  "bos_token": {
-    "content": "<s>",
-    "lstrip": false,
-    "normalized": true,
-    "rstrip": false,
-    "single_word": false
-  },
-  "eos_token": {
-    "content": "</s>",
-    "lstrip": false,
-    "normalized": true,
-    "rstrip": false,
-    "single_word": false
-  },
-  "unk_token": {
-    "content": "<unk>",
-    "lstrip": false,
-    "normalized": true,
-    "rstrip": false,
-    "single_word": false
-  },
+  "bos_token": "<s>",
+  "eos_token": "</s>",
+  "unk_token": "<unk>",
   "additional_special_tokens": [
-    "<stim>",
-    "</stim>",
-    "<act>",
-    "</act>"
+    "<tool_call>",
+    "</tool_call>",
+    "<tool_response>",
+    "</tool_response>"
   ]
 }

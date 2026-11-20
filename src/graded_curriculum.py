@@ -178,10 +178,13 @@ class GradedCurriculumStreamer:
         else:
             self.online_streaming = online_streaming
 
-        self.search_dirs = search_dirs or [
-            "data",
-            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data"),
-        ]
+        if search_dirs is not None:
+            self.search_dirs = list(search_dirs)
+        else:
+            self.search_dirs = [
+                "data",
+                os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data"),
+            ]
         self._dataset_files = self._locate_local_datasets()
         self._local_pools: Dict[str, List[Tuple[str, str]]] = {}
         self._local_cursors: Dict[str, int] = {}
@@ -411,7 +414,7 @@ class GradedCurriculumStreamer:
             if f in seen_files:
                 continue
             seen_files.add(f)
-            pairs.extend(self._stream_parquet_samples(f))
+            pairs.extend(self._stream_parquet_samples(f, max_samples=2000))
         if not pairs:
             return []
         self.rng.shuffle(pairs)
@@ -698,7 +701,7 @@ class GradedCurriculumStreamer:
         buckets: Optional[List[Tuple[str, int, int]]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], CurriculumPhase, str]:
         """
-        V4-style Strategy-A Elastic / Static Sliding Context Window batcher with teacher feedback.
+        Strategy-A Elastic / Static Sliding Context Window batcher with teacher feedback.
         Pass explicit `buckets=[("static", prompt_len, seq_len)]` for exact TPU sequence parity.
         """
         B = batch_size or self.config.batch_size

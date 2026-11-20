@@ -21,7 +21,6 @@ and Periodic Consolidation Annealing (100 steps every 1,000 steps):
   3. Full Backup & Cloud Synchronization:
      - Local checkpoints: v5_compact_pretrain_latest.pt & _best.pt
      - Background Cloud Sync: bioflo.in live push (push_checkpoint_async)
-     - Google Drive auto-mirror if mounted (/content/drive)
 """
 
 import os
@@ -629,17 +628,6 @@ def run_pretraining(
                     except Exception as e:
                         print(f"  ⚠️ Cloud sync notice: {e}")
 
-                # 4. Google Drive Backup (if mounted)
-                gdrive_dir = "/content/drive/MyDrive/cerebro_checkpoints"
-                if os.path.exists("/content/drive"):
-                    try:
-                        os.makedirs(gdrive_dir, exist_ok=True)
-                        shutil.copy(latest_ckpt_path, os.path.join(gdrive_dir, "v5_compact_pretrain_latest.pt"))
-                        if is_best:
-                            shutil.copy(best_ckpt_path, os.path.join(gdrive_dir, "v5_compact_pretrain_best.pt"))
-                        print("  💾 Checkpoint backed up to Google Drive.")
-                    except Exception as ge:
-                        print(f"  ⚠️ Google Drive backup notice: {ge}")
 
                 # 5. Live Linguistic Probe
                 model.eval()

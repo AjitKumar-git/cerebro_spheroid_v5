@@ -1,0 +1,22 @@
+from_unit,to_unit,multiplier,category,formula
+meter,foot,3.28084,Length,feet = meters * 3.28084
+foot,meter,0.3048,Length,meters = feet * 0.3048
+inch,centimeter,2.54,Length,cm = inches * 2.54
+mile,kilometer,1.60934,Length,km = miles * 1.60934
+kilometer,mile,0.621371,Length,miles = km * 0.621371
+kilogram,pound,2.20462,Mass,lbs = kg * 2.20462
+pound,kilogram,0.453592,Mass,kg = lbs * 0.453592
+ounce,gram,28.3495,Mass,grams = oz * 28.3495
+gram,ounce,0.035274,Mass,oz = grams * 0.035274
+bar,pascal,100000.0,Pressure,Pa = bar * 100000
+pascal,bar,1e-05,Pressure,bar = Pa * 1e-5
+atmosphere,pascal,101325.0,Pressure,Pa = atm * 101325
+psi,pascal,6894.76,Pressure,Pa = psi * 6894.76
+joule,calorie,0.239006,Energy,cal = J * 0.239006
+calorie,joule,4.184,Energy,J = cal * 4.184
+kilowatt_hour,joule,3600000.0,Energy,J = kWh * 3.6e6
+electron_volt,joule,1.602176634e-19,Energy,J = eV * 1.602176634e-19
+liter,cubic_meter,0.001,Volume,m^3 = L * 0.001
+gallon_us,liter,3.78541,Volume,L = gal * 3.78541
+horsepower,watt,745.7,Power,W = hp * 745.7
+watt,horsepower,0.00134102,Power,hp = W * 0.00134102

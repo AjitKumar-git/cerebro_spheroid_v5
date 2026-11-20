@@ -83,7 +83,7 @@ def test_reasoning_prompt_header_preservation_across_continuation_slices():
     assert t_batch.shape == (1, 64)
 
     # The prompt batch in continuation slices preserves the question header tokens!
-    q_tokens = tok.encode(f"<stim> {question} </stim>")
+    q_tokens = tok.encode(question)
     expected_header = q_tokens[:min(len(q_tokens), 32 // 3)]
     for h_tok in expected_header[:3]:
         assert h_tok in p_batch[0], "Prompt header tokens must be preserved in sliced reasoning slices!"

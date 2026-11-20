@@ -63,6 +63,8 @@ class ModelConfigV5:
     audio_dim: int = 512                   # Acoustic / Audio frame dimension
     num_visual_patches: int = 16           # Default visual tokens per perceptual stimulus
     image_patch_size: int = 16             # Pixel patch size (16x16)
+    tool_token_id: Optional[int] = None    # Token ID for tool execution trigger (optional)
+    act_token_id: Optional[int] = None     # Backward-compatible alias for tool_token_id
 
 
 PRESETS_V5: Dict[str, Dict[str, Any]] = {
@@ -863,7 +865,7 @@ class PremotorMotorDecoderV5(nn.Module):
             self.efference_proj = nn.Linear(surface_dim, surface_dim, bias=False)
             plan_in_dim = surface_dim * 2
         else:
-            # Untied head mode (1:1 V4 architectural parity for exact weight salvaging)
+            # Untied head mode (standalone output projection)
             self.fc_gate = nn.Linear(fused_dim, surface_dim * 2, bias=False)
             self.fc_val = nn.Linear(fused_dim, surface_dim * 2, bias=False)
             self.norm_mid = RMSNorm(surface_dim * 2)
@@ -2020,17 +2022,18 @@ class CerebroSpheroidV5(nn.Module):
                     ignore_index=-100,
                 )
 
-            # Anti-Premature <act> Unlikelihood Penalty: penalizes token 33 (<act>) whenever target is NOT <act>
+            # Anti-Premature Tool Unlikelihood Penalty: penalizes tool token if explicitly configured
             if suppress_premature_act and t_len > 0:
-                act_id = getattr(self.config, "act_token_id", 33)
-                non_act_mask = (tgt_slice >= 0) & (tgt_slice != -100) & (tgt_slice != act_id)
-                if non_act_mask.any():
-                    log_probs = F.log_softmax(logits_stacked.float(), dim=-1)
-                    act_log_prob = log_probs[:, :, act_id]
-                    act_prob = torch.exp(act_log_prob)
-                    act_unlikelihood = -torch.log(torch.clamp(1.0 - act_prob, min=1e-5))
-                    act_penalty = (act_unlikelihood * non_act_mask.float()).sum() / torch.clamp(non_act_mask.float().sum(), min=1.0)
-                    loss = loss + act_penalty_weight * act_penalty
+                act_id = getattr(self.config, "tool_token_id", None) or getattr(self.config, "act_token_id", None)
+                if act_id is not None:
+                    non_act_mask = (tgt_slice >= 0) & (tgt_slice != -100) & (tgt_slice != act_id)
+                    if non_act_mask.any():
+                        log_probs = F.log_softmax(logits_stacked.float(), dim=-1)
+                        act_log_prob = log_probs[:, :, act_id]
+                        act_prob = torch.exp(act_log_prob)
+                        act_unlikelihood = -torch.log(torch.clamp(1.0 - act_prob, min=1e-5))
+                        act_penalty = (act_unlikelihood * non_act_mask.float()).sum() / torch.clamp(non_act_mask.float().sum(), min=1.0)
+                        loss = loss + act_penalty_weight * act_penalty
 
             # Auxiliary predictive coding thought alignment loss
             if deliberation_mode == "predictive_coding" and t_len > 1 and pred_loss_total.item() > 0:
@@ -2326,7 +2329,7 @@ class CerebroSpheroidV5(nn.Module):
         Generates text using the 3-tier cognitive output protocol:
           1. Thinking   : <think> ... </think> -> Private scratchpad (hidden or collapsed)
           2. Talking    : Unbounded plain text to EOS -> Fluid zero-overhead answering
-          3. Tool Action: <act> ... </act> -> Structured external tool execution boundary
+          3. Tool Action: <tool_call> ... </tool_call> -> Structured external tool execution boundary
         """
         from src.corpus import (
             format_stimulus_prompt,
@@ -2346,14 +2349,13 @@ class CerebroSpheroidV5(nn.Module):
         bio_ids = get_bio_token_ids(tokenizer)
         raw_eos = getattr(tokenizer, "eos_token_id", 2)
         eos_id = int(raw_eos) if raw_eos is not None else 2
-        seed_id = seed_token_id  # Unbiased generation: do not force <act> by default
+        seed_id = seed_token_id  # Unbiased generation: do not force tool call by default
 
-        # Dynamic Stopping Criteria: EOS and stimulus restart </stim>
+        # Dynamic Stopping Criteria: EOS and optional end delimiters
         stop_list = [eos_id]
-        if strict_act and bio_ids.get("act_end") is not None:
-            stop_list.append(bio_ids.get("act_end"))
-        if bio_ids.get("stim") is not None:
-            stop_list.append(bio_ids.get("stim"))
+        if strict_act and (bio_ids.get("tool_call_end") is not None or bio_ids.get("act_end") is not None):
+            end_t = bio_ids.get("tool_call_end") or bio_ids.get("act_end")
+            stop_list.append(end_t)
 
         stop_ids = tuple(s for s in stop_list if s is not None)
 
@@ -2383,8 +2385,8 @@ class CerebroSpheroidV5(nn.Module):
                 break
 
         decoded = tokenizer.decode(seq, skip_special_tokens=False)
-        # Check text-level stops: ChatML <|im_end|>, </stim>, </s>
-        for stop_str in ("<|im_end|>", "</stim>", "</s>"):
+        # Check text-level stops: ChatML <|im_end|>, </s>
+        for stop_str in ("<|im_end|>", "</s>"):
             if stop_str in decoded:
                 decoded = decoded.split(stop_str)[0]
 
@@ -2453,7 +2455,7 @@ class CerebroSpheroidV5(nn.Module):
         tool_res = step1.get("tool_result") or execute_agentic_tool(tool_call)
 
         # Closed-loop stimulus continuation
-        feedback_prompt = f"{prompt.strip()}\n<act> {tool_call} </act>\nObservation: {tool_res}\nAnswer:"
+        feedback_prompt = f"{prompt.strip()}\n<tool_call> {tool_call} </tool_call>\n<tool_response> {tool_res} </tool_response>\nAnswer:"
         step2 = self.generate_text(
             prompt=feedback_prompt,
             tokenizer=tokenizer,

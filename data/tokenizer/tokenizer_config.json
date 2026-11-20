@@ -32,9 +32,9 @@
     "single_word": false
   },
   "additional_special_tokens": [
-    "<stim>",
-    "</stim>",
-    "<act>",
-    "</act>"
+    "<tool_call>",
+    "</tool_call>",
+    "<tool_response>",
+    "</tool_response>"
   ]
 }

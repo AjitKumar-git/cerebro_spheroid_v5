@@ -9,11 +9,11 @@ Automatically handles:
   2. Hugging Face Hub authentication (eliminates 429 rate limits)
   3. Bioflo.in cloud synchronization token setup
   4. Repository synchronization to latest origin/main
-  5. Checkpoint directory resolution (mirrored to Google Drive if mounted)
+  5. Checkpoint directory resolution (local scratch storage, zero Google Drive dependency)
   6. Autonomous resumption from highest step milestone or remote latest.pt
-  7. Cognitive Reasoning & Tool-Calling Dataset Training:
-     (AjitKumar-Bio/cerebro-spheroid-v5-frontier-reasoning-tools-100k / data/frontier_100k)
-     with full deliberative reasoning (<think> ... </think>) and tool dispatches (<act> ... </act>)
+  7. Pure 100% Loss-Bearing Contiguous Pretraining:
+     (85% FineWeb sample-10BT broad web + 15% Code The Stack v2 / Python code)
+     with contiguous unbroken sequence blocks and next-token supervision
   8. Option A lightweight cloud sync (~229 MB weights-only, 2.9s non-blocking upload)
 """
 
@@ -100,14 +100,9 @@ def setup_colab_environment():
         except Exception:
             pass
 
-    # 5. Resolve Persistent Checkpoint Directory
-    drive_dir = "/content/drive/MyDrive/cerebro_checkpoints/v5_small_scratch"
-    local_dir = "/content/checkpoints/v5_small_scratch"
-    if os.path.exists("/content/drive/MyDrive"):
-        ckpt_dir = drive_dir
-        print(f"📁 Checkpoint Destination: Google Drive Persistent Storage ({ckpt_dir})")
-    elif os.path.exists("/content"):
-        ckpt_dir = local_dir
+    # 5. Resolve Local Checkpoint Directory (Zero Google Drive dependency, synced directly to bioflo.in)
+    if os.path.exists("/content"):
+        ckpt_dir = "/content/checkpoints/v5_small_scratch"
         print(f"📁 Checkpoint Destination: Colab Scratch Storage ({ckpt_dir})")
     else:
         ckpt_dir = os.path.join(REPO_ROOT, "checkpoints", "v5_small_scratch")
@@ -133,8 +128,8 @@ def main():
         force_tune=False,                      # Bypasses micro-benchmarks; adopts verified config
         effective_batch_size=16,               # Effective batch size
         target_tokens=15_700_000_000,          # 15.70 Billion Tokens target budget
-        dataset_source=os.environ.get("DATASET_SOURCE", "dataset"),  # Training directly from Frontier 100k Reasoning & Tool Dataset (HF / local)
-        elastic_window=True,                   # Elastic Context Window with deliberative prompt/response packing
+        dataset_source=os.environ.get("DATASET_SOURCE", "pretrain"),  # Pure Contiguous Pretraining (85% FineWeb 10BT + 15% The Stack v2 Code)
+        elastic_window=False,                  # Pure contiguous 100% loss-bearing sequences (zero prompt masking)
         thinking_cycles=8,                     # 8 deliberation cycles per token
         min_context_window=512,                # Stage 0: 512 tokens
         context_stage_steps=100_000,           # Curriculum stages: 512, 1024, 2048, 4096 (100k steps/stage)

@@ -1451,7 +1451,7 @@ def generate_text_jax(
     Generates text using the 3-tier cognitive protocol in JAX:
       1. Thinking   : <think> ... </think> -> Private scratchpad
       2. Talking    : Unbounded plain text to EOS -> Fluid zero-overhead answering
-      3. Tool Action: <act> ... </act> -> Structured external tool execution boundary
+      3. Tool Action: <tool_call> ... </tool_call> -> Structured external tool execution boundary
     """
     from src.corpus import (
         format_stimulus_prompt,
@@ -1463,7 +1463,7 @@ def generate_text_jax(
     )
 
     bio_ids = get_bio_token_ids(tokenizer)
-    seed = seed_token_id  # Unbiased generation: do not force <act> by default
+    seed = seed_token_id  # Unbiased generation: do not force tool call by default
 
     formatted_prompt = format_stimulus_prompt(prompt)
     prompt_ids = encode_no_special(tokenizer, formatted_prompt)
@@ -1505,8 +1505,8 @@ def generate_text_jax(
         return extract_strict_act_payload(token_ids, tokenizer)
 
     decoded = tokenizer.decode(token_ids, skip_special_tokens=False)
-    # Check text-level stops: ChatML <|im_end|>, </stim>, </s>
-    for stop_str in ("<|im_end|>", "</stim>", "</s>"):
+    # Check text-level stops: ChatML <|im_end|>, </s>
+    for stop_str in ("<|im_end|>", "</s>"):
         if stop_str in decoded:
             decoded = decoded.split(stop_str)[0]
 

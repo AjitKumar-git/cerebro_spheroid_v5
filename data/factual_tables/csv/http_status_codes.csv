@@ -1,0 +1,36 @@
+code,name,category,description
+100,Continue,Informational,"Initial part of a request received, client should continue with request."
+101,Switching Protocols,Informational,Server agreed to switch protocols according to Upgrade header.
+102,Processing,Informational,"Server has received and is processing the request, but no response is available yet."
+103,Early Hints,Informational,"Returns headers before rest of response, allowing client to preload resources."
+200,OK,Success,Standard response for successful HTTP requests.
+201,Created,Success,"Request fulfilled, resulting in the creation of a new resource."
+202,Accepted,Success,"Request accepted for processing, but processing has not been completed."
+204,No Content,Success,"Server successfully processed request, but is not returning any content."
+206,Partial Content,Success,Server is delivering only part of resource due to Range header sent by client.
+301,Moved Permanently,Redirection,Target resource has been assigned a new permanent URI.
+302,Found,Redirection,Target resource resides temporarily under a different URI.
+303,See Other,Redirection,Response can be found under another URI using the GET method.
+304,Not Modified,Redirection,Indicates resource has not been modified since version specified in If-Modified-Since.
+307,Temporary Redirect,Redirection,Target resource resides temporarily under different URI; method must not change.
+308,Permanent Redirect,Redirection,Target resource has been assigned new permanent URI; method must not change.
+400,Bad Request,Client Error,Server cannot process request due to client error or malformed syntax.
+401,Unauthorized,Client Error,Authentication is required and has failed or has not yet been provided.
+402,Payment Required,Client Error,Reserved for digital payment systems; occasionally used for quota paywalls.
+403,Forbidden,Client Error,Server understood request but refuses to authorize it; credentials lack permissions.
+404,Not Found,Client Error,Server cannot find the requested resource.
+405,Method Not Allowed,Client Error,HTTP method is known by server but not supported for target resource.
+408,Request Timeout,Client Error,Server timed out waiting for client request.
+409,Conflict,Client Error,"Request conflicts with current state of target resource (e.g., edit conflict)."
+410,Gone,Client Error,Target resource is no longer available at origin server and no forwarding address is known.
+413,Payload Too Large,Client Error,Request entity is larger than limits defined by server.
+415,Unsupported Media Type,Client Error,Payload format is in unsupported format for requested endpoint.
+418,I'm a teapot,Client Error,April Fools joke RFC 2324; returned when attempting to brew coffee on a teapot.
+422,Unprocessable Entity,Client Error,"Request syntax was well-formed, but semantic instructions could not be followed."
+429,Too Many Requests,Client Error,User has sent too many requests in a given amount of time (rate limited).
+500,Internal Server Error,Server Error,Generic error message when an unexpected condition was encountered on server.
+501,Not Implemented,Server Error,"Server does not recognize request method, or lacks ability to fulfil it."
+502,Bad Gateway,Server Error,Server acting as gateway/proxy received invalid response from inbound server.
+503,Service Unavailable,Server Error,Server is currently unable to handle request due to temporary overload/maintenance.
+504,Gateway Timeout,Server Error,Server acting as gateway/proxy did not receive timely response from upstream server.
+505,HTTP Version Not Supported,Server Error,Server does not support HTTP protocol version used in request.

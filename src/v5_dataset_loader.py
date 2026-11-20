@@ -8,7 +8,7 @@ automated Token-Level Answer-Anchor Loss Weighting (AALW).
 Weights:
   - Thinking scratchpad tokens (<think> ... </think>): 1.0x
   - Deliberation boundary closing tag (</think>):      2.0x
-  - Tool action payload tokens (<act> ... </act>):     3.5x
+  - Tool action payload tokens (<tool_call> ... </tool_call>): 3.5x
   - Plain-text answer & anchor tokens:                 4.5x
 """
 
@@ -111,12 +111,12 @@ class CerebroV5Dataset(Dataset):
         else:
             # Mark boundaries in output string
             # Level 1/2: <think> ... </think> {answer}
-            # Level 3:   <think> ... </think> <act> ... </act> {answer}
+            # Level 3:   <think> ... </think> <tool_call> ... </tool_call> {answer}
             # Fast substring token locator
             out_str = o_raw
             think_end_str = "</think>"
-            act_start_str = "<act>"
-            act_end_str = "</act>"
+            act_start_str = "<tool_call>" if "<tool_call>" in out_str else "<act>"
+            act_end_str = "</tool_call>" if "</tool_call>" in out_str else "</act>"
 
             pos_think_end = out_str.find(think_end_str)
             pos_act_end = out_str.find(act_end_str)
@@ -152,14 +152,23 @@ class CerebroV5Dataset(Dataset):
         }
 
 
-def collate_cerebro_v5_batch(batch: List[Dict[str, Any]], pad_id: int = 0) -> Dict[str, torch.Tensor]:
-    """Collates variable-length tokenized pairs into right-padded batch tensors."""
+def collate_cerebro_v5_batch(
+    batch: List[Dict[str, Any]],
+    pad_id: int = 0,
+    target_pad_id: int = -100,
+) -> Dict[str, torch.Tensor]:
+    """Collates variable-length tokenized pairs into right-padded batch tensors.
+    
+    Target padding is strictly set to target_pad_id (-100) so that F.cross_entropy
+    (which ignores -100) never computes loss on padded positions or trains the model
+    to predict Token 0 (<unk>).
+    """
     max_p = max(len(b["prompt_ids"]) for b in batch)
     max_t = max(len(b["target_ids"]) for b in batch)
     bsz = len(batch)
 
     prompts = torch.full((bsz, max_p), pad_id, dtype=torch.long)
-    targets = torch.full((bsz, max_t), pad_id, dtype=torch.long)
+    targets = torch.full((bsz, max_t), target_pad_id, dtype=torch.long)
     weights = torch.zeros((bsz, max_t), dtype=torch.float32)
     levels = torch.tensor([b["thinking_level"] for b in batch], dtype=torch.long)
 

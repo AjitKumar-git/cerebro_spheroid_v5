@@ -198,7 +198,7 @@ def parse_args(args_list: Optional[Sequence[str]] = None):
     parser.add_argument("--offline", action="store_true", help="Force offline mode using local datasets & cache")
     parser.add_argument("--elastic-window", action=argparse.BooleanOptionalAction, default=False, help="Enable multi-bucket elastic sliding window instead of static TPU (256, 512) shape")
     parser.add_argument("--total-window", type=int, default=768, help="Total sequence budget (prompt + response) for elastic window")
-    parser.add_argument("--tail-prob", type=float, default=0.25, help="V4 tail probability for EOS representation in window sampling")
+    parser.add_argument("--tail-prob", type=float, default=0.25, help="Tail probability for EOS representation in window sampling")
     parser.add_argument("--num-mtp-heads", "--num_mtp_heads", dest="num_mtp_heads", type=int, default=1, choices=[1, 2, 3, 4], help="Multi-Token Prediction heads (1: standard single-token emission; 2 or 3: speculative decoding & future-token predictive training)")
     parser.add_argument("--persona-id", "--persona_id", dest="persona_id", type=int, default=None, choices=[0, 1, 2, 3], help="Cognitive Persona Steering basis (None: unbiased representation; 0: Reasoner, 1: Explorer, 2: Concise, 3: Verifier)")
     parser.add_argument("--use-adaptive-thinking", "--use_adaptive_thinking", dest="use_adaptive_thinking", action=argparse.BooleanOptionalAction, default=True, help="Toggle dynamic subconscious deliberation halting gate (True: adaptive thinking up to max cycles; False: fast fixed cycles)")

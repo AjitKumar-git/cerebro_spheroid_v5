@@ -382,28 +382,11 @@ class RectifiedContiguousPretrainStreamer:
 
         if target_shares is not None:
             self.shares = target_shares
-        elif self.stage == "pretrain":
-            # Stage 1: Full broad web + code ingestion (~15B+ tokens)
+        else:
+            # Stage 1 Pure Pretraining: Full broad web + code ingestion (~15B+ tokens)
             self.shares = {
                 "broad_web": 0.85,      # HuggingFaceFW/fineweb (sample-10BT)
-                "code": 0.15,           # Indented Python software repos
-            }
-        elif self.stage == "midtrain":
-            # Stage 2: Targeted skills, mathematics, and 4k associative retrieval
-            self.shares = {
-                "edu_academic": 0.45,   # FineWeb-Edu (score > min_edu_score)
-                "math": 0.25,           # FineMath / OpenWebMath
-                "code": 0.15,           # Algorithmic code & proofs
-                "retrieval": 0.15,      # 4k multi-position key-value retrieval
-            }
-        else:
-            # All-in-one balanced mixture
-            self.shares = {
-                "broad_web": 0.70,
-                "edu_academic": 0.15,
-                "code": 0.07,
-                "math": 0.05,
-                "retrieval": 0.03,
+                "code": 0.15,           # Indented Python software repos (The Stack v2)
             }
         self.quota_mgr = TokenQuotaManager(self.shares)
         self.batch_queue: queue.Queue = queue.Queue(maxsize=queue_size)
@@ -582,13 +565,11 @@ class RectifiedContiguousPretrainStreamer:
 
     def _worker_loop(self):
         """Background prefetch loop that fills domain buffers and packages 4096-token batches."""
-        streams = {
-            "broad_web": self._open_fineweb_stream(),
-            "edu_academic": self._open_edu_stream(),
-            "code": self._open_code_stream(),
-            "math": self._open_math_stream(),
-            "retrieval": self._open_retrieval_stream(),
+        stream_openers = {
+            "broad_web": self._open_fineweb_stream,
+            "code": self._open_code_stream,
         }
+        streams = {d: stream_openers[d]() for d in self.shares.keys() if d in stream_openers}
 
         while self.running:
             # Assemble one batch of batch_size blocks

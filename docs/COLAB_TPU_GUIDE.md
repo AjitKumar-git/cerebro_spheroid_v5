@@ -8,7 +8,7 @@
 
 Open [`CerebroSpheroid_V5_Colab_TPU_JAX.ipynb`](CerebroSpheroid_V5_Colab_TPU_JAX.ipynb) directly in Google Colab:
 1. Select **Runtime -> Change runtime type -> TPU** (v5e-1 / v2-8 / v3-8).
-2. Run **Cells 1 to 4** to verify your TPU device and mount Google Drive.
+2. Run **Cells 1 to 4** to verify your TPU device and environment.
 3. Run **Cell 5** to begin full-dataset pre-training from scratch ($60,000$ steps $\approx 15.7$ Billion loss-bearing tokens).
 4. Run **Cell 8** for live interactive prompt generation from your saved checkpoint.
 
@@ -20,7 +20,6 @@ Open [`CerebroSpheroid_V5_Colab_TPU_JAX.ipynb`](CerebroSpheroid_V5_Colab_TPU_JAX
 |---|---|
 | [`CerebroSpheroid_V5_Colab_TPU_JAX.ipynb`](CerebroSpheroid_V5_Colab_TPU_JAX.ipynb) | Master interactive Google Colab notebook for the complete 3-stage lifecycle (Pretrain $\to$ Midtrain $\to$ SFT $\to$ Inference). |
 | [`train_v5_small_colab_tpu.py`](train_v5_small_colab_tpu.py) | Standalone production CLI trainer supporting multi-device TPU `pmap`, continuous 4096-token sequence packing, and token-weighted streaming. |
-| `archive/legacy_notebooks/` | Preserved older experimental notebooks from previous runs. |
 
 ---
 
@@ -44,7 +43,7 @@ python colab/train_v5_small_colab_tpu.py \
     --milestone-every 1000 \
     --probe-every 500 \
     --resume \
-    --checkpoint-dir /content/drive/MyDrive/cerebro_v5_small_scratch
+    --checkpoint-dir /content/checkpoints/v5_small_scratch
 ```
 
 ### Stage 2: (Optional) Mid-training (~4B Tokens)
@@ -57,7 +56,7 @@ python colab/train_v5_small_colab_tpu.py \
     --total-window 4096 \
     --lr 5e-4 \
     --total-steps 15000 \
-    --checkpoint-dir /content/drive/MyDrive/cerebro_v5_small_midtrain
+    --checkpoint-dir /content/checkpoints/v5_small_midtrain
 ```
 
 ### Stage 3: (Optional) SFT & Tool Calling (~50M Tokens)
@@ -70,13 +69,13 @@ python colab/train_v5_small_colab_tpu.py \
     --total-window 4096 \
     --lr 2e-4 \
     --total-steps 2000 \
-    --checkpoint-dir /content/drive/MyDrive/cerebro_v5_small_sft
+    --checkpoint-dir /content/checkpoints/v5_small_sft
 ```
 
 ---
 
-## 4. Google Colab Resumption Safety
-All training commands automatically mirror checkpoints to `/content/drive/MyDrive/...`:
+## 4. Google Colab & Kaggle Resumption Safety
+All training commands automatically save checkpoints to local fast scratch storage `/content/checkpoints/...` and sync directly to `bioflo.in`:
 - `v5_small_scratch_latest.pt` (overwritten every 250 steps).
 - `v5_small_scratch_best.pt` (saved whenever held-out loss improves).
 - `v5_small_scratch_step_{step}.pt` (permanent milestone archives every 1,000 steps).

@@ -1,0 +1,38 @@
+{
+  "Direct-Answer Baseline": {
+    "system_name": "Direct-Answer Baseline",
+    "total_samples": 150,
+    "correct_tool_choice_rate": 66.67,
+    "unnecessary_call_rate": 0.0,
+    "missed_call_rate": 100.0,
+    "tool_call_schema_validity": 0.0,
+    "tool_execution_success": 0.0,
+    "accuracy_after_tool_results": 0.0,
+    "direct_answer_accuracy": 51.33,
+    "overall_accuracy": 51.33
+  },
+  "Tool-Enabled (No SCMER)": {
+    "system_name": "Tool-Enabled (No SCMER)",
+    "total_samples": 150,
+    "correct_tool_choice_rate": 100.0,
+    "unnecessary_call_rate": 0.0,
+    "missed_call_rate": 0.0,
+    "tool_call_schema_validity": 98.0,
+    "tool_execution_success": 70.0,
+    "accuracy_after_tool_results": 46.0,
+    "direct_answer_accuracy": 77.0,
+    "overall_accuracy": 66.67
+  },
+  "Tool-Enabled (With SCMER)": {
+    "system_name": "Tool-Enabled (With SCMER)",
+    "total_samples": 150,
+    "correct_tool_choice_rate": 100.0,
+    "unnecessary_call_rate": 0.0,
+    "missed_call_rate": 0.0,
+    "tool_call_schema_validity": 100.0,
+    "tool_execution_success": 70.0,
+    "accuracy_after_tool_results": 46.0,
+    "direct_answer_accuracy": 74.0,
+    "overall_accuracy": 64.67
+  }
+}

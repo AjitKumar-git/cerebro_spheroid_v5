@@ -23,9 +23,9 @@ Key Technical Highlights:
 3. Strict Cognitive Tool Boundaries:
    - Natural conversational text, chain-of-thought, answers, and code stay plain text outside <act>.
    - Strictly genuine external tool invocations (calc(...), python(...)) are enclosed in <act> ... </act>.
-4. Colab Preemption Resilience & Google Drive Mirroring:
-   - Automatically detects Google Drive (`/content/drive/MyDrive/cerebro_v5_small_scratch`).
-   - Saves dual-copy checkpoints (`latest.pt`, `best.pt`, and milestone `.pt`) with metadata JSON.
+4. Colab Preemption Resilience & Direct Cloud Sync (bioflo.in):
+   - Fast local scratch storage with background cloud synchronization.
+   - Saves checkpoints (`latest.pt`, `best.pt`, and milestone `.pt`) with metadata JSON.
 5. Live Generalization Probing:
    - Evaluates factual recall, arithmetic/tool calling, coding, analogy, and 500+ token reading
      comprehension every N steps with full uncapped text decoding.
@@ -130,8 +130,8 @@ def parse_args(args_list: Optional[List[str]] = None):
                         choices=["contiguous_pretrain", "sft"],
                         help="Training mode: 'contiguous_pretrain' (100%% loss-bearing tokens on full dataset) or 'sft'")
     parser.add_argument("--stage", type=str, default="pretrain",
-                        choices=["pretrain", "midtrain", "balanced"],
-                        help="Curriculum stage: 'pretrain' (85%% FineWeb broad web + 15%% code; 10B-15B full dataset), 'midtrain' (skills, math, retrieval), or 'balanced'")
+                        choices=["pretrain"],
+                        help="Curriculum stage: 'pretrain' (85%% FineWeb broad web + 15%% code; 10B-15B full dataset)")
 
     # Context & Target Horizon (Longest possible 4096-token window)
     parser.add_argument("--prompt-len", "--prompt_len", type=int, default=2048,
@@ -438,12 +438,7 @@ def main(args=None):
     if args.mode == "contiguous_pretrain":
         print(f"\n🌊 Rectified Contiguous Pretraining Engine Active (100% Loss-Bearing Tokens):")
         print(f"   - Curriculum Stage:     {args.stage.upper()}")
-        if args.stage == "pretrain":
-            print(f"   - Target Token Mixture: 85% Broad Web (FineWeb 10BT) | 15% Pretraining Code")
-        elif args.stage == "midtrain":
-            print(f"   - Target Token Mixture: 45% FineWeb-Edu (>= 3.5) | 25% FineMath | 15% Code | 15% 4k Retrieval")
-        else:
-            print(f"   - Target Token Mixture: 70% Broad Web (FineWeb) | 15% Edu | 7% Code | 5% Math | 3% Retrieval")
+        print(f"   - Target Token Mixture: 85% Broad Web (FineWeb 10BT) | 15% Pretraining Code (The Stack v2)")
         print(f"   - Block Size:           {args.total_window} contiguous tokens per sequence")
         print(f"   - Prompt Input:         1 token (BOS seed)")
         print(f"   - Target Supervision:   {args.total_window} tokens with cross-entropy next-token loss")

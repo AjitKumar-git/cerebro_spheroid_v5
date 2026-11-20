@@ -14,11 +14,20 @@ Standard Tables:
   6. lexical_antonyms_synonyms  (Antonyms, synonyms, lexical relationships)
   7. biochemical_amino_acids    (20 standard amino acids, codons, MW, charges)
   8. world_history_milestones   (Historical milestones, dates, eras)
+  9. http_status_codes          (RFC HTTP response codes: 1xx, 2xx, 3xx, 4xx, 5xx)
+  10. linux_commands            (Core Linux commands, flags, descriptions, examples)
+  11. mime_types                (File extensions and standardized IANA media types)
+  12. standard_regex_patterns   (Production regexes: emails, IPs, UUIDs, dates, etc.)
+  13. planetary_astronomy       (Solar system celestial bodies, gravity, mass, orbits)
+  14. si_unit_conversions       (SI and empirical unit multipliers, categories, formulas)
+  15. bioprocess_cell_lines     (Industrial host cell lines: CHO, HEK, Vero, doubling times)
+  16. prime_numbers             (First 500 prime numbers indexed 1 to 500)
+  17. available_tools           (Agentic tool calling registry, schemas, and usage examples)
 
 Supported Protocols:
-  - Level 0 (Direct Plain Text):   <stim> ... </stim> -> Plain text answer
-  - Level 1 (Short Verification):  <stim> ... </stim> -> <think> ... </think> Answer
-  - Level 3 (Agentic SQL Tool):    <stim> ... </stim> -> <think> ... </think> <act> sql_query(...) </act> Answer
+  - Level 0 (Direct Plain Text):   Prompt -> Plain text answer
+  - Level 1 (Short Verification):  Prompt -> <think> ... </think> Answer
+  - Level 3 (Agentic SQL Tool):    Prompt -> <think> ... </think> <tool_call> sql_query(...) </tool_call> Answer
 """
 
 import os
@@ -281,6 +290,216 @@ HISTORY_DATA = [
     ("Launch of Sputnik 1", "1957", "First artificial Earth satellite launched by the Soviet Union, initiating the Space Age.", "Modern Era"),
 ]
 
+HTTP_STATUS_CODES_DATA = [
+    (100, "Continue", "Informational", "Initial part of a request received, client should continue with request."),
+    (101, "Switching Protocols", "Informational", "Server agreed to switch protocols according to Upgrade header."),
+    (102, "Processing", "Informational", "Server has received and is processing the request, but no response is available yet."),
+    (103, "Early Hints", "Informational", "Returns headers before rest of response, allowing client to preload resources."),
+    (200, "OK", "Success", "Standard response for successful HTTP requests."),
+    (201, "Created", "Success", "Request fulfilled, resulting in the creation of a new resource."),
+    (202, "Accepted", "Success", "Request accepted for processing, but processing has not been completed."),
+    (204, "No Content", "Success", "Server successfully processed request, but is not returning any content."),
+    (206, "Partial Content", "Success", "Server is delivering only part of resource due to Range header sent by client."),
+    (301, "Moved Permanently", "Redirection", "Target resource has been assigned a new permanent URI."),
+    (302, "Found", "Redirection", "Target resource resides temporarily under a different URI."),
+    (303, "See Other", "Redirection", "Response can be found under another URI using the GET method."),
+    (304, "Not Modified", "Redirection", "Indicates resource has not been modified since version specified in If-Modified-Since."),
+    (307, "Temporary Redirect", "Redirection", "Target resource resides temporarily under different URI; method must not change."),
+    (308, "Permanent Redirect", "Redirection", "Target resource has been assigned new permanent URI; method must not change."),
+    (400, "Bad Request", "Client Error", "Server cannot process request due to client error or malformed syntax."),
+    (401, "Unauthorized", "Client Error", "Authentication is required and has failed or has not yet been provided."),
+    (402, "Payment Required", "Client Error", "Reserved for digital payment systems; occasionally used for quota paywalls."),
+    (403, "Forbidden", "Client Error", "Server understood request but refuses to authorize it; credentials lack permissions."),
+    (404, "Not Found", "Client Error", "Server cannot find the requested resource."),
+    (405, "Method Not Allowed", "Client Error", "HTTP method is known by server but not supported for target resource."),
+    (408, "Request Timeout", "Client Error", "Server timed out waiting for client request."),
+    (409, "Conflict", "Client Error", "Request conflicts with current state of target resource (e.g., edit conflict)."),
+    (410, "Gone", "Client Error", "Target resource is no longer available at origin server and no forwarding address is known."),
+    (413, "Payload Too Large", "Client Error", "Request entity is larger than limits defined by server."),
+    (415, "Unsupported Media Type", "Client Error", "Payload format is in unsupported format for requested endpoint."),
+    (418, "I'm a teapot", "Client Error", "April Fools joke RFC 2324; returned when attempting to brew coffee on a teapot."),
+    (422, "Unprocessable Entity", "Client Error", "Request syntax was well-formed, but semantic instructions could not be followed."),
+    (429, "Too Many Requests", "Client Error", "User has sent too many requests in a given amount of time (rate limited)."),
+    (500, "Internal Server Error", "Server Error", "Generic error message when an unexpected condition was encountered on server."),
+    (501, "Not Implemented", "Server Error", "Server does not recognize request method, or lacks ability to fulfil it."),
+    (502, "Bad Gateway", "Server Error", "Server acting as gateway/proxy received invalid response from inbound server."),
+    (503, "Service Unavailable", "Server Error", "Server is currently unable to handle request due to temporary overload/maintenance."),
+    (504, "Gateway Timeout", "Server Error", "Server acting as gateway/proxy did not receive timely response from upstream server."),
+    (505, "HTTP Version Not Supported", "Server Error", "Server does not support HTTP protocol version used in request."),
+]
+
+LINUX_COMMANDS_DATA = [
+    ("ls", "-l", "Use a long listing format displaying permissions, owner, size, and modification date", "ls -l /var/log", "File Management"),
+    ("ls", "-a", "Show all files including hidden entries starting with a dot", "ls -la ~", "File Management"),
+    ("ls", "-h", "Print sizes in human-readable format (e.g., 1K 234M 2G) with -l", "ls -lh", "File Management"),
+    ("grep", "-r", "Recursively search subdirectories for matching patterns", "grep -r 'TODO' src/", "Text Processing"),
+    ("grep", "-i", "Perform case-insensitive matching", "grep -i 'error' app.log", "Text Processing"),
+    ("grep", "-n", "Prefix each line of matching output with its 1-based line number", "grep -n 'main' script.py", "Text Processing"),
+    ("find", "-name", "Search for files matching the specified shell glob pattern", "find . -name '*.py'", "File Search"),
+    ("find", "-type", "Filter search results by file type (f for regular file, d for directory)", "find /data -type f -size +100M", "File Search"),
+    ("find", "-mtime", "Find files modified within or beyond n*24 hours", "find . -type f -mtime -7", "File Search"),
+    ("tar", "-czvf", "Create a gzip-compressed archive with verbose progress output", "tar -czvf backup.tar.gz /data", "Archiving"),
+    ("tar", "-xzvf", "Extract a gzip-compressed archive with verbose output", "tar -xzvf archive.tar.gz -C /opt", "Archiving"),
+    ("chmod", "-R", "Recursively change file mode bits / permissions across directory tree", "chmod -R 755 /var/www", "Security / Permissions"),
+    ("curl", "-s", "Silent or quiet mode; do not show progress meter or error messages", "curl -s https://api.ipify.org", "Networking"),
+    ("curl", "-I", "Fetch HTTP headers only (HEAD request)", "curl -I https://bioflo.in", "Networking"),
+    ("curl", "-d", "Send specified data in a POST request to HTTP server", "curl -d '{\"key\":\"val\"}' -H 'Content-Type: application/json' http://localhost:8000/api", "Networking"),
+    ("ps", "aux", "Report snapshot of current processes across all users with terminal/no-terminal", "ps aux | grep python", "Process Management"),
+    ("df", "-h", "Report file system disk space usage in human-readable units (GB, MB)", "df -h", "System Monitoring"),
+    ("du", "-sh", "Display summary disk usage of target directory in human-readable format", "du -sh /home/ajit", "System Monitoring"),
+    ("kill", "-9", "Send SIGKILL signal to forcibly terminate process immediately without cleanup", "kill -9 12345", "Process Management"),
+    ("kill", "-15", "Send SIGTERM signal requesting graceful process termination", "kill -15 12345", "Process Management"),
+    ("rsync", "-avz", "Archive mode, verbose, compressed remote file transfer", "rsync -avz ./src/ remote:/opt/app/", "Networking / Transfer"),
+    ("git", "status", "Show working tree status including staged, unstaged, and untracked files", "git status", "Version Control"),
+    ("git", "log", "Show commit logs with history and metadata", "git log -n 5 --oneline", "Version Control"),
+    ("git", "diff", "Show changes between commits, commit and working tree, etc.", "git diff HEAD~1", "Version Control"),
+    ("ssh", "-i", "Select identity file (private key) for public key authentication", "ssh -i ~/.ssh/id_rsa user@host", "Remote Access"),
+    ("docker", "ps -a", "List all containers including stopped and exited ones", "docker ps -a", "Containers"),
+    ("docker", "exec -it", "Execute interactive command inside running container with allocated pseudo-TTY", "docker exec -it web_app bash", "Containers"),
+    ("systemctl", "status", "Inspect runtime status of systemd system and service manager units", "systemctl status nginx", "System Administration"),
+    ("journalctl", "-u", "Query systemd journal logs filtered by specific systemd unit service", "journalctl -u my_service -f", "Logging"),
+    ("jq", "-r", "Output raw strings instead of JSON quotes", "cat payload.json | jq -r '.data.id'", "Text Processing"),
+]
+
+MIME_TYPES_DATA = [
+    ("json", "application/json", "application"),
+    ("csv", "text/csv", "text"),
+    ("html", "text/html", "text"),
+    ("htm", "text/html", "text"),
+    ("txt", "text/plain", "text"),
+    ("pdf", "application/pdf", "application"),
+    ("png", "image/png", "image"),
+    ("jpeg", "image/jpeg", "image"),
+    ("jpg", "image/jpeg", "image"),
+    ("parquet", "application/vnd.apache.parquet", "application"),
+    ("zip", "application/zip", "application"),
+    ("tar", "application/x-tar", "application"),
+    ("gz", "application/gzip", "application"),
+    ("xml", "application/xml", "application"),
+    ("js", "application/javascript", "application"),
+    ("mjs", "application/javascript", "application"),
+    ("ts", "application/typescript", "application"),
+    ("py", "text/x-python", "text"),
+    ("wasm", "application/wasm", "application"),
+    ("mp4", "video/mp4", "video"),
+    ("webm", "video/webm", "video"),
+    ("mp3", "audio/mpeg", "audio"),
+    ("wav", "audio/wav", "audio"),
+    ("webp", "image/webp", "image"),
+    ("svg", "image/svg+xml", "image"),
+    ("css", "text/css", "text"),
+    ("sqlite", "application/vnd.sqlite3", "application"),
+    ("db", "application/vnd.sqlite3", "application"),
+    ("bin", "application/octet-stream", "application"),
+    ("yaml", "application/yaml", "application"),
+    ("yml", "application/yaml", "application"),
+]
+
+STANDARD_REGEX_PATTERNS_DATA = [
+    ("email_validation", r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$", "none", "Standard RFC 5322 compatible email address pattern"),
+    ("ipv4_address", r"^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$", "none", "Validates dotted quad IPv4 address (0.0.0.0 to 255.255.255.255)"),
+    ("ipv6_address", r"^([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$", "none", "Matches standard 8-group full IPv6 address"),
+    ("iso8601_datetime", r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$", "none", "Matches ISO 8601 extended UTC/offset timestamp"),
+    ("url_http_https", r"^https?:\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=]*)$", "none", "Validates HTTP and HTTPS Web URLs"),
+    ("uuid_v4", r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$", "none", "Validates 128-bit RFC 4122 Version 4 UUID"),
+    ("semver", r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$", "none", "Semantic Versioning 2.0.0 specification regex"),
+    ("hex_color", r"^#?([a-fA-F0-9]{6}|[a-fA-F0-9]{3})$", "none", "Matches 3-digit or 6-digit hex color code with optional leading hash"),
+    ("phone_e164", r"^\+[1-9]\d{1,14}$", "none", "ITU-T E.164 international phone number format (+ followed by up to 15 digits)"),
+    ("mac_address", r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$", "none", "Standard 48-bit MAC hardware address (colon or hyphen separated)"),
+    ("slug", r"^[a-z0-9]+(?:-[a-z0-9]+)*$", "none", "URL-friendly kebab-case alphanumeric slug"),
+    ("jwt_token", r"^[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*$", "none", "Structure of JSON Web Token (header.payload.signature)"),
+    ("markdown_link", r"\[([^\]]+)\]\(([^)]+)\)", "none", "Extracts markdown text anchor and URL target"),
+]
+
+PLANETARY_ASTRONOMY_DATA = [
+    ("Sun", "Star", "1.989e30", 696340.0, 274.0, 0.0, 0.0, 8),
+    ("Mercury", "Terrestrial Planet", "3.301e23", 2439.7, 3.70, 57.9, 87.97, 0),
+    ("Venus", "Terrestrial Planet", "4.867e24", 6051.8, 8.87, 108.2, 224.70, 0),
+    ("Earth", "Terrestrial Planet", "5.972e24", 6371.0, 9.807, 149.6, 365.25, 1),
+    ("Moon", "Moon", "7.342e22", 1737.4, 1.62, 149.6, 27.32, 0),
+    ("Mars", "Terrestrial Planet", "6.417e23", 3389.5, 3.721, 227.9, 686.98, 2),
+    ("Jupiter", "Gas Giant", "1.898e27", 69911.0, 24.79, 778.6, 4332.59, 95),
+    ("Saturn", "Gas Giant", "5.683e26", 58232.0, 10.44, 1433.5, 10759.22, 146),
+    ("Uranus", "Ice Giant", "8.681e25", 25362.0, 8.69, 2872.5, 30685.4, 28),
+    ("Neptune", "Ice Giant", "1.024e26", 24622.0, 11.15, 4495.1, 60189.0, 16),
+    ("Pluto", "Dwarf Planet", "1.303e22", 1188.3, 0.62, 5906.4, 90560.0, 5),
+    ("Ceres", "Dwarf Planet", "9.393e20", 473.0, 0.27, 413.7, 1682.0, 0),
+    ("Titan", "Moon", "1.345e23", 2574.7, 1.352, 1433.5, 15.95, 0),
+    ("Europa", "Moon", "4.800e22", 1560.8, 1.315, 778.6, 3.55, 0),
+    ("Ganymede", "Moon", "1.482e23", 2634.1, 1.428, 778.6, 7.15, 0),
+    ("Enceladus", "Moon", "1.080e20", 252.1, 0.113, 1433.5, 1.37, 0),
+]
+
+SI_UNIT_CONVERSIONS_DATA = [
+    ("meter", "foot", 3.28084, "Length", "feet = meters * 3.28084"),
+    ("foot", "meter", 0.3048, "Length", "meters = feet * 0.3048"),
+    ("inch", "centimeter", 2.54, "Length", "cm = inches * 2.54"),
+    ("mile", "kilometer", 1.60934, "Length", "km = miles * 1.60934"),
+    ("kilometer", "mile", 0.621371, "Length", "miles = km * 0.621371"),
+    ("kilogram", "pound", 2.20462, "Mass", "lbs = kg * 2.20462"),
+    ("pound", "kilogram", 0.453592, "Mass", "kg = lbs * 0.453592"),
+    ("ounce", "gram", 28.3495, "Mass", "grams = oz * 28.3495"),
+    ("gram", "ounce", 0.035274, "Mass", "oz = grams * 0.035274"),
+    ("bar", "pascal", 100000.0, "Pressure", "Pa = bar * 100000"),
+    ("pascal", "bar", 0.00001, "Pressure", "bar = Pa * 1e-5"),
+    ("atmosphere", "pascal", 101325.0, "Pressure", "Pa = atm * 101325"),
+    ("psi", "pascal", 6894.76, "Pressure", "Pa = psi * 6894.76"),
+    ("joule", "calorie", 0.239006, "Energy", "cal = J * 0.239006"),
+    ("calorie", "joule", 4.184, "Energy", "J = cal * 4.184"),
+    ("kilowatt_hour", "joule", 3600000.0, "Energy", "J = kWh * 3.6e6"),
+    ("electron_volt", "joule", 1.602176634e-19, "Energy", "J = eV * 1.602176634e-19"),
+    ("liter", "cubic_meter", 0.001, "Volume", "m^3 = L * 0.001"),
+    ("gallon_us", "liter", 3.78541, "Volume", "L = gal * 3.78541"),
+    ("horsepower", "watt", 745.7, "Power", "W = hp * 745.7"),
+    ("watt", "horsepower", 0.00134102, "Power", "hp = W * 0.00134102"),
+]
+
+BIOPROCESS_CELL_LINES_DATA = [
+    ("CHO-K1", "Cricetulus griseus (Chinese Hamster)", "Ovary epithelial", 18.0, 37.0, 7.1, "Therapeutic monoclonal antibody (mAb) and recombinant protein production"),
+    ("HEK293", "Homo sapiens", "Embryonic kidney epithelial", 24.0, 37.0, 7.2, "Viral vector manufacturing (AAV, lentivirus) and transient gene expression"),
+    ("Vero", "Chlorocebus aethiops (African Green Monkey)", "Kidney epithelial", 24.0, 37.0, 7.4, "Viral vaccine manufacturing (polio, rabies, rotavirus)"),
+    ("Sf9", "Spodoptera frugiperda (Fall Armyworm)", "Ovarian insect", 24.0, 27.5, 6.2, "Baculovirus expression vector system (BEVS) for complex proteins and VLPs"),
+    ("HeLa", "Homo sapiens", "Cervical carcinoma", 22.0, 37.0, 7.3, "Biomedical research, cancer biology, and cellular biology models"),
+    ("Jurkat", "Homo sapiens", "T-lymphocyte", 26.0, 37.0, 7.2, "Immunology, CAR-T development, and T-cell leukemia research"),
+    ("E. coli BL21(DE3)", "Escherichia coli", "Gram-negative bacterium", 0.35, 37.0, 7.0, "High-yield non-glycosylated recombinant protein and enzyme synthesis"),
+    ("Pichia pastoris", "Komagataella phaffii (Yeast)", "Methylotrophic yeast", 2.5, 30.0, 6.0, "High-density fermentation of secreted eukaryotic proteins with post-translational folding"),
+    ("BHK-21", "Mesocricetus auratus (Golden Hamster)", "Kidney fibroblast", 20.0, 37.0, 7.2, "Foot-and-mouth disease (FMD) vaccines and rabies vaccine culture"),
+    ("Hybridoma", "Mus musculus / Mouse", "B-cell myeloma fusion", 18.0, 37.0, 7.2, "Diagnostic and murine monoclonal antibody secretor"),
+    ("PER.C6", "Homo sapiens", "Retinoblast", 30.0, 37.0, 7.3, "Human adenovirus-based gene therapy vectors and recombinant biopharmaceuticals"),
+    ("Sp2/0-Ag14", "Mus musculus", "B-cell myeloma", 14.0, 37.0, 7.2, "Hybridoma fusion partner for monoclonal antibody generation"),
+]
+
+def _generate_first_n_primes(n: int = 500) -> List[Tuple[int, int]]:
+    primes = []
+    candidate = 2
+    while len(primes) < n:
+        is_prime = True
+        for p in primes:
+            if p * p > candidate:
+                break
+            if candidate % p == 0:
+                is_prime = False
+                break
+        if is_prime:
+            primes.append(candidate)
+        candidate += 1
+    return [(i + 1, p) for i, p in enumerate(primes)]
+
+PRIME_NUMBERS_DATA = _generate_first_n_primes(500)
+
+AVAILABLE_TOOLS_DATA = [
+    ("sql_query", "Database", "Executes read-only SQL queries against cerebro_factual.db tables", json.dumps({"type": "function", "function": {"name": "sql_query", "description": "Execute a SELECT SQL query", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}}), "sql_query(\"SELECT * FROM periodic_table WHERE symbol='Au';\")"),
+    ("calculator", "Computation", "Evaluates mathematical and arithmetic expressions safely", json.dumps({"type": "function", "function": {"name": "calculator", "description": "Evaluate math expression", "parameters": {"type": "object", "properties": {"expression": {"type": "string"}}, "required": ["expression"]}}}), "calculator(\"2.99792458e8 / 500e-9\")"),
+    ("fetch_web_url", "Networking", "Fetches page HTML or text content from an external HTTP/HTTPS URL", json.dumps({"type": "function", "function": {"name": "fetch_web_url", "description": "Fetch web content", "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}}), "fetch_web_url(\"https://bioflo.in\")"),
+    ("execute_bash", "Terminal", "Executes shell commands in a sandboxed Linux execution environment", json.dumps({"type": "function", "function": {"name": "execute_bash", "description": "Execute bash command", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}}), "execute_bash(\"grep -rn 'class SCMER' src/\")"),
+    ("file_read", "Filesystem", "Reads UTF-8 text from workspace file path with optional line offsets", json.dumps({"type": "function", "function": {"name": "file_read", "description": "Read file contents", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}}, "required": ["path"]}}}), "file_read(\"src/jax/scmer.py\", 1, 50)"),
+    ("file_write", "Filesystem", "Writes or appends UTF-8 string content to specified file path", json.dumps({"type": "function", "function": {"name": "file_write", "description": "Write file contents", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}, "overwrite": {"type": "boolean"}}, "required": ["path", "content"]}}}), "file_write(\"data/sample.txt\", \"Hello Cerebro\", True)"),
+    ("pdb_structure_fetch", "Biomolecular", "Fetches 3D atomic coordinates in mmCIF or PDB format from RCSB PDB by 4-letter ID", json.dumps({"type": "function", "function": {"name": "pdb_structure_fetch", "description": "Fetch PDB structure", "parameters": {"type": "object", "properties": {"pdb_id": {"type": "string"}}, "required": ["pdb_id"]}}}), "pdb_structure_fetch(\"4HHB\")"),
+    ("unit_converter", "Physics", "Converts numerical physical quantities between compatible measurement units", json.dumps({"type": "function", "function": {"name": "unit_converter", "description": "Convert physical units", "parameters": {"type": "object", "properties": {"value": {"type": "number"}, "from_unit": {"type": "string"}, "to_unit": {"type": "string"}}, "required": ["value", "from_unit", "to_unit"]}}}), "unit_converter(100.0, \"meter\", \"foot\")"),
+    ("regex_match", "Text Processing", "Tests regex pattern against target text and returns captured groups", json.dumps({"type": "function", "function": {"name": "regex_match", "description": "Execute regex matching", "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}, "text": {"type": "string"}}, "required": ["pattern", "text"]}}}), "regex_match(\"^[0-9]+$\", \"12345\")"),
+    ("date_time_now", "System", "Returns current UTC timestamp, ISO date, and time information", json.dumps({"type": "function", "function": {"name": "date_time_now", "description": "Get current timestamp", "parameters": {"type": "object", "properties": {}}}}), "date_time_now()"),
+]
+
 
 # ==============================================================================
 # 2. FACTUAL KNOWLEDGE ENGINE (CORE DATABASE MANAGER)
@@ -399,6 +618,105 @@ class FactualKnowledgeEngine:
             );
             """)
 
+            # 9. HTTP Status Codes
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS http_status_codes (
+                code INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                category TEXT NOT NULL,
+                description TEXT NOT NULL
+            );
+            """)
+
+            # 10. Linux Commands
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS linux_commands (
+                command TEXT NOT NULL,
+                flag TEXT NOT NULL,
+                description TEXT NOT NULL,
+                example TEXT NOT NULL,
+                category TEXT NOT NULL,
+                PRIMARY KEY (command, flag)
+            );
+            """)
+
+            # 11. MIME Types
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS mime_types (
+                extension TEXT PRIMARY KEY,
+                mime_type TEXT NOT NULL,
+                category TEXT NOT NULL
+            );
+            """)
+
+            # 12. Standard Regex Patterns
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS standard_regex_patterns (
+                purpose TEXT PRIMARY KEY,
+                pattern TEXT NOT NULL,
+                flags TEXT,
+                description TEXT NOT NULL
+            );
+            """)
+
+            # 13. Planetary Astronomy
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS planetary_astronomy (
+                body_name TEXT PRIMARY KEY,
+                body_type TEXT NOT NULL,
+                mass_kg_sci TEXT NOT NULL,
+                radius_km REAL NOT NULL,
+                gravity_m_s2 REAL NOT NULL,
+                distance_sun_10e6_km REAL NOT NULL,
+                orbital_period_days REAL NOT NULL,
+                moons_count INTEGER NOT NULL
+            );
+            """)
+
+            # 14. SI Unit Conversions
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS si_unit_conversions (
+                from_unit TEXT NOT NULL,
+                to_unit TEXT NOT NULL,
+                multiplier REAL NOT NULL,
+                category TEXT NOT NULL,
+                formula TEXT NOT NULL,
+                PRIMARY KEY (from_unit, to_unit)
+            );
+            """)
+
+            # 15. Bioprocess Cell Lines
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS bioprocess_cell_lines (
+                cell_line TEXT PRIMARY KEY,
+                organism TEXT NOT NULL,
+                cell_type TEXT NOT NULL,
+                doubling_time_hr REAL NOT NULL,
+                optimal_temp_c REAL NOT NULL,
+                optimal_ph REAL NOT NULL,
+                primary_application TEXT NOT NULL
+            );
+            """)
+
+            # 16. Prime Numbers
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS prime_numbers (
+                n_index INTEGER PRIMARY KEY,
+                prime_value INTEGER NOT NULL UNIQUE
+            );
+            """)
+
+            # 17. Available Tools
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS available_tools (
+                tool_name TEXT PRIMARY KEY,
+                category TEXT NOT NULL,
+                description TEXT NOT NULL,
+                schema_json TEXT NOT NULL,
+                example_call TEXT NOT NULL
+            );
+            """)
+
             conn.commit()
 
         # Seed data if tables are empty
@@ -455,6 +773,60 @@ class FactualKnowledgeEngine:
                 cur.executemany("""
                 INSERT OR IGNORE INTO world_history_milestones VALUES (?, ?, ?, ?);
                 """, HISTORY_DATA)
+
+            # HTTP Status Codes
+            if cur.execute("SELECT COUNT(*) FROM http_status_codes;").fetchone()[0] == 0:
+                cur.executemany("""
+                INSERT OR IGNORE INTO http_status_codes VALUES (?, ?, ?, ?);
+                """, HTTP_STATUS_CODES_DATA)
+
+            # Linux Commands
+            if cur.execute("SELECT COUNT(*) FROM linux_commands;").fetchone()[0] == 0:
+                cur.executemany("""
+                INSERT OR IGNORE INTO linux_commands VALUES (?, ?, ?, ?, ?);
+                """, LINUX_COMMANDS_DATA)
+
+            # MIME Types
+            if cur.execute("SELECT COUNT(*) FROM mime_types;").fetchone()[0] == 0:
+                cur.executemany("""
+                INSERT OR IGNORE INTO mime_types VALUES (?, ?, ?);
+                """, MIME_TYPES_DATA)
+
+            # Regex Patterns
+            if cur.execute("SELECT COUNT(*) FROM standard_regex_patterns;").fetchone()[0] == 0:
+                cur.executemany("""
+                INSERT OR IGNORE INTO standard_regex_patterns VALUES (?, ?, ?, ?);
+                """, STANDARD_REGEX_PATTERNS_DATA)
+
+            # Planetary Astronomy
+            if cur.execute("SELECT COUNT(*) FROM planetary_astronomy;").fetchone()[0] == 0:
+                cur.executemany("""
+                INSERT OR IGNORE INTO planetary_astronomy VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                """, PLANETARY_ASTRONOMY_DATA)
+
+            # SI Unit Conversions
+            if cur.execute("SELECT COUNT(*) FROM si_unit_conversions;").fetchone()[0] == 0:
+                cur.executemany("""
+                INSERT OR IGNORE INTO si_unit_conversions VALUES (?, ?, ?, ?, ?);
+                """, SI_UNIT_CONVERSIONS_DATA)
+
+            # Bioprocess Cell Lines
+            if cur.execute("SELECT COUNT(*) FROM bioprocess_cell_lines;").fetchone()[0] == 0:
+                cur.executemany("""
+                INSERT OR IGNORE INTO bioprocess_cell_lines VALUES (?, ?, ?, ?, ?, ?, ?);
+                """, BIOPROCESS_CELL_LINES_DATA)
+
+            # Prime Numbers
+            if cur.execute("SELECT COUNT(*) FROM prime_numbers;").fetchone()[0] == 0:
+                cur.executemany("""
+                INSERT OR IGNORE INTO prime_numbers VALUES (?, ?);
+                """, PRIME_NUMBERS_DATA)
+
+            # Available Tools
+            if cur.execute("SELECT COUNT(*) FROM available_tools;").fetchone()[0] == 0:
+                cur.executemany("""
+                INSERT OR IGNORE INTO available_tools VALUES (?, ?, ?, ?, ?);
+                """, AVAILABLE_TOOLS_DATA)
 
             conn.commit()
 
@@ -584,7 +956,7 @@ class FactualKnowledgeEngine:
         Adheres 100% to the 3-Tier Cognitive Output Protocol:
           - Level 0: Pure fluid plain-text answers (Zero tags)
           - Level 1: Short deductive scratchpad (<think>...</think> answer)
-          - Level 3: Agentic SQL tool calls (<think>...</think> <act> sql_query(...) </act> answer)
+          - Level 3: Agentic SQL tool calls (<think>...</think> <tool_call> sql_query(...) </tool_call> answer)
         """
         samples: List[Dict[str, Any]] = []
 
@@ -597,12 +969,23 @@ class FactualKnowledgeEngine:
         lex = self.query("SELECT * FROM lexical_antonyms_synonyms;")
         aminos = self.query("SELECT * FROM biochemical_amino_acids;")
         hist = self.query("SELECT * FROM world_history_milestones;")
+        http_codes = self.query("SELECT * FROM http_status_codes;")
+        linux_cmds = self.query("SELECT * FROM linux_commands;")
+        mimes = self.query("SELECT * FROM mime_types;")
+        regexes = self.query("SELECT * FROM standard_regex_patterns;")
+        astronomy = self.query("SELECT * FROM planetary_astronomy;")
+        si_units = self.query("SELECT * FROM si_unit_conversions;")
+        cell_lines = self.query("SELECT * FROM bioprocess_cell_lines;")
+        primes = self.query("SELECT * FROM prime_numbers;")
+        tools = self.query("SELECT * FROM available_tools;")
 
         while len(samples) < num_samples:
             target_level = random.choice(thinking_levels)
             domain = random.choice([
                 "countries", "elements", "physical_constants", "math_constants",
-                "irregular_verbs", "antonyms", "amino_acids", "history"
+                "irregular_verbs", "antonyms", "amino_acids", "history",
+                "http_codes", "linux_cmds", "mimes", "regexes",
+                "astronomy", "si_units", "cell_lines", "primes", "tools"
             ])
 
             if domain == "countries" and countries:
@@ -721,7 +1104,152 @@ class FactualKnowledgeEngine:
                     th = f"Biochemistry: Checking side-chain physical properties for '{a_name}'."
                     sql = f"SELECT polarity, side_chain_charge FROM biochemical_amino_acids WHERE name='{a_name}';"
 
-            else:  # history
+            elif domain == "http_codes" and http_codes:
+                row = random.choice(http_codes)
+                code = row["code"]
+                name = row["name"]
+                desc = row["description"]
+                cat = row["category"]
+                if random.random() < 0.5:
+                    p = f"What does HTTP status code {code} mean?"
+                    ans = f"HTTP {code} ({name}) is a {cat.lower()} status code: {desc}"
+                    short_ans = f"{name}: {desc}"
+                    th = f"Networking protocol query: Looking up RFC HTTP status code {code}."
+                    sql = f"SELECT name, category, description FROM http_status_codes WHERE code={code};"
+                else:
+                    p = f"What is the HTTP status code for '{name}'?"
+                    ans = f"The HTTP status code for '{name}' is {code} ({cat})."
+                    short_ans = str(code)
+                    th = f"Networking protocol query: Identifying numeric HTTP code for '{name}'."
+                    sql = f"SELECT code, category FROM http_status_codes WHERE name='{name}';"
+
+            elif domain == "linux_cmds" and linux_cmds:
+                row = random.choice(linux_cmds)
+                cmd = row["command"]
+                flag = row["flag"]
+                desc = row["description"]
+                ex = row["example"]
+                p = f"In Linux, what is the purpose of the '{flag}' flag in the '{cmd}' command?"
+                ans = f"In the '{cmd}' command, '{flag}' is used to: {desc}. Example usage: `{ex}`."
+                short_ans = desc
+                th = f"Linux systems administration: Retrieving option flag '{flag}' documentation for '{cmd}'."
+                sql = f"SELECT description, example FROM linux_commands WHERE command='{cmd}' AND flag='{flag}';"
+
+            elif domain == "mimes" and mimes:
+                row = random.choice(mimes)
+                ext = row["extension"]
+                m_type = row["mime_type"]
+                cat = row["category"]
+                p = f"What is the official MIME media type for file extension '.{ext}'?"
+                ans = f"The MIME media type for '.{ext}' files is '{m_type}' ({cat})."
+                short_ans = m_type
+                th = f"Web standard media typing: Looking up IANA MIME type for '.{ext}'."
+                sql = f"SELECT mime_type, category FROM mime_types WHERE extension='{ext}';"
+
+            elif domain == "regexes" and regexes:
+                row = random.choice(regexes)
+                purpose = row["purpose"]
+                pat = row["pattern"]
+                desc = row["description"]
+                display_purpose = purpose.replace("_", " ")
+                p = f"What regular expression pattern is used for {display_purpose}?"
+                ans = f"A standard regular expression pattern for {display_purpose} ({desc}) is: `{pat}`"
+                short_ans = pat
+                th = f"Text processing regex registry: Retrieving validated pattern for '{purpose}'."
+                sql = f"SELECT pattern, description FROM standard_regex_patterns WHERE purpose='{purpose}';"
+
+            elif domain == "astronomy" and astronomy:
+                row = random.choice(astronomy)
+                b_name = row["body_name"]
+                q_type = random.choice(["gravity", "distance", "radius", "moons"])
+                if q_type == "gravity":
+                    p = f"What is the surface gravity of {b_name}?"
+                    ans = f"The surface gravity of {b_name} is {row['gravity_m_s2']} m/s^2."
+                    short_ans = f"{row['gravity_m_s2']} m/s^2"
+                    th = f"Planetary astronomy query: Retrieving surface acceleration due to gravity for '{b_name}'."
+                    sql = f"SELECT gravity_m_s2 FROM planetary_astronomy WHERE body_name='{b_name}';"
+                elif q_type == "distance":
+                    p = f"What is the average distance from the Sun to {b_name}?"
+                    ans = f"The average distance from the Sun to {b_name} is approximately {row['distance_sun_10e6_km']} million km."
+                    short_ans = f"{row['distance_sun_10e6_km']} million km"
+                    th = f"Astrophysical orbital mechanics: Retrieving semi-major axis distance for '{b_name}'."
+                    sql = f"SELECT distance_sun_10e6_km FROM planetary_astronomy WHERE body_name='{b_name}';"
+                elif q_type == "radius":
+                    p = f"What is the mean volumetric radius of {b_name}?"
+                    ans = f"The mean radius of {b_name} is approximately {row['radius_km']} km."
+                    short_ans = f"{row['radius_km']} km"
+                    th = f"Planetary physics: Retrieving volumetric radius for '{b_name}'."
+                    sql = f"SELECT radius_km FROM planetary_astronomy WHERE body_name='{b_name}';"
+                else:
+                    p = f"How many known natural satellites (moons) orbit {b_name}?"
+                    ans = f"{b_name} has {row['moons_count']} known natural satellites."
+                    short_ans = str(row["moons_count"])
+                    th = f"Solar system astronomy: Checking confirmed moon count for '{b_name}'."
+                    sql = f"SELECT moons_count FROM planetary_astronomy WHERE body_name='{b_name}';"
+
+            elif domain == "si_units" and si_units:
+                row = random.choice(si_units)
+                f_u = row["from_unit"].replace("_", " ")
+                t_u = row["to_unit"].replace("_", " ")
+                mult = row["multiplier"]
+                cat = row["category"]
+                form = row["formula"]
+                p = f"How do you convert from {f_u} to {t_u}?"
+                ans = f"To convert {f_u} to {t_u} ({cat}): multiply by {mult} ({form})."
+                short_ans = f"Multiply by {mult}"
+                th = f"Dimensional analysis & unit conversion: Calculating conversion factor from {row['from_unit']} to {row['to_unit']}."
+                sql = f"SELECT multiplier, formula FROM si_unit_conversions WHERE from_unit='{row['from_unit']}' AND to_unit='{row['to_unit']}';"
+
+            elif domain == "cell_lines" and cell_lines:
+                row = random.choice(cell_lines)
+                c_line = row["cell_line"]
+                org = row["organism"]
+                c_type = row["cell_type"]
+                dt = row["doubling_time_hr"]
+                app = row["primary_application"]
+                q_type = random.choice(["organism_type", "doubling_time", "application"])
+                if q_type == "organism_type":
+                    p = f"What is the source organism and cellular origin of the {c_line} cell line?"
+                    ans = f"{c_line} originates from {org} ({c_type})."
+                    short_ans = f"{org} ({c_type})"
+                    th = f"Bioprocess cellular biology: Retrieving source organism and tissue origin for cell line '{c_line}'."
+                    sql = f"SELECT organism, cell_type FROM bioprocess_cell_lines WHERE cell_line='{c_line}';"
+                elif q_type == "doubling_time":
+                    p = f"What is the typical doubling time and optimal growth temperature for {c_line} cells?"
+                    ans = f"{c_line} cells have an average doubling time of ~{dt} hours at {row['optimal_temp_c']} °C."
+                    short_ans = f"~{dt} hours at {row['optimal_temp_c']} °C"
+                    th = f"Bioreactor kinetics: Retrieving cellular doubling time and temperature optimum for '{c_line}'."
+                    sql = f"SELECT doubling_time_hr, optimal_temp_c FROM bioprocess_cell_lines WHERE cell_line='{c_line}';"
+                else:
+                    p = f"What is the primary bioprocess or therapeutic application of the {c_line} host cell line?"
+                    ans = f"The primary application of {c_line} is: {app}."
+                    short_ans = app
+                    th = f"Biotechnology manufacturing: Retrieving industrial bioprocess application for cell line '{c_line}'."
+                    sql = f"SELECT primary_application FROM bioprocess_cell_lines WHERE cell_line='{c_line}';"
+
+            elif domain == "primes" and primes:
+                row = random.choice(primes)
+                idx = row["n_index"]
+                val = row["prime_value"]
+                p = f"What is the {idx}th prime number?"
+                ans = f"The {idx}th prime number is {val}."
+                short_ans = str(val)
+                th = f"Number theory: Retrieving the prime number at index {idx}."
+                sql = f"SELECT prime_value FROM prime_numbers WHERE n_index={idx};"
+
+            elif domain == "tools" and tools:
+                row = random.choice(tools)
+                t_name = row["tool_name"]
+                t_cat = row["category"]
+                t_desc = row["description"]
+                t_ex = row["example_call"]
+                p = f"What is the function and invocation syntax for the agentic tool '{t_name}'?"
+                ans = f"The '{t_name}' tool ({t_cat}) {t_desc.lower()}. Example call: `{t_ex}`."
+                short_ans = t_desc
+                th = f"Agentic tool capability registry: Inspecting schema and description for tool '{t_name}'."
+                sql = f"SELECT description, example_call, schema_json FROM available_tools WHERE tool_name='{t_name}';"
+
+            else:  # history fallback
                 row = random.choice(hist)
                 e_name = row["event_name"]
                 p = f"When did the {e_name} occur?"
@@ -745,7 +1273,7 @@ class FactualKnowledgeEngine:
                 th_body = th
             else:  # Level 3: Agentic SQL tool
                 act_str = f"sql_query(\"{sql}\")"
-                final_out = f"<think>\n{th} Executing database lookup.\n</think>\n<act> {act_str} </act>\n{ans}"
+                final_out = f"<think>\n{th} Executing database lookup.\n</think>\n<tool_call> {act_str} </tool_call>\n{ans}"
                 action_call = act_str
                 th_body = f"{th} Executing database lookup."
 

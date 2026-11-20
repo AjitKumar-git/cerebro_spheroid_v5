@@ -51,9 +51,9 @@ def parse_args():
         "--dataset_source",
         dest="dataset_source",
         type=str,
-        default="autonomous",
-        choices=["autonomous", "v5_base", "reasoning_anneal", "tri_pillar", "dense_edu", "consolidation", "conversation_sft", "local"],
-        help="Curriculum stream: 'autonomous' for 4-phase step-aware developmental curriculum (default: autonomous)",
+        default="pretrain",
+        choices=["pretrain", "rectified_pretrain", "clean_pretrain", "autonomous", "v5_base", "reasoning_anneal", "tri_pillar", "dense_edu", "consolidation", "conversation_sft", "local"],
+        help="Pretraining dataset stream: 'pretrain' for 85% FineWeb (10BT) + 15% Code (The Stack v2) (default: pretrain)",
     )
     parser.add_argument(
         "--total-steps",

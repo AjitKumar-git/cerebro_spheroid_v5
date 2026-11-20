@@ -1,0 +1,31 @@
+command,flag,description,example,category
+ls,-l,"Use a long listing format displaying permissions, owner, size, and modification date",ls -l /var/log,File Management
+ls,-a,Show all files including hidden entries starting with a dot,ls -la ~,File Management
+ls,-h,"Print sizes in human-readable format (e.g., 1K 234M 2G) with -l",ls -lh,File Management
+grep,-r,Recursively search subdirectories for matching patterns,grep -r 'TODO' src/,Text Processing
+grep,-i,Perform case-insensitive matching,grep -i 'error' app.log,Text Processing
+grep,-n,Prefix each line of matching output with its 1-based line number,grep -n 'main' script.py,Text Processing
+find,-name,Search for files matching the specified shell glob pattern,find . -name '*.py',File Search
+find,-type,"Filter search results by file type (f for regular file, d for directory)",find /data -type f -size +100M,File Search
+find,-mtime,Find files modified within or beyond n*24 hours,find . -type f -mtime -7,File Search
+tar,-czvf,Create a gzip-compressed archive with verbose progress output,tar -czvf backup.tar.gz /data,Archiving
+tar,-xzvf,Extract a gzip-compressed archive with verbose output,tar -xzvf archive.tar.gz -C /opt,Archiving
+chmod,-R,Recursively change file mode bits / permissions across directory tree,chmod -R 755 /var/www,Security / Permissions
+curl,-s,Silent or quiet mode; do not show progress meter or error messages,curl -s https://api.ipify.org,Networking
+curl,-I,Fetch HTTP headers only (HEAD request),curl -I https://bioflo.in,Networking
+curl,-d,Send specified data in a POST request to HTTP server,"curl -d '{""key"":""val""}' -H 'Content-Type: application/json' http://localhost:8000/api",Networking
+ps,aux,Report snapshot of current processes across all users with terminal/no-terminal,ps aux | grep python,Process Management
+df,-h,"Report file system disk space usage in human-readable units (GB, MB)",df -h,System Monitoring
+du,-sh,Display summary disk usage of target directory in human-readable format,du -sh /home/ajit,System Monitoring
+kill,-9,Send SIGKILL signal to forcibly terminate process immediately without cleanup,kill -9 12345,Process Management
+kill,-15,Send SIGTERM signal requesting graceful process termination,kill -15 12345,Process Management
+rsync,-avz,"Archive mode, verbose, compressed remote file transfer",rsync -avz ./src/ remote:/opt/app/,Networking / Transfer
+git,status,"Show working tree status including staged, unstaged, and untracked files",git status,Version Control
+git,log,Show commit logs with history and metadata,git log -n 5 --oneline,Version Control
+git,diff,"Show changes between commits, commit and working tree, etc.",git diff HEAD~1,Version Control
+ssh,-i,Select identity file (private key) for public key authentication,ssh -i ~/.ssh/id_rsa user@host,Remote Access
+docker,ps -a,List all containers including stopped and exited ones,docker ps -a,Containers
+docker,exec -it,Execute interactive command inside running container with allocated pseudo-TTY,docker exec -it web_app bash,Containers
+systemctl,status,Inspect runtime status of systemd system and service manager units,systemctl status nginx,System Administration
+journalctl,-u,Query systemd journal logs filtered by specific systemd unit service,journalctl -u my_service -f,Logging
+jq,-r,Output raw strings instead of JSON quotes,cat payload.json | jq -r '.data.id',Text Processing

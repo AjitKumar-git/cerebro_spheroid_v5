@@ -32,7 +32,7 @@
     },
     {
       "id": 31,
-      "content": "<stim>",
+      "content": "<tool_call>",
       "single_word": false,
       "lstrip": true,
       "rstrip": true,
@@ -41,7 +41,7 @@
     },
     {
       "id": 32,
-      "content": "</stim>",
+      "content": "</tool_call>",
       "single_word": false,
       "lstrip": true,
       "rstrip": true,
@@ -50,7 +50,7 @@
     },
     {
       "id": 33,
-      "content": "<act>",
+      "content": "<tool_response>",
       "single_word": false,
       "lstrip": true,
       "rstrip": true,
@@ -59,7 +59,7 @@
     },
     {
       "id": 34,
-      "content": "</act>",
+      "content": "</tool_response>",
       "single_word": false,
       "lstrip": true,
       "rstrip": true,
@@ -196,10 +196,6 @@
       "<0x19>": 28,
       "<0x1A>": 29,
       "<0x1B>": 30,
-      "<stim>": 31,
-      "</stim>": 32,
-      "<act>": 33,
-      "</act>": 34,
       "<0x20>": 35,
       "<0x21>": 36,
       "<0x22>": 37,
@@ -32164,7 +32160,11 @@
       "왕": 31996,
       "收": 31997,
       "弘": 31998,
-      "给": 31999
+      "给": 31999,
+      "<tool_call>": 31,
+      "</tool_call>": 32,
+      "<tool_response>": 33,
+      "</tool_response>": 34
     },
     "merges": [
       "▁ t",

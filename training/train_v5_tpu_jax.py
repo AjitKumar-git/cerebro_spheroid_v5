@@ -3,7 +3,7 @@
 CerebroSpheroid V5: Pure JAX Cloud TPU High-Throughput Production Trainer
 ========================================================================
 
-Ported and enhanced from the battle-tested CerebroSpheroid V4 production trainer:
+High-throughput CerebroSpheroid V5 production trainer:
 - Pure JAX V5 Architecture: 3D SwiGLU tensor contractions, vectorized axonal shortcuts, affine-tied emission
 - Native TPU BF16 MXU Systolic Acceleration (~50,000 to 120,000 tokens/sec on TPU v5e-1)
 - Multi-Corpus Cognitive Streaming: Cosmopedia-v2, FineWeb-Edu, SmolTalk, OpenHermes-2.5, GSM8K, and offline local corpus
@@ -208,11 +208,11 @@ def parse_args(args_list=None):
 
     # Data Source & Tokenizer
     parser.add_argument("--hf-token", "--hf_token", dest="hf_token", type=str, default=None, help="Hugging Face API token for authenticated dataset streaming")
-    parser.add_argument("--dataset_source", "--dataset-source", dest="dataset_source", type=str, default="autonomous",
-                        help="Data stream: 'autonomous', 'fineweb' (sample-10BT), or a Hugging Face dataset repo")
+    parser.add_argument("--dataset_source", "--dataset-source", dest="dataset_source", type=str, default="pretrain",
+                        help="Data stream: 'pretrain' (SmolLM2 4-stage mixture: FineWeb, Stack-Edu, FineMath, Cosmopedia), 'rectified', 'clean_pretrain', 'local', or a Hugging Face dataset repo")
     parser.add_argument("--dataset-config", type=str, default=None, help="Optional Hugging Face dataset config (FineWeb defaults to sample-10BT)")
     parser.add_argument("--dataset-revision", type=str, default=None, help="Optional immutable Hugging Face commit/revision override")
-    parser.add_argument("--retrieval-injection", action=argparse.BooleanOptionalAction, default=True, help="Mix curated retrieval examples into online streams (disable for a clean general-text baseline)")
+    parser.add_argument("--retrieval-injection", action=argparse.BooleanOptionalAction, default=False, help="Mix curated retrieval examples into online streams (disabled by default for clean pretrain baseline)")
     parser.add_argument("--tokenizer_name", type=str, default="llama", help="Tokenizer model name or path (default: 'llama' -> data/tokenizer)")
 
     # Checkpoint & Cloud Sync
@@ -300,7 +300,7 @@ def build_data_stream(
     prefetch: bool = True,
     dataset_config: Optional[str] = None,
     dataset_revision: Optional[str] = None,
-    retrieval_injection: bool = True,
+    retrieval_injection: bool = False,
 ):
     """Initializes multi-corpus streaming engine with background prefetching and offline fallback."""
     # Check if HuggingFace datasets library is available for online streaming
@@ -312,18 +312,18 @@ def build_data_stream(
         pass
 
     # 100% Loss-Bearing Rectified Contiguous Pretraining Streamer
-    if dataset_source in ("pretrain", "rectified", "rectified_pretrain", "clean_pretrain", "midtrain", "rectified_midtrain") and HAS_DATASETS:
+    if dataset_source in ("pretrain", "rectified", "rectified_pretrain", "clean_pretrain") and HAS_DATASETS:
         from src.rectified_streamer import RectifiedContiguousPretrainStreamer
-        streamer_stage = "midtrain" if "midtrain" in dataset_source else "pretrain"
         print(f"\n📦 Initializing 100% Loss-Bearing Rectified Contiguous Streamer [{dataset_source.upper()}]...")
-        print(f"   • Stage:          {streamer_stage.upper()}")
+        print(f"   • Stage:          PURE CONTIGUOUS PRETRAIN")
+        print(f"   • Target Mixture: 85% Broad Web (FineWeb sample-10BT) | 15% Code (The Stack v2)")
         print(f"   • Context Window: {total_window} tokens (contiguous unbroken next-token loss)")
         print(f"   • Global Batch:   {batch_size} sequences/step")
         streamer = RectifiedContiguousPretrainStreamer(
             tokenizer=tokenizer,
             batch_size=batch_size,
             block_size=total_window,
-            stage=streamer_stage,
+            stage="pretrain",
             queue_size=max(16, int(prefetch_queue_size)),
         )
         return streamer, None
@@ -2262,7 +2262,7 @@ def run_training(**kwargs):
             setattr(args, attr, v)
         elif hasattr(args, k):
             setattr(args, k, v)
-        elif k in ("drive_dir", "checkpoint_dir"):
+        elif k in ("checkpoint_dir", "ckpt_dir"):
             setattr(args, "checkpoint_dir", v)
         elif k in ("max_steps", "total_steps"):
             setattr(args, "total_steps", v)

@@ -95,7 +95,7 @@ class TestSFTTruncationResolution(unittest.TestCase):
             def _load_data(self):
                 self.samples = [
                     {
-                        "formatted_input": "<stim> " + "context " * 300 + "What is 2+2? </stim>",
+                        "formatted_input": "context " * 300 + "What is 2+2?",
                         "formatted_output": "<think> 2+2=4 </think> 4",
                         "thinking_level": 2,
                     }

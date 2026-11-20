@@ -1,0 +1,13 @@
+cell_line,organism,cell_type,doubling_time_hr,optimal_temp_c,optimal_ph,primary_application
+CHO-K1,Cricetulus griseus (Chinese Hamster),Ovary epithelial,18.0,37.0,7.1,Therapeutic monoclonal antibody (mAb) and recombinant protein production
+HEK293,Homo sapiens,Embryonic kidney epithelial,24.0,37.0,7.2,"Viral vector manufacturing (AAV, lentivirus) and transient gene expression"
+Vero,Chlorocebus aethiops (African Green Monkey),Kidney epithelial,24.0,37.0,7.4,"Viral vaccine manufacturing (polio, rabies, rotavirus)"
+Sf9,Spodoptera frugiperda (Fall Armyworm),Ovarian insect,24.0,27.5,6.2,Baculovirus expression vector system (BEVS) for complex proteins and VLPs
+HeLa,Homo sapiens,Cervical carcinoma,22.0,37.0,7.3,"Biomedical research, cancer biology, and cellular biology models"
+Jurkat,Homo sapiens,T-lymphocyte,26.0,37.0,7.2,"Immunology, CAR-T development, and T-cell leukemia research"
+E. coli BL21(DE3),Escherichia coli,Gram-negative bacterium,0.35,37.0,7.0,High-yield non-glycosylated recombinant protein and enzyme synthesis
+Pichia pastoris,Komagataella phaffii (Yeast),Methylotrophic yeast,2.5,30.0,6.0,High-density fermentation of secreted eukaryotic proteins with post-translational folding
+BHK-21,Mesocricetus auratus (Golden Hamster),Kidney fibroblast,20.0,37.0,7.2,Foot-and-mouth disease (FMD) vaccines and rabies vaccine culture
+Hybridoma,Mus musculus / Mouse,B-cell myeloma fusion,18.0,37.0,7.2,Diagnostic and murine monoclonal antibody secretor
+PER.C6,Homo sapiens,Retinoblast,30.0,37.0,7.3,Human adenovirus-based gene therapy vectors and recombinant biopharmaceuticals
+Sp2/0-Ag14,Mus musculus,B-cell myeloma,14.0,37.0,7.2,Hybridoma fusion partner for monoclonal antibody generation

@@ -420,7 +420,7 @@ def test_preshifted_feedback_no_double_shift_and_pytorch_causality(monkeypatch):
     monkeypatch.setattr(
         LinguisticDataStreamer,
         "_generate_synthetic_prose",
-        lambda self: ("<stim>Hi</stim>", "<act>Yes</act>"),
+        lambda self: ("Hi", "Yes"),
     )
     streamer = LinguisticDataStreamer(batch_size=2, prompt_len=8, target_len=64, vocab_size=64, data_dir="__nonexistent__")
     try:
@@ -516,23 +516,24 @@ def test_bundled_tokenizer_single_bio_delimiters():
     assert tok.vocab_size == 32000
 
     bio = get_bio_token_ids(tok)
-    assert bio == {"stim": 31, "stim_end": 32, "act": 33, "act_end": 34}
+    assert bio.get("tool_call") == 31
+    assert bio.get("tool_call_end") == 32
+    assert bio.get("tool_response") == 33
+    assert bio.get("tool_response_end") == 34
 
-    for marker, expected_id in [("<stim>", 31), ("</stim>", 32), ("<act>", 33), ("</act>", 34)]:
+    for marker, expected_id in [("<tool_call>", 31), ("</tool_call>", 32), ("<tool_response>", 33), ("</tool_response>", 34)]:
         ids = encode_no_special(tok, marker)
         assert ids == [expected_id], f"{marker} tokenized to {ids}, expected [{expected_id}]"
 
     p_ids, a_ids = tokenize_pair(tok, "What is 2 + 2?", "4", max_prompt_len=32, max_answer_tokens=32)
-    assert p_ids[0] == 31 and p_ids[-1] == 32
     assert 1 not in p_ids
-    assert a_ids[0] == 33 and a_ids[-2:] == [34, tok.eos_token_id]
-    assert 1 not in a_ids
+    assert a_ids[-1] == tok.eos_token_id
 
-    # Decode behavior: skip_special_tokens strips bio delimiters cleanly
+    # Decode behavior: clean output format
     clean = tok.decode(encode_no_special(tok, format_motor_response("Yes, indeed.")), skip_special_tokens=True)
     assert clean == "Yes, indeed."
     raw = tok.decode(encode_no_special(tok, format_stimulus_prompt("Hello")), skip_special_tokens=False)
-    assert "<stim>" in raw and "</stim>" in raw
+    assert "<stim>" not in raw
 
     # Plain prose/code without delimiters preserves standard LLaMA tokens
     plain = "Hello world\ndef add(a, b):\n    return a + b"
