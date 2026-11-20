@@ -23,6 +23,21 @@ This document establishes the mandatory operational rules, architectural invaria
 4. **NEVER RUN `git push` WITHOUT EXPLICIT PERMISSION**:
    - Never push changes to remote git branches unless the user explicitly requests a push.
 
+5. **ALWAYS UPLOAD B16 WEIGHTS ONLY WITHOUT OPTIMIZER MOMENTUM**:
+   - **BARE BF16 SERIALIZATION ONLY**: Checkpoint synchronization to `bioflo.in` or remote cloud storage must strictly upload bare `bfloat16` weights (`model_state`) with minimal scalar metadata (`step`, `loss`, `eval_loss`, `model`).
+   - **STRICT FLUFF & MOMENTUM PURGE**: Never serialize or upload optimizer momentum (`opt_state`, moments `m`, `v`, `master_p`, `power_v`, or gradient buffers) to remote storage. Local scratch disk may preserve optimizer state for resuming on the same node, but remote uploads are strictly bare `bfloat16` weights (~2 bytes per parameter) to prevent multi-GB transfer stalls.
+   - All floating-point tensors in the checkpoint payload must be strictly verified and converted to `torch.bfloat16`.
+
+6. **ALWAYS FETCH HF TOKEN FROM WEBSITE**:
+   - Hugging Face authentication tokens (`HF_TOKEN`) must always be retrieved dynamically from the centralized secure vault on the website endpoint:
+     `https://bioflo.in/api/cerebro/sync.php?action=get_config&model=v5_small&device=backup_hf_token` via `fetch_hf_token_from_website()`.
+   - Never rely on static hardcoded tokens or brittle manual secret entry. Dynamic fetching ensures seamless authentication and instant token rotation across all cloud compute nodes (TPU, GPU, Colab, local).
+
+7. **NO LOCKED SHELLS (100% UNLOCKED CONCENTRIC LAYERS)**:
+   - **STRICT PROHIBITION**: Never freeze, lock, or mask any shell (from Shell 0 to Shell $K-1$) in CerebroSpheroid architectures (`v5_compact`, `v5_small`, `v5_base`).
+   - All concentric shells must remain fully active, trainable, and participate in backpropagation across all training iterations.
+   - Initial gains, SwiGLU weights, intra-norms, radial gains, and inter-shell shortcut tracts must never be frozen or restricted by unfreeze schedules or mask schedules. Every single shell must adapt and receive non-zero gradients to guarantee full computational depth.
+
 ---
 
 ## 2. Pretraining Curriculum Invariants (SmolLM2 Parity)
