@@ -372,7 +372,9 @@ def compute_soft_target_distribution(
                 formatted = f"<start_of_turn>user\n{q}<end_of_turn>\n<start_of_turn>model\n{r}<end_of_turn>\n"
             teacher_texts.append(formatted)
 
-        inp = teacher_tok(teacher_texts, return_tensors="pt", padding=True, truncation=True, max_length=1024).to(teacher_device)
+        # Dynamic safety clamp on teacher sequence length to guarantee zero-OOM on GPU 0
+        teacher_max_len = min(512, max(128, target_len + 128))
+        inp = teacher_tok(teacher_texts, return_tensors="pt", padding=True, truncation=True, max_length=teacher_max_len).to(teacher_device)
 
         with torch.inference_mode():
             out = teacher(**inp)
@@ -383,11 +385,15 @@ def compute_soft_target_distribution(
 
         # Sequence Alignment on teacher_device
         z_aligned = F.interpolate(z_teacher.transpose(1, 2), size=target_len, mode="linear", align_corners=False).transpose(1, 2)
+        del out, z_teacher  # Free raw teacher logits immediately (frees 1-2 GB VRAM on GPU 0)
 
         # Monotonic Top-K Optimization: Extract Top-K directly on logits (exact same ordering as softmax),
         # then compute softmax only over the 64 items instead of 262,144 items (saves 3.2 GB memory allocations).
         topk_logits, topk_indices = torch.topk(z_aligned, k=topk, dim=-1)  # [B, target_len, topk]
+        del z_aligned  # Free interpolated logits immediately (frees 1-2 GB VRAM on GPU 0)
+
         topk_probs = F.softmax(topk_logits / temp, dim=-1)  # [B, target_len, topk]
+        del topk_logits
 
         # Project Gemma indices on teacher_device
         map_g = map_g_to_c.to(teacher_device)
@@ -534,8 +540,8 @@ def run_distillation(
     student_preset: str = "v5_small",
     mode: str = "stream",  # 'stream', 'live', or 'hybrid'
     total_steps: int = 5000,
-    batch_size: int = 4,
-    grad_accum_steps: int = 4,
+    batch_size: int = 2,
+    grad_accum_steps: int = 8,
     learning_rate: float = 3e-4,
     min_learning_rate: float = 3e-5,
     warmup_steps: int = 100,
@@ -889,8 +895,8 @@ def parse_args():
     parser.add_argument("--student", "--student-preset", dest="student_preset", type=str, default="v5_small", help="Student model preset ('v5_small' = 105.9M params)")
     parser.add_argument("--mode", type=str, default="stream", choices=["stream", "live", "hybrid"], help="Distillation mode: 'stream' (high-throughput frontier dataset), 'live' (on-policy generation), 'hybrid'")
     parser.add_argument("--steps", "--total-steps", dest="total_steps", type=int, default=5000, help="Total distillation steps")
-    parser.add_argument("--batch-size", "--batch_size", dest="batch_size", type=int, default=4, help="Micro-batch size")
-    parser.add_argument("--grad-accum", "--grad_accum", dest="grad_accum_steps", type=int, default=4, help="Gradient accumulation steps")
+    parser.add_argument("--batch-size", "--batch_size", dest="batch_size", type=int, default=2, help="Micro-batch size (default: 2 for zero-OOM)")
+    parser.add_argument("--grad-accum", "--grad_accum", dest="grad_accum_steps", type=int, default=8, help="Gradient accumulation steps (default: 8)")
     parser.add_argument("--lr", "--learning-rate", dest="learning_rate", type=float, default=3e-4, help="Peak learning rate")
     parser.add_argument("--min-lr", dest="min_learning_rate", type=float, default=3e-5, help="Minimum learning rate after cosine decay")
     parser.add_argument("--aalw-weight", dest="aalw_weight", type=float, default=4.0, help="Answer-Anchor Loss Weight for deliberation and answer tokens")
