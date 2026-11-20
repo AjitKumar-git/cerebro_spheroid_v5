@@ -1,15 +1,26 @@
 # Agent Work State & Activity Tracker
 
-> **Status**: 🟢 `COMPLETED` | **Last Updated**: `2026-11-21T00:57:51.254485+05:30` | **Session**: `1ffa7ab2-b764-480a-b597-d783c09f257d`
+> **Status**: 🟢 `COMPLETED` | **Last Updated**: `2026-11-21T01:34:00+05:30`
 
 ## Current / Active Objective
-**Goal**: make the uploads lightest
+**Goal**: Fresh Clean Slate Reset: Wiped All Remote & Local Models and Telemetry
 
-- **Phase**: `completed`
-- **Current Task**: Idle / Awaiting next request
+- **Phase**: `reset_complete`
+- **Current Task**: Cleared all remote model weights and telemetry on bioflo.in; wiped all local checkpoint directories and archives. Ready for fresh training from scratch.
 
 ## Summary of Completed Work
-The cloud synchronization and checkpoint serialization pipeline has been updated to make uploads as light and fast as possible:
+1. **Remote Cloud Reset (`bioflo.in`)**:
+   - Deleted all model weights: `v5_compact_latest.pt`, `v5_compact_best.pt`, `v5_small_latest.pt`, `v5_small_best.pt`, `gemma2cerebro_latest.pt`.
+   - Deleted all historical loss logs: `loss_history_v5_compact.json`, `loss_history_v5_small.json`, `loss_history_gemma2cerebro.json`.
+   - Reset live telemetry tokens and step counters to 0 (`step: 0`, `cumulative_tokens: 0`, `pct_complete: 0.0%`).
+2. **Local Storage Reset**:
+   - Cleared `cerebro_spheroid_v5/checkpoints/` (deleted all `.pt`, `.part`, `.bak` files, preserved clean `.gitkeep`).
+   - Removed legacy `cerebro_checkpoints_archive/` freeing ~6.4 GB of disk space.
+3. **Tokenizer & Architecture Ready**:
+   - Standard industry tokens active: `<think>` (29), `</think>` (30), `<tool_call>` (31), `</tool_call>` (32), `<tool_response>` (33), `</tool_response>` (34).
+   - Target padding cleanly masked with `-100`.
+   - Native `SCMEROptimizer` configured.
+   - All 36 verification tests passing.
 
 ## Modified Files
 - [`AGENTS.md`](AGENTS.md)

@@ -214,7 +214,7 @@ def pull_checkpoint(
     model = normalize_model_name(model)
 
     os.makedirs(os.path.dirname(os.path.abspath(local_dest)), exist_ok=True)
-    download_url = f"{sync_url}?action=download&type={target_type}"
+    download_url = f"{sync_url}?action=download&type={target_type}&token={sync_token}"
     if model:
         download_url += f"&model={model}"
     tmp_dest = local_dest + ".part"
