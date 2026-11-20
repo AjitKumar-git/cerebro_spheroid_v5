@@ -3,6 +3,8 @@
   "eos_token": "</s>",
   "unk_token": "<unk>",
   "additional_special_tokens": [
+    "<think>",
+    "</think>",
     "<tool_call>",
     "</tool_call>",
     "<tool_response>",

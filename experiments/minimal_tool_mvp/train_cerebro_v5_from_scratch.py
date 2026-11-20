@@ -78,15 +78,17 @@ def prepare_spheroid_data(traces: List[ToolTrace]) -> List[SpheroidTrainingItem]
 def collate_spheroid_batch(
     batch: List[SpheroidTrainingItem], tokenizer: Any, pad_id: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    eos_id = getattr(tokenizer, "eos_token_id", 2) or 2
     p_ids_list = [tokenizer.encode(item.prompt, add_special_tokens=False) for item in batch]
-    t_ids_list = [tokenizer.encode(item.target, add_special_tokens=False) for item in batch]
+    t_ids_list = [tokenizer.encode(item.target, add_special_tokens=False) + [eos_id] for item in batch]
 
     max_p = max(len(p) for p in p_ids_list)
     max_t = max(len(t) for t in t_ids_list)
     B = len(batch)
 
     prompts = torch.full((B, max_p), pad_id, dtype=torch.long)
-    targets = torch.full((B, max_t), pad_id, dtype=torch.long)
+    # Pad targets with -100 so cross_entropy ignores padding (no <unk> token training!)
+    targets = torch.full((B, max_t), -100, dtype=torch.long)
 
     for i in range(B):
         prompts[i, :len(p_ids_list[i])] = torch.tensor(p_ids_list[i], dtype=torch.long)

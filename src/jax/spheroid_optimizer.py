@@ -170,6 +170,7 @@ def init_spheroid_opt_state(params: Dict[str, jnp.ndarray], key: Optional[jax.Ar
             "u_ratio_vocab": jnp.array(0.0, dtype=jnp.float32),
             "u_ratio_1d": jnp.array(0.0, dtype=jnp.float32),
             "replica_drift": jnp.array(0.0, dtype=jnp.float32),
+            "scmer_loss": jnp.array(0.0, dtype=jnp.float32),
             "neg_cov_loss": jnp.array(0.0, dtype=jnp.float32),
         },
     }

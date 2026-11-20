@@ -127,6 +127,8 @@ def test_tokenizer_tool_delimiters_are_atomic_tokens():
     tok = build_tokenizer()
     spec = get_special_token_ids(tok)
 
+    assert spec.get("think") == 29
+    assert spec.get("think_end") == 30
     assert spec.get("tool_call") == 31
     assert spec.get("tool_call_end") == 32
     assert spec.get("tool_response") == 33
@@ -134,6 +136,8 @@ def test_tokenizer_tool_delimiters_are_atomic_tokens():
 
     # Each tag must encode to exactly one token ID, not multiple split subwords
     for tag, expected_id in [
+        ("<think>", 29),
+        ("</think>", 30),
         ("<tool_call>", 31),
         ("</tool_call>", 32),
         ("<tool_response>", 33),

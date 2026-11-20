@@ -32,6 +32,8 @@
     "single_word": false
   },
   "additional_special_tokens": [
+    "<think>",
+    "</think>",
     "<tool_call>",
     "</tool_call>",
     "<tool_response>",
