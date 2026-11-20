@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+🧠 CerebroSpheroid V5: One-Click Cloud TPU Runner
+=================================================
+Complete, self-contained one-click training script for Google Colab TPU v5e/lite.
+Automatically handles:
+  1. Cloud TPU device verification (JAX + native TPU v5 lite MXU bfloat16)
+  2. Hugging Face Hub authentication (eliminates 429 rate limits)
+  3. Bioflo.in cloud synchronization token setup
+  4. Repository synchronization to latest origin/main
+  5. Checkpoint directory resolution (mirrored to Google Drive if mounted)
+  6. Autonomous resumption from highest step milestone or remote latest.pt
+  7. 100% loss-bearing contiguous pretraining across context curriculum:
+     [512, 1024, 2048, 4096] tokens (100k steps/stage)
+  8. Option A lightweight cloud sync (~229 MB weights-only, 2.9s non-blocking upload)
+"""
+
+import os
+import sys
+import json
+import time
+import subprocess
+import urllib.request
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+
+def setup_colab_environment():
+    """Configures system hugepages, TPU backend, Hugging Face auth, and directories."""
+    print("=" * 80)
+    print("⚡ CEREBROSPHEROID V5: PURE JAX HIGH-THROUGHPUT CLOUD TPU RUNNER")
+    print("=" * 80)
+
+    # 1. Enable Linux Transparent Hugepages
+    os.system("sudo sh -c 'echo always > /sys/kernel/mm/transparent_hugepage/enabled' 2>/dev/null || true")
+
+    # 2. Verify JAX and TPU acceleration
+    try:
+        import jax
+        devices = jax.devices()
+        dev_kind = devices[0].device_kind if devices else "CPU"
+        is_tpu = any("TPU" in d.device_kind.upper() for d in devices)
+        print(f"JAX Version     : {jax.__version__}")
+        print(f"JAX Backend     : {jax.default_backend().upper()}")
+        print(f"Active Devices  : {len(devices)} x {dev_kind}")
+        if is_tpu:
+            print("Precision       : bfloat16 (Native TPU v5 lite MXU)")
+        else:
+            print("⚠️ Warning: Running on CPU/GPU. In Colab, select: Runtime -> Change runtime type -> TPU v5e.")
+    except Exception as e_jax:
+        print(f"⚠️ JAX device detection notice: {e_jax}")
+
+    # 3. Setup Bioflo Cloud Sync Token
+    bioflo_tok = os.environ.get("BIOFLO_SYNC_TOKEN", "")
+    if not bioflo_tok:
+        try:
+            from google.colab import userdata
+            bioflo_tok = userdata.get("BIOFLO_SYNC_TOKEN") or ""
+        except Exception:
+            pass
+    if not bioflo_tok:
+        bioflo_tok = "CerebroSpheroid_Sync_Secure_2026"
+
+    os.environ["BIOFLO_SYNC_TOKEN"] = bioflo_tok
+    os.environ["CEREBRO_SYNC_TOKEN"] = bioflo_tok
+
+    # 4. Authenticate Hugging Face Hub
+    hf_tok = os.environ.get("HF_TOKEN", "")
+    if not hf_tok:
+        try:
+            from google.colab import userdata
+            hf_tok = userdata.get("HF_TOKEN") or ""
+        except Exception:
+            pass
+
+    # Fallback to Bioflo secure backup vault if not set in Colab secrets
+    if not hf_tok:
+        try:
+            req = urllib.request.Request(
+                "https://bioflo.in/api/cerebro/sync.php?action=get_config&model=v5_small&device=backup_hf_token",
+                headers={"Authorization": f"Bearer {bioflo_tok}"}
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+                hf_tok = data.get("config", {}).get("dtype", "")
+        except Exception:
+            pass
+
+    if hf_tok:
+        os.environ["HF_TOKEN"] = hf_tok
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_tok
+        try:
+            from huggingface_hub import login
+            login(token=hf_tok, add_to_git_credential=False)
+            print(f"🔑 Hugging Face Hub token verified and active (token: {hf_tok[:4]}...{hf_tok[-4:]})")
+        except Exception:
+            pass
+
+    # 5. Resolve Persistent Checkpoint Directory
+    drive_dir = "/content/drive/MyDrive/cerebro_checkpoints/v5_small_scratch"
+    local_dir = "/content/checkpoints/v5_small_scratch"
+    if os.path.exists("/content/drive/MyDrive"):
+        ckpt_dir = drive_dir
+        print(f"📁 Checkpoint Destination: Google Drive Persistent Storage ({ckpt_dir})")
+    elif os.path.exists("/content"):
+        ckpt_dir = local_dir
+        print(f"📁 Checkpoint Destination: Colab Scratch Storage ({ckpt_dir})")
+    else:
+        ckpt_dir = os.path.join(REPO_ROOT, "checkpoints", "v5_small_scratch")
+        print(f"📁 Checkpoint Destination: Local Directory ({ckpt_dir})")
+
+    os.makedirs(ckpt_dir, exist_ok=True)
+    print("=" * 80 + "\n")
+    return ckpt_dir, bioflo_tok
+
+
+def main():
+    ckpt_dir, bioflo_tok = setup_colab_environment()
+
+    # Import training runner
+    from training.train_v5_tpu_jax import run_training
+
+    # Launch with verified production configuration
+    run_training(
+        preset="v5_small",                     # 105.9M Params (16 Shells, 40 Shortcut Tracts)
+        from_scratch=False,                    # Resumes highest milestone step or latest.pt from cloud
+        auto_tune=True,                        # Adopts verified B=32, remat=True (192,360 tok/s on TPU v5 lite)
+        force_tune=False,                      # Bypasses micro-benchmarks; adopts verified config
+        effective_batch_size=16,               # Effective batch size
+        target_tokens=15_700_000_000,          # 15.70 Billion Tokens target budget
+        dataset_source="pretrain",             # Rectified contiguous stream (FineWeb 10BT)
+        thinking_cycles=8,                     # 8 deliberation cycles per token
+        min_context_window=512,                # Stage 0: 512 tokens
+        context_stage_steps=100_000,           # Curriculum stages: 512, 1024, 2048, 4096 (100k steps/stage)
+        total_window=4096,                     # Max horizon
+        sensory_position_steps=4096,           # Learned position step horizon
+        max_phase_steps=4096,                  # Learned phase clock horizon
+        checkpoint_dir=ckpt_dir,               # Checkpoint destination
+        cloud_sync=True,                       # Bioflo.in bi-directional live sync
+        cloud_weights_only=True,               # Option A: ~229 MB lightweight fast uploads (2.9s)
+        save_optimizer_state=True,             # Preserves Spheroid moments locally on disk
+        cloud_token=bioflo_tok,
+        resume_target="latest",                # Prioritizes latest checkpoint
+        resume_warmup_steps=100,               # Smooth 100-step warmup on resume
+    )
+
+
+if __name__ == "__main__":
+    main()
