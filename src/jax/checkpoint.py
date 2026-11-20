@@ -391,22 +391,59 @@ def adapt_and_load_checkpoint_weights(
         target_params["motor.temporal_router.bias"] = jnp.array([0.5, -0.8, 1.0], dtype=target_params["motor.temporal_router.bias"].dtype)
         restored_keys.add("motor.temporal_router.bias")
 
-    # 4. Progressive Cortical Expansion: Preserve tract wiring and apply Net2Net zero-regression init
+    # 4. Progressive Cortical Expansion: Check if incoming checkpoint is from a smaller model
+    src_shells = None
+    if "core.intra_norms.weight" in raw_state:
+        src_shells = raw_state["core.intra_norms.weight"].shape[0]
+    elif "motor.shell_score" in raw_state:
+        src_shells = raw_state["motor.shell_score"].shape[0]
+    else:
+        # Check 2D key prefixes
+        count_2d = 0
+        for k in range(128):
+            found = False
+            for pfx in ["volumetric_core.intra_norms", "core.intra_norms", "intra_norms"]:
+                if f"{pfx}.{k}.weight" in raw_state:
+                    found = True
+                    break
+            if found:
+                count_2d += 1
+            else:
+                break
+        if count_2d > 0:
+            src_shells = count_2d
+
+    src_tracts = None
+    if "core.shortcut_weight" in raw_state:
+        src_tracts = raw_state["core.shortcut_weight"].shape[0]
+    elif "core.shortcut_gate" in raw_state:
+        src_tracts = raw_state["core.shortcut_gate"].shape[0]
+
+    # Only treat as structural expansion if incoming checkpoint has strictly fewer shells/tracts
+    is_expanding_shells = (src_shells is not None and src_shells < config.num_shells)
+    is_expanding_tracts = (src_tracts is not None and src_tracts < config.num_shortcut_tracts)
+    is_structural_expansion = is_expanding_shells or is_expanding_tracts
+
     updated_buffers = buffers
-    if buffers is not None and "core.src_indices" in raw_state and "core.dst_indices" in raw_state:
+    if buffers is not None and is_structural_expansion and "core.src_indices" in raw_state and "core.dst_indices" in raw_state:
         base_src = _to_numpy(raw_state["core.src_indices"])
         base_dst = _to_numpy(raw_state["core.dst_indices"])
+        frozen_shells = src_shells if src_shells is not None else 16
         updated_buffers = generate_expanded_tract_wiring(
             num_shells=config.num_shells,
             num_tracts=config.num_shortcut_tracts,
             base_src=base_src,
             base_dst=base_dst,
-            num_frozen_shells=16,
+            num_frozen_shells=frozen_shells,
             framework="jax",
         )
 
-    if apply_net2net and config.num_shells > 16:
-        apply_net2net_cortical_init(target_params, num_frozen_shells=16, num_frozen_tracts=40)
+    # Net2Net cortical zero-regression initialization is ONLY applied during actual expansion
+    # into a larger mantle (never on normal checkpoint resumption of the same architecture tier)
+    if apply_net2net and is_structural_expansion and config.num_shells > 16:
+        frozen_shells = src_shells if src_shells is not None else 16
+        frozen_tracts = src_tracts if src_tracts is not None else 40
+        apply_net2net_cortical_init(target_params, num_frozen_shells=frozen_shells, num_frozen_tracts=frozen_tracts)
 
     missing = [k for k in target_params.keys() if k not in restored_keys and k != "core.radial_up_out.weight"]
     if missing:
@@ -595,8 +632,8 @@ class AsyncCheckpointManager:
         self.cloud_weights_only = cloud_weights_only
         self.save_optimizer_state = save_optimizer_state
         self._last_cloud_upload_at: Dict[str, float] = {}
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="ckpt_async")
-        self._last_future: Optional[concurrent.futures.Future] = None
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="ckpt_async")
+        self._last_futures: Dict[str, concurrent.futures.Future] = {}
         os.makedirs(self.local_dir, exist_ok=True)
         os.makedirs(self.target_dir, exist_ok=True)
 
@@ -694,14 +731,17 @@ class AsyncCheckpointManager:
         opt_state: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Dispatches an asynchronous save job. Returns True if job was queued."""
-        is_critical = ("best" in filename) or ("step_" in filename) or block_if_busy
-        if not is_critical and (self._last_future is not None and not self._last_future.done()):
+        target_slot = "best" if "best" in filename else ("step" if "step_" in filename else "latest")
+        is_critical = (target_slot in ("best", "step")) or block_if_busy
+        last_fut = self._last_futures.get(target_slot)
+        if not is_critical and (last_fut is not None and not last_fut.done()):
             return False
 
         params_cpu = jax.device_get(params)
         buffers_cpu = jax.device_get(buffers)
         opt_state_cpu = jax.device_get(opt_state) if opt_state is not None else None
-        self._last_future = self.executor.submit(self._worker, params_cpu, buffers_cpu, filename, meta_dict, False, opt_state_cpu)
+        fut = self.executor.submit(self._worker, params_cpu, buffers_cpu, filename, meta_dict, False, opt_state_cpu)
+        self._last_futures[target_slot] = fut
         return True
 
     def flush(

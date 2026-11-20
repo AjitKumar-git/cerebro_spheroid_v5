@@ -776,7 +776,11 @@ def main(args=None):
                 restored_ema = ckpt.get("ema_loss", ckpt.get("loss", ckpt.get("eval_loss", None)))
                 if restored_ema is not None and math.isfinite(float(restored_ema)) and float(restored_ema) > 0.0:
                     initial_ema_loss = float(restored_ema)
-                adapt_res = adapt_and_load_checkpoint_weights(ckpt, params, target_dtype, config, buffers=buffers)
+                is_resuming_active = (existing_preset_step > 0 or not getattr(args, "from_scratch", False))
+                adapt_res = adapt_and_load_checkpoint_weights(
+                    ckpt, params, target_dtype, config, buffers=buffers,
+                    apply_net2net=(not is_resuming_active and getattr(args, "freeze_core", False))
+                )
                 if isinstance(adapt_res, tuple):
                     restored, buffers = adapt_res
                 else:

@@ -443,7 +443,7 @@ def main(args=None):
         ckpt = safe_torch_load(sft_resume_path, map_location="cpu", weights_only=True)
         start_step = int(ckpt.get("step", 0))
         best_eval_loss = float(ckpt.get("eval_loss", float("inf")))
-        restored, buffers = adapt_and_load_checkpoint_weights(ckpt, params, target_dtype, config, buffers=buffers)
+        restored, buffers = adapt_and_load_checkpoint_weights(ckpt, params, target_dtype, config, buffers=buffers, apply_net2net=False)
         print(f"✓ Resumed SFT Step {start_step:,} (Eval Loss: {best_eval_loss:.4f}, Restored: {restored}/{len(params)} arrays)")
         loaded_source = sft_resume_path
     else:
@@ -499,7 +499,7 @@ def main(args=None):
             ckpt = safe_torch_load(base_ckpt_path, map_location="cpu", weights_only=True)
             pretrain_step = int(ckpt.get("step", 0))
             pretrain_loss = float(ckpt.get("loss", ckpt.get("eval_loss", 0.0)))
-            restored, buffers = adapt_and_load_checkpoint_weights(ckpt, params, target_dtype, config, buffers=buffers)
+            restored, buffers = adapt_and_load_checkpoint_weights(ckpt, params, target_dtype, config, buffers=buffers, apply_net2net=False)
             print(f"✅ Foundation Model Loaded: Step {pretrain_step:,} (Loss: {pretrain_loss:.4f}) | Adapted {restored}/{len(params)} arrays.")
             print("🌱 Initializing SFT Step 0 with calibrated pre-trained weights!")
             start_step = 0

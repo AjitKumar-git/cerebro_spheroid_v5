@@ -1361,6 +1361,27 @@ if ($action === 'upload_chunk') {
             'size_bytes' => filesize($final_file),
             'md5' => md5_file($final_file)
         ];
+
+        // Auto-promote: If a newer 'best' checkpoint has step >= current 'latest', mirror it to 'latest' at 0 network cost
+        if ($type === 'best') {
+            $latest_filename = get_model_filename($model, 'latest');
+            $latest_file = $storage_dir . '/' . $latest_filename;
+            $latest_key = !empty($norm_m) ? ($norm_m . '_latest') : 'latest';
+            $curr_latest_step = isset($manifest[$latest_key]['step']) ? intval($manifest[$latest_key]['step']) : 0;
+            if ($step >= $curr_latest_step) {
+                @copy($final_file, $latest_file);
+                $manifest[$latest_key] = [
+                    'model' => $norm_m,
+                    'type' => 'latest',
+                    'step' => $step,
+                    'loss' => $loss,
+                    'source' => $source,
+                    'updated_at' => date('c'),
+                    'size_bytes' => filesize($final_file),
+                    'md5' => $manifest[$manifest_key]['md5']
+                ];
+            }
+        }
         file_put_contents($manifest_file, json_encode($manifest, JSON_PRETTY_PRINT));
 
         // Auto-record completed checkpoint into model loss history

@@ -396,7 +396,7 @@ def push_checkpoint(
     source_node: Optional[str] = None,
     url: Optional[str] = None,
     token: Optional[str] = None,
-    chunk_size_mb: int = 10,
+    chunk_size_mb: int = 25,
 ) -> bool:
     """
     Uploads a checkpoint to bioflo.in using chunked streaming for a specific model tier.

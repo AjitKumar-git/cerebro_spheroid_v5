@@ -1,15 +1,15 @@
 # Agent Work State & Activity Tracker
 
-> **Status**: 🟢 `COMPLETED` | **Last Updated**: `2026-11-20T22:13:32.768754+05:30` | **Session**: `1ffa7ab2-b764-480a-b597-d783c09f257d`
+> **Status**: 🟢 `COMPLETED` | **Last Updated**: `2026-11-21T00:57:51.254485+05:30` | **Session**: `1ffa7ab2-b764-480a-b597-d783c09f257d`
 
 ## Current / Active Objective
-**Goal**: remove v5 compact 166M preset from website not usable, and for v5 compact please check forward pass loss again from website
+**Goal**: make the uploads lightest
 
 - **Phase**: `completed`
 - **Current Task**: Idle / Awaiting next request
 
 ## Summary of Completed Work
----
+The cloud synchronization and checkpoint serialization pipeline has been updated to make uploads as light and fast as possible:
 
 ## Modified Files
 - [`AGENTS.md`](AGENTS.md)
@@ -93,20 +93,23 @@
 - [`tests/test_teacher_digester.py`](tests/test_teacher_digester.py)
 - [`training/train_v5_tpu_jax.py`](training/train_v5_tpu_jax.py)
 - [`../../../../.gemini/antigravity/brain/1ffa7ab2-b764-480a-b597-d783c09f257d/scratch/check_website_compact.py`](../../../../.gemini/antigravity/brain/1ffa7ab2-b764-480a-b597-d783c09f257d/scratch/check_website_compact.py)
+- [`../../../../.gemini/antigravity/brain/1ffa7ab2-b764-480a-b597-d783c09f257d/scratch/evaluate_v5_compact_best.py`](../../../../.gemini/antigravity/brain/1ffa7ab2-b764-480a-b597-d783c09f257d/scratch/evaluate_v5_compact_best.py)
+- [`../../../../.gemini/antigravity/brain/1ffa7ab2-b764-480a-b597-d783c09f257d/scratch/evaluate_v5_small_920k.py`](../../../../.gemini/antigravity/brain/1ffa7ab2-b764-480a-b597-d783c09f257d/scratch/evaluate_v5_small_920k.py)
+- [`src/cloud_sync.py`](src/cloud_sync.py)
 
 ## Recent Actions (Last 10)
 | Time | Tool | Details |
 | :--- | :--- | :--- |
-| `22:13:18` | `run_command` | Refresh v5_compact telemetry from website |
-| `22:13:00` | `run_command` | Remove v5_compact_166m.json |
-| `22:12:48` | `run_command` | Run check_website_compact.py |
-| `22:12:36` | `write_file` | write_file |
-| `22:12:27` | `run_command` | Fetch complete v5_compact training telemetry from website |
-| `22:12:18` | `run_command` | Fetch complete v5_compact training telemetry from website |
-| `22:12:02` | `run_command` | Search for bioflo.in in repo |
-| `22:11:56` | `run_command` | Check model tabs in dashboard |
-| `22:11:47` | `run_command` | Search for compact 166m and 32shells |
-| `22:11:42` | `manage_task` | manage_task |
+| `00:57:37` | `run_command` | Run test_vram_tuner_and_sync.py |
+| `00:54:17` | `manage_task` | manage_task |
+| `00:54:12` | `manage_task` | manage_task |
+| `00:53:52` | `edit_file` | edit_file |
+| `00:53:42` | `edit_file` | edit_file |
+| `00:53:34` | `read_file` | read_file |
+| `00:53:28` | `read_file` | read_file |
+| `00:53:22` | `edit_file` | edit_file |
+| `00:53:10` | `read_file` | read_file |
+| `00:52:58` | `run_command` | Test gzip compression on checkpoint |
 
 ---
 *This file is automatically maintained by `auto-work-tracker`. Other agents can parse `.agents/work_state.json` or inspect this file directly to resume or review progress.*
