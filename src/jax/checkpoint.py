@@ -42,7 +42,7 @@ import jax.numpy as jnp
 from .v5_model import ModelConfigV5, PRESETS_V5, init_params_v5, generate_small_world_indices
 
 
-def _safe_torch_tensor(arr):
+def _safe_torch_tensor(arr, dtype=None):
     """Safely converts an array (including ml_dtypes.bfloat16 from TPU/JAX) into a torch.Tensor."""
     if not HAS_TORCH:
         raise RuntimeError(
@@ -50,12 +50,20 @@ def _safe_torch_tensor(arr):
             "If on Google Colab, please do 'Runtime -> Restart session' after pip install."
         )
     if isinstance(arr, torch.Tensor):
+        if dtype is not None and arr.is_floating_point():
+            return arr.to(dtype)
         return arr
     if hasattr(arr, "dtype") and str(arr.dtype) == "bfloat16":
         np_f32 = np.array(arr, dtype=np.float32)
-        return torch.from_numpy(np_f32).to(torch.bfloat16)
+        t = torch.from_numpy(np_f32).to(torch.bfloat16)
+        if dtype is not None and dtype != torch.bfloat16 and t.is_floating_point():
+            return t.to(dtype)
+        return t
     np_arr = np.array(arr)
-    return torch.from_numpy(np_arr)
+    t = torch.from_numpy(np_arr)
+    if dtype is not None and t.is_floating_point():
+        return t.to(dtype)
+    return t
 
 
 def safe_torch_load(
@@ -90,16 +98,26 @@ def save_jax_to_torch_pt(
     save_path: str,
     meta: Optional[dict] = None,
     opt_state: Optional[Dict[str, Any]] = None,
+    bare_bf16: bool = False,
 ) -> None:
-    """Converts JAX PyTree into PyTorch state_dict and saves to .pt format (including Spheroid optimizer moments)."""
+    """Converts JAX PyTree into PyTorch state_dict and saves to .pt format.
+    
+    If bare_bf16=True:
+      - Strictly casts all parameter tensors to torch.bfloat16.
+      - Retains buffer indices as integer tensors.
+      - Strips all optimizer moments ('opt_state'), master weights, and non-essential fluff.
+      - Retains only minimal scalar metadata (step, loss, eval_loss, model, timestamp).
+    """
     if not HAS_TORCH:
         raise RuntimeError(
             f"PyTorch is required to save .pt checkpoints: {_TORCH_ERR}."
         )
     os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+    target_float_dtype = torch.bfloat16 if bare_bf16 else None
+
     torch_state: Dict[str, torch.Tensor] = {}
     for k, v in params.items():
-        t = _safe_torch_tensor(v)
+        t = _safe_torch_tensor(v, dtype=target_float_dtype)
         torch_state[k] = t
 
     torch_state["core.src_indices"] = _safe_torch_tensor(buffers[0])
@@ -113,12 +131,17 @@ def save_jax_to_torch_pt(
         "timestamp": time.time(),
     }
     if meta:
-        for mk, mv in meta.items():
-            if mk not in checkpoint:
-                checkpoint[mk] = mv
+        if bare_bf16:
+            for mk in ["model", "sync_model", "preset", "best_eval_loss"]:
+                if mk in meta:
+                    checkpoint[mk] = meta[mk]
+        else:
+            for mk, mv in meta.items():
+                if mk not in checkpoint:
+                    checkpoint[mk] = mv
 
-    # Persist optimizer state (moments, master weights, and spectral vectors) to prevent cold restarts
-    if opt_state is not None and isinstance(opt_state, dict):
+    # Persist optimizer state only when not saving bare weights
+    if not bare_bf16 and opt_state is not None and isinstance(opt_state, dict):
         try:
             torch_opt: Dict[str, Any] = {}
             if "step" in opt_state:
@@ -137,7 +160,7 @@ def save_jax_to_torch_pt(
     torch.save(checkpoint, tmp_path)
     os.replace(tmp_path, save_path)
 
-    if meta:
+    if meta and not bare_bf16:
         meta_path = save_path.replace(".pt", ".json")
         def _json_default(obj):
             if dataclasses.is_dataclass(obj):
@@ -683,13 +706,10 @@ class AsyncCheckpointManager:
                         loss_val = loss_f if (loss_f == loss_f and abs(loss_f) < 1e30) else 0.0
                         sync_model = meta_dict.get("sync_model") if meta_dict else None
                         # Snapshot isolation: stage to a dedicated temporary file so ongoing TPU training
-                        # steps never mutate or overwrite the checkpoint file while the async upload streams chunks
+                        # steps never mutate or overwrite the checkpoint file while the async upload streams chunks.
+                        # Strict Bare BF16 Guarantee: Cloud uploads only stream bare bfloat16 weights (zero fluff, zero opt_state).
                         upload_stage = f"{local_path}.upload.{os.getpid()}.{time.time_ns()}.pt"
-                        if self.cloud_weights_only:
-                            # Option A: Save lightweight weights-only checkpoint (~229 MB) for rapid, non-blocking cloud upload
-                            save_jax_to_torch_pt(params_cpu, buffers_cpu, upload_stage, meta=meta_dict, opt_state=None)
-                        else:
-                            shutil.copyfile(local_path, upload_stage)
+                        save_jax_to_torch_pt(params_cpu, buffers_cpu, upload_stage, meta=meta_dict, opt_state=None, bare_bf16=True)
                         push_checkpoint_async(
                             upload_stage,
                             step=step_val,

@@ -586,7 +586,7 @@ def main(args=None):
         if args.cloud_sync:
             try:
                 step0_stage = f"{local_latest}.upload.{os.getpid()}.{time.time_ns()}.pt"
-                shutil.copyfile(local_latest, step0_stage)
+                save_jax_to_torch_pt(params, buffers, step0_stage, meta=step0_meta, opt_state=None, bare_bf16=True)
                 push_checkpoint_async(
                     step0_stage,
                     step=0,
@@ -1625,6 +1625,19 @@ def main(args=None):
         cumulative_loss_tokens = int(loaded_ckpt.get("cumulative_loss_tokens", 0))
         cumulative_padded_tokens = int(loaded_ckpt.get("cumulative_padded_tokens", 0))
         initial_lifetime_tokens = int(loaded_ckpt.get("lifetime_tokens", 0))
+
+        # Check website remote token tracker to prevent token regression on worker restart
+        if args.cloud_sync:
+            try:
+                remote_tracker = fetch_remote_token_tracker(sync_model_name or args.preset, url=args.cloud_url, token=args.cloud_token)
+                if remote_tracker and isinstance(remote_tracker, dict):
+                    remote_cum = int(remote_tracker.get("cumulative_tokens", 0))
+                    if remote_cum > cumulative_tokens:
+                        print(f"🌐 [cloud_sync] Restored persistent cumulative tokens from bioflo.in website: {remote_cum:,} tokens")
+                        cumulative_tokens = remote_cum
+            except Exception:
+                pass
+
     lifetime_tokens = initial_lifetime_tokens + cumulative_tokens
 
     # Diagnostic Tracking for Optimizer Health & Stability

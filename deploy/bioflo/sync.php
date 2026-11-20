@@ -281,6 +281,19 @@ if ($action === 'save_tokens' || $action === 'record_tokens') {
 
     $tracker_file = $storage_dir . '/token_tracker_' . $model . '.json';
 
+    // Monotonic Token Ingestion Safeguard: Prevent restarted sessions from resetting global token accounting
+    $force_reset = isset($input_data['force_reset']) && filter_var($input_data['force_reset'], FILTER_VALIDATE_BOOLEAN);
+    if (!$force_reset && file_exists($tracker_file)) {
+        $old_tracker = json_decode(file_get_contents($tracker_file), true);
+        if (is_array($old_tracker)) {
+            $old_cum = isset($old_tracker['cumulative_tokens']) ? floatval($old_tracker['cumulative_tokens']) : 0;
+            if ($old_cum > $cumulative_tokens && $step < 10000) {
+                // Worker restarted from Step 0/scratch: accumulate new tokens on top of preserved historical baseline
+                $cumulative_tokens = $old_cum + $cumulative_tokens;
+            }
+        }
+    }
+
     $tracker_data = [
         'model' => $model,
         'cumulative_tokens' => $cumulative_tokens,

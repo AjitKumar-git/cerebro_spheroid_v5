@@ -415,7 +415,8 @@ class RectifiedContiguousPretrainStreamer:
                 from src.hf_utils import get_hf_token
                 hf_tok = get_hf_token()
                 kw = {"name": "sample-10BT", "split": "train", "streaming": True}
-                if hf_tok:
+                # Use token on first attempt; if it fails (e.g. 401 Unauthorized), retry anonymously
+                if hf_tok and attempt == 0:
                     kw["token"] = hf_tok
                 print("🌐 [Streamer] Connecting to HuggingFaceFW/fineweb (sample-10BT)...")
                 ds = load_dataset("HuggingFaceFW/fineweb", **kw)
@@ -457,7 +458,8 @@ class RectifiedContiguousPretrainStreamer:
                 from src.hf_utils import get_hf_token
                 hf_tok = get_hf_token()
                 kw = {"name": "sample-10BT", "split": "train", "streaming": True}
-                if hf_tok:
+                # Use token on first attempt; if it fails (e.g. 401 Unauthorized), retry anonymously
+                if hf_tok and attempt == 0:
                     kw["token"] = hf_tok
                 print(f"📚 [Streamer] Connecting to HuggingFaceFW/fineweb-edu (sample-10BT, score > {self.min_edu_score})...")
                 ds = load_dataset("HuggingFaceFW/fineweb-edu", **kw)
@@ -535,22 +537,24 @@ class RectifiedContiguousPretrainStreamer:
 
     def _open_math_stream(self) -> Iterator[str]:
         """Streams mathematical web text and proofs (FineMath) with resilient fallback."""
-        try:
-            from datasets import load_dataset
-            from src.hf_utils import get_hf_token
-            hf_tok = get_hf_token()
-            kw = {"name": "finemath-4plus", "split": "train", "streaming": True}
-            if hf_tok:
-                kw["token"] = hf_tok
-            print("📐 [Streamer] Connecting to HuggingFaceTB/finemath...")
-            ds = load_dataset("HuggingFaceTB/finemath", **kw)
-            for row in ds:
-                t = row.get("text", "")
-                if t and len(t) > 150:
-                    yield t
-            return
-        except Exception as e:
-            err_msg = str(e)
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                from datasets import load_dataset
+                from src.hf_utils import get_hf_token
+                hf_tok = get_hf_token()
+                kw = {"name": "finemath-4plus", "split": "train", "streaming": True}
+                if hf_tok and attempt == 0:
+                    kw["token"] = hf_tok
+                print("📐 [Streamer] Connecting to HuggingFaceTB/finemath...")
+                ds = load_dataset("HuggingFaceTB/finemath", **kw)
+                for row in ds:
+                    t = row.get("text", "")
+                    if t and len(t) > 150:
+                        yield t
+                return
+            except Exception as e:
+                err_msg = str(e)
 
         print(f"⚠️ [Streamer Notice] 'math' stream unavailable ({err_msg}). Engaged diverse offline mathematical corpus ({len(DIVERSE_FALLBACKS['math'])} proofs).")
         yield from self._cycle_corpus(DIVERSE_FALLBACKS["math"])

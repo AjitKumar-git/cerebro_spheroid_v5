@@ -56,7 +56,7 @@ def get_sync_token(token: Optional[str] = None) -> str:
                         return t
             except Exception:
                 pass
-    return ""
+    return "CerebroSpheroid_Sync_Secure_2026"
 
 
 DEFAULT_URL = os.environ.get("BIOFLO_SYNC_URL", "https://bioflo.in/api/cerebro/sync.php")
@@ -314,7 +314,9 @@ def pull_checkpoint(
 
 
 def _ensure_bfloat16_checkpoint(file_path: str) -> None:
-    """Ensures any PyTorch .pt checkpoint has all floating-point tensors converted to bfloat16 before cloud upload."""
+    """Ensures any PyTorch .pt checkpoint uploaded to cloud contains ONLY bare bfloat16 weights,
+    stripping optimizer state ('opt_state'), master weights, and non-essential fluff.
+    """
     if not file_path.endswith(".pt") or not os.path.exists(file_path):
         return
     try:
@@ -330,61 +332,78 @@ def _ensure_bfloat16_checkpoint(file_path: str) -> None:
         if not isinstance(ckpt, dict):
             return
 
-        def _has_fp32(d: dict) -> bool:
-            for v in d.values():
-                if isinstance(v, torch.Tensor) and v.is_floating_point() and v.dtype in (torch.float32, torch.float64):
-                    return True
-                if isinstance(v, dict) and _has_fp32(v):
-                    return True
-            return False
+        needs_rewrite = False
 
-        def _convert_dict_to_bf16(d: dict) -> int:
+        # 1. Strip fluff: remove optimizer state if present
+        if "opt_state" in ckpt:
+            ckpt.pop("opt_state", None)
+            needs_rewrite = True
+
+        # 2. Strip any large non-essential objects in root
+        allowed_root_keys = {
+            "model_state", "state_dict", "params",
+            "step", "loss", "eval_loss", "best_eval_loss",
+            "model", "sync_model", "preset", "timestamp"
+        }
+        for k in list(ckpt.keys()):
+            if k not in allowed_root_keys and not isinstance(ckpt[k], (int, float, str, bool)):
+                if isinstance(ckpt[k], (dict, list)) and len(str(ckpt[k])) > 500:
+                    ckpt.pop(k, None)
+                    needs_rewrite = True
+
+        # 3. Ensure all floating-point tensors are converted to bfloat16
+        def _convert_dict_to_bf16(d: dict) -> Tuple[int, bool]:
             count = 0
-            for k, v in d.items():
-                if isinstance(v, torch.Tensor) and v.is_floating_point() and v.dtype in (torch.float32, torch.float64):
-                    d[k] = v.to(torch.bfloat16)
-                    count += 1
+            has_changes = False
+            for k, v in list(d.items()):
+                if isinstance(v, torch.Tensor):
+                    if v.is_floating_point() and v.dtype != torch.bfloat16:
+                        d[k] = v.to(torch.bfloat16)
+                        count += 1
+                        has_changes = True
                 elif isinstance(v, dict):
-                    count += _convert_dict_to_bf16(v)
-            return count
+                    c, ch = _convert_dict_to_bf16(v)
+                    count += c
+                    if ch:
+                        has_changes = True
+            return count, has_changes
 
-        has_fp = False
-        target_keys = ["model_state", "state_dict", "action_head_state", "action_head_state_dict", "opt_state"]
+        target_keys = ["model_state", "state_dict", "params", "action_head_state", "action_head_state_dict"]
         is_nested = any(k in ckpt for k in target_keys)
-
-        if is_nested:
-            for tk in target_keys:
-                sub = ckpt.get(tk)
-                if isinstance(sub, dict) and _has_fp32(sub):
-                    has_fp = True
-                    break
-        else:
-            has_fp = _has_fp32(ckpt)
-
-        if not has_fp:
-            return
-
         converted_count = 0
+
         if is_nested:
             for tk in target_keys:
                 sub = ckpt.get(tk)
                 if isinstance(sub, dict):
-                    converted_count += _convert_dict_to_bf16(sub)
+                    c, ch = _convert_dict_to_bf16(sub)
+                    converted_count += c
+                    if ch:
+                        needs_rewrite = True
         else:
-            converted_count += _convert_dict_to_bf16(ckpt)
+            c, ch = _convert_dict_to_bf16(ckpt)
+            converted_count += c
+            if ch:
+                needs_rewrite = True
 
-        tmp_out = f"{file_path}.bf16.{os.getpid()}"
+        if not needs_rewrite:
+            return
+
+        tmp_out = f"{file_path}.bare_bf16.{os.getpid()}"
         torch.save(ckpt, tmp_out)
         if zipfile.is_zipfile(tmp_out):
             os.replace(tmp_out, file_path)
             new_mb = os.path.getsize(file_path) / 1e6
-            print(f"✅ [cloud_sync] Converted {converted_count} float32 tensors to bfloat16 ({new_mb:.1f} MB) in {os.path.basename(file_path)}")
+            print(f"✅ [cloud_sync] Pruned fluff & converted {converted_count} tensors to bare bfloat16 ({new_mb:.1f} MB) in {os.path.basename(file_path)}")
         else:
             if os.path.exists(tmp_out):
                 os.remove(tmp_out)
-            print(f"⚠️ [cloud_sync] Bfloat16 conversion produced invalid zip archive; keeping original {file_path}")
+            print(f"⚠️ [cloud_sync] Bare bfloat16 conversion produced invalid zip archive; keeping original {file_path}")
     except Exception as e:
-        print(f"⚠️ [cloud_sync] Warning during bfloat16 check: {e}")
+        print(f"⚠️ [cloud_sync] Warning during bare bfloat16 check: {e}")
+
+
+_ensure_bare_bf16_checkpoint = _ensure_bfloat16_checkpoint
 
 
 def push_checkpoint(
@@ -739,7 +758,7 @@ def fetch_remote_loss_history(
     sync_token = token or DEFAULT_TOKEN
     clean_model = normalize_model_name(model) or model
 
-    req_url = f"{sync_url}?action=get_loss_history&model={clean_model}"
+    req_url = f"{sync_url}?action=get_loss_history&model={clean_model}&token={sync_token}"
     req = urllib.request.Request(
         req_url,
         headers={"Authorization": f"Bearer {sync_token}", "User-Agent": "CerebroV5CloudSync/1.0"}
