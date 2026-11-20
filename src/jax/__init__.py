@@ -24,6 +24,14 @@ from .spheroid_optimizer import (
     build_train_step_spheroid,
 )
 
+from .scmer_optimizer import (
+    init_scmer_opt_state,
+    build_scmer_train_engine,
+    build_train_step_scmer,
+    build_pmap_local_sgd_step_scmer,
+)
+from .scmer import compute_scmer_step
+
 from .checkpoint import (
     save_jax_to_torch_pt,
     load_torch_pt_to_jax,

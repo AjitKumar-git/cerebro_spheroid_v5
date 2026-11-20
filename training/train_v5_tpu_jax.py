@@ -157,9 +157,20 @@ def parse_args(args_list=None):
     parser.add_argument("--resume_warmup_steps", "--resume-warmup-steps", dest="resume_warmup_steps", type=int, default=100, help="Smooth warmup steps upon checkpoint resumption (default: 100)")
     parser.add_argument("--lr_schedule", type=str, default="cosine", choices=["cosine", "warm_restart", "session", "anneal"], help="Learning rate schedule")
     parser.add_argument("--restart_steps", type=int, default=25000, help="Cycle period for warm_restart schedule")
-    parser.add_argument("--optimizer", type=str, default="spheroid", choices=["spheroid", "adamw"], help="Optimizer choice (default: spheroid)")
+    parser.add_argument("--optimizer", type=str, default="scmer", choices=["scmer", "spheroid", "adamw"], help="Optimizer choice (default: scmer)")
     parser.add_argument("--weight_decay", type=float, default=1e-5, help="Weight decay multiplier")
     parser.add_argument("--repetition_penalty", type=float, default=1.25, help="Two-tier refractory repetition penalty multiplier")
+    parser.add_argument("--scmer-lambda", "--scmer_lambda", dest="scmer_lambda", type=float, default=0.05, help="Selective Cosine-Margin Embedding Regularization strength (0 disables it, default: 0.05)")
+    parser.add_argument("--scmer-margin", "--scmer_margin", dest="scmer_margin", type=float, default=0.12, help="Cosine margin threshold m above which positive similarity is penalized (default: 0.12)")
+    parser.add_argument("--scmer-subsample", "--scmer_subsample", dest="scmer_subsample", type=int, default=512, help="Number of token embedding rows sampled per regularizer event")
+    parser.add_argument("--scmer-pair-samples", "--scmer_pair_samples", dest="scmer_pair_samples", type=int, default=8192, help="Number of unique unordered token pairs sampled without replacement")
+    parser.add_argument("--scmer-interval", "--scmer_interval", dest="scmer_interval", type=int, default=8, help="Apply SCMER regularization every N optimizer updates")
+
+    # Backward compatibility aliases for SCMER
+    parser.add_argument("--neg-cov-lambda", "--neg_cov_lambda", dest="neg_cov_lambda", type=float, default=None, help="Alias for --scmer-lambda")
+    parser.add_argument("--neg-cov-mode", "--neg_cov_mode", dest="neg_cov_mode", choices=["asymmetric", "full_decorr"], default="asymmetric", help="Compatibility flag")
+    parser.add_argument("--neg-cov-subsample", "--neg_cov_subsample", dest="neg_cov_subsample", type=int, default=None, help="Alias for --scmer-subsample")
+    parser.add_argument("--neg-cov-interval", "--neg_cov_interval", dest="neg_cov_interval", type=int, default=None, help="Alias for --scmer-interval")
 
     # Model & Precision
     parser.add_argument("--preset", type=str, default="auto", choices=["auto", "v5_small", "v5_compact_32shells", "v5_compact", "v5_base", "v5_test", "tpu_v5e_1", "tpu_v6e_1", "tpu_v6e"], help="Model preset (default: auto -> auto-detects tpu_v6e_1 / tpu_v5e_1)")
@@ -507,7 +518,7 @@ def main(args=None):
     print(f"\nModel Config    : {args.preset} | Shells: {config.num_shells} | Surface Dim: {config.surface_dim} | Radial Dim: {config.radial_dim} | Thinking Cycles: {config.thinking_cycles}")
     print(f"Total Parameters: {total_params:,} (~{total_params/1e6:.1f}M)")
     print(f"Active Compute  : {active_compute:,} (~{active_compute/1e6:.1f}M) ({active_compute/total_params*100:.2f}%)")
-    print(f"Optimizer       : {args.optimizer.upper()} ({'Polar Newton-Schulz NS-5 + Spectral Clamp' if args.optimizer == 'spheroid' else 'Optax AdamW'})")
+    print(f"Optimizer       : {args.optimizer.upper()} ({'SCMER (Polar NS-5 + Spectral Clamp + Selective Cosine Margin)' if args.optimizer in ('spheroid', 'scmer') else 'Optax AdamW'})")
 
     # 3. Tokenizer
     tokenizer = build_tokenizer(args.tokenizer_name)
@@ -928,9 +939,9 @@ def main(args=None):
         verbose=True,
     )
     multi_mode = getattr(args, "multi_tpu", "auto")
-    use_multi_tpu_local_sgd = (num_devices > 1) and (args.optimizer == "spheroid") and (multi_mode != "single")
-    if num_devices > 1 and args.optimizer != "spheroid":
-        print(f"ℹ️ [Multi-Device Dispatch] Multi-device pmap Local-SGD is specialized for the SPHEROID optimizer (polar NS-5 + spectral clamp). Running {args.optimizer.upper()} in standard single-accelerator JIT mode.")
+    use_multi_tpu_local_sgd = (num_devices > 1) and (args.optimizer in ("spheroid", "scmer")) and (multi_mode != "single")
+    if num_devices > 1 and args.optimizer not in ("spheroid", "scmer"):
+        print(f"ℹ️ [Multi-Device Dispatch] Multi-device pmap Local-SGD is specialized for the SCMER / Spheroid optimizer (polar NS-5 + spectral clamp). Running {args.optimizer.upper()} in standard single-accelerator JIT mode.")
     eff_num_devices = num_devices if use_multi_tpu_local_sgd else 1
     base_local_steps = max(1, int(getattr(args, "local_steps", 4)))
     eff_local_steps = max(1, base_local_steps * grad_accum) if use_multi_tpu_local_sgd else 1
@@ -961,7 +972,13 @@ def main(args=None):
     train_step_fn_frozen = None
     train_step_fn_anneal = None
 
-    if args.optimizer == "spheroid":
+    eff_scmer_lambda = args.neg_cov_lambda if args.neg_cov_lambda is not None else args.scmer_lambda
+    eff_scmer_subsample = args.neg_cov_subsample if args.neg_cov_subsample is not None else args.scmer_subsample
+    eff_scmer_interval = args.neg_cov_interval if args.neg_cov_interval is not None else args.scmer_interval
+    eff_scmer_margin = args.scmer_margin
+    eff_scmer_pairs = args.scmer_pair_samples
+
+    if args.optimizer in ("spheroid", "scmer"):
         if start_step > 0 and "discovered_ckpt" in locals() and discovered_ckpt and os.path.exists(discovered_ckpt):
             from src.jax.checkpoint import restore_spheroid_opt_state
             opt_state = restore_spheroid_opt_state(discovered_ckpt, params)
@@ -977,6 +994,11 @@ def main(args=None):
                 remat=remat_choice,
                 local_steps=eff_local_steps,
                 devices=devices,
+                scmer_lambda=eff_scmer_lambda,
+                scmer_subsample=eff_scmer_subsample,
+                scmer_interval=eff_scmer_interval,
+                scmer_margin=eff_scmer_margin,
+                scmer_pair_samples=eff_scmer_pairs,
             )
             rep_params = replicate_for_pmap(params, devices)
             rep_opt_state = replicate_for_pmap(opt_state, devices)
@@ -991,6 +1013,11 @@ def main(args=None):
                 remat=remat_choice,
                 deliberation_mode=args.deliberation_mode,
                 param_masks=None,
+                scmer_lambda=eff_scmer_lambda,
+                scmer_subsample=eff_scmer_subsample,
+                scmer_interval=eff_scmer_interval,
+                scmer_margin=eff_scmer_margin,
+                scmer_pair_samples=eff_scmer_pairs,
             )
             train_step_fn_frozen = build_train_step_spheroid(
                 config,
@@ -1001,6 +1028,11 @@ def main(args=None):
                 remat=remat_choice,
                 deliberation_mode=args.deliberation_mode,
                 param_masks=param_masks,
+                scmer_lambda=eff_scmer_lambda,
+                scmer_subsample=eff_scmer_subsample,
+                scmer_interval=eff_scmer_interval,
+                scmer_margin=eff_scmer_margin,
+                scmer_pair_samples=eff_scmer_pairs,
             ) if param_masks is not None else train_step_fn_anneal
             train_step_fn = train_step_fn_anneal
             compute_grad_step, apply_opt_step = None, None
@@ -1014,6 +1046,11 @@ def main(args=None):
                 remat=remat_choice,
                 deliberation_mode=args.deliberation_mode,
                 param_masks=None,
+                scmer_lambda=eff_scmer_lambda,
+                scmer_subsample=eff_scmer_subsample,
+                scmer_interval=eff_scmer_interval,
+                scmer_margin=eff_scmer_margin,
+                scmer_pair_samples=eff_scmer_pairs,
             )
             _, apply_opt_step_frozen = build_spheroid_train_engine(
                 config,
@@ -1024,6 +1061,11 @@ def main(args=None):
                 remat=remat_choice,
                 deliberation_mode=args.deliberation_mode,
                 param_masks=param_masks,
+                scmer_lambda=eff_scmer_lambda,
+                scmer_subsample=eff_scmer_subsample,
+                scmer_interval=eff_scmer_interval,
+                scmer_margin=eff_scmer_margin,
+                scmer_pair_samples=eff_scmer_pairs,
             ) if param_masks is not None else (None, apply_opt_step_anneal)
             apply_opt_step = apply_opt_step_anneal
 
@@ -1298,11 +1340,17 @@ def main(args=None):
                         config, buffers, pad_id=pad_id, weight_decay=args.weight_decay,
                         repetition_penalty=args.repetition_penalty, remat=remat_choice,
                         deliberation_mode=args.deliberation_mode, param_masks=None,
+                        scmer_lambda=eff_scmer_lambda, scmer_subsample=eff_scmer_subsample,
+                        scmer_interval=eff_scmer_interval, scmer_margin=eff_scmer_margin,
+                        scmer_pair_samples=eff_scmer_pairs,
                     )
                     _, apply_opt_step_frozen = build_spheroid_train_engine(
                         config, buffers, pad_id=pad_id, weight_decay=args.weight_decay,
                         repetition_penalty=args.repetition_penalty, remat=remat_choice,
                         deliberation_mode=args.deliberation_mode, param_masks=param_masks,
+                        scmer_lambda=eff_scmer_lambda, scmer_subsample=eff_scmer_subsample,
+                        scmer_interval=eff_scmer_interval, scmer_margin=eff_scmer_margin,
+                        scmer_pair_samples=eff_scmer_pairs,
                     ) if param_masks is not None else (None, apply_opt_step_anneal)
     if start_step > 0 and math.isfinite(best_eval_loss):
         print(f"✓ XLA Compilation complete in {time.time() - t0_compile:.2f}s! Baseline Restored Loss: {best_eval_loss:.4f} (Tracer init: {init_loss_val:.2f})")
@@ -1780,6 +1828,11 @@ def main(args=None):
                             remat=remat_choice,
                             local_steps=eff_local_steps,
                             devices=devices,
+                            scmer_lambda=eff_scmer_lambda,
+                            scmer_subsample=eff_scmer_subsample,
+                            scmer_interval=eff_scmer_interval,
+                            scmer_margin=eff_scmer_margin,
+                            scmer_pair_samples=eff_scmer_pairs,
                         )
                         host_p = _get_host_params()
                         host_opt = _get_host_opt_state()
@@ -1791,21 +1844,33 @@ def main(args=None):
                             config, buffers, pad_id=pad_id, weight_decay=args.weight_decay,
                             repetition_penalty=args.repetition_penalty, remat=remat_choice,
                             deliberation_mode=args.deliberation_mode, param_masks=None,
+                            scmer_lambda=eff_scmer_lambda, scmer_subsample=eff_scmer_subsample,
+                            scmer_interval=eff_scmer_interval, scmer_margin=eff_scmer_margin,
+                            scmer_pair_samples=eff_scmer_pairs,
                         )
                         _, apply_opt_step_frozen = build_spheroid_train_engine(
                             config, buffers, pad_id=pad_id, weight_decay=args.weight_decay,
                             repetition_penalty=args.repetition_penalty, remat=remat_choice,
                             deliberation_mode=args.deliberation_mode, param_masks=param_masks,
+                            scmer_lambda=eff_scmer_lambda, scmer_subsample=eff_scmer_subsample,
+                            scmer_interval=eff_scmer_interval, scmer_margin=eff_scmer_margin,
+                            scmer_pair_samples=eff_scmer_pairs,
                         ) if param_masks is not None else (None, apply_opt_step_anneal)
                         train_step_fn_anneal = build_train_step_spheroid(
                             config, buffers, pad_id=pad_id, weight_decay=args.weight_decay,
                             repetition_penalty=args.repetition_penalty, remat=remat_choice,
                             deliberation_mode=args.deliberation_mode, param_masks=None,
+                            scmer_lambda=eff_scmer_lambda, scmer_subsample=eff_scmer_subsample,
+                            scmer_interval=eff_scmer_interval, scmer_margin=eff_scmer_margin,
+                            scmer_pair_samples=eff_scmer_pairs,
                         )
                         train_step_fn_frozen = build_train_step_spheroid(
                             config, buffers, pad_id=pad_id, weight_decay=args.weight_decay,
                             repetition_penalty=args.repetition_penalty, remat=remat_choice,
                             deliberation_mode=args.deliberation_mode, param_masks=param_masks,
+                            scmer_lambda=eff_scmer_lambda, scmer_subsample=eff_scmer_subsample,
+                            scmer_interval=eff_scmer_interval, scmer_margin=eff_scmer_margin,
+                            scmer_pair_samples=eff_scmer_pairs,
                         ) if param_masks is not None else train_step_fn_anneal
 
             loss_val = float(loss)

@@ -177,6 +177,14 @@ class SpheroidOptimizer(Optimizer):
         spectral_clamp: Optional[float] = 1.0,
         half_precision_moments: bool = False,
         orthogonal_embeddings: bool = False,
+        neg_cov_enabled: bool = False,
+        neg_cov_mode: str = "cosine_asymmetric",
+        neg_cov_lambda: float = 0.001,
+        neg_cov_margin: float = 0.10,
+        neg_cov_subsample: int = 512,
+        neg_cov_interval: int = 8,
+        neg_cov_center: str = "global",
+        neg_cov_normalize: bool = True,
     ):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -201,8 +209,76 @@ class SpheroidOptimizer(Optimizer):
             spectral_clamp=spectral_clamp,
             half_precision_moments=half_precision_moments,
             orthogonal_embeddings=orthogonal_embeddings,
+            neg_cov_enabled=neg_cov_enabled,
+            neg_cov_mode=neg_cov_mode,
+            neg_cov_lambda=neg_cov_lambda,
+            neg_cov_margin=neg_cov_margin,
+            neg_cov_subsample=neg_cov_subsample,
+            neg_cov_interval=neg_cov_interval,
+            neg_cov_center=neg_cov_center,
+            neg_cov_normalize=neg_cov_normalize,
         )
         super().__init__(params, defaults)
+
+    @staticmethod
+    def _compute_negative_covariance_grad(
+        W: torch.Tensor,
+        subsample: int = 512,
+        margin: float = 0.10,
+        eps: float = 1e-6,
+        center_mode: str = "global",
+        normalize: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor, float]:
+        """
+        Computes analytic negative covariance gradient for sampled rows of embedding matrix W.
+        Returns (indices, grad_rows, loss_val).
+        """
+        V, D = W.shape
+        B = min(subsample, V)
+        if B < 2:
+            return torch.empty(0, dtype=torch.long, device=W.device), torch.empty(0, D, device=W.device), 0.0
+
+        # Uniform sampling without replacement
+        indices = torch.randperm(V, device=W.device)[:B]
+        W_S = W[indices].float()
+
+        # Global Centering vs Local Centering
+        if center_mode == "global":
+            mu_V = W.float().mean(dim=0, keepdim=True)
+            X_S = W_S - mu_V
+        else:
+            X_S = W_S - W_S.mean(dim=0, keepdim=True)
+
+        if normalize:
+            norms = X_S.norm(dim=1, keepdim=True).clamp_min(eps)
+            U = X_S / norms
+            G = U @ U.t()
+            mask = ~torch.eye(B, dtype=torch.bool, device=W.device)
+            H = torch.clamp(G - margin, min=0.0) * mask.float()
+            denom = float(B * (B - 1))
+            loss_val = 0.5 * (H ** 2).sum().item() / denom
+
+            # Gradient wrt U
+            grad_U = (2.0 / denom) * (H @ U)
+            # Tangent projection through row normalization (prevents vector shrinkage)
+            u_dot_g = (U * grad_U).sum(dim=1, keepdim=True)
+            grad_X = (grad_U - U * u_dot_g) / norms
+        else:
+            # Unnormalized dot-product covariance
+            K = (X_S @ X_S.t()) / float(D)
+            mask = ~torch.eye(B, dtype=torch.bool, device=W.device)
+            H = torch.clamp(K - margin, min=0.0) * mask.float()
+            denom = float(B * (B - 1))
+            loss_val = 0.5 * (H ** 2).sum().item() / denom
+            grad_X = (4.0 / (float(D) * denom)) * (H @ X_S)
+
+        # Centering derivative
+        if center_mode != "global":
+            grad_rows = grad_X - grad_X.mean(dim=0, keepdim=True)
+        else:
+            grad_rows = grad_X
+
+        return indices, grad_rows, loss_val
 
     @torch.no_grad()
     def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
@@ -210,6 +286,8 @@ class SpheroidOptimizer(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        seen_storage_ptrs = set()
 
         for group in self.param_groups:
             # lr is dynamically updated by PyTorch learning rate schedulers (e.g. LambdaLR)
@@ -261,6 +339,27 @@ class SpheroidOptimizer(Optimizer):
                     step = state["step"]
                     work_p = state["master_p"] if need_master else p
                     work_g = grad.float() if (need_master or grad.dtype != work_p.dtype) else grad
+
+                    # Negative Covariance Regularization for vocabulary embeddings
+                    neg_cov_enabled = group.get("neg_cov_enabled", False)
+                    neg_cov_interval = group.get("neg_cov_interval", 8)
+                    if is_vocab and neg_cov_enabled and (step % neg_cov_interval == 0):
+                        ptr = p.data_ptr()
+                        if ptr not in seen_storage_ptrs:
+                            seen_storage_ptrs.add(ptr)
+                            idx, g_rows, cov_loss = self._compute_negative_covariance_grad(
+                                work_p,
+                                subsample=group.get("neg_cov_subsample", 512),
+                                margin=group.get("neg_cov_margin", 0.10),
+                                center_mode=group.get("neg_cov_center", "global"),
+                                normalize=group.get("neg_cov_normalize", True),
+                            )
+                            if idx.numel() > 0:
+                                neg_cov_lambda = group.get("neg_cov_lambda", 0.001)
+                                if work_g is grad:
+                                    work_g = work_g.clone()
+                                work_g[idx].add_(g_rows.to(work_g.dtype), alpha=neg_cov_lambda)
+                                state["last_neg_cov_loss"] = cov_loss
 
                     # Decoupled AdamW weight decay
                     if wd > 0.0:
@@ -351,6 +450,14 @@ def create_spheroid_param_groups(
     spectral_clamp: float = 1.0,
     half_precision_moments: bool = False,
     orthogonal_embeddings: bool = False,
+    neg_cov_enabled: bool = False,
+    neg_cov_mode: str = "cosine_asymmetric",
+    neg_cov_lambda: float = 0.001,
+    neg_cov_margin: float = 0.10,
+    neg_cov_subsample: int = 512,
+    neg_cov_interval: int = 8,
+    neg_cov_center: str = "global",
+    neg_cov_normalize: bool = True,
 ) -> List[Dict]:
     """
     Automatically classifies model parameters into tailored groups for Spheroid models:
@@ -503,4 +610,106 @@ def build_spheroid_optimizer(
         spectral_clamp=spectral_clamp,
         half_precision_moments=half_precision_moments,
         orthogonal_embeddings=orthogonal_embeddings,
+    )
+
+
+class SCMEROptimizer(SpheroidOptimizer):
+    """
+    Selective Cosine-Margin Embedding Regularization (SCMER) Optimizer for CerebroSpheroid.
+    Enforces active SCM regularization on vocabulary representations alongside Polar Newton-Schulz
+    for manifold operators and contractive spectral clamp for recurrent core matrices.
+    """
+    def __init__(
+        self,
+        params,
+        lr: float = 0.002,
+        lr_1d: Optional[float] = None,
+        lr_vocab: Optional[float] = None,
+        momentum: float = 0.95,
+        weight_decay: float = 0.01,
+        ns_steps: int = 3,
+        power_steps: int = 2,
+        spectral_clamp: float = 1.0,
+        half_precision_moments: bool = False,
+        orthogonal_embeddings: bool = False,
+        scmer_enabled: bool = True,
+        scmer_lambda: float = 0.001,
+        scmer_margin: float = 0.10,
+        scmer_subsample: int = 512,
+        scmer_pair_samples: int = 8192,
+        scmer_interval: int = 8,
+        scmer_center: str = "global",
+        scmer_normalize: bool = True,
+        **kwargs,
+    ):
+        super().__init__(
+            params=params,
+            lr=lr,
+            lr_1d=lr_1d,
+            lr_vocab=lr_vocab,
+            momentum=momentum,
+            weight_decay=weight_decay,
+            ns_steps=ns_steps,
+            power_steps=power_steps,
+            spectral_clamp=spectral_clamp,
+            half_precision_moments=half_precision_moments,
+            orthogonal_embeddings=orthogonal_embeddings,
+            neg_cov_enabled=scmer_enabled,
+            neg_cov_lambda=scmer_lambda,
+            neg_cov_margin=scmer_margin,
+            neg_cov_subsample=scmer_subsample,
+            neg_cov_interval=scmer_interval,
+            neg_cov_center=scmer_center,
+            neg_cov_normalize=scmer_normalize,
+            **kwargs,
+        )
+
+
+def build_scmer_optimizer(
+    model: nn.Module,
+    lr: float = 0.002,
+    lr_1d: Optional[float] = None,
+    lr_vocab: Optional[float] = None,
+    momentum: float = 0.95,
+    weight_decay: float = 0.01,
+    ns_steps: int = 3,
+    power_steps: int = 2,
+    spectral_clamp: float = 1.0,
+    half_precision_moments: bool = False,
+    orthogonal_embeddings: bool = False,
+    scmer_lambda: float = 0.001,
+    scmer_margin: float = 0.10,
+    scmer_subsample: int = 512,
+    scmer_pair_samples: int = 8192,
+    scmer_interval: int = 8,
+) -> SCMEROptimizer:
+    """Convenience factory to construct a fully-configured SCMEROptimizer for PyTorch models."""
+    groups = create_spheroid_param_groups(
+        model=model,
+        lr=lr,
+        lr_1d=lr_1d,
+        lr_vocab=lr_vocab,
+        weight_decay=weight_decay,
+        spectral_clamp=spectral_clamp,
+        half_precision_moments=half_precision_moments,
+        orthogonal_embeddings=orthogonal_embeddings,
+    )
+    return SCMEROptimizer(
+        params=groups,
+        lr=lr,
+        lr_1d=lr_1d,
+        lr_vocab=lr_vocab,
+        momentum=momentum,
+        weight_decay=weight_decay,
+        ns_steps=ns_steps,
+        power_steps=power_steps,
+        spectral_clamp=spectral_clamp,
+        half_precision_moments=half_precision_moments,
+        orthogonal_embeddings=orthogonal_embeddings,
+        scmer_enabled=True,
+        scmer_lambda=scmer_lambda,
+        scmer_margin=scmer_margin,
+        scmer_subsample=scmer_subsample,
+        scmer_pair_samples=scmer_pair_samples,
+        scmer_interval=scmer_interval,
     )

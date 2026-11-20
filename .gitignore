@@ -63,3 +63,6 @@ loss_history*.json
 loss_trajectory*.png
 metrics/
 .pytest_cache/
+
+# Local backups
+backups/

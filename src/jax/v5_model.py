@@ -1358,19 +1358,21 @@ def training_rollout(
         if ponder_cost is not None and getattr(config, "use_adaptive_thinking", False):
             base_loss = base_loss + float(getattr(config, "thinking_cost_weight", 0.01)) * ponder_cost
 
-        # Supervise Temporal Router on prompt_flux
-        w_r = params.get("motor.temporal_router.weight")
-        b_r = params.get("motor.temporal_router.bias")
-        if w_r is not None and b_r is not None:
-            router_logits = jnp.matmul(prompt_flux.astype(jnp.float32), w_r.T) + b_r
-            tgt_act = jnp.any(targets == 33, axis=-1).astype(jnp.float32)
-            tgt_th = jnp.any(targets == 386, axis=-1).astype(jnp.float32)
-            tgt_an = jnp.ones_like(tgt_act)
-            tgt_gates = jnp.stack([tgt_th, tgt_act, tgt_an], axis=-1)
-            max_val = jnp.maximum(router_logits, 0.0)
-            router_bce = max_val - router_logits * tgt_gates + jnp.log1p(jnp.exp(-jnp.abs(router_logits)))
-            gate_loss = jnp.mean(router_bce)
-            return base_loss + 0.15 * gate_loss
+        # Optional Temporal Router supervision (Strictly 0.0 during pretraining to allow free exploration)
+        router_weight = float(getattr(config, "router_loss_weight", 0.0))
+        if router_weight > 0.0:
+            w_r = params.get("motor.temporal_router.weight")
+            b_r = params.get("motor.temporal_router.bias")
+            if w_r is not None and b_r is not None:
+                router_logits = jnp.matmul(prompt_flux.astype(jnp.float32), w_r.T) + b_r
+                tgt_act = jnp.any(targets == 33, axis=-1).astype(jnp.float32)
+                tgt_th = jnp.any(targets == 386, axis=-1).astype(jnp.float32)
+                tgt_an = jnp.ones_like(tgt_act)
+                tgt_gates = jnp.stack([tgt_th, tgt_act, tgt_an], axis=-1)
+                max_val = jnp.maximum(router_logits, 0.0)
+                router_bce = max_val - router_logits * tgt_gates + jnp.log1p(jnp.exp(-jnp.abs(router_logits)))
+                gate_loss = jnp.mean(router_bce)
+                return base_loss + router_weight * gate_loss
 
         return base_loss
 
@@ -1381,18 +1383,20 @@ def training_rollout(
         base_ce = jnp.sum(all_loss) / jnp.maximum(jnp.sum(all_mask), 1.0)
         if ponder_cost is not None and getattr(config, "use_adaptive_thinking", False):
             base_ce = base_ce + float(getattr(config, "thinking_cost_weight", 0.01)) * ponder_cost
-        w_r = params.get("motor.temporal_router.weight")
-        b_r = params.get("motor.temporal_router.bias")
-        if w_r is not None and b_r is not None:
-            router_logits = jnp.matmul(prompt_flux.astype(jnp.float32), w_r.T) + b_r
-            tgt_act = jnp.any(targets == 33, axis=-1).astype(jnp.float32)
-            tgt_th = jnp.any(targets == 386, axis=-1).astype(jnp.float32)
-            tgt_an = jnp.ones_like(tgt_act)
-            tgt_gates = jnp.stack([tgt_th, tgt_act, tgt_an], axis=-1)
-            max_val = jnp.maximum(router_logits, 0.0)
-            router_bce = max_val - router_logits * tgt_gates + jnp.log1p(jnp.exp(-jnp.abs(router_logits)))
-            gate_loss = jnp.mean(router_bce)
-            return base_ce + 0.15 * gate_loss
+        router_weight = float(getattr(config, "router_loss_weight", 0.0))
+        if router_weight > 0.0:
+            w_r = params.get("motor.temporal_router.weight")
+            b_r = params.get("motor.temporal_router.bias")
+            if w_r is not None and b_r is not None:
+                router_logits = jnp.matmul(prompt_flux.astype(jnp.float32), w_r.T) + b_r
+                tgt_act = jnp.any(targets == 33, axis=-1).astype(jnp.float32)
+                tgt_th = jnp.any(targets == 386, axis=-1).astype(jnp.float32)
+                tgt_an = jnp.ones_like(tgt_act)
+                tgt_gates = jnp.stack([tgt_th, tgt_act, tgt_an], axis=-1)
+                max_val = jnp.maximum(router_logits, 0.0)
+                router_bce = max_val - router_logits * tgt_gates + jnp.log1p(jnp.exp(-jnp.abs(router_logits)))
+                gate_loss = jnp.mean(router_bce)
+                return base_ce + router_weight * gate_loss
         return base_ce
 
     _, all_logits = lax.scan(scan_fn, (state, init_refractory, init_plan, init_thought), jnp.arange(target_len))

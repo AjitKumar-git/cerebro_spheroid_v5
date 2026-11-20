@@ -115,6 +115,11 @@ def parse_sft_args(args_list: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--warmup_steps", "--warmup-steps", dest="warmup_steps", type=int, default=500, help="Linear warmup steps (default: 500)")
     parser.add_argument("--weight_decay", "--weight-decay", dest="weight_decay", type=float, default=0.01, help="SFT weight decay (default: 0.01)")
     parser.add_argument("--repetition_penalty", "--repetition-penalty", dest="repetition_penalty", type=float, default=1.20, help="Motor action repetition penalty (default: 1.20)")
+    parser.add_argument("--scmer-lambda", "--scmer_lambda", dest="scmer_lambda", type=float, default=0.001, help="Selective Cosine-Margin Embedding Regularization strength (default: 0.001)")
+    parser.add_argument("--scmer-margin", "--scmer_margin", dest="scmer_margin", type=float, default=0.10, help="Cosine margin threshold m above which positive similarity is penalized")
+    parser.add_argument("--scmer-subsample", "--scmer_subsample", dest="scmer_subsample", type=int, default=512, help="Number of token embedding rows sampled per regularizer event")
+    parser.add_argument("--scmer-pair-samples", "--scmer_pair_samples", dest="scmer_pair_samples", type=int, default=8192, help="Number of unique unordered token pairs sampled without replacement")
+    parser.add_argument("--scmer-interval", "--scmer_interval", dest="scmer_interval", type=int, default=8, help="Apply SCMER regularization every N optimizer updates")
     parser.add_argument("--save_interval", "--save-interval", dest="save_interval", type=int, default=250, help="Checkpoint save step interval (default: 250)")
     parser.add_argument("--eval_interval", "--eval-interval", dest="eval_interval", type=int, default=100, help="Validation step interval (default: 100)")
     parser.add_argument("--probe_interval", "--probe-interval", dest="probe_interval", type=int, default=500, help="Live generation probe step interval (default: 500)")
@@ -539,6 +544,11 @@ def main(args=None):
         remat=remat_choice,
         deliberation_mode=args.deliberation_mode,
         param_masks=param_masks,
+        scmer_lambda=args.scmer_lambda,
+        scmer_margin=args.scmer_margin,
+        scmer_subsample=args.scmer_subsample,
+        scmer_pair_samples=args.scmer_pair_samples,
+        scmer_interval=args.scmer_interval,
     )
 
     @jax.jit

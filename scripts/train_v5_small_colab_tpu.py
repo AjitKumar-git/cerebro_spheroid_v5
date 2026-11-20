@@ -188,6 +188,16 @@ def parse_args(args_list: Optional[List[str]] = None):
                         help="Matrix execution precision (default: bf16 for TPU MXU)")
     parser.add_argument("--remat", action=argparse.BooleanOptionalAction, default=True,
                         help="Enable activation rematerialization for memory efficiency")
+    parser.add_argument("--scmer-lambda", "--scmer_lambda", dest="scmer_lambda", type=float, default=0.05,
+                        help="Selective Cosine-Margin Embedding Regularization strength (default: 0.05)")
+    parser.add_argument("--scmer-margin", "--scmer_margin", dest="scmer_margin", type=float, default=0.12,
+                        help="Cosine margin threshold m above which similarity is penalized (default: 0.12)")
+    parser.add_argument("--scmer-subsample", "--scmer_subsample", dest="scmer_subsample", type=int, default=512,
+                        help="Sampled vocabulary rows per SCMER event (default: 512)")
+    parser.add_argument("--scmer-pair-samples", "--scmer_pair_samples", dest="scmer_pair_samples", type=int, default=8192,
+                        help="Sampled token pairs per SCMER event (default: 8192)")
+    parser.add_argument("--scmer-interval", "--scmer_interval", dest="scmer_interval", type=int, default=8,
+                        help="Apply SCMER regularization once every N optimizer updates (default: 8)")
 
     # Dataset & Tokenizer
     parser.add_argument("--dataset-source", type=str, default="autonomous",
@@ -508,6 +518,11 @@ def main(args=None):
             remat=args.remat,
             local_steps=args.local_steps,
             devices=devices,
+            scmer_lambda=args.scmer_lambda,
+            scmer_subsample=args.scmer_subsample,
+            scmer_interval=args.scmer_interval,
+            scmer_margin=args.scmer_margin,
+            scmer_pair_samples=args.scmer_pair_samples,
         )
         train_step_fn = None
     else:
@@ -521,6 +536,11 @@ def main(args=None):
             repetition_penalty=args.repetition_penalty,
             remat=args.remat,
             deliberation_mode=args.deliberation_mode,
+            scmer_lambda=args.scmer_lambda,
+            scmer_subsample=args.scmer_subsample,
+            scmer_interval=args.scmer_interval,
+            scmer_margin=args.scmer_margin,
+            scmer_pair_samples=args.scmer_pair_samples,
         )
 
     # 8. Training Loop

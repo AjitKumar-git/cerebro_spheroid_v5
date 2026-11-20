@@ -125,9 +125,10 @@ def main():
     from training.train_v5_tpu_jax import run_training
 
     # Launch with verified production configuration
+    from_scratch = os.environ.get("FROM_SCRATCH", "true").lower() in ("true", "1")
     run_training(
         preset="v5_small",                     # 105.9M Params (16 Shells, 40 Shortcut Tracts)
-        from_scratch=False,                    # Resumes highest milestone step or latest.pt from cloud
+        from_scratch=from_scratch,             # True: Clean start from Step 0; False: Resume
         auto_tune=True,                        # Adopts verified B=32, remat=True (192,360 tok/s on TPU v5 lite)
         force_tune=False,                      # Bypasses micro-benchmarks; adopts verified config
         effective_batch_size=16,               # Effective batch size
@@ -147,6 +148,11 @@ def main():
         cloud_token=bioflo_tok,
         resume_target="latest",                # Prioritizes latest checkpoint
         resume_warmup_steps=100,               # Smooth 100-step warmup on resume
+        scmer_lambda=0.05,                     # SCMER anti-anisotropy regularizer strength
+        scmer_margin=0.12,                     # Cosine margin threshold m (3.04 sigma)
+        scmer_subsample=512,                   # Subsampled vocabulary rows per event
+        scmer_pair_samples=8192,               # Subsampled unique token pairs
+        scmer_interval=8,                      # SCMER execution interval (every 8 steps)
     )
 
 
