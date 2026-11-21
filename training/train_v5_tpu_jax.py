@@ -93,6 +93,7 @@ from src.jax.checkpoint import (
     adapt_and_load_checkpoint_weights,
     discover_latest_checkpoint,
     AsyncCheckpointManager,
+    get_current_rss_gb,
 )
 from src.cloud_sync import (
     check_remote_manifest,
@@ -2000,12 +2001,23 @@ def main(args=None):
                         f"Skips: {cumulative_skips} | U/W [M: {u_m:.2e}, Vocab: {u_v:.2e}, 1D: {u_1d:.2e}]{drift_str}"
                     )
 
+                rss_gb = get_current_rss_gb()
+                mem_str = f"Host RSS: {rss_gb:.2f} GB | "
+                devs = jax.devices()
+                if devs and hasattr(devs[0], "memory_stats"):
+                    stats = devs[0].memory_stats()
+                    if stats and "bytes_in_use" in stats:
+                        used_hbm = stats["bytes_in_use"] / (1024.0 ** 3)
+                        limit_hbm = stats.get("bytes_limit", 0) / (1024.0 ** 3)
+                        mem_str = f"Host RSS: {rss_gb:.2f} GB | HBM: {used_hbm:.1f}/{limit_hbm:.1f} GB | "
+
                 print(
                     f"[Step {step:6d}/{args.total_steps}]{phase_tag} "
                     f"{tok_str}"
                     f"Loss: {loss_val:6.4f} | "
                     f"Steps/s: {steps_per_sec:5.2f} | "
                     f"Tok/s: {tok_per_sec:7,.0f} | "
+                    f"{mem_str}"
                     f"LR: {cur_lr:.2e} | "
                     f"Samp_p: {cur_sampling_p:.2f}{gov_str}"
                     f"{diag_info}"

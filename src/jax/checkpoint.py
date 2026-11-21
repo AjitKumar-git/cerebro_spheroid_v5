@@ -20,6 +20,8 @@ import shutil
 import time
 import math
 import dataclasses
+import gc
+import threading
 from typing import Dict, Tuple, Optional, Any, List, Union
 import concurrent.futures
 
@@ -40,6 +42,20 @@ import jax
 import jax.numpy as jnp
 
 from .v5_model import ModelConfigV5, PRESETS_V5, init_params_v5, generate_small_world_indices
+
+
+def get_current_rss_gb() -> float:
+    """Returns current process Resident Set Size (RSS) in gigabytes."""
+    try:
+        with open("/proc/self/statm", "r") as f:
+            pages = int(f.read().split()[1])
+            return (pages * os.sysconf("SC_PAGE_SIZE")) / (1024.0 ** 3)
+    except Exception:
+        try:
+            import resource
+            return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024.0 * 1024.0)
+        except Exception:
+            return 0.0
 
 
 def _safe_torch_tensor(arr, dtype=None):
@@ -662,7 +678,9 @@ class AsyncCheckpointManager:
         self.cloud_weights_only = cloud_weights_only
         self.save_optimizer_state = save_optimizer_state
         self._last_cloud_upload_at: Dict[str, float] = {}
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="ckpt_async")
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="ckpt_async")
+        self._active_future: Optional[concurrent.futures.Future] = None
+        self._active_lock = threading.Lock()
         self._last_futures: Dict[str, concurrent.futures.Future] = {}
         os.makedirs(self.local_dir, exist_ok=True)
         os.makedirs(self.target_dir, exist_ok=True)
@@ -731,6 +749,12 @@ class AsyncCheckpointManager:
                         print(f"⚠️ [cloud_sync] Async upload notice: {sync_err}")
         except Exception as err:
             print(f"⚠️ [AsyncCheckpoint Error]: {err}")
+        finally:
+            try:
+                del params_cpu, buffers_cpu, opt_state_cpu
+            except Exception:
+                pass
+            gc.collect()
 
     def _prune_scratch(self):
         try:
@@ -757,31 +781,36 @@ class AsyncCheckpointManager:
         block_if_busy: bool = False,
         opt_state: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        """Dispatches an asynchronous save job. Returns True if job was queued."""
+        """Dispatches an asynchronous save job with bounded queue depth (max 1 in-flight).
+        Guarantees host memory does not grow unbounded from queued snapshots.
+        """
         target_slot = "best" if "best" in filename else ("step" if "step_" in filename else "latest")
         is_critical = (target_slot in ("best", "step")) or block_if_busy
-        last_fut = self._last_futures.get(target_slot)
-        if last_fut is not None and not last_fut.done():
-            if is_critical or block_if_busy:
-                try:
-                    last_fut.result(timeout=30.0)
-                except Exception:
-                    pass
-            else:
-                # For non-critical latest checkpoints, wait briefly (up to 5s) for previous write to settle
-                try:
-                    last_fut.result(timeout=5.0)
-                except concurrent.futures.TimeoutError:
-                    return False
-                except Exception:
-                    pass
 
-        params_cpu = jax.device_get(params)
-        buffers_cpu = jax.device_get(buffers)
-        opt_state_cpu = jax.device_get(opt_state) if opt_state is not None else None
-        fut = self.executor.submit(self._worker, params_cpu, buffers_cpu, filename, meta_dict, False, opt_state_cpu)
-        self._last_futures[target_slot] = fut
-        return True
+        with self._active_lock:
+            if self._active_future is not None and not self._active_future.done():
+                if is_critical or block_if_busy:
+                    try:
+                        self._active_future.result()
+                    except Exception as err:
+                        print(f"⚠️ [AsyncCheckpoint] Previous write warning: {err}")
+                else:
+                    # Non-critical save: if disk writer is busy, skip this interval to prevent host RAM buildup
+                    return False
+
+            # Transfer device tensors to host RAM only after confirming writer is idle
+            params_cpu = jax.device_get(params)
+            buffers_cpu = jax.device_get(buffers)
+            opt_state_cpu = jax.device_get(opt_state) if opt_state is not None else None
+
+            fut = self.executor.submit(self._worker, params_cpu, buffers_cpu, filename, meta_dict, False, opt_state_cpu)
+            self._active_future = fut
+            self._last_futures[target_slot] = fut
+
+            rss_gb = get_current_rss_gb()
+            step_str = f" @ Step {meta_dict.get('step', '?')}" if meta_dict else ""
+            print(f"💾 [Checkpoint Dispatch] '{filename}'{step_str} | Host RSS: {rss_gb:.2f} GB")
+            return True
 
     def flush(
         self,
