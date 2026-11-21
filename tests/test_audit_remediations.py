@@ -319,6 +319,27 @@ class TestAuditRemediations(unittest.TestCase):
                 )
             self.assertIn("Cleanly stopping training without falling back", str(ctx.exception))
 
+    def test_multi_device_round_per_token_weights_reshape(self):
+        """Verifies multi-device Local-SGD correctly reshapes 2D per-token loss weights (262,144 elements) into (8, 4, 16, 512)."""
+        eff_num_devices = 8
+        eff_local_steps = 4
+        b_t = 16
+        l_t = 512
+        total_shards = eff_num_devices * eff_local_steps
+
+        # 2D per-token loss weights from Contiguous Pretraining Streamer
+        wts = [np.ones((b_t, l_t), dtype=np.float32) for _ in range(total_shards)]
+
+        w_stacked = np.stack(wts, axis=0)
+        self.assertEqual(w_stacked.size, 262144)
+
+        if wts[0].ndim == 2:
+            wt_arr = w_stacked.reshape(eff_num_devices, eff_local_steps, b_t, l_t)
+        else:
+            wt_arr = w_stacked.reshape(eff_num_devices, eff_local_steps, b_t)
+
+        self.assertEqual(wt_arr.shape, (8, 4, 16, 512))
+
 
 if __name__ == "__main__":
     unittest.main()

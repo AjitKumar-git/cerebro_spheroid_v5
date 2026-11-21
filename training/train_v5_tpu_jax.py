@@ -1302,6 +1302,11 @@ def main(args=None):
             if (elastic_batcher is not None or is_pretrain_source)
             else None
         )
+        dummy_weights = (
+            np.ones((eff_num_devices, eff_local_steps, args.batch_size, dummy_target_len), dtype=np.float32)
+            if is_pretrain_source
+            else None
+        )
         _warm_p, _warm_opt, initial_loss = pmap_round_fn(
             rep_params,
             rep_opt_state,
@@ -1309,6 +1314,7 @@ def main(args=None):
             dummy_targets,
             args.lr,
             feedback_micro=dummy_feedback,
+            target_weights_micro=dummy_weights,
         )
         jax.block_until_ready(initial_loss)
         init_loss_val = float(initial_loss[0])
@@ -1582,11 +1588,14 @@ def main(args=None):
             if len(fbs) == total_shards
             else None
         )
-        wt_arr = (
-            np.stack(wts, axis=0).reshape(eff_num_devices, eff_local_steps, b_t)
-            if len(wts) == total_shards
-            else None
-        )
+        if len(wts) == total_shards:
+            w_stacked = np.stack(wts, axis=0)
+            if wts[0].ndim == 2:
+                wt_arr = w_stacked.reshape(eff_num_devices, eff_local_steps, b_t, l_t)
+            else:
+                wt_arr = w_stacked.reshape(eff_num_devices, eff_local_steps, b_t)
+        else:
+            wt_arr = None
         return q_arr, r_arr, fb_arr, wt_arr
 
     def _get_host_params():
