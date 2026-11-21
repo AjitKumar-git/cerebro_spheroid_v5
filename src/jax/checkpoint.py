@@ -743,6 +743,7 @@ class AsyncCheckpointManager:
                             model=sync_model,
                             url=self.cloud_url,
                             token=self.cloud_token,
+                            chunk_size_mb=15,
                         )
                         self._last_cloud_upload_at[target_type] = now
                     except Exception as sync_err:

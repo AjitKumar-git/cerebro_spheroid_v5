@@ -501,13 +501,14 @@ def push_checkpoint(
     source_node: Optional[str] = None,
     url: Optional[str] = None,
     token: Optional[str] = None,
-    chunk_size_mb: int = 35,
+    chunk_size_mb: int = 15,
     num_workers: int = 1,
 ) -> bool:
     """
     Uploads a checkpoint to bioflo.in using reliable sequential chunked streaming for a specific model tier.
     Sequential chunk delivery (0, 1, ..., N-1) eliminates out-of-order 400 race conditions on the server,
-    bypasses Cloudflare payload limits, and ensures zero timeouts.
+    bypasses Cloudflare payload limits, and ensures zero timeouts. Default chunk size is 15 MB to safely
+    comply with PHP post_max_size (32MB) and upload_max_filesize (30MB) restrictions across all hosting environments.
     """
     if not os.path.exists(file_path):
         print(f"⚠️ [cloud_sync] Cannot push: {file_path} not found.")
@@ -561,7 +562,6 @@ def push_checkpoint(
           f"to {sync_url} across {total_chunks} chunk(s)...")
 
     upload_id = uuid.uuid4().hex[:12]
-    upload_url = f"{sync_url}?action=upload_chunk&token={sync_token}"
     t0 = time.time()
     try:
         chunk_ranges = []
@@ -573,8 +573,23 @@ def push_checkpoint(
 
         uploaded_bytes = 0
         for idx, off, lg in chunk_ranges:
+            chunk_query = {
+                "action": "upload_chunk",
+                "token": sync_token,
+                "upload_id": upload_id,
+                "type": target_type,
+                "chunk_index": str(idx),
+                "total_chunks": str(total_chunks),
+                "step": str(step),
+                "loss": f"{loss:.6f}",
+                "source": node_name,
+            }
+            if model:
+                chunk_query["model"] = str(model)
+            chunk_url = f"{sync_url}?{urllib.parse.urlencode(chunk_query)}"
+
             bytes_sent = _upload_single_chunk(
-                upload_url,
+                chunk_url,
                 sync_token,
                 upload_id,
                 target_type,
@@ -622,6 +637,7 @@ def push_checkpoint_async(
     source_node: Optional[str] = None,
     url: Optional[str] = None,
     token: Optional[str] = None,
+    chunk_size_mb: int = 15,
 ) -> threading.Thread:
     """Non-blocking background thread upload so training compute never stalls."""
     thread = threading.Thread(
@@ -635,6 +651,7 @@ def push_checkpoint_async(
             "source_node": source_node,
             "url": url,
             "token": token,
+            "chunk_size_mb": chunk_size_mb,
         },
         daemon=True,
         name=f"cloud_sync_upload_{model or 'default'}_{target_type}_{step}",
