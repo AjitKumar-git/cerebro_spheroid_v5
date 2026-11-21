@@ -1781,9 +1781,9 @@ class CerebroSpheroidV5(nn.Module):
                 prompt_valid_mask = None
                 prompt_centroid = self._recency_weighted_pool(sensory_flux)
 
-        # 2. State Initialization: Cortical Surface receives sensory prompt flux out-of-place
-        subcortical = torch.zeros(B, self.config.num_shells - 1, self.config.surface_dim, device=dev, dtype=prompt_centroid.dtype)
-        state = torch.cat([subcortical, prompt_centroid.unsqueeze(1)], dim=1)
+        # 2. State Initialization: Radial laminar depth profile ensuring all shells receive signal
+        radial_profile = (torch.arange(1, self.config.num_shells + 1, device=dev, dtype=torch.float32) / float(self.config.num_shells)).view(1, -1, 1)
+        state = (prompt_centroid.unsqueeze(1).repeat(1, self.config.num_shells, 1).float() * radial_profile).to(prompt_centroid.dtype)
 
         # 3. Subconscious Deliberation Cycles with Memory Probing & Adaptive Halting
         use_adapt = self.config.use_adaptive_thinking and self.halting_gate is not None
@@ -2143,9 +2143,9 @@ class CerebroSpheroidV5(nn.Module):
             sensory_flux, sensory_kv = self.sensory_dnn(prompt_ids, attn_mask=prompt_attn_mask)
             prompt_centroid = self._recency_weighted_pool(sensory_flux, safe_mask)
 
-        # 2. State Initialization: Cortical Surface receives sensory prompt flux out-of-place
-        subcortical = torch.zeros(B, self.config.num_shells - 1, self.config.surface_dim, device=dev, dtype=prompt_centroid.dtype)
-        state = torch.cat([subcortical, prompt_centroid.unsqueeze(1)], dim=1)
+        # 2. State Initialization: Radial laminar depth profile ensuring all shells receive signal
+        radial_profile = (torch.arange(1, self.config.num_shells + 1, device=dev, dtype=torch.float32) / float(self.config.num_shells)).view(1, -1, 1)
+        state = (prompt_centroid.unsqueeze(1).repeat(1, self.config.num_shells, 1).float() * radial_profile).to(prompt_centroid.dtype)
 
         for cycle in range(cycles):
             if sensory_kv is not None and self.deliberation_probe is not None:
@@ -2546,8 +2546,8 @@ class CerebroSpheroidV5(nn.Module):
         emit_act = gate_act_val >= 0.45
         emit_ans = gate_ans_val >= 0.35
 
-        subcortical = torch.zeros(B, self.config.num_shells - 1, self.config.surface_dim, device=dev, dtype=prompt_centroid.dtype)
-        state = torch.cat([subcortical, prompt_centroid.unsqueeze(1)], dim=1)
+        radial_profile = (torch.arange(1, self.config.num_shells + 1, device=dev, dtype=torch.float32) / float(self.config.num_shells)).view(1, -1, 1)
+        state = (prompt_centroid.unsqueeze(1).repeat(1, self.config.num_shells, 1).float() * radial_profile).to(prompt_centroid.dtype)
 
         cycles = self.config.thinking_cycles
         for _ in range(cycles):

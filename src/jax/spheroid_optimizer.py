@@ -244,15 +244,18 @@ def _scmer_grad(
     if interval < 1:
         raise ValueError("scmer_interval must be at least 1")
 
-    width = p[key].shape[1] if key in p else 1
-    dummy_ids = jnp.zeros((sample_size,), dtype=jnp.int32)
-    dummy_grad = jnp.zeros((sample_size, width), dtype=jnp.float32)
-
     if key not in p or strength == 0.0:
+        width = p[key].shape[1] if key in p else 1
+        dummy_ids = jnp.zeros((sample_size,), dtype=jnp.int32)
+        dummy_grad = jnp.zeros((sample_size, width), dtype=jnp.float32)
         return dummy_ids, dummy_grad, zero
 
     table = opt_s.get("master_p", {}).get(key, p[key]).astype(jnp.float32)
     vocab_size, width = table.shape
+    actual_sample_size = min(max(2, int(sample_size)), int(vocab_size))
+    dummy_ids = jnp.zeros((actual_sample_size,), dtype=jnp.int32)
+    dummy_grad = jnp.zeros((actual_sample_size, width), dtype=jnp.float32)
+
     if vocab_size < 2:
         return dummy_ids, dummy_grad, zero
 

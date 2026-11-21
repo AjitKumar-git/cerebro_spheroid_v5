@@ -552,6 +552,140 @@ class TestAuditRemediations(unittest.TestCase):
         # Invariant 3: $done_file marker is used for idempotent replay of same upload_id
         self.assertIn(".done", content, "sync.php must use per-upload done marker for idempotency!")
 
+    def test_all_shells_receive_nonzero_gradients(self):
+        """Audit Issue 1: In v5_small, all 16 shells must receive non-zero gradients on every iteration."""
+        import jax
+        import jax.numpy as jnp
+        from src.jax.v5_model import ModelConfigV5, PRESETS_V5, init_params_v5, training_rollout
+
+        cfg = ModelConfigV5(**PRESETS_V5["v5_small"])
+        params, buffers = init_params_v5(jax.random.PRNGKey(42), cfg)
+        prompts = jnp.array([[2, 3, 4, 5, 6, 7]], dtype=jnp.int32)
+        targets = jnp.array([[8, 9, 10, 11]], dtype=jnp.int32)
+
+        def loss_fn(p):
+            return training_rollout(
+                params=p,
+                prompts=prompts,
+                target_len=targets.shape[1],
+                buffers=buffers,
+                config=cfg,
+                targets=targets,
+                pure_teacher_forcing=True,
+                deliberation_mode="teacher_forcing",
+            )
+
+        grads = jax.grad(loss_fn)(params)
+        w_gate_grads = grads["core.intra_swiglu.w_gate"]
+        self.assertEqual(w_gate_grads.shape[0], cfg.num_shells)
+        for k in range(cfg.num_shells):
+            norm_k = float(jnp.linalg.norm(w_gate_grads[k]))
+            self.assertGreater(norm_k, 1e-7, f"Shell {k} received zero gradient!")
+
+    def test_generation_temperature_sampling(self):
+        """Audit Issue 2: generate_text_jax must honor temperature and sample non-greedily when temperature > 0."""
+        import jax
+        from src.jax.v5_model import ModelConfigV5, init_params_v5, generate_text_jax
+
+        class MockTokenizer:
+            pad_token_id = 0
+            eos_token_id = 2
+            def encode(self, text, **kwargs):
+                return [1, 20, 21, 22]
+            def decode(self, token_ids, **kwargs):
+                return " ".join(str(t) for t in token_ids)
+
+        tok = MockTokenizer()
+        cfg = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, thinking_cycles=1)
+        params, buffers = init_params_v5(jax.random.PRNGKey(42), cfg)
+
+        out_sampled_1 = generate_text_jax(params, buffers, cfg, "Hello", tok, max_new_tokens=16, temperature=1.5, key=jax.random.PRNGKey(101))
+        out_sampled_2 = generate_text_jax(params, buffers, cfg, "Hello", tok, max_new_tokens=16, temperature=1.5, key=jax.random.PRNGKey(202))
+        self.assertNotEqual(out_sampled_1, out_sampled_2, "Sampling with different keys and T=1.5 produced identical outputs!")
+
+    def test_tri_head_independent_gradient_specialization(self):
+        """Audit Issue 3: affine_think, affine_act, and affine_answer must receive independent gradients on their respective domains."""
+        import jax
+        import jax.numpy as jnp
+        from src.jax.v5_model import ModelConfigV5, init_params_v5, training_rollout
+
+        cfg = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, thinking_cycles=1)
+        params, buffers = init_params_v5(jax.random.PRNGKey(42), cfg)
+        prompts = jnp.array([[2, 3, 4, 5]], dtype=jnp.int32)
+
+        # 1. Sequence with ONLY think tokens (inside <think> 29 ... </think> 30)
+        targets_think = jnp.array([[29, 10, 11, 30]], dtype=jnp.int32)
+        grads_think = jax.grad(lambda p: training_rollout(p, prompts, 4, buffers, config=cfg, targets=targets_think, pure_teacher_forcing=True, deliberation_mode="teacher_forcing"))(params)
+
+        self.assertGreater(float(jnp.linalg.norm(grads_think["motor.affine_think"])), 1e-6)
+        self.assertEqual(float(jnp.linalg.norm(grads_think["motor.affine_act"])), 0.0)
+
+        # 2. Sequence with ONLY act tokens (inside <tool_call> 31 ... </tool_call> 32)
+        targets_act = jnp.array([[31, 12, 13, 32]], dtype=jnp.int32)
+        grads_act = jax.grad(lambda p: training_rollout(p, prompts, 4, buffers, config=cfg, targets=targets_act, pure_teacher_forcing=True, deliberation_mode="teacher_forcing"))(params)
+
+        self.assertGreater(float(jnp.linalg.norm(grads_act["motor.affine_act"])), 1e-6)
+        self.assertEqual(float(jnp.linalg.norm(grads_act["motor.affine_think"])), 0.0)
+
+        # 3. Base motor.affine_scale must receive gradients in both cases
+        self.assertGreater(float(jnp.linalg.norm(grads_think["motor.affine_scale"])), 1e-6)
+        self.assertGreater(float(jnp.linalg.norm(grads_act["motor.affine_scale"])), 1e-6)
+
+    def test_dormant_model_configurations_consumed(self):
+        """Audit Issue 4: num_mtp_heads, use_tied_embeddings, use_sparse_mot, and top_k_tracts must be consumed."""
+        import jax
+        import jax.numpy as jnp
+        from src.jax.v5_model import ModelConfigV5, init_params_v5, deliberate_step, training_rollout
+
+        cfg_sparse = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, thinking_cycles=1, use_sparse_mot=True, top_k_tracts=2)
+        params_s, buffers_s = init_params_v5(jax.random.PRNGKey(42), cfg_sparse)
+        state = jax.random.normal(jax.random.PRNGKey(0), (2, 4, 32))
+
+        # use_sparse_mot must affect deliberate_step output vs dense
+        cfg_dense = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, thinking_cycles=1, use_sparse_mot=False)
+        out_sparse = deliberate_step(params_s, state, buffers_s, config=cfg_sparse)
+        out_dense = deliberate_step(params_s, state, buffers_s, config=cfg_dense)
+        self.assertGreater(float(jnp.linalg.norm(out_sparse - out_dense)), 1e-5)
+
+        # use_tied_embeddings=False must initialize motor.head.weight
+        cfg_untied = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, thinking_cycles=1, use_tied_embeddings=False)
+        params_u, _ = init_params_v5(jax.random.PRNGKey(42), cfg_untied)
+        self.assertIn("motor.head.weight", params_u)
+
+        # num_mtp_heads > 1 must initialize MTP weights and affect training loss
+        cfg_mtp = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, thinking_cycles=1, num_mtp_heads=2)
+        params_m, buffers_m = init_params_v5(jax.random.PRNGKey(42), cfg_mtp)
+        self.assertIn("motor.mtp.1.fc_gate.weight", params_m)
+
+        prompts = jnp.array([[2, 3, 4, 5]], dtype=jnp.int32)
+        targets = jnp.array([[10, 11, 12, 13]], dtype=jnp.int32)
+        loss_mtp = training_rollout(params_m, prompts, 4, buffers_m, config=cfg_mtp, targets=targets, pure_teacher_forcing=True, deliberation_mode="teacher_forcing")
+        cfg_no_mtp = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, thinking_cycles=1, num_mtp_heads=1)
+        loss_no_mtp = training_rollout(params_m, prompts, 4, buffers_m, config=cfg_no_mtp, targets=targets, pure_teacher_forcing=True, deliberation_mode="teacher_forcing")
+        self.assertNotEqual(float(loss_mtp), float(loss_no_mtp))
+
+    def test_temporal_router_token_ids(self):
+        """Audit Issue 5: Temporal router loss must trigger on canonical tokens 31 (tool_call) and 29 (think)."""
+        import jax
+        import jax.numpy as jnp
+        from src.jax.v5_model import ModelConfigV5, init_params_v5, training_rollout
+
+        cfg_router = ModelConfigV5(
+            vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, thinking_cycles=1,
+            router_loss_weight=1.0, act_token_id=31, think_token_id=29
+        )
+        params, buffers = init_params_v5(jax.random.PRNGKey(42), cfg_router)
+        params["motor.temporal_router.weight"] = jax.random.normal(jax.random.PRNGKey(1), (3, 32))
+        params["motor.temporal_router.bias"] = jnp.zeros(3, dtype=jnp.float32)
+
+        prompts = jnp.array([[2, 3, 4, 5]], dtype=jnp.int32)
+        targets_31 = jnp.array([[10, 31, 12, 13]], dtype=jnp.int32)
+        targets_33 = jnp.array([[10, 33, 12, 13]], dtype=jnp.int32)
+
+        loss_31 = float(training_rollout(params, prompts, 4, buffers, config=cfg_router, targets=targets_31, pure_teacher_forcing=True, deliberation_mode="teacher_forcing"))
+        loss_33 = float(training_rollout(params, prompts, 4, buffers, config=cfg_router, targets=targets_33, pure_teacher_forcing=True, deliberation_mode="teacher_forcing"))
+        self.assertNotEqual(loss_31, loss_33)
+
 
 if __name__ == "__main__":
     unittest.main()
