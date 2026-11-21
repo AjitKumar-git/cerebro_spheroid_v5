@@ -210,6 +210,38 @@ class TestAuditRemediations(unittest.TestCase):
             if os.path.exists(bad_path):
                 os.remove(bad_path)
 
+    def test_push_checkpoint_strictly_sequential_ordering(self):
+        """Verifies push_checkpoint delivers chunks strictly sequentially (0, 1, ..., N-1) to eliminate 400 race conditions."""
+        from src.cloud_sync import push_checkpoint
+
+        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as tmp:
+            valid_path = tmp.name
+
+        try:
+            # Create a valid PyTorch zip checkpoint > 2.5 MB using random float tensors
+            torch.save(
+                {"model_state": {"layer.weight": torch.randn(1200, 1200, dtype=torch.bfloat16)}},
+                valid_path
+            )
+
+            uploaded_indices = []
+            def mock_upload_chunk(*args, **kwargs):
+                # args: upload_url, sync_token, upload_id, target_type, chunk_idx, total_chunks, step, loss, node_name, model, file_path, offset, length
+                chunk_idx = args[4]
+                uploaded_indices.append(chunk_idx)
+                return args[12]
+
+            with patch("src.cloud_sync._upload_single_chunk", side_effect=mock_upload_chunk):
+                # Push with 1 MB chunks to create at least 2-3 chunks
+                res = push_checkpoint(valid_path, step=200, loss=4.2, target_type="latest", model="v5_small", chunk_size_mb=1)
+                self.assertTrue(res)
+                self.assertGreaterEqual(len(uploaded_indices), 2)
+                # Verify strictly monotonically increasing sequential chunk indices [0, 1, 2, ...]
+                self.assertEqual(uploaded_indices, list(range(len(uploaded_indices))))
+        finally:
+            if os.path.exists(valid_path):
+                os.remove(valid_path)
+
     def test_finding_9_cloud_weights_only_option_a(self):
         """Verifies Option A: cloud_weights_only=True uploads pure weights while keeping local checkpoints intact."""
         from src.jax.checkpoint import AsyncCheckpointManager, restore_spheroid_opt_state

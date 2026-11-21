@@ -502,11 +502,12 @@ def push_checkpoint(
     url: Optional[str] = None,
     token: Optional[str] = None,
     chunk_size_mb: int = 35,
-    num_workers: int = 4,
+    num_workers: int = 1,
 ) -> bool:
     """
-    Uploads a checkpoint to bioflo.in using parallel concurrent streaming for a specific model tier.
-    Bypasses Cloudflare limits and ensures zero timeouts.
+    Uploads a checkpoint to bioflo.in using reliable sequential chunked streaming for a specific model tier.
+    Sequential chunk delivery (0, 1, ..., N-1) eliminates out-of-order 400 race conditions on the server,
+    bypasses Cloudflare payload limits, and ensures zero timeouts.
     """
     if not os.path.exists(file_path):
         print(f"⚠️ [cloud_sync] Cannot push: {file_path} not found.")
@@ -554,11 +555,10 @@ def push_checkpoint(
     file_size = os.path.getsize(file_path)
     chunk_size = chunk_size_mb * 1024 * 1024
     total_chunks = max(1, (file_size + chunk_size - 1) // chunk_size)
-    workers = min(num_workers, total_chunks)
 
     model_label = f"[{model}] " if model else ""
     print(f"\n🌐 [cloud_sync] Mirroring {model_label}{target_type}.pt (Step {step:,}, Loss {loss:.4f}) "
-          f"to {sync_url} across {total_chunks} chunk(s) ({workers} worker threads)...")
+          f"to {sync_url} across {total_chunks} chunk(s)...")
 
     upload_id = uuid.uuid4().hex[:12]
     upload_url = f"{sync_url}?action=upload_chunk&token={sync_token}"
@@ -572,32 +572,27 @@ def push_checkpoint(
             offset += length
 
         uploaded_bytes = 0
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = [
-                executor.submit(
-                    _upload_single_chunk,
-                    upload_url,
-                    sync_token,
-                    upload_id,
-                    target_type,
-                    idx,
-                    total_chunks,
-                    step,
-                    loss,
-                    node_name,
-                    model,
-                    file_path,
-                    off,
-                    lg,
-                )
-                for idx, off, lg in chunk_ranges
-            ]
-            for fut in as_completed(futures):
-                uploaded_bytes += fut.result()
-                pct = (uploaded_bytes / file_size) * 100
-                speed = (uploaded_bytes / 1e6) / max(time.time() - t0, 0.1)
-                print(f"\r  Uploading ({workers} threads): {uploaded_bytes / 1e6:.1f} / {file_size / 1e6:.1f} MB "
-                      f"({pct:.1f}%) | {speed:.1f} MB/s", end="", flush=True)
+        for idx, off, lg in chunk_ranges:
+            bytes_sent = _upload_single_chunk(
+                upload_url,
+                sync_token,
+                upload_id,
+                target_type,
+                idx,
+                total_chunks,
+                step,
+                loss,
+                node_name,
+                model,
+                file_path,
+                off,
+                lg,
+            )
+            uploaded_bytes += bytes_sent
+            pct = (uploaded_bytes / file_size) * 100
+            speed = (uploaded_bytes / 1e6) / max(time.time() - t0, 0.1)
+            print(f"\r  Uploading: {uploaded_bytes / 1e6:.1f} / {file_size / 1e6:.1f} MB "
+                  f"({pct:.1f}%) | {speed:.1f} MB/s", end="", flush=True)
 
         dt = time.time() - t0
         sz_mb = file_size / 1e6
