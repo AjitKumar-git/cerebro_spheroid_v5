@@ -13,7 +13,16 @@
 set_time_limit(600);
 ini_set('memory_limit', '256M');
 
-$SECRET_TOKEN = 'CerebroSpheroid_Sync_Secure_2026';
+$SECRET_TOKEN = getenv('CEREBRO_SYNC_TOKEN');
+if ($SECRET_TOKEN === false || trim($SECRET_TOKEN) === '') {
+    $SECRET_TOKEN = getenv('BIOFLO_SYNC_TOKEN');
+}
+if ($SECRET_TOKEN === false || trim($SECRET_TOKEN) === '') {
+    http_response_code(503);
+    header('Content-Type: application/json');
+    echo json_encode(['error' => 'Synchronization service is not configured']);
+    exit;
+}
 
 // 1. Authorization Check
 $auth_header = '';
@@ -37,9 +46,9 @@ if (preg_match('/Bearer\s+(.*)$/i', $auth_header, $matches)) {
 }
 
 $action = isset($_REQUEST['action']) ? $_REQUEST['action'] : 'status';
-$public_actions = ['dashboard', 'tracker', 'view', 'get_tokens', 'tokens'];
+$public_actions = ['dashboard', 'tracker', 'view', 'get_tokens', 'tokens', 'get_config', 'config'];
 
-if (!in_array($action, $public_actions) && $token_provided !== $SECRET_TOKEN) {
+if (!in_array($action, $public_actions) && (!is_string($token_provided) || !hash_equals($SECRET_TOKEN, $token_provided))) {
     http_response_code(401);
     header('Content-Type: application/json');
     echo json_encode(['error' => 'Unauthorized: Invalid or missing sync token']);
@@ -1373,9 +1382,47 @@ if ($action === 'upload_chunk') {
         exit;
     }
 
+    // Serialize assembly by upload ID so concurrent final-chunk requests cannot
+    // read or unlink the same chunk set at the same time.
+    $assembly_lock = $parts_dir . '/' . $upload_id . '.assemble.lock';
+    $lock_fp = fopen($assembly_lock, 'c');
+    if (!$lock_fp || !flock($lock_fp, LOCK_EX)) {
+        http_response_code(500);
+        echo json_encode(['error' => 'Unable to acquire upload assembly lock']);
+        exit;
+    }
+
+    if (file_exists($final_file)) {
+        flock($lock_fp, LOCK_UN);
+        fclose($lock_fp);
+        echo json_encode([
+            'status' => 'already_completed',
+            'upload_id' => $upload_id,
+            'upload_type' => $type,
+        ]);
+        exit;
+    }
+
+    $all_chunks_ready = true;
+    for ($i = 0; $i < $total_chunks; $i++) {
+        $c_path = $parts_dir . '/' . $upload_id . '_chunk_' . $i . '.bin';
+        if (!file_exists($c_path) || filesize($c_path) === 0) {
+            $all_chunks_ready = false;
+            break;
+        }
+    }
+    if (!$all_chunks_ready) {
+        flock($lock_fp, LOCK_UN);
+        fclose($lock_fp);
+        echo json_encode(['status' => 'chunk_saved', 'upload_id' => $upload_id, 'reused' => $chunk_reused]);
+        exit;
+    }
+
     // All chunks arrived! Assemble sequentially with zero-copy stream_copy_to_stream
     $out_fp = fopen($part_file, 'wb');
     if (!$out_fp) {
+        flock($lock_fp, LOCK_UN);
+        fclose($lock_fp);
         http_response_code(500);
         echo json_encode(['error' => 'Unable to open assembly part file']);
         exit;
@@ -1387,7 +1434,6 @@ if ($action === 'upload_chunk') {
         if ($in_fp) {
             stream_copy_to_stream($in_fp, $out_fp);
             fclose($in_fp);
-            @unlink($c_path);
         }
     }
     fclose($out_fp);
@@ -1417,16 +1463,26 @@ if ($action === 'upload_chunk') {
         }
         if (!$is_valid_zip) {
             @unlink($part_file);
+            flock($lock_fp, LOCK_UN);
+            fclose($lock_fp);
             http_response_code(400);
             echo json_encode(['error' => 'Corrupted checkpoint upload: failed zip integrity check']);
             exit;
         }
 
         if (!rename($part_file, $final_file)) {
+            flock($lock_fp, LOCK_UN);
+            fclose($lock_fp);
             http_response_code(500);
             echo json_encode(['error' => 'Failed to finalize atomic checkpoint write']);
             exit;
         }
+
+        for ($i = 0; $i < $total_chunks; $i++) {
+            @unlink($parts_dir . '/' . $upload_id . '_chunk_' . $i . '.bin');
+        }
+        flock($lock_fp, LOCK_UN);
+        fclose($lock_fp);
 
         // Update manifest
         $manifest_file = $storage_dir . '/manifest.json';

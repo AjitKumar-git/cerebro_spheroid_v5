@@ -55,50 +55,27 @@ def setup_colab_environment():
         print(f"⚠️ JAX device detection notice: {e_jax}")
 
     # 3. Setup Bioflo Cloud Sync Token
-    bioflo_tok = os.environ.get("BIOFLO_SYNC_TOKEN", "")
-    if not bioflo_tok:
-        try:
-            from google.colab import userdata
-            bioflo_tok = userdata.get("BIOFLO_SYNC_TOKEN") or ""
-        except Exception:
-            pass
-    if not bioflo_tok:
-        bioflo_tok = "CerebroSpheroid_Sync_Secure_2026"
+    from src.cloud_sync import get_sync_token
+    from src.hf_utils import get_hf_token
 
+    bioflo_tok = get_sync_token()
     os.environ["BIOFLO_SYNC_TOKEN"] = bioflo_tok
     os.environ["CEREBRO_SYNC_TOKEN"] = bioflo_tok
+    print("🌐 Bioflo Cloud Sync Token configured.")
 
-    # 4. Authenticate Hugging Face Hub
-    hf_tok = os.environ.get("HF_TOKEN", "")
-    if not hf_tok:
-        try:
-            from google.colab import userdata
-            hf_tok = userdata.get("HF_TOKEN") or ""
-        except Exception:
-            pass
-
-    # Fallback to Bioflo secure backup vault if not set in Colab secrets
-    if not hf_tok:
-        try:
-            req = urllib.request.Request(
-                "https://bioflo.in/api/cerebro/sync.php?action=get_config&model=v5_small&device=backup_hf_token",
-                headers={"Authorization": f"Bearer {bioflo_tok}"}
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
-                hf_tok = data.get("config", {}).get("dtype", "")
-        except Exception:
-            pass
-
+    # 4. Authenticate Hugging Face Hub (Dynamically fetched from website vault)
+    hf_tok = get_hf_token()
     if hf_tok:
         os.environ["HF_TOKEN"] = hf_tok
         os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_tok
         try:
             from huggingface_hub import login
             login(token=hf_tok, add_to_git_credential=False)
-            print(f"🔑 Hugging Face Hub token verified and active (token: {hf_tok[:4]}...{hf_tok[-4:]})")
-        except Exception:
-            pass
+            print(f"🔑 Hugging Face Hub dynamically authenticated from website vault ({hf_tok[:4]}...{hf_tok[-4:]}).")
+        except Exception as e_login:
+            print(f"ℹ️ Hugging Face login notice: {e_login}")
+    else:
+        print("⚠️ Hugging Face Hub token could not be resolved.")
 
     # 5. Resolve Local Checkpoint Directory (Zero Google Drive dependency, synced directly to bioflo.in)
     if os.path.exists("/content"):

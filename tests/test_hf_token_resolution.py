@@ -49,19 +49,26 @@ class TestHFTokenResolution(unittest.TestCase):
         tok = get_hf_token()
         self.assertEqual(tok, "hf_env_secret_token")
 
+    def test_website_vault_pickup(self):
+        with patch("src.hf_utils.fetch_hf_token_from_website", return_value="hf_vault_secret"):
+            tok = get_hf_token()
+            self.assertEqual(tok, "hf_vault_secret")
+
     def test_colab_userdata_pickup(self):
         mock_userdata = MagicMock()
         mock_userdata.get.return_value = "hf_colab_secret"
-        with patch.dict("sys.modules", {"google.colab": MagicMock(userdata=mock_userdata)}):
-            tok = get_hf_token()
-            self.assertEqual(tok, "hf_colab_secret")
+        with patch("src.hf_utils.fetch_hf_token_from_website", return_value=None):
+            with patch.dict("sys.modules", {"google.colab": MagicMock(userdata=mock_userdata)}):
+                tok = get_hf_token()
+                self.assertEqual(tok, "hf_colab_secret")
 
     def test_kaggle_secrets_pickup(self):
         mock_client = MagicMock()
         mock_client.return_value.get_secret.return_value = "hf_kaggle_secret"
-        with patch.dict("sys.modules", {"kaggle_secrets": MagicMock(UserSecretsClient=mock_client)}):
-            tok = get_hf_token()
-            self.assertEqual(tok, "hf_kaggle_secret")
+        with patch("src.hf_utils.fetch_hf_token_from_website", return_value=None):
+            with patch.dict("sys.modules", {"kaggle_secrets": MagicMock(UserSecretsClient=mock_client)}):
+                tok = get_hf_token()
+                self.assertEqual(tok, "hf_kaggle_secret")
 
     def test_setup_hf_token_exports_and_masks(self):
         with patch("huggingface_hub.login") as mock_login:

@@ -365,6 +365,8 @@ class RectifiedContiguousPretrainStreamer:
         queue_size: int = 16,
         stage: str = "pretrain",
         target_shares: Optional[Dict[str, float]] = None,
+        progress_getter: Optional[Any] = None,
+        total_steps: int = 1_500_000,
         min_edu_score: float = 3.0,
         domain_loss_weights: Optional[Dict[str, float]] = None,
         reasoning_weight: float = 1.0,
@@ -378,17 +380,16 @@ class RectifiedContiguousPretrainStreamer:
         self.min_edu_score = float(min_edu_score)
         self.domain_loss_weights = domain_loss_weights or {}
         self.reasoning_weight = float(reasoning_weight)
+        self.progress_getter = progress_getter
+        self.total_steps = max(1, int(total_steps))
+        self.dynamic_curriculum = target_shares is None
         self.running = True
         self.fatal_error: Optional[Exception] = None
 
         if target_shares is not None:
             self.shares = target_shares
         else:
-            # Stage 1 Pure Pretraining: Full broad web + code ingestion (~15B+ tokens)
-            self.shares = {
-                "broad_web": 0.85,      # HuggingFaceFW/fineweb (sample-10BT)
-                "code": 0.15,           # Indented Python software repos (The Stack v2)
-            }
+            self.shares = self._smollm2_shares()
         self.quota_mgr = TokenQuotaManager(self.shares)
         self.batch_queue: queue.Queue = queue.Queue(maxsize=queue_size)
 
@@ -398,6 +399,34 @@ class RectifiedContiguousPretrainStreamer:
         # Launch background worker
         self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self.worker_thread.start()
+
+    def _smollm2_shares(self) -> Dict[str, float]:
+        """Return the SmolLM2 developmental mixture for cumulative training progress."""
+        progress = 0.0
+        if self.progress_getter is not None:
+            try:
+                progress = float(self.progress_getter()) / float(self.total_steps)
+            except Exception:
+                progress = 0.0
+        progress = min(1.0, max(0.0, progress))
+
+        if progress < 0.55:
+            return {"broad_web": 0.90, "code": 0.10}
+        if progress < 0.73:
+            return {"broad_web": 0.75, "code": 0.20, "math": 0.05}
+        if progress < 0.91:
+            return {"broad_web": 0.70, "code": 0.20, "math": 0.10}
+        return {"broad_web": 0.58, "code": 0.24, "math": 0.14, "cosmopedia": 0.04}
+
+    def _refresh_curriculum_shares(self) -> None:
+        if not self.dynamic_curriculum:
+            return
+        new_shares = self._smollm2_shares()
+        if new_shares != self.shares:
+            self.shares = new_shares
+            self.quota_mgr = TokenQuotaManager(self.shares)
+            for domain in new_shares:
+                self.buffers.setdefault(domain, [])
 
     def _cycle_corpus(self, corpus: List[str]) -> Iterator[str]:
         """Cycles indefinitely through a diverse list of multi-paragraph passages."""
@@ -547,6 +576,37 @@ class RectifiedContiguousPretrainStreamer:
             f"Cleanly stopping training without falling back to mock data."
         )
 
+    def _open_cosmopedia_stream(self) -> Iterator[str]:
+        """Streams Cosmopedia v2 synthetic textbook and explanatory text."""
+        from datasets import load_dataset
+        from src.hf_utils import get_hf_token
+
+        candidates = [
+            ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2"),
+            ("HuggingFaceTB/cosmopedia-v2", "cosmopedia-v2"),
+        ]
+        last_error = None
+        for repo, config in candidates:
+            try:
+                kwargs = {"split": "train", "streaming": True}
+                if config:
+                    kwargs["name"] = config
+                hf_tok = get_hf_token()
+                if hf_tok:
+                    kwargs["token"] = hf_tok
+                ds = load_dataset(repo, **kwargs)
+                for row in ds:
+                    text = row.get("text", "")
+                    if text and len(text) > 150:
+                        yield text
+                return
+            except Exception as exc:
+                last_error = exc
+
+        raise RuntimeError(
+            f"Cosmopedia v2 stream failed after configured candidates: {last_error}"
+        )
+
     def _open_retrieval_stream(self) -> Iterator[str]:
         """Generates continuous long-context associative retrieval documents."""
         doc_id = 0
@@ -562,10 +622,12 @@ class RectifiedContiguousPretrainStreamer:
             "code": self._open_code_stream,
             "edu_academic": self._open_edu_stream,
             "math": self._open_math_stream,
+            "cosmopedia": self._open_cosmopedia_stream,
             "retrieval": self._open_retrieval_stream,
         }
         try:
             streams = {}
+            self._refresh_curriculum_shares()
             for d in self.shares.keys():
                 if d in stream_openers:
                     streams[d] = stream_openers[d]()
@@ -573,6 +635,7 @@ class RectifiedContiguousPretrainStreamer:
                     raise RuntimeError(f"❌ [Streamer Fatal] Domain '{d}' has no configured stream opener.")
 
             while self.running:
+                self._refresh_curriculum_shares()
                 cur_block_size = int(self.block_size)
                 cur_batch_size = int(self.batch_size)
                 # Assemble one batch of cur_batch_size blocks
@@ -583,6 +646,10 @@ class RectifiedContiguousPretrainStreamer:
                 for _ in range(cur_batch_size):
                     # Choose domain by token deficit
                     chosen_domain = self.quota_mgr.get_next_domain()
+                    if chosen_domain not in streams:
+                        if chosen_domain not in stream_openers:
+                            raise RuntimeError(f"❌ [Streamer Fatal] Domain '{chosen_domain}' has no configured stream opener.")
+                        streams[chosen_domain] = stream_openers[chosen_domain]()
                     buf = self.buffers[chosen_domain]
 
                     # Top up buffer until we have cur_block_size tokens

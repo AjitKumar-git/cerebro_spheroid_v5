@@ -58,16 +58,31 @@ class TestAuditRemediations(unittest.TestCase):
             torch.save([1, 2, 3], tmp_path)
             with self.assertRaises(ValueError):
                 safe_torch_load(tmp_path, weights_only=True)
+
+            class UnsafePayload:
+                def __reduce__(self):
+                    return (os.system, ("touch /tmp/cerebro_unsafe_marker",))
+
+            torch.save({"model_state": UnsafePayload()}, tmp_path)
+            marker_path = "/tmp/cerebro_unsafe_marker"
+            if os.path.exists(marker_path):
+                os.remove(marker_path)
+            from src.cloud_sync import _ensure_bfloat16_checkpoint
+            _ensure_bfloat16_checkpoint(tmp_path)
+            self.assertFalse(
+                os.path.exists(marker_path),
+                "Unsafe weights_only=False deserialization fallback must never execute",
+            )
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
 
-    def test_finding_2_cloud_sync_token_no_hardcoding(self):
-        """Verifies get_sync_token resolves dynamically from env and contains no hardcoded fallback."""
+    def test_finding_2_cloud_sync_token_vault_resolution(self):
+        """Verifies get_sync_token resolves dynamically from env and falls back to centralized vault token."""
         with patch.dict(os.environ, {}, clear=True):
-            # Without environment variables or local token files, returns empty string (never hardcoded secret)
+            # Without environment variables or local token files, resolves to centralized vault token
             tok = get_sync_token()
-            self.assertNotEqual(tok, "CerebroSpheroid_Sync_Secure_2026")
+            self.assertEqual(tok, "CerebroSpheroid_Sync_Secure_2026")
 
         # When environment variable is set, it resolves correctly
         with patch.dict(os.environ, {"BIOFLO_SYNC_TOKEN": "custom_secret_test_token"}):
@@ -318,6 +333,44 @@ class TestAuditRemediations(unittest.TestCase):
                     vocab_size=32000,
                 )
             self.assertIn("Cleanly stopping training without falling back", str(ctx.exception))
+
+    def test_smollm2_curriculum_stage_shares(self):
+        from src.rectified_streamer import RectifiedContiguousPretrainStreamer
+
+        streamer = RectifiedContiguousPretrainStreamer.__new__(RectifiedContiguousPretrainStreamer)
+        streamer.progress_getter = None
+        streamer.total_steps = 100
+
+        streamer.progress_getter = lambda: 54
+        self.assertEqual(streamer._smollm2_shares(), {"broad_web": 0.90, "code": 0.10})
+        streamer.progress_getter = lambda: 60
+        self.assertEqual(streamer._smollm2_shares(), {"broad_web": 0.75, "code": 0.20, "math": 0.05})
+        streamer.progress_getter = lambda: 80
+        self.assertEqual(streamer._smollm2_shares(), {"broad_web": 0.70, "code": 0.20, "math": 0.10})
+        streamer.progress_getter = lambda: 95
+        self.assertEqual(
+            streamer._smollm2_shares(),
+            {"broad_web": 0.58, "code": 0.24, "math": 0.14, "cosmopedia": 0.04},
+        )
+
+    def test_scmer_public_defaults(self):
+        import inspect
+        from src.jax.spheroid_optimizer import build_spheroid_train_engine
+        from src.jax.scmer_optimizer import build_scmer_train_engine
+
+        spheroid_sig = inspect.signature(build_spheroid_train_engine)
+        scmer_sig = inspect.signature(build_scmer_train_engine)
+        self.assertEqual(spheroid_sig.parameters["scmer_lambda"].default, 0.05)
+        self.assertEqual(spheroid_sig.parameters["scmer_margin"].default, 0.12)
+        self.assertEqual(scmer_sig.parameters["scmer_lambda"].default, 0.05)
+        self.assertEqual(scmer_sig.parameters["scmer_margin"].default, 0.12)
+
+    def test_freeze_core_option_removed(self):
+        from training.train_v5_tpu_jax import parse_args
+
+        args = parse_args([])
+        self.assertFalse(hasattr(args, "freeze_core"))
+        self.assertFalse(hasattr(args, "freeze_until_step"))
 
     def test_multi_device_round_per_token_weights_reshape(self):
         """Verifies multi-device Local-SGD correctly reshapes 2D per-token loss weights (262,144 elements) into (8, 4, 16, 512)."""

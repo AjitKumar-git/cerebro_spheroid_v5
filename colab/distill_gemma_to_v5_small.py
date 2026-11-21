@@ -117,40 +117,22 @@ def setup_colab_environment() -> Tuple[str, str, torch.device, torch.device, tor
         print("⚡ Precision Dtype             : float32")
 
     # 3. Setup Bioflo Cloud Sync Token
-    bioflo_tok = os.environ.get("BIOFLO_SYNC_TOKEN", "")
-    if not bioflo_tok:
-        try:
-            from google.colab import userdata
-            bioflo_tok = userdata.get("BIOFLO_SYNC_TOKEN") or ""
-        except Exception:
-            pass
-    if not bioflo_tok:
-        bioflo_tok = "CerebroSpheroid_Sync_Secure_2026"
+    from src.cloud_sync import get_sync_token
+    from src.hf_utils import get_hf_token
 
+    bioflo_tok = get_sync_token()
     os.environ["BIOFLO_SYNC_TOKEN"] = bioflo_tok
     os.environ["CEREBRO_SYNC_TOKEN"] = bioflo_tok
 
-    # 4. Authenticate Hugging Face Hub Token
-    hf_tok = setup_hf_token(verbose=False)
-    if not hf_tok:
-        try:
-            req = urllib.request.Request(
-                f"https://bioflo.in/api/cerebro/sync.php?action=get_config&model=v5_small&device=backup_hf_token",
-                headers={"Authorization": f"Bearer {bioflo_tok}"}
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
-                hf_tok = data.get("config", {}).get("dtype", "")
-        except Exception:
-            pass
-
+    # 4. Authenticate Hugging Face Hub Token (Dynamically from website vault)
+    hf_tok = get_hf_token()
     if hf_tok:
         os.environ["HF_TOKEN"] = hf_tok
         os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_tok
         try:
             from huggingface_hub import login
             login(token=hf_tok, add_to_git_credential=False)
-            print(f"🔑 Hugging Face Hub            : Authenticated (token: {hf_tok[:4]}...{hf_tok[-4:]})")
+            print(f"🔑 Hugging Face Hub            : Authenticated dynamically from website vault ({hf_tok[:4]}...{hf_tok[-4:]})")
         except Exception:
             pass
     else:

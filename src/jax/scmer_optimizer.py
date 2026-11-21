@@ -54,10 +54,10 @@ def build_scmer_train_engine(
     remat: bool = True,
     deliberation_mode: str = "teacher_forcing",
     param_masks: Optional[Dict[str, jnp.ndarray]] = None,
-    scmer_lambda: float = 0.001,
+    scmer_lambda: float = 0.05,
     scmer_subsample: int = 512,
     scmer_interval: int = 8,
-    scmer_margin: float = 0.10,
+    scmer_margin: float = 0.12,
     scmer_pair_samples: int = 8192,
 ) -> Tuple[Callable, Callable]:
     """
@@ -92,10 +92,10 @@ def build_train_step_scmer(
     remat: bool = True,
     deliberation_mode: str = "teacher_forcing",
     param_masks: Optional[Dict[str, jnp.ndarray]] = None,
-    scmer_lambda: float = 0.001,
+    scmer_lambda: float = 0.05,
     scmer_subsample: int = 512,
     scmer_interval: int = 8,
-    scmer_margin: float = 0.10,
+    scmer_margin: float = 0.12,
     scmer_pair_samples: int = 8192,
 ) -> Callable:
     """
@@ -130,10 +130,10 @@ def build_pmap_local_sgd_step_scmer(
     remat: bool = True,
     local_steps: int = 4,
     devices: Optional[Any] = None,
-    scmer_lambda: float = 0.001,
+    scmer_lambda: float = 0.05,
     scmer_subsample: int = 512,
     scmer_interval: int = 8,
-    scmer_margin: float = 0.10,
+    scmer_margin: float = 0.12,
     scmer_pair_samples: int = 8192,
 ) -> Callable:
     """Multi-TPU pmap Local-SGD runner with SCMER optimizer."""

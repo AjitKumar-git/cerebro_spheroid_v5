@@ -96,6 +96,7 @@ from src.jax.checkpoint import (
     get_current_rss_gb,
 )
 from src.cloud_sync import (
+    get_sync_token,
     check_remote_manifest,
     select_highest_step_slot,
     pull_checkpoint,
@@ -246,8 +247,8 @@ def parse_args(args_list=None):
     parser.add_argument(
         "--cloud_token",
         type=str,
-        default=os.environ.get("BIOFLO_SYNC_TOKEN", os.environ.get("CEREBRO_SYNC_TOKEN", "")),
-        help="Secret sync token (defaults to BIOFLO_SYNC_TOKEN environment variable)",
+        default=get_sync_token(),
+        help="Secret sync token (defaults to BIOFLO_SYNC_TOKEN environment variable or website vault)",
     )
     parser.add_argument("--run_id", "--run-id", "--run", dest="run_id", type=str, default=None, help="Unique training run identifier linking token ingestion and telemetry to this specific session")
     parser.add_argument("--resume_target", type=str, default="latest", choices=["latest", "best"], help="Target checkpoint to pull from cloud ('latest' or 'best')")
@@ -259,10 +260,6 @@ def parse_args(args_list=None):
     parser.add_argument("--reset_step_counter", "--reset-step-counter", dest="reset_step_counter", action="store_true", default=False, help="Reset step counter to 0 after loading base weights to start new campaign from scratch")
     parser.add_argument("--target-eval-loss", "--target_eval_loss", dest="target_eval_loss", type=float, default=1.60, help="Target held-out evaluation loss for convergence early stopping (default: 1.60)")
     parser.add_argument("--consistent-eval-threshold", "--consistent_eval_threshold", dest="consistent_eval_threshold", type=int, default=3, help="Consecutive evaluations required <= target-eval-loss to confirm convergence (default: 3)")
-    parser.add_argument("--freeze_core", "--freeze-core", dest="freeze_core", action=argparse.BooleanOptionalAction, default=False, help="Enable cyclical cortical expansion pretraining (freeze core for 900 steps, anneal for 100 steps every 1000 steps)")
-    parser.add_argument("--freeze_until_step", "--freeze-until-step", dest="freeze_until_step", type=int, default=50000, help="Step number until which core freezing is active; after this step, core is permanently unfrozen for full end-to-end training (default: 50,000)")
-    parser.add_argument("--cycle_length", "--cycle-length", dest="cycle_length", type=int, default=1000, help="Cycle length in steps for freeze/anneal consolidation (default: 1000)")
-    parser.add_argument("--anneal_steps", "--anneal-steps", dest="anneal_steps", type=int, default=100, help="Steps within each cycle spent annealing/unfrozen (default: 100)")
     parser.add_argument("--teacher_digest", "--teacher-digest", dest="teacher_digest", type=str, default="none", choices=["online", "heuristic", "none"], help="Enable Teacher Digestion & Dynamic Next-Token Loss Weighting (default: none)")
     parser.add_argument("--teacher_model", "--teacher-model", dest="teacher_model", type=str, default="Qwen/Qwen2.5-1.5B-Instruct", help="HuggingFace teacher model for digestion")
     parser.add_argument("--teacher_scale", "--teacher-scale", dest="teacher_scale", type=float, default=1.5, help="Scaling factor alpha for dynamic next-token weights")
@@ -323,8 +320,8 @@ def build_data_stream(
             )
         from src.rectified_streamer import RectifiedContiguousPretrainStreamer
         print(f"\n📦 Initializing 100% Loss-Bearing Rectified Contiguous Streamer [{dataset_source.upper()}]...")
-        print(f"   • Stage:          PURE CONTIGUOUS PRETRAIN")
-        print(f"   • Target Mixture: 85% Broad Web (FineWeb sample-10BT) | 15% Code (The Stack v2)")
+        print(f"   • Stage:          SmolLM2 4-stage developmental curriculum")
+        print(f"   • Mixture:        90/10 -> 75/20/5 -> 70/20/10 -> 58/24/14/4")
         print(f"   • Context Window: {total_window} tokens (contiguous unbroken next-token loss)")
         print(f"   • Global Batch:   {batch_size} sequences/step")
         streamer = RectifiedContiguousPretrainStreamer(
@@ -333,6 +330,8 @@ def build_data_stream(
             block_size=total_window,
             stage="pretrain",
             queue_size=max(16, int(prefetch_queue_size)),
+            progress_getter=step_getter,
+            total_steps=total_steps,
         )
         return streamer, None
 
@@ -498,6 +497,9 @@ def main(args=None):
     pad_id = getattr(tokenizer, "pad_token_id", 0) or 0
 
     # 5. Checkpoint Manager & Resumption
+    args.cloud_token = get_sync_token(args.cloud_token)
+    os.environ["BIOFLO_SYNC_TOKEN"] = args.cloud_token
+    os.environ["CEREBRO_SYNC_TOKEN"] = args.cloud_token
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     os.makedirs(args.scratch_dir, exist_ok=True)
 
@@ -792,7 +794,7 @@ def main(args=None):
                 is_resuming_active = (existing_preset_step > 0 or not getattr(args, "from_scratch", False))
                 adapt_res = adapt_and_load_checkpoint_weights(
                     ckpt, params, target_dtype, config, buffers=buffers,
-                    apply_net2net=(not is_resuming_active and getattr(args, "freeze_core", False))
+                    apply_net2net=False
                 )
                 if isinstance(adapt_res, tuple):
                     restored, buffers = adapt_res
@@ -968,18 +970,6 @@ def main(args=None):
     # prefetch wrapper, which otherwise mixes shapes within a pmap scan.
 
     param_masks = None
-    if getattr(args, "freeze_core", False):
-        from src.cortical_expansion import build_cortical_expansion_masks, count_cortical_expansion_params
-        param_masks = build_cortical_expansion_masks(params, num_frozen_shells=16, num_frozen_tracts=40, framework="jax")
-        stats = count_cortical_expansion_params(params, param_masks)
-        print("\n" + "=" * 84)
-        print("🧠 [Progressive Cortical Expansion TPU Mode Enabled]")
-        print(f"   • Total Compact Parameters  : {stats['total_params']:,} ({stats['total_params']/1e6:.2f}M)")
-        print(f"   • Frozen Core & Headers      : {stats['frozen_params']:,} ({stats['frozen_pct']:.1f}%)")
-        print(f"   • Trainable Outer Mantle     : {stats['trainable_params']:,} ({stats['trainable_pct']:.1f}%)")
-        print(f"   • Freeze Schedule Window     : Initial {getattr(args, 'freeze_until_step', 50000):,} steps (permanently unfrozen thereafter)")
-        print(f"   • Cyclical Anneal Schedule   : Freeze {args.cycle_length - args.anneal_steps} steps ➔ Anneal {args.anneal_steps} steps (every {args.cycle_length} steps)")
-        print("=" * 84 + "\n")
 
     pmap_round_fn = None
     rep_params = None
@@ -1759,25 +1749,9 @@ def main(args=None):
             else:
                 enc_alpha = 1.0
 
-            # Cyclical Core Freeze & Consolidation Anneal Schedule
-            freeze_limit = getattr(args, "freeze_until_step", 50000)
-            is_past_freeze_limit = step >= freeze_limit
-            is_frozen_active = getattr(args, "freeze_core", False) and not is_past_freeze_limit
-
-            if getattr(args, "freeze_core", False) and step == freeze_limit:
-                print(
-                    f"\n🔓 [Cortical Maturation Triggered] Step {step:,} reached freeze limit ({freeze_limit:,})!\n"
-                    f"   Subcortical core permanently unfrozen. Full end-to-end mantle+core training active across all {config.num_shells} shells!\n"
-                )
-
+            is_past_freeze_limit = True
+            is_frozen_active = False
             is_anneal = False
-            if is_frozen_active:
-                step_in_cycle = step % args.cycle_length
-                is_anneal = step_in_cycle >= (args.cycle_length - args.anneal_steps)
-                if is_anneal:
-                    anneal_prog = (step_in_cycle - (args.cycle_length - args.anneal_steps)) / max(1, args.anneal_steps)
-                    anneal_factor = 0.5 * (1.0 + math.cos(math.pi * anneal_prog))
-                    cur_lr = 2e-6 + (cur_lr - 2e-6) * anneal_factor
 
             step_executed = False
             while not step_executed:
@@ -1991,10 +1965,7 @@ def main(args=None):
                         f"[Loss: {cumulative_loss_tokens/1e9:5.3f}B, Prompt: {cumulative_prompt_tokens/1e9:5.3f}B | Pad: {pad_ratio:4.1f}%] | "
                     )
 
-                if getattr(args, "freeze_core", False):
-                    phase_tag = f" [{'ALL_TRAINABLE' if is_past_freeze_limit else ('ANNEAL' if is_anneal else 'FROZEN')}]"
-                else:
-                    phase_tag = ""
+                phase_tag = " [ALL_TRAINABLE]"
 
                 clip_pct = (window_clipped_count / max(1, window_step_count)) * 100.0
                 diag_info = ""

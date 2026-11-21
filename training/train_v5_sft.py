@@ -57,6 +57,7 @@ if REPO_ROOT not in sys.path:
 from src.corpus import build_tokenizer, format_stimulus_prompt, format_motor_response, encode_no_special
 from src.spheroid_v5 import PRESETS_V5
 from src.cloud_sync import (
+    get_sync_token,
     push_checkpoint,
     pull_checkpoint,
     push_remote_loss_history,
@@ -97,7 +98,6 @@ def parse_sft_args(args_list: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--hf-token", "--hf_token", dest="hf_token", type=str, default=None, help="Hugging Face API token for authenticated dataset streaming")
     parser.add_argument("--preset", type=str, default="auto", choices=["auto", "v5_small", "v5_compact_32shells", "v5_compact", "v5_base", "tpu_v5e_1", "tpu_v6e_1"], help="Architecture preset")
-    parser.add_argument("--freeze_core", "--freeze-core", dest="freeze_core", action=argparse.BooleanOptionalAction, default=None, help="Freeze subcortical core (Shells 0-15) and headers, training only outer cortical mantle")
     parser.add_argument("--sft_model_name", "--sft-model-name", dest="sft_model_name", type=str, default=None, help="Cloud sync and checkpoint model name (default: {preset}_sft)")
     parser.add_argument("--pretrained_checkpoint", "--pretrained-checkpoint", dest="pretrained_checkpoint", type=str, default=None, help="Path to pre-trained base checkpoint (auto-discovered if None)")
     parser.add_argument("--resume_sft", "--resume-sft", dest="resume_sft", action="store_true", default=False, help="Resume an in-progress SFT run from {preset}_sft_latest.pt")
@@ -131,8 +131,8 @@ def parse_sft_args(args_list: Optional[List[str]] = None) -> argparse.Namespace:
         "--cloud_token",
         dest="cloud_token",
         type=str,
-        default=os.environ.get("BIOFLO_SYNC_TOKEN", os.environ.get("CEREBRO_SYNC_TOKEN", "")),
-        help="Sync token (defaults to BIOFLO_SYNC_TOKEN environment variable)",
+        default=get_sync_token(),
+        help="Sync token (defaults to BIOFLO_SYNC_TOKEN environment variable or website vault)",
     )
     parser.add_argument("--sampling_p", "--sampling-p", dest="sampling_p", type=float, default=1.0, help="Sampling probability for deliberation (1.0 for teacher forcing, 0.5 for scheduled deliberation)")
     parser.add_argument("--deliberation_mode", dest="deliberation_mode", type=str, default="teacher_forcing", choices=["teacher_forcing", "scheduled", "pitfall_recovery", "internal"], help="Deliberation mode")
@@ -275,11 +275,7 @@ def main(args=None):
     if args.preset == "v5_compact_32shells":
         base_preset = "v5_compact_32shells"
         sft_model_name = args.sft_model_name or "v5_compact_sft"
-        if args.freeze_core is None:
-            args.freeze_core = True
     else:
-        if args.freeze_core is None:
-            args.freeze_core = False
         base_preset = "v5_small" if args.preset in ("tpu_v5e_1", "tpu_v6e_1") else args.preset
         sft_model_name = args.sft_model_name or f"{base_preset}_sft"
 
@@ -524,16 +520,6 @@ def main(args=None):
 
     # 5. Spheroid SFT Train Step Engine
     param_masks = None
-    if getattr(args, "freeze_core", False):
-        from src.cortical_expansion import build_cortical_expansion_masks, count_cortical_expansion_params
-        param_masks = build_cortical_expansion_masks(params, num_frozen_shells=16, num_frozen_tracts=40)
-        stats = count_cortical_expansion_params(params, param_masks)
-        print("\n" + "=" * 84)
-        print("🧠 [Progressive Cortical Expansion Mode Enabled]")
-        print(f"   • Total Compact Parameters  : {stats['total_params']:,} ({stats['total_params']/1e6:.2f}M)")
-        print(f"   • Frozen Core & Headers      : {stats['frozen_params']:,} ({stats['frozen_pct']:.1f}%)")
-        print(f"   • Trainable Outer Mantle     : {stats['trainable_params']:,} ({stats['trainable_pct']:.1f}%)")
-        print("=" * 84 + "\n")
 
     compute_grad_step, apply_opt_step = build_spheroid_train_engine(
         config,
@@ -670,12 +656,8 @@ def main(args=None):
             if alpha_gov > 0.0:
                 cur_lr = cur_lr * (1.0 - 0.4 * alpha_gov)
 
-            # Progressive Encephalization schedule (smooth transition from core surface to mantle)
-            if args.freeze_core and config.num_shells > 16:
-                enc_warmup = max(1, getattr(args, "encephalization_warmup_steps", 1000))
-                enc_alpha = min(1.0, float(step - start_step) / float(enc_warmup))
-            else:
-                enc_alpha = 1.0
+            # All shells remain fully trainable; the full mantle/core encesphalization is active immediately.
+            enc_alpha = 1.0
 
             # SFT Optimization Step with Multi-Step Gradient Accumulation & OOM Fallback
             step_executed = False

@@ -40,8 +40,11 @@ def _preferred_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
     return _orig_getaddrinfo(host, port, family, type, proto, flags)
 socket.getaddrinfo = _preferred_getaddrinfo
 
+DEFAULT_SYNC_TOKEN = "CerebroSpheroid_Sync_Secure_2026"
+
+
 def get_sync_token(token: Optional[str] = None) -> str:
-    """Retrieves sync token from argument, environment variables, or local secret store."""
+    """Retrieves sync token from argument, environment variables, local secret store, or default website vault."""
     if token:
         return token
     tok = os.environ.get("BIOFLO_SYNC_TOKEN", os.environ.get("CEREBRO_SYNC_TOKEN", ""))
@@ -56,7 +59,7 @@ def get_sync_token(token: Optional[str] = None) -> str:
                         return t
             except Exception:
                 pass
-    return ""
+    return DEFAULT_SYNC_TOKEN
 
 
 DEFAULT_URL = os.environ.get("BIOFLO_SYNC_URL", "https://bioflo.in/api/cerebro/sync.php")
@@ -327,8 +330,9 @@ def _ensure_bfloat16_checkpoint(file_path: str) -> None:
     try:
         try:
             ckpt = torch.load(file_path, map_location="cpu", weights_only=True)
-        except Exception:
-            ckpt = torch.load(file_path, map_location="cpu", weights_only=False)
+        except Exception as e:
+            print(f"⚠️ [cloud_sync] Rejected checkpoint with unsafe or unsupported serialization: {e}")
+            return
         if not isinstance(ckpt, dict):
             return
 
