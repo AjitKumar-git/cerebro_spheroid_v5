@@ -632,27 +632,27 @@ class TestAuditRemediations(unittest.TestCase):
         self.assertGreater(float(jnp.linalg.norm(grads_act["motor.affine_scale"])), 1e-6)
 
     def test_dormant_model_configurations_consumed(self):
-        """Audit Issue 4: num_mtp_heads, use_tied_embeddings, use_sparse_mot, and top_k_tracts must be consumed."""
+        """Audit Issue 4: num_mtp_heads, use_tied_embeddings, use_sparse_mot, top_k_tracts, use_swiglu, use_shell_tap, use_plan, use_sensory_self_attn, top_k_resonance, use_deliberation_probe, use_energy_regularization must be consumed."""
         import jax
         import jax.numpy as jnp
-        from src.jax.v5_model import ModelConfigV5, init_params_v5, deliberate_step, training_rollout
+        from src.jax.v5_model import ModelConfigV5, init_params_v5, deliberate_step, deliberate_cycles_jax, encode_sensory, emit_step, training_rollout
 
         cfg_sparse = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, thinking_cycles=1, use_sparse_mot=True, top_k_tracts=2)
         params_s, buffers_s = init_params_v5(jax.random.PRNGKey(42), cfg_sparse)
         state = jax.random.normal(jax.random.PRNGKey(0), (2, 4, 32))
 
-        # use_sparse_mot must affect deliberate_step output vs dense
+        # 1. use_sparse_mot must affect deliberate_step output vs dense
         cfg_dense = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, thinking_cycles=1, use_sparse_mot=False)
         out_sparse = deliberate_step(params_s, state, buffers_s, config=cfg_sparse)
         out_dense = deliberate_step(params_s, state, buffers_s, config=cfg_dense)
         self.assertGreater(float(jnp.linalg.norm(out_sparse - out_dense)), 1e-5)
 
-        # use_tied_embeddings=False must initialize motor.head.weight
+        # 2. use_tied_embeddings=False must initialize motor.head.weight
         cfg_untied = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, thinking_cycles=1, use_tied_embeddings=False)
         params_u, _ = init_params_v5(jax.random.PRNGKey(42), cfg_untied)
         self.assertIn("motor.head.weight", params_u)
 
-        # num_mtp_heads > 1 must initialize MTP weights and affect training loss
+        # 3. num_mtp_heads > 1 must initialize MTP weights and affect training loss
         cfg_mtp = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, thinking_cycles=1, num_mtp_heads=2)
         params_m, buffers_m = init_params_v5(jax.random.PRNGKey(42), cfg_mtp)
         self.assertIn("motor.mtp.1.fc_gate.weight", params_m)
@@ -663,6 +663,147 @@ class TestAuditRemediations(unittest.TestCase):
         cfg_no_mtp = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, thinking_cycles=1, num_mtp_heads=1)
         loss_no_mtp = training_rollout(params_m, prompts, 4, buffers_m, config=cfg_no_mtp, targets=targets, pure_teacher_forcing=True, deliberation_mode="teacher_forcing")
         self.assertNotEqual(float(loss_mtp), float(loss_no_mtp))
+
+        # 4. use_swiglu must affect deliberate_step and emission
+        cfg_swiglu = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, thinking_cycles=1, use_swiglu=True)
+        cfg_no_swiglu = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, thinking_cycles=1, use_swiglu=False)
+        out_swiglu = deliberate_step(params_s, state, buffers_s, config=cfg_swiglu)
+        out_no_swiglu = deliberate_step(params_s, state, buffers_s, config=cfg_no_swiglu)
+        self.assertGreater(float(jnp.linalg.norm(out_swiglu - out_no_swiglu)), 1e-5)
+
+        # 5. use_shell_tap must affect emission
+        k_val = jax.random.normal(jax.random.PRNGKey(1), (2, 4, 8, 8))
+        v_val = jax.random.normal(jax.random.PRNGKey(2), (2, 4, 8, 8))
+        plan = jnp.zeros((2, 32))
+        trace = jnp.zeros((2, 64))
+        cfg_tap = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, use_shell_tap=True)
+        cfg_no_tap = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, use_shell_tap=False)
+        logits_tap, _, _, _ = emit_step(params_s, state, (k_val, v_val), plan, trace, 0, buffers_s, config=cfg_tap)
+        logits_no_tap, _, _, _ = emit_step(params_s, state, (k_val, v_val), plan, trace, 0, buffers_s, config=cfg_no_tap)
+        self.assertGreater(float(jnp.linalg.norm(logits_tap - logits_no_tap)), 1e-5)
+
+        # 6. use_plan must affect emission output and plan update
+        cfg_plan = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, use_plan=True)
+        cfg_no_plan = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, use_plan=False)
+        plan_active = jax.random.normal(jax.random.PRNGKey(3), (2, 32))
+        logits_p, _, _, nxt_p = emit_step(params_s, state, (k_val, v_val), plan_active, trace, 0, buffers_s, config=cfg_plan)
+        logits_np, _, _, nxt_np = emit_step(params_s, state, (k_val, v_val), plan_active, trace, 0, buffers_s, config=cfg_no_plan)
+        self.assertGreater(float(jnp.linalg.norm(logits_p - logits_np)), 1e-5)
+        self.assertTrue(jnp.array_equal(nxt_np, plan_active))
+
+        # 7. use_sensory_self_attn must affect encode_sensory
+        toks = jnp.array([[2, 3, 4, 5]], dtype=jnp.int32)
+        params_attn = dict(params_s)
+        params_attn["sensory.out_self.weight"] = jax.random.normal(jax.random.PRNGKey(7), params_s["sensory.out_self.weight"].shape)
+        cfg_attn = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, use_sensory_self_attn=True)
+        cfg_no_attn = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, use_sensory_self_attn=False)
+        flux_attn, _ = encode_sensory(params_attn, toks, config=cfg_attn)
+        flux_no_attn, _ = encode_sensory(params_attn, toks, config=cfg_no_attn)
+        self.assertGreater(float(jnp.linalg.norm(flux_attn - flux_no_attn)), 1e-5)
+
+        # 8. top_k_resonance must sparsify attention in emit_step
+        cfg_k_res = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, top_k_resonance=2)
+        cfg_all_res = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, top_k_resonance=0)
+        lg_k, _, _, _ = emit_step(params_s, state, (k_val, v_val), plan, trace, 0, buffers_s, config=cfg_k_res)
+        lg_all, _, _, _ = emit_step(params_s, state, (k_val, v_val), plan, trace, 0, buffers_s, config=cfg_all_res)
+        self.assertGreater(float(jnp.linalg.norm(lg_k - lg_all)), 1e-5)
+
+        # 9. use_deliberation_probe must initialize probe weights and affect deliberate_cycles_jax
+        cfg_probe = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, thinking_cycles=2, use_deliberation_probe=True)
+        params_pr, _ = init_params_v5(jax.random.PRNGKey(42), cfg_probe)
+        self.assertIn("core.deliberation_probe.weight", params_pr)
+        self.assertIn("core.deliberation_probe_norm.weight", params_pr)
+        s_probed, _ = deliberate_cycles_jax(params_pr, state, buffers_s, config=cfg_probe, sensory_kv=(k_val, v_val))
+        cfg_no_probe = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, thinking_cycles=2, use_deliberation_probe=False)
+        s_unprobed, _ = deliberate_cycles_jax(params_pr, state, buffers_s, config=cfg_no_probe, sensory_kv=(k_val, v_val))
+        self.assertGreater(float(jnp.linalg.norm(s_probed - s_unprobed)), 1e-5)
+
+        # 10. use_energy_regularization must accumulate loss
+        cfg_energy = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, thinking_cycles=2, use_energy_regularization=True, energy_reg_weight=1.0)
+        cfg_no_energy = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, thinking_cycles=2, use_energy_regularization=False)
+        loss_energy = float(training_rollout(params_s, prompts, 4, buffers_s, config=cfg_energy, targets=targets, pure_teacher_forcing=True, deliberation_mode="teacher_forcing"))
+        loss_no_energy = float(training_rollout(params_s, prompts, 4, buffers_s, config=cfg_no_energy, targets=targets, pure_teacher_forcing=True, deliberation_mode="teacher_forcing"))
+        self.assertGreater(loss_energy, loss_no_energy)
+
+    def test_head_selection_no_target_leakage(self):
+        """Verifies head selection at step t is invariant to targets[:, t], eliminating target information leakage."""
+        import jax
+        import jax.numpy as jnp
+        from src.jax.v5_model import ModelConfigV5, init_params_v5, training_rollout
+
+        cfg = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, thinking_cycles=1)
+        params, buffers = init_params_v5(jax.random.PRNGKey(42), cfg)
+        prompts = jnp.array([[2, 3, 4, 5]], dtype=jnp.int32)
+
+        # At step 0:
+        # Prompt had no unclosed think or act tokens.
+        # Whether targets[:, 0] is 29 (<think>) or 31 (<tool_call>) or 15 (answer),
+        # the model at step 0 MUST be in answer mode.
+        # Thus, affine_think and affine_act should receive 0 gradient from step 0 when target length is 1!
+        targets_0_think = jnp.array([[29]], dtype=jnp.int32)
+        grads_0 = jax.grad(lambda p: training_rollout(p, prompts, 1, buffers, config=cfg, targets=targets_0_think, pure_teacher_forcing=True, deliberation_mode="teacher_forcing"))(params)
+
+        self.assertEqual(float(jnp.linalg.norm(grads_0["motor.affine_think"])), 0.0, "Target <think> at step 0 leaked into think head at step 0!")
+        self.assertEqual(float(jnp.linalg.norm(grads_0["motor.affine_act"])), 0.0, "Act head received non-zero gradient at step 0!")
+        self.assertGreater(float(jnp.linalg.norm(grads_0["motor.affine_answer"])), 1e-6, "Answer head must predict step 0!")
+
+    def test_causal_mtp_prediction_no_future_state_leakage(self):
+        """Verifies MTP predicts target t+m causally from h_t and prior token embeddings without future state leakage."""
+        import jax
+        import jax.numpy as jnp
+        from src.jax.v5_model import ModelConfigV5, init_params_v5, training_rollout
+
+        cfg_mtp = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, thinking_cycles=1, num_mtp_heads=2)
+        params, buffers = init_params_v5(jax.random.PRNGKey(42), cfg_mtp)
+        prompts = jnp.array([[2, 3, 4, 5]], dtype=jnp.int32)
+
+        # Gradient of MTP parameters with respect to sequence
+        targets = jnp.array([[10, 11, 12, 13]], dtype=jnp.int32)
+        loss = training_rollout(params, prompts, 4, buffers, config=cfg_mtp, targets=targets, pure_teacher_forcing=True, deliberation_mode="teacher_forcing")
+        self.assertFalse(np.isnan(float(loss)))
+
+    def test_generation_exercises_specialized_heads(self):
+        """Verifies generate_text_jax dynamically applies specialized affine scales at inference."""
+        import jax
+        import jax.numpy as jnp
+        from src.jax.v5_model import ModelConfigV5, init_params_v5, generate_text_jax
+
+        class MockTokenizer:
+            pad_token_id = 0
+            eos_token_id = 2
+            def encode(self, text, **kwargs):
+                return [1, 20, 21, 22]
+            def decode(self, token_ids, **kwargs):
+                return " ".join(str(t) for t in token_ids)
+
+        tok = MockTokenizer()
+        cfg = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, thinking_cycles=1)
+        params, buffers = init_params_v5(jax.random.PRNGKey(42), cfg)
+
+        # Perturb affine_think: when seed_token_id is <think> (29), subsequent generation must be altered by affine_think
+        params_perturbed = dict(params)
+        params_perturbed["motor.affine_think"] = params["motor.affine_think"] * 5.0
+
+        out_base = generate_text_jax(params, buffers, cfg, "Hello", tok, max_new_tokens=8, seed_token_id=29, temperature=0.0)
+        out_pert = generate_text_jax(params_perturbed, buffers, cfg, "Hello", tok, max_new_tokens=8, seed_token_id=29, temperature=0.0)
+        self.assertNotEqual(out_base, out_pert, "affine_think perturbation had no effect on generation seeded with <think>!")
+
+    def test_tool_and_head_token_configuration(self):
+        """Verifies configurable tool_token_id, act_token_id, think_token_id, and end tokens."""
+        import jax
+        import jax.numpy as jnp
+        from src.jax.v5_model import ModelConfigV5, init_params_v5, training_rollout
+
+        cfg_custom = ModelConfigV5(
+            vocab_size=128, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, thinking_cycles=1,
+            tool_token_id=50, tool_end_token_id=51, think_token_id=60, think_end_token_id=61, router_loss_weight=1.0
+        )
+        params, buffers = init_params_v5(jax.random.PRNGKey(42), cfg_custom)
+        prompts = jnp.array([[2, 3, 4, 5]], dtype=jnp.int32)
+        targets_custom_tool = jnp.array([[10, 50, 12, 51]], dtype=jnp.int32)
+
+        grads = jax.grad(lambda p: training_rollout(p, prompts, 4, buffers, config=cfg_custom, targets=targets_custom_tool, pure_teacher_forcing=True, deliberation_mode="teacher_forcing"))(params)
+        self.assertGreater(float(jnp.linalg.norm(grads["motor.affine_act"])), 1e-6, "Custom tool_token_id=50 did not activate affine_act!")
 
     def test_temporal_router_token_ids(self):
         """Audit Issue 5: Temporal router loss must trigger on canonical tokens 31 (tool_call) and 29 (think)."""

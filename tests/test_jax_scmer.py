@@ -59,7 +59,7 @@ def test_independent_pair_sampling_properties():
     assert jnp.all(pair_i < pair_j), "Pairs must strictly satisfy i < j!"
 
     # 2. No duplicate pairs
-    flat_pair_ids = pair_i.astype(jnp.int64) * num_rows + pair_j.astype(jnp.int64)
+    flat_pair_ids = pair_i.astype(jnp.int32) * num_rows + pair_j.astype(jnp.int32)
     unique_pairs = jnp.unique(flat_pair_ids)
     assert unique_pairs.shape[0] == K, f"Expected {K} unique pairs, found duplicates ({unique_pairs.shape[0]})"
 

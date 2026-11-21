@@ -64,7 +64,11 @@ class ModelConfigV5:
     tool_token_id: Optional[int] = 31
     act_token_id: Optional[int] = 31
     think_token_id: Optional[int] = 29
+    think_end_token_id: Optional[int] = 30
+    tool_end_token_id: Optional[int] = 32
+    act_end_token_id: Optional[int] = 32
     router_loss_weight: float = 0.0
+    energy_reg_weight: float = 0.01
 
 
 # Register ModelConfigV5 as static PyTree node
@@ -78,7 +82,8 @@ jax.tree_util.register_pytree_node(
         c.use_adaptive_thinking, c.max_thinking_cycles, c.thinking_halt_threshold,
         c.num_mtp_heads, c.use_sparse_mot, c.top_k_tracts, c.use_energy_regularization,
         c.enable_multimodal, c.visual_dim, c.audio_dim, c.num_visual_patches, c.image_patch_size,
-        c.tool_token_id, c.act_token_id, c.think_token_id, c.router_loss_weight,
+        c.tool_token_id, c.act_token_id, c.think_token_id, c.think_end_token_id,
+        c.tool_end_token_id, c.act_end_token_id, c.router_loss_weight, c.energy_reg_weight,
     )),
     lambda aux, _: ModelConfigV5(*aux),
 )
@@ -203,9 +208,11 @@ def rms_norm(x: jnp.ndarray, weight: jnp.ndarray, eps: float = 1e-6) -> jnp.ndar
     return (normed * weight.astype(jnp.float32)).astype(orig_dtype)
 
 
-def swiglu(x: jnp.ndarray, w_gate: jnp.ndarray, w_val: jnp.ndarray, w_down: jnp.ndarray) -> jnp.ndarray:
-    """Swish Gated Linear Unit in JAX."""
+def swiglu(x: jnp.ndarray, w_gate: jnp.ndarray, w_val: jnp.ndarray, w_down: jnp.ndarray, use_swiglu: bool = True) -> jnp.ndarray:
+    """Swish Gated Linear Unit in JAX with optional non-gated SiLU bypass."""
     g = jax.nn.silu(jnp.matmul(x, w_gate.T))
+    if not use_swiglu:
+        return jnp.matmul(g, w_down.T)
     v = jnp.matmul(x, w_val.T)
     return jnp.matmul(g * v, w_down.T)
 
@@ -364,6 +371,12 @@ def init_params_v5(key: jax.random.PRNGKey, config: ModelConfigV5) -> Tuple[Dict
     params["core.intra_swiglu.w_val"] = jax.random.normal(keys[25], (K, s_dim, s_dim * 2)) * (1.0 / math.sqrt(s_dim))
     params["core.intra_swiglu.w_down"] = jax.random.normal(keys[26], (K, s_dim * 2, s_dim)) * (1.0 / math.sqrt(s_dim * 2))
 
+    # Optional Subconscious Deliberation Memory Probe
+    if getattr(config, "use_deliberation_probe", False):
+        probe_key = jax.random.fold_in(key, 999)
+        params["core.deliberation_probe.weight"] = jax.random.normal(probe_key, (s_dim, s_dim)) * (1.0 / math.sqrt(s_dim))
+        params["core.deliberation_probe_norm.weight"] = jnp.ones(s_dim, dtype=jnp.float32)
+
     # 4. Multimodal Perceptual Projections (Images, Audio, Continuous Sensors)
     if getattr(config, "enable_multimodal", False):
         v_dim = getattr(config, "visual_dim", s_dim)
@@ -509,11 +522,17 @@ def encode_sensory(
         x = x + pos_enc[None, :, :].astype(x.dtype)
 
     h = rms_norm(x, params["sensory.norm_in.weight"])
-    h_swiglu = swiglu(h, params["sensory.swiglu.fc_gate.weight"], params["sensory.swiglu.fc_val.weight"], params["sensory.swiglu.fc_down.weight"])
+    h_swiglu = swiglu(
+        h,
+        params["sensory.swiglu.fc_gate.weight"],
+        params["sensory.swiglu.fc_val.weight"],
+        params["sensory.swiglu.fc_down.weight"],
+        use_swiglu=getattr(config, "use_swiglu", True),
+    )
     flux = rms_norm(x + h_swiglu, params["sensory.norm_out.weight"])
 
     # Contextual Inter-Token Multi-Head Self-Attention (zero-init residual)
-    if L > 1 and "sensory.out_self.weight" in params:
+    if L > 1 and "sensory.out_self.weight" in params and getattr(config, "use_sensory_self_attn", True):
         h_ctx = rms_norm(flux, params["sensory.ctx_norm.weight"])
         q_s = jnp.matmul(h_ctx, params["sensory.q_self.weight"].T).reshape(B, L, num_heads, head_dim)
         q_s = jnp.swapaxes(q_s, 1, 2)  # [B, H, L, head_dim]
@@ -608,8 +627,11 @@ def deliberate_step(
 
     # 2. Batched 3D SwiGLU: Single systolic tensor contraction across all K shells in parallel
     gate = jax.nn.silu(jnp.einsum("bkd,kde->bke", h, params["core.intra_swiglu.w_gate"]))
-    val = jnp.einsum("bkd,kde->bke", h, params["core.intra_swiglu.w_val"])
-    down = jnp.einsum("bke,ked->bkd", gate * val, params["core.intra_swiglu.w_down"])
+    if getattr(config, "use_swiglu", True):
+        val = jnp.einsum("bkd,kde->bke", h, params["core.intra_swiglu.w_val"])
+        down = jnp.einsum("bke,ked->bkd", gate * val, params["core.intra_swiglu.w_down"])
+    else:
+        down = jnp.einsum("bke,ked->bkd", gate, params["core.intra_swiglu.w_down"])
     state_intra = state + down * params["core.shell_gains"][None, :, None].astype(st_dtype)
 
     # 3. Pre-Norm before radial convection & shortcuts (eliminates global RMSNorm shell collapse)
@@ -654,14 +676,17 @@ def deliberate_cycles_jax(
     buffers: Tuple[jnp.ndarray, jnp.ndarray],
     config: Optional[ModelConfigV5] = None,
     is_training: bool = False,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    sensory_kv: Optional[Tuple[jnp.ndarray, jnp.ndarray]] = None,
+    return_energy: bool = False,
+) -> Union[Tuple[jnp.ndarray, jnp.ndarray], Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
     """
     Executes subconscious deliberation cycles across concentric laminae with static-iteration
     lax.scan Adaptive Computation Time (ACT) for TPU/XLA compilation efficiency.
 
     Returns:
-        (final_state, ponder_cost)
+        (final_state, ponder_cost) or (final_state, ponder_cost, energy_loss)
     """
+    B, K, D = state.shape
     if config is None:
         use_adapt = False
         cycles = 4
@@ -669,28 +694,61 @@ def deliberate_cycles_jax(
         use_adapt = bool(getattr(config, "use_adaptive_thinking", False)) and ("core.halting_gate.weight" in params)
         cycles = int(getattr(config, "max_thinking_cycles", getattr(config, "thinking_cycles", 4))) if use_adapt else int(getattr(config, "thinking_cycles", 4))
 
-    if not use_adapt:
-        def step_fn(curr_state, _):
-            next_state = deliberate_step(params, curr_state, buffers, config=config)
-            return next_state, None
+    def _apply_probe(curr_s, step_idx):
+        if sensory_kv is not None and "core.deliberation_probe.weight" in params and getattr(config, "use_deliberation_probe", False):
+            keys, values = sensory_kv
+            L_kv = keys.shape[2]
+            num_h = keys.shape[1]
+            h_dim = keys.shape[3]
+            mean_state = jnp.mean(curr_s, axis=1)
+            probe_q = jnp.matmul(mean_state, params["core.deliberation_probe.weight"].T).reshape(B, 1, num_h, h_dim)
+            probe_q = jnp.swapaxes(probe_q, 1, 2)
+            if getattr(config, "use_rope", True):
+                probe_q = apply_rope(probe_q, step_idx, theta=config.rope_theta)
+                keys_r = apply_rope(keys, jnp.arange(L_kv, dtype=jnp.int32), theta=config.rope_theta)
+            else:
+                keys_r = keys
+            scores = jnp.matmul(probe_q, jnp.swapaxes(keys_r, -1, -2)) / math.sqrt(h_dim)
+            top_k_res = getattr(config, "top_k_resonance", 0) if config is not None else 0
+            if top_k_res > 0 and L_kv > top_k_res:
+                topk_v, _ = lax.top_k(scores, top_k_res)
+                scores = jnp.where(scores >= topk_v[..., -1:], scores, -1e4)
+            attn_p = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(curr_s.dtype)
+            retrieved = jnp.matmul(attn_p, values)
+            retrieved = jnp.swapaxes(retrieved, 1, 2).reshape(B, D)
+            retrieved_normed = rms_norm(retrieved, params["core.deliberation_probe_norm.weight"])
+            state_mantle = curr_s[:, -1:, :] + 0.1 * retrieved_normed[:, None, :]
+            return jnp.concatenate([curr_s[:, :-1, :], state_mantle], axis=1)
+        return curr_s
 
-        final_state, _ = lax.scan(step_fn, state, None, length=cycles)
+    if not use_adapt:
+        def step_fn(carry, step_idx):
+            curr_state, cum_energy = carry
+            probed_state = _apply_probe(curr_state, step_idx)
+            next_state = deliberate_step(params, probed_state, buffers, config=config)
+            step_energy = jnp.mean((next_state.astype(jnp.float32) - probed_state.astype(jnp.float32)) ** 2)
+            return (next_state, cum_energy + step_energy), None
+
+        (final_state, total_energy), _ = lax.scan(step_fn, (state, jnp.array(0.0, dtype=jnp.float32)), jnp.arange(cycles))
+        if return_energy:
+            return final_state, jnp.array(0.0, dtype=jnp.float32), total_energy
         return final_state, jnp.array(0.0, dtype=jnp.float32)
 
     # Static ACT formulation for TPU/XLA:
-    B, K, D = state.shape
     threshold = float(getattr(config, "thinking_halt_threshold", 0.75))
     w_gate = params["core.halting_gate.weight"]  # [1, D]
     b_gate = params["core.halting_gate.bias"]    # [1]
 
-    # Carry: (curr_state, accum_state, cum_p, cum_ponder)
+    # Carry: (curr_state, accum_state, cum_p, cum_ponder, cum_energy)
     init_accum = jnp.zeros_like(state)
     init_cum_p = jnp.zeros((B,), dtype=jnp.float32)
     init_ponder = jnp.zeros((B,), dtype=jnp.float32)
 
     def scan_body(carry, step_idx):
-        curr_state, accum_state, cum_p, cum_ponder = carry
-        next_state = deliberate_step(params, curr_state, buffers, config=config)
+        curr_state, accum_state, cum_p, cum_ponder, cum_energy = carry
+        probed_state = _apply_probe(curr_state, step_idx)
+        next_state = deliberate_step(params, probed_state, buffers, config=config)
+        step_energy = jnp.mean((next_state.astype(jnp.float32) - probed_state.astype(jnp.float32)) ** 2)
 
         # Deliberation state pooling across cortical/subcortical laminae
         state_mean = jnp.mean(next_state.astype(jnp.float32), axis=1)  # [B, D]
@@ -707,11 +765,11 @@ def deliberate_cycles_jax(
         accum_state = accum_state + step_weight[:, None, None].astype(state.dtype) * next_state
         cum_ponder = cum_ponder + rem_p
 
-        return (next_state, accum_state, new_cum_p, cum_ponder), None
+        return (next_state, accum_state, new_cum_p, cum_ponder, cum_energy + step_energy), None
 
-    (_, final_accum, final_cum_p, cum_ponder), _ = lax.scan(
+    (_, final_accum, final_cum_p, cum_ponder, total_energy), _ = lax.scan(
         scan_body,
-        (state, init_accum, init_cum_p, init_ponder),
+        (state, init_accum, init_cum_p, init_ponder, jnp.array(0.0, dtype=jnp.float32)),
         jnp.arange(cycles),
     )
 
@@ -719,6 +777,8 @@ def deliberate_cycles_jax(
     final_state = (final_accum / norm_factor).astype(state.dtype)
     ponder_cost = jnp.mean(cum_ponder)
 
+    if return_energy:
+        return final_state, ponder_cost, total_energy
     return final_state, ponder_cost
 
 
@@ -772,28 +832,37 @@ def emit_step(
     if config is not None and config.use_rope:
         q_pos = step_idx if query_position is None else query_position
         q = apply_rope(q, q_pos, theta=config.rope_theta)
-        keys = apply_rope(keys, jnp.arange(keys.shape[2]), theta=config.rope_theta)
+        keys = apply_rope(keys, jnp.arange(keys.shape[2], dtype=jnp.int32), theta=config.rope_theta)
     scores = jnp.matmul(q, jnp.swapaxes(keys, -1, -2)) / math.sqrt(head_dim)
     if attn_mask is not None:
         scores = jnp.where(attn_mask, scores, -1e4)
+    top_k_res = getattr(config, "top_k_resonance", 0) if config is not None else 0
+    if top_k_res > 0 and scores.shape[-1] > top_k_res:
+        top_vals, _ = lax.top_k(scores, top_k_res)
+        min_top = top_vals[..., -1:]
+        scores = jnp.where(scores >= min_top, scores, -1e4)
     attn_weights = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(st_dtype)
     res_heads = jnp.matmul(attn_weights, values)  # [B, H, 1, head_dim]
     res_heads = jnp.swapaxes(res_heads, 1, 2).reshape(B, D)
     resonance = rms_norm(jnp.matmul(res_heads, params["motor.out_proj.weight"].T), params["motor.resonance_norm.weight"])
 
     # 3. Multi-Shell Softmax Pooling
-    shell_weights = jax.nn.softmax(params["motor.shell_score"].astype(jnp.float32), axis=0)[None, :, None].astype(st_dtype)
-    shell_proj = jnp.matmul(state, params["motor.shell_proj.weight"].T)
-    shell_pool = jnp.sum(shell_weights * shell_proj, axis=1) * params["motor.shell_scale"].astype(st_dtype)
+    if getattr(config, "use_shell_tap", True):
+        shell_weights = jax.nn.softmax(params["motor.shell_score"].astype(jnp.float32), axis=0)[None, :, None].astype(st_dtype)
+        shell_proj = jnp.matmul(state, params["motor.shell_proj.weight"].T)
+        shell_pool = jnp.sum(shell_weights * shell_proj, axis=1) * params["motor.shell_scale"].astype(st_dtype)
+    else:
+        shell_pool = jnp.zeros((B, D), dtype=st_dtype)
 
     # 4. Gated Deep Motor Integration via SwiGLU (per-source learnable importance gating)
+    use_plan = getattr(config, "use_plan", True)
     ig = jnp.clip(params.get("motor.input_gate", jnp.ones(5, dtype=jnp.float32)), -5.0, 5.0).astype(st_dtype)
     fused_in = jnp.concatenate([
         ig[0] * motor_surface,
         ig[1] * core,
         ig[2] * resonance,
         ig[3] * shell_pool,
-        ig[4] * plan,
+        ig[4] * (plan if use_plan else jnp.zeros_like(plan)),
     ], axis=-1)
     fused = rms_norm(fused_in, params["motor.fused_norm.weight"])
     h = rms_norm(
@@ -802,24 +871,28 @@ def emit_step(
             params["motor.swiglu.fc_gate.weight"],
             params["motor.swiglu.fc_val.weight"],
             params["motor.swiglu.fc_down.weight"],
+            use_swiglu=getattr(config, "use_swiglu", True),
         ),
         params["motor.norm_mid.weight"],
     )
 
     # 5. Premotor Recurrent Executive Plan Update
-    phase_batch = jnp.repeat(p_scaled[None, :], B, axis=0)
-    plan_input = jnp.concatenate([h, phase_batch], axis=-1)
-    p_gate = jax.nn.sigmoid(
-        jnp.matmul(plan_input, params["motor.plan_gate.weight"].T) + params["motor.plan_gate.bias"].astype(st_dtype)
-    )
-    plan_decay = jnp.clip(params["motor.plan_decay"].astype(jnp.float32), 0.0, 0.92).astype(st_dtype)
-    plan_write = params["motor.plan_write"].astype(st_dtype)
-    plan_update = jnp.matmul(plan_input, params["motor.plan_update.weight"].T)
-    next_plan = jnp.clip(
-        plan_decay * plan + plan_write * p_gate * plan_update,
-        -50.0,
-        50.0,
-    ).astype(st_dtype)
+    if use_plan:
+        phase_batch = jnp.repeat(p_scaled[None, :], B, axis=0)
+        plan_input = jnp.concatenate([h, phase_batch], axis=-1)
+        p_gate = jax.nn.sigmoid(
+            jnp.matmul(plan_input, params["motor.plan_gate.weight"].T) + params["motor.plan_gate.bias"].astype(st_dtype)
+        )
+        plan_decay = jnp.clip(params["motor.plan_decay"].astype(jnp.float32), 0.0, 0.92).astype(st_dtype)
+        plan_write = params["motor.plan_write"].astype(st_dtype)
+        plan_update = jnp.matmul(plan_input, params["motor.plan_update.weight"].T)
+        next_plan = jnp.clip(
+            plan_decay * plan + plan_write * p_gate * plan_update,
+            -50.0,
+            50.0,
+        ).astype(st_dtype)
+    else:
+        next_plan = plan
 
     # 6. Affine-Tied (or Untied) Dictionary Projection (W_motor = gamma * W_sensory or W_motor)
     # Memory-optimal: Scale hidden vector [B, D] instead of vocabulary matrix [V, D]
@@ -1016,8 +1089,8 @@ def training_rollout(
     state = (jnp.broadcast_to(prompt_flux[:, None, :], (B, num_shells, surface_dim)).astype(jnp.float32) * radial_profile).astype(target_dtype)
 
     # Subconscious deliberation cycles with Adaptive Computation Time (ACT)
-    state, ponder_cost = deliberate_cycles_jax(
-        params, state, buffers, config=config, is_training=(targets is not None)
+    state, ponder_cost, energy_loss = deliberate_cycles_jax(
+        params, state, buffers, config=config, is_training=(targets is not None), sensory_kv=sensory_kv, return_energy=True
     )
 
     # Initial executive plan and refractory trace
@@ -1051,43 +1124,6 @@ def training_rollout(
     else:
         target_weights = None
 
-    # Track independent tri-head affine scale specialization
-    aff_base = params["motor.affine_scale"][None, None, :].astype(target_dtype)
-    aff_th = params.get("motor.affine_think")
-    aff_ac = params.get("motor.affine_act")
-    aff_an = params.get("motor.affine_answer")
-    if targets is not None and aff_th is not None and aff_ac is not None and aff_an is not None:
-        th_start = getattr(config, "think_token_id", 29) if config is not None else 29
-        th_end = 30
-        act_start = getattr(config, "act_token_id", 31) if config is not None else 31
-        act_end = 32
-
-        is_th_start = (targets[:, :target_len] == th_start)
-        is_th_end = (targets[:, :target_len] == th_end)
-        is_ac_start = (targets[:, :target_len] == act_start)
-        is_ac_end = (targets[:, :target_len] == act_end)
-
-        th_depth = jnp.cumsum(is_th_start.astype(jnp.int32), axis=-1) - jnp.cumsum(is_th_end.astype(jnp.int32), axis=-1)
-        in_th = (th_depth > 0) | is_th_end
-
-        ac_depth = jnp.cumsum(is_ac_start.astype(jnp.int32), axis=-1) - jnp.cumsum(is_ac_end.astype(jnp.int32), axis=-1)
-        in_ac = (ac_depth > 0) | is_ac_end
-
-        in_an = (~in_th) & (~in_ac)
-
-        m_th = in_th[:, :, None].astype(target_dtype)
-        m_ac = in_ac[:, :, None].astype(target_dtype)
-        m_an = in_an[:, :, None].astype(target_dtype)
-
-        head_mod = (
-            m_th * aff_th[None, None, :].astype(target_dtype)
-            + m_ac * aff_ac[None, None, :].astype(target_dtype)
-            + m_an * aff_an[None, None, :].astype(target_dtype)
-        )
-        per_token_affine = aff_base * head_mod
-    else:
-        per_token_affine = aff_base
-
     # Build strictly non-leaking prev_tokens[0..target_len-1] aligned 1:1 with emission step 0..target_len-1
     if feedback_tokens is None and targets is not None:
         bos_pad = jnp.full((B, 1), -100, dtype=targets.dtype)
@@ -1104,6 +1140,55 @@ def training_rollout(
             prev_tokens = jnp.concatenate([bos_pad, fb_slice[:, :target_len - 1]], axis=1) if target_len > 1 else bos_pad[:, :target_len]
     else:
         prev_tokens = None
+
+    # Track independent tri-head affine scale specialization strictly without target leakage
+    th_start = getattr(config, "think_token_id", 29) if config is not None else 29
+    th_end = getattr(config, "think_end_token_id", 30) if config is not None else 30
+    act_start = getattr(config, "act_token_id", 31) if config is not None else 31
+    if config is not None and getattr(config, "tool_token_id", None) is not None:
+        act_start = config.tool_token_id
+    act_end = getattr(config, "act_end_token_id", 32) if config is not None else 32
+    if config is not None and getattr(config, "tool_end_token_id", None) is not None:
+        act_end = config.tool_end_token_id
+
+    # Check whether prompt had unclosed think or act tokens
+    if prompts is not None and prompts.ndim == 2:
+        prompt_th_unclosed = (jnp.sum(prompts == th_start, axis=-1) > jnp.sum(prompts == th_end, axis=-1))
+        prompt_ac_unclosed = (jnp.sum(prompts == act_start, axis=-1) > jnp.sum(prompts == act_end, axis=-1))
+    else:
+        prompt_th_unclosed = jnp.zeros((B,), dtype=bool)
+        prompt_ac_unclosed = jnp.zeros((B,), dtype=bool)
+
+    aff_base = params["motor.affine_scale"][None, None, :].astype(target_dtype)
+    aff_th = params.get("motor.affine_think")
+    aff_ac = params.get("motor.affine_act")
+    aff_an = params.get("motor.affine_answer")
+    if prev_tokens is not None and aff_th is not None and aff_ac is not None and aff_an is not None:
+        is_th_start = (prev_tokens == th_start).astype(jnp.int32)
+        is_th_end = (prev_tokens == th_end).astype(jnp.int32)
+        is_ac_start = (prev_tokens == act_start).astype(jnp.int32)
+        is_ac_end = (prev_tokens == act_end).astype(jnp.int32)
+
+        th_depth = jnp.cumsum(is_th_start - is_th_end, axis=-1) + prompt_th_unclosed[:, None].astype(jnp.int32)
+        in_th = th_depth > 0
+
+        ac_depth = jnp.cumsum(is_ac_start - is_ac_end, axis=-1) + prompt_ac_unclosed[:, None].astype(jnp.int32)
+        in_ac = ac_depth > 0
+
+        in_an = (~in_th) & (~in_ac)
+
+        m_th = in_th[:, :, None].astype(target_dtype)
+        m_ac = in_ac[:, :, None].astype(target_dtype)
+        m_an = in_an[:, :, None].astype(target_dtype)
+
+        head_mod = (
+            m_th * aff_th[None, None, :].astype(target_dtype)
+            + m_ac * aff_ac[None, None, :].astype(target_dtype)
+            + m_an * aff_an[None, None, :].astype(target_dtype)
+        )
+        per_token_affine = aff_base * head_mod
+    else:
+        per_token_affine = aff_base
 
     prompt_k, prompt_v = sensory_kv
     num_heads = prompt_k.shape[1]
@@ -1209,13 +1294,27 @@ def training_rollout(
         gen_valid = jnp.concatenate([prompt_valid, target_gen_valid], axis=-1)
 
         def _emit_gen(carry, step_idx):
-            cur_state, cur_trace, cur_plan, prev_thought, k_buf, v_buf = carry
+            cur_state, cur_trace, cur_plan, prev_thought, k_buf, v_buf, mode_th, mode_ac = carry
             internal_feed = jnp.where(step_idx == 0, 0.0, prev_thought)
 
             cur_all_k = jnp.concatenate([prompt_k, k_buf], axis=2)
             cur_all_v = jnp.concatenate([prompt_v, v_buf], axis=2)
-            pos = jnp.arange(total_prompt_L + target_len)
+            pos = jnp.arange(total_prompt_L + target_len, dtype=jnp.int32)
             step_mask = gen_valid & (pos <= (total_prompt_L + step_idx))[None, None, None, :]
+
+            if aff_th is not None and aff_ac is not None and aff_an is not None:
+                head_mod = jnp.where(
+                    mode_th[:, None],
+                    aff_th[None, :],
+                    jnp.where(
+                        mode_ac[:, None],
+                        aff_ac[None, :],
+                        aff_an[None, :]
+                    )
+                ).astype(target_dtype)
+                active_affine = aff_base.squeeze(1) * head_mod
+            else:
+                active_affine = aff_base.squeeze(1)
 
             logits, nxt_s, nxt_t, nxt_p = emit_step(
                 params,
@@ -1231,6 +1330,7 @@ def training_rollout(
                 attn_mask=step_mask,
                 encephalization_alpha=encephalization_alpha,
                 query_position=total_prompt_L + step_idx,
+                affine_scale=active_affine,
             )
 
             if temperature is not None and temperature > 1e-4 and key is not None:
@@ -1258,9 +1358,16 @@ def training_rollout(
             nxt_k_buf = lax.dynamic_update_slice(k_buf, new_k, (0, 0, update_slot, 0))
             nxt_v_buf = lax.dynamic_update_slice(v_buf, new_v, (0, 0, update_slot, 0))
 
-            return (nxt_s.astype(target_dtype), nxt_t, nxt_p.astype(target_dtype), nxt_thought, nxt_k_buf, nxt_v_buf), (logits, tok_idx)
+            nxt_mode_th = (mode_th | (tok_idx == th_start)) & (tok_idx != th_end)
+            nxt_mode_ac = (mode_ac | (tok_idx == act_start)) & (tok_idx != act_end)
 
-        _, (all_logits, all_toks) = lax.scan(_emit_gen, (state, init_refractory, init_plan, init_thought, init_k_buf, init_v_buf), jnp.arange(target_len))
+            return (nxt_s.astype(target_dtype), nxt_t, nxt_p.astype(target_dtype), nxt_thought, nxt_k_buf, nxt_v_buf, nxt_mode_th, nxt_mode_ac), (logits, tok_idx)
+
+        _, (all_logits, all_toks) = lax.scan(
+            _emit_gen,
+            (state, init_refractory, init_plan, init_thought, init_k_buf, init_v_buf, prompt_th_unclosed, prompt_ac_unclosed),
+            jnp.arange(target_len, dtype=jnp.int32),
+        )
         if return_tokens:
             return jnp.swapaxes(all_logits, 0, 1), jnp.swapaxes(all_toks, 0, 1)
         return jnp.swapaxes(all_logits, 0, 1)
@@ -1308,16 +1415,21 @@ def training_rollout(
             q_all = jnp.matmul(ms_all, params["motor.q_proj.weight"].T).reshape(B, T, num_heads, head_dim)
             q_all = jnp.swapaxes(q_all, 1, 2)  # [B, H, T, head_dim]
             if config.use_rope:
-                q_all = apply_rope(q_all, total_prompt_L + jnp.arange(T), theta=config.rope_theta)
-                keys_att = apply_rope(causal_keys, jnp.arange(total_len), theta=config.rope_theta)
+                q_all = apply_rope(q_all, total_prompt_L + jnp.arange(T, dtype=jnp.int32), theta=config.rope_theta)
+                keys_att = apply_rope(causal_keys, jnp.arange(total_len, dtype=jnp.int32), theta=config.rope_theta)
                 keys_att_t = jnp.swapaxes(keys_att, -1, -2)
             else:
                 keys_att_t = keys_t
             scores_all = jnp.matmul(q_all, keys_att_t) / math.sqrt(head_dim)
-            pos = jnp.arange(total_len)[None, :]
-            step_pos = (total_prompt_L + jnp.arange(T))[:, None]
+            pos = jnp.arange(total_len, dtype=jnp.int32)[None, :]
+            step_pos = (total_prompt_L + jnp.arange(T, dtype=jnp.int32))[:, None]
             step_mask_all = all_valid & ((pos <= step_pos)[None, None, :, :])
             scores_all = jnp.where(step_mask_all, scores_all, -1e4)
+            top_k_res = getattr(config, "top_k_resonance", 0) if config is not None else 0
+            if top_k_res > 0 and scores_all.shape[-1] > top_k_res:
+                top_vals, _ = lax.top_k(scores_all, top_k_res)
+                min_top = top_vals[..., -1:]
+                scores_all = jnp.where(scores_all >= min_top, scores_all, -1e4)
             attn_w = jax.nn.softmax(scores_all.astype(jnp.float32), axis=-1).astype(target_dtype)
             res_heads = jnp.matmul(attn_w, causal_values)
             res_heads = jnp.swapaxes(res_heads, 1, 2).reshape(B, T, surface_dim)
@@ -1330,12 +1442,16 @@ def training_rollout(
         resonance_all = res_fn(motor_surface_all)  # [B, T, D]
 
         # 3. Precompute static shell pooling for shells 1..K-1 (only shell 0 evolves inside emission)
-        shell_weights = jax.nn.softmax(params["motor.shell_score"].astype(jnp.float32), axis=0).astype(target_dtype)
-        shell_scale = params["motor.shell_scale"].astype(target_dtype)
         w_shell_t = params["motor.shell_proj.weight"].T
-        static_shell_proj = jnp.matmul(state[:, 1:, :], w_shell_t)
-        static_shell_pool = jnp.sum(shell_weights[None, 1:, None] * static_shell_proj, axis=1) * shell_scale
-        w0_shell_scale = shell_weights[0] * shell_scale
+        if getattr(config, "use_shell_tap", True):
+            shell_weights = jax.nn.softmax(params["motor.shell_score"].astype(jnp.float32), axis=0).astype(target_dtype)
+            shell_scale = params["motor.shell_scale"].astype(target_dtype)
+            static_shell_proj = jnp.matmul(state[:, 1:, :], w_shell_t)
+            static_shell_pool = jnp.sum(shell_weights[None, 1:, None] * static_shell_proj, axis=1) * shell_scale
+            w0_shell_scale = shell_weights[0] * shell_scale
+        else:
+            static_shell_pool = jnp.zeros((B, surface_dim), dtype=target_dtype)
+            w0_shell_scale = jnp.zeros((), dtype=target_dtype)
 
         ig = jnp.clip(params.get("motor.input_gate", jnp.ones(5, dtype=jnp.float32)), -5.0, 5.0).astype(target_dtype)
         gated_ms_seq = jnp.swapaxes(ig[0] * motor_surface_all, 0, 1)  # [T, B, D]
@@ -1354,6 +1470,8 @@ def training_rollout(
         eff_proj_t = params["motor.efference_proj.weight"].T
         eff_gate_t = params["core.efference_gate.weight"].T
         radial_norm_w = params["core.radial_norm.weight"]
+        use_plan = getattr(config, "use_plan", True)
+        use_swiglu_motor = getattr(config, "use_swiglu", True)
 
         def _tf_motor_step(carry, xs):
             cur_core, cur_plan = carry
@@ -1365,16 +1483,19 @@ def training_rollout(
                 ig[1] * cur_core,
                 res_t,
                 ig[3] * shell_pool,
-                ig[4] * cur_plan,
+                ig[4] * (cur_plan if use_plan else jnp.zeros_like(cur_plan)),
             ], axis=-1)
             fused = rms_norm(fused_in, fused_norm_w)
-            h = rms_norm(swiglu(fused, fc_gate_w, fc_val_w, fc_down_w), norm_mid_w)
+            h = rms_norm(swiglu(fused, fc_gate_w, fc_val_w, fc_down_w, use_swiglu=use_swiglu_motor), norm_mid_w)
 
-            phase_batch = jnp.broadcast_to(p_scaled_t[None, :], (B, surface_dim))
-            plan_input = jnp.concatenate([h, phase_batch], axis=-1)
-            p_gate = jax.nn.sigmoid(jnp.matmul(plan_input, plan_gate_w_t) + plan_gate_b)
-            plan_update = jnp.matmul(plan_input, plan_update_w_t)
-            nxt_plan = jnp.clip(plan_decay * cur_plan + plan_write * p_gate * plan_update, -50.0, 50.0).astype(target_dtype)
+            if use_plan:
+                phase_batch = jnp.broadcast_to(p_scaled_t[None, :], (B, surface_dim))
+                plan_input = jnp.concatenate([h, phase_batch], axis=-1)
+                p_gate = jax.nn.sigmoid(jnp.matmul(plan_input, plan_gate_w_t) + plan_gate_b)
+                plan_update = jnp.matmul(plan_input, plan_update_w_t)
+                nxt_plan = jnp.clip(plan_decay * cur_plan + plan_write * p_gate * plan_update, -50.0, 50.0).astype(target_dtype)
+            else:
+                nxt_plan = cur_plan
 
             efference = jnp.matmul(h, eff_proj_t)
             eff_projected = jnp.matmul(jax.nn.silu(efference), eff_gate_t)
@@ -1432,13 +1553,17 @@ def training_rollout(
         if getattr(config, "num_mtp_heads", 1) > 1:
             mtp_loss_sum = 0.0
             h_btd = jnp.swapaxes(h_seq, 0, 1)  # [B, T, D]
+            h_prev = h_btd
+            w_tok_emb = params.get("sensory.embedding.weight")
             for m in range(1, config.num_mtp_heads):
                 if T > m:
-                    h_m_in = jnp.concatenate([h_btd[:, :T - m, :], h_btd[:, m:T, :]], axis=-1)
+                    tok_prefix = targets[:, m - 1:T - 1]
+                    emb_prefix = w_tok_emb[jnp.maximum(tok_prefix, 0)]  # [B, T - m, D]
+                    h_m_in = jnp.concatenate([h_prev[:, :T - m, :], emb_prefix], axis=-1)
                     gate_m = jax.nn.silu(jnp.matmul(h_m_in, params[f"motor.mtp.{m}.fc_gate.weight"].T))
                     val_m = jnp.matmul(h_m_in, params[f"motor.mtp.{m}.fc_val.weight"].T)
                     down_m = jnp.matmul(gate_m * val_m, params[f"motor.mtp.{m}.fc_down.weight"].T)
-                    h_m = rms_norm(h_btd[:, :T - m, :] + down_m, params[f"motor.mtp.{m}.norm.weight"])
+                    h_m = rms_norm(h_prev[:, :T - m, :] + down_m, params[f"motor.mtp.{m}.norm.weight"])
                     scale_m = params[f"motor.mtp.{m}.affine_scale"][None, None, :]
                     h_m_scaled = (h_m * scale_m) / temp
                     logits_m = jnp.matmul(h_m_scaled, w_emb_t).astype(jnp.float32)
@@ -1451,7 +1576,11 @@ def training_rollout(
                     eff_w_m = mask_m * w_m
                     mtp_loss_m = -jnp.sum(tgt_logp_m * eff_w_m) / jnp.maximum(jnp.sum(eff_w_m), 1.0)
                     mtp_loss_sum = mtp_loss_sum + (0.3 / float(config.num_mtp_heads - 1)) * mtp_loss_m
+                    h_prev = h_m
             base_loss = base_loss + mtp_loss_sum
+
+        if energy_loss is not None and getattr(config, "use_energy_regularization", False):
+            base_loss = base_loss + float(getattr(config, "energy_reg_weight", 0.01)) * (energy_loss / max(thinking_cycles, 1))
 
         # Optional Temporal Router supervision (Strictly 0.0 during pretraining to allow free exploration)
         router_weight = float(getattr(config, "router_loss_weight", 0.0))
@@ -1460,7 +1589,7 @@ def training_rollout(
             b_r = params.get("motor.temporal_router.bias")
             if w_r is not None and b_r is not None:
                 router_logits = jnp.matmul(prompt_flux.astype(jnp.float32), w_r.T) + b_r
-                act_id = getattr(config, "act_token_id", 31) if config is not None else 31
+                act_id = getattr(config, "tool_token_id", None) or getattr(config, "act_token_id", 31) if config is not None else 31
                 th_id = getattr(config, "think_token_id", 29) if config is not None else 29
                 tgt_act = jnp.any(targets == act_id, axis=-1).astype(jnp.float32)
                 tgt_th = jnp.any(targets == th_id, axis=-1).astype(jnp.float32)
@@ -1480,13 +1609,15 @@ def training_rollout(
         base_ce = jnp.sum(all_loss) / jnp.maximum(jnp.sum(all_mask), 1.0)
         if ponder_cost is not None and getattr(config, "use_adaptive_thinking", False):
             base_ce = base_ce + float(getattr(config, "thinking_cost_weight", 0.01)) * ponder_cost
+        if energy_loss is not None and getattr(config, "use_energy_regularization", False):
+            base_ce = base_ce + float(getattr(config, "energy_reg_weight", 0.01)) * (energy_loss / max(thinking_cycles, 1))
         router_weight = float(getattr(config, "router_loss_weight", 0.0))
         if router_weight > 0.0:
             w_r = params.get("motor.temporal_router.weight")
             b_r = params.get("motor.temporal_router.bias")
             if w_r is not None and b_r is not None:
                 router_logits = jnp.matmul(prompt_flux.astype(jnp.float32), w_r.T) + b_r
-                act_id = getattr(config, "act_token_id", 31) if config is not None else 31
+                act_id = getattr(config, "tool_token_id", None) or getattr(config, "act_token_id", 31) if config is not None else 31
                 th_id = getattr(config, "think_token_id", 29) if config is not None else 29
                 tgt_act = jnp.any(targets == act_id, axis=-1).astype(jnp.float32)
                 tgt_th = jnp.any(targets == th_id, axis=-1).astype(jnp.float32)
