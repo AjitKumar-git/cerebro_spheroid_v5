@@ -379,6 +379,7 @@ class RectifiedContiguousPretrainStreamer:
         self.domain_loss_weights = domain_loss_weights or {}
         self.reasoning_weight = float(reasoning_weight)
         self.running = True
+        self.fatal_error: Optional[Exception] = None
 
         if target_shares is not None:
             self.shares = target_shares
@@ -407,8 +408,9 @@ class RectifiedContiguousPretrainStreamer:
             idx += 1
 
     def _open_fineweb_stream(self) -> Iterator[str]:
-        """Streams broad clean web text from HuggingFaceFW/fineweb with resilient fallback."""
+        """Streams broad clean web text from HuggingFaceFW/fineweb. Cleanly stops on failure (no mock fallback)."""
         max_retries = 3
+        err_msg = "Unknown error"
         for attempt in range(max_retries):
             try:
                 from datasets import load_dataset
@@ -426,39 +428,27 @@ class RectifiedContiguousPretrainStreamer:
                         yield text
                 return
             except Exception as e:
+                err_msg = str(e)
                 wait_t = 1.0 * (2 ** attempt)
                 if attempt < max_retries - 1:
+                    print(f"⚠️ [Streamer] FineWeb attempt {attempt + 1}/{max_retries} failed ({e}). Retrying in {wait_t:.1f}s...")
                     time.sleep(wait_t)
-                else:
-                    err_msg = str(e)
 
-        # Check local validation/pretrain parquets if available
-        try:
-            local_val_path = os.path.join(REPO_ROOT, "data", "cerebro_v5_custom_dataset", "validation.parquet")
-            if os.path.exists(local_val_path):
-                import pyarrow.parquet as pq
-                tbl = pq.read_table(local_val_path)
-                for col in ["text", "content", "prompt"]:
-                    if col in tbl.column_names:
-                        for item in tbl[col].to_pylist():
-                            if item and len(item) > 200:
-                                yield item
-        except Exception:
-            pass
-
-        print(f"⚠️ [Streamer Notice] 'broad_web' online stream unavailable ({err_msg}). Engaged diverse offline corpus ({len(DIVERSE_FALLBACKS['broad_web'])} passages).")
-        yield from self._cycle_corpus(DIVERSE_FALLBACKS["broad_web"])
+        raise RuntimeError(
+            f"❌ [Streamer Fatal] 'broad_web' online stream (HuggingFaceFW/fineweb) failed after {max_retries} attempts: {err_msg}. "
+            f"Cleanly stopping training without falling back to mock data."
+        )
 
     def _open_edu_stream(self) -> Iterator[str]:
-        """Streams academic and educational text from FineWeb-Edu with resilient fallback."""
+        """Streams academic and educational text from FineWeb-Edu. Cleanly stops on failure (no mock fallback)."""
         max_retries = 3
+        err_msg = "Unknown error"
         for attempt in range(max_retries):
             try:
                 from datasets import load_dataset
                 from src.hf_utils import get_hf_token
                 hf_tok = get_hf_token()
                 kw = {"name": "sample-10BT", "split": "train", "streaming": True}
-                # Use token on first attempt; if it fails (e.g. 401 Unauthorized), retry anonymously
                 if hf_tok and attempt == 0:
                     kw["token"] = hf_tok
                 print(f"📚 [Streamer] Connecting to HuggingFaceFW/fineweb-edu (sample-10BT, score > {self.min_edu_score})...")
@@ -471,33 +461,21 @@ class RectifiedContiguousPretrainStreamer:
                             yield text
                 return
             except Exception as e:
+                err_msg = str(e)
                 wait_t = 1.0 * (2 ** attempt)
                 if attempt < max_retries - 1:
+                    print(f"⚠️ [Streamer] FineWeb-Edu attempt {attempt + 1}/{max_retries} failed ({e}). Retrying in {wait_t:.1f}s...")
                     time.sleep(wait_t)
-                else:
-                    err_msg = str(e)
 
-        print(f"⚠️ [Streamer Notice] 'edu_academic' online stream unavailable ({err_msg}). Engaged diverse offline corpus ({len(DIVERSE_FALLBACKS['edu_academic'])} passages).")
-        yield from self._cycle_corpus(DIVERSE_FALLBACKS["edu_academic"])
+        raise RuntimeError(
+            f"❌ [Streamer Fatal] 'edu_academic' online stream (HuggingFaceFW/fineweb-edu) failed after {max_retries} attempts: {err_msg}. "
+            f"Cleanly stopping training without falling back to mock data."
+        )
 
     def _open_code_stream(self) -> Iterator[str]:
-        """Streams algorithmic and software Python code with resilient local + diverse fallback."""
-        # First priority: local code parquets if present
-        local_code = glob.glob(os.path.join(REPO_ROOT, "data", "*code*.parquet"))
-        if local_code:
-            try:
-                import pyarrow.parquet as pq
-                for p in local_code:
-                    tbl = pq.read_table(p)
-                    for col in ["text", "content", "code"]:
-                        if col in tbl.column_names:
-                            for item in tbl[col].to_pylist():
-                                if item and len(item) > 100:
-                                    yield item
-            except Exception:
-                pass
-
-        # Second priority: online stream
+        """Streams algorithmic and software Python code. Cleanly stops on failure (no mock fallback)."""
+        # First priority: authenticated code stream
+        err_msg = "Unknown error"
         try:
             from datasets import load_dataset
             from src.hf_utils import get_hf_token
@@ -511,10 +489,11 @@ class RectifiedContiguousPretrainStreamer:
                     if c and len(c) > 100:
                         yield c
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            err_msg = str(e)
+            print(f"⚠️ [Streamer] the-stack-dedup code stream notice: {e}. Trying open-access Python stream...")
 
-        # Third priority: public open-access Python stream (no token / anonymous friendly)
+        # Second priority: public open-access Python stream (no token / anonymous friendly)
         try:
             from datasets import load_dataset
             print("💻 [Streamer] Connecting to open-access Python code stream (ajibawa-2023/Python-Code-Large)...")
@@ -532,12 +511,15 @@ class RectifiedContiguousPretrainStreamer:
         except Exception as e:
             err_msg = str(e)
 
-        print(f"⚠️ [Streamer Notice] 'code' stream using diverse offline repository corpus ({len(DIVERSE_FALLBACKS['code'])} modules).")
-        yield from self._cycle_corpus(DIVERSE_FALLBACKS["code"])
+        raise RuntimeError(
+            f"❌ [Streamer Fatal] 'code' online stream (the-stack-dedup / Python-Code-Large) failed: {err_msg}. "
+            f"Cleanly stopping training without falling back to mock data."
+        )
 
     def _open_math_stream(self) -> Iterator[str]:
-        """Streams mathematical web text and proofs (FineMath) with resilient fallback."""
+        """Streams mathematical web text and proofs (FineMath). Cleanly stops on failure (no mock fallback)."""
         max_retries = 2
+        err_msg = "Unknown error"
         for attempt in range(max_retries):
             try:
                 from datasets import load_dataset
@@ -555,9 +537,15 @@ class RectifiedContiguousPretrainStreamer:
                 return
             except Exception as e:
                 err_msg = str(e)
+                wait_t = 1.0 * (2 ** attempt)
+                if attempt < max_retries - 1:
+                    print(f"⚠️ [Streamer] FineMath attempt {attempt + 1}/{max_retries} failed ({e}). Retrying in {wait_t:.1f}s...")
+                    time.sleep(wait_t)
 
-        print(f"⚠️ [Streamer Notice] 'math' stream unavailable ({err_msg}). Engaged diverse offline mathematical corpus ({len(DIVERSE_FALLBACKS['math'])} proofs).")
-        yield from self._cycle_corpus(DIVERSE_FALLBACKS["math"])
+        raise RuntimeError(
+            f"❌ [Streamer Fatal] 'math' online stream (HuggingFaceTB/finemath) failed after {max_retries} attempts: {err_msg}. "
+            f"Cleanly stopping training without falling back to mock data."
+        )
 
     def _open_retrieval_stream(self) -> Iterator[str]:
         """Generates continuous long-context associative retrieval documents."""
@@ -572,88 +560,122 @@ class RectifiedContiguousPretrainStreamer:
         stream_openers = {
             "broad_web": self._open_fineweb_stream,
             "code": self._open_code_stream,
+            "edu_academic": self._open_edu_stream,
+            "math": self._open_math_stream,
+            "retrieval": self._open_retrieval_stream,
         }
-        streams = {d: stream_openers[d]() for d in self.shares.keys() if d in stream_openers}
+        try:
+            streams = {}
+            for d in self.shares.keys():
+                if d in stream_openers:
+                    streams[d] = stream_openers[d]()
+                else:
+                    raise RuntimeError(f"❌ [Streamer Fatal] Domain '{d}' has no configured stream opener.")
 
-        while self.running:
-            # Assemble one batch of batch_size blocks
-            batch_prompts = []
-            batch_targets = []
-            batch_weights = []
+            while self.running:
+                cur_block_size = int(self.block_size)
+                cur_batch_size = int(self.batch_size)
+                # Assemble one batch of cur_batch_size blocks
+                batch_prompts = []
+                batch_targets = []
+                batch_weights = []
 
-            for _ in range(self.batch_size):
-                # Choose domain by token deficit
-                chosen_domain = self.quota_mgr.get_next_domain()
-                buf = self.buffers[chosen_domain]
+                for _ in range(cur_batch_size):
+                    # Choose domain by token deficit
+                    chosen_domain = self.quota_mgr.get_next_domain()
+                    buf = self.buffers[chosen_domain]
 
-                # Top up buffer until we have block_size tokens
-                stream_it = streams[chosen_domain]
-                while len(buf) < self.block_size:
-                    try:
-                        doc_text = next(stream_it)
-                    except StopIteration:
-                        break
-                    except Exception:
-                        continue
+                    # Top up buffer until we have cur_block_size tokens
+                    stream_it = streams[chosen_domain]
+                    while len(buf) < cur_block_size:
+                        try:
+                            doc_text = next(stream_it)
+                        except StopIteration:
+                            raise RuntimeError(f"❌ [Streamer Fatal] Online stream for domain '{chosen_domain}' exhausted unexpectedly.")
 
-                    # Tokenize in bounded character chunks (<= 16k chars) to prevent HF >100k sequence length warnings
-                    CHUNK_CHAR_SIZE = 16384
-                    if len(doc_text) <= CHUNK_CHAR_SIZE:
-                        text_chunks = [doc_text]
-                    else:
-                        text_chunks = [doc_text[ci : ci + CHUNK_CHAR_SIZE] for ci in range(0, len(doc_text), CHUNK_CHAR_SIZE)]
-
-                    for c_text in text_chunks:
-                        if hasattr(self.tokenizer, "encode"):
-                            toks = self.tokenizer.encode(c_text, add_special_tokens=False)
+                        # Tokenize in bounded character chunks (<= 16k chars) to prevent HF >100k sequence length warnings
+                        CHUNK_CHAR_SIZE = 16384
+                        if len(doc_text) <= CHUNK_CHAR_SIZE:
+                            text_chunks = [doc_text]
                         else:
-                            toks = [ord(c) % 32000 for c in c_text]
-                        buf.extend(toks)
-                        if len(buf) >= self.block_size * 2:
-                            break
-                    buf.append(self.eos_token_id)
+                            text_chunks = [doc_text[ci : ci + CHUNK_CHAR_SIZE] for ci in range(0, len(doc_text), CHUNK_CHAR_SIZE)]
 
-                # Extract exactly block_size tokens
-                chunk = buf[:self.block_size]
-                self.buffers[chosen_domain] = buf[self.block_size:]
-                self.quota_mgr.record_tokens(chosen_domain, len(chunk))
+                        for c_text in text_chunks:
+                            if hasattr(self.tokenizer, "encode"):
+                                toks = self.tokenizer.encode(c_text, add_special_tokens=False)
+                            else:
+                                toks = [ord(c) % 32000 for c in c_text]
+                            buf.extend(toks)
+                            if len(buf) >= cur_block_size * 2:
+                                break
+                        buf.append(self.eos_token_id)
 
-                # Build full-sequence pretraining pair:
-                # Prompt: 1 token (BOS seed)
-                # Target: block_size tokens (100% loss-bearing)
-                batch_prompts.append([self.bos_token_id])
-                batch_targets.append(chunk)
+                    # Extract exactly cur_block_size tokens
+                    chunk = buf[:cur_block_size]
+                    self.buffers[chosen_domain] = buf[cur_block_size:]
+                    self.quota_mgr.record_tokens(chosen_domain, len(chunk))
 
-                # Loss weight construction:
-                # 1. Base domain weight (per-block loss multiplier)
-                domain_w = float(self.domain_loss_weights.get(chosen_domain, 1.0))
-                seq_weights = np.full(len(chunk), domain_w, dtype=np.float32)
+                    # Build full-sequence pretraining pair:
+                    # Prompt: 1 token (BOS seed)
+                    # Target: cur_block_size tokens (100% loss-bearing)
+                    batch_prompts.append([self.bos_token_id])
+                    batch_targets.append(chunk)
 
-                # 2. Per-token reasoning/anchor weighting if configured (> 1.0)
-                if self.reasoning_weight > 1.0:
-                    # Scale reasoning or code tokens if applicable
-                    if chosen_domain in ("math", "code", "edu_academic"):
-                        seq_weights *= float(self.reasoning_weight)
+                    # Loss weight construction:
+                    # 1. Base domain weight (per-block loss multiplier)
+                    domain_w = float(self.domain_loss_weights.get(chosen_domain, 1.0))
+                    seq_weights = np.full(len(chunk), domain_w, dtype=np.float32)
 
-                batch_weights.append(seq_weights)
+                    # 2. Per-token reasoning/anchor weighting if configured (> 1.0)
+                    if self.reasoning_weight > 1.0:
+                        # Scale reasoning or code tokens if applicable
+                        if chosen_domain in ("math", "code", "edu_academic"):
+                            seq_weights *= float(self.reasoning_weight)
 
-            # Convert to arrays
-            p_arr = np.asarray(batch_prompts, dtype=np.int32)
-            t_arr = np.asarray(batch_targets, dtype=np.int32)
-            w_arr = np.asarray(batch_weights, dtype=np.float32)
+                    batch_weights.append(seq_weights)
 
-            # Feed to bounded queue
-            self.batch_queue.put({"prompt": p_arr, "target": t_arr, "weights": w_arr}, block=True)
+                # Convert to arrays
+                p_arr = np.asarray(batch_prompts, dtype=np.int32)
+                t_arr = np.asarray(batch_targets, dtype=np.int32)
+                w_arr = np.asarray(batch_weights, dtype=np.float32)
+
+                # Feed to bounded queue
+                self.batch_queue.put({"prompt": p_arr, "target": t_arr, "weights": w_arr}, block=True)
+        except Exception as e:
+            self.fatal_error = e
+            self.running = False
+            print(f"❌ [Streamer Fatal] Background prefetch loop encountered error: {e}")
+            try:
+                self.batch_queue.put({"error": e}, block=False)
+            except Exception:
+                pass
 
     def __iter__(self):
         return self
 
     def __next__(self) -> Dict[str, np.ndarray]:
-        while self.running:
-            batch = self.batch_queue.get(block=True)
+        if self.fatal_error is not None:
+            raise RuntimeError(f"❌ [Streamer Fatal] Data streamer stopped with error: {self.fatal_error}") from self.fatal_error
+
+        while self.running or not self.batch_queue.empty():
+            try:
+                batch = self.batch_queue.get(block=True, timeout=1.0)
+            except queue.Empty:
+                if self.fatal_error is not None:
+                    raise RuntimeError(f"❌ [Streamer Fatal] Data streamer stopped with error: {self.fatal_error}") from self.fatal_error
+                if not self.running:
+                    break
+                continue
+
+            if isinstance(batch, dict) and "error" in batch:
+                raise RuntimeError(f"❌ [Streamer Fatal] Streamer worker encountered error: {batch['error']}") from batch["error"]
+
             # If a curriculum transition occurred while a batch was in-flight, discard stale-dimension batch
             if batch["target"].shape[1] == self.block_size and batch["target"].shape[0] == self.batch_size:
                 return batch
+
+        if self.fatal_error is not None:
+            raise RuntimeError(f"❌ [Streamer Fatal] Data streamer stopped with error: {self.fatal_error}") from self.fatal_error
         raise StopIteration
 
     def get_batch(self, return_weights: bool = False):

@@ -142,16 +142,14 @@ class TestAutonomousSmolLM2Curriculum(unittest.TestCase):
                 self.assertEqual(item["prompt"], "Document:\n")
                 self.assertEqual(item["_dataset"], "english_web")
 
-    def test_offline_emergency_fallback(self):
-        # When all online streams fail, generator draws gracefully from local emergency pool
+    def test_offline_stream_failure_clean_stop(self):
+        # When all online streams fail, generator must cleanly stop and raise RuntimeError without mock fallback
         with patch("src.elastic_window._open_hf_stream") as mock_hf:
             mock_hf.side_effect = RuntimeError("Simulated total HF connection timeout")
             it = build_online_dataset_iterator(dataset_source="autonomous", total_steps=1000)
-            item = next(it)
-            self.assertEqual(item["prompt"], "Document:\n")
-            self.assertIn(item["_dataset"], ("offline_emergency_reserve", "english_web"))
-            self.assertNotIn("<act>", item["text"])
-            self.assertNotIn("<think>", item["text"])
+            with self.assertRaises(RuntimeError) as ctx:
+                next(it)
+            self.assertIn("Cleanly stopping training without falling back to mock data", str(ctx.exception))
 
 if __name__ == "__main__":
     unittest.main()

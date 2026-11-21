@@ -98,6 +98,9 @@ def test_rectified_streamer_update_block_size(monkeypatch):
 
     monkeypatch.setattr(RectifiedContiguousPretrainStreamer, "_open_fineweb_stream", lambda self: _mock_doc_gen())
     monkeypatch.setattr(RectifiedContiguousPretrainStreamer, "_open_code_stream", lambda self: _mock_doc_gen())
+    monkeypatch.setattr(RectifiedContiguousPretrainStreamer, "_open_edu_stream", lambda self: _mock_doc_gen())
+    monkeypatch.setattr(RectifiedContiguousPretrainStreamer, "_open_math_stream", lambda self: _mock_doc_gen())
+    monkeypatch.setattr(RectifiedContiguousPretrainStreamer, "_open_retrieval_stream", lambda self: _mock_doc_gen())
 
     tok = MockTokenizer()
     streamer = RectifiedContiguousPretrainStreamer(

@@ -218,7 +218,7 @@ def parse_args(args_list=None):
     # Checkpoint & Cloud Sync
     parser.add_argument("--checkpoint-dir", "--ckpt-dir", dest="checkpoint_dir", type=str, default="/content/checkpoints" if os.path.exists("/content") else "checkpoints/tpu_jax", help="Checkpoint directory")
     parser.add_argument("--scratch_dir", type=str, default="/tmp/cerebro_v5_ckpts", help="Fast local disk for staging")
-    parser.add_argument("--save-interval", "--save-every", dest="save_interval", type=int, default=250, help="Steps between local checkpoint saves (default: 250)")
+    parser.add_argument("--save-interval", "--save-every", dest="save_interval", type=int, default=100, help="Steps between local checkpoint saves (default: 100)")
     parser.add_argument("--periodic_every", type=int, default=1000, help="Steps between milestone archive saves (default: 1000)")
     parser.add_argument("--log-every", "--log_every", dest="log_every", type=int, default=10, help="Steps between console progress lines (default: 10)")
     parser.add_argument("--eval_interval", type=int, default=100, help="Steps between held-out validation evaluations (default: 100)")
@@ -313,7 +313,13 @@ def build_data_stream(
         pass
 
     # 100% Loss-Bearing Rectified Contiguous Pretraining Streamer
-    if dataset_source in ("pretrain", "rectified", "rectified_pretrain", "clean_pretrain") and HAS_DATASETS:
+    if dataset_source in ("pretrain", "rectified", "rectified_pretrain", "clean_pretrain"):
+        if not HAS_DATASETS:
+            raise RuntimeError(
+                f"❌ [DataStreamer Fatal] 'datasets' library is required for online pretraining dataset '{dataset_source}', "
+                f"but is not installed. Please install it via: pip install datasets.\n"
+                f"   Cleanly stopping training without falling back to mock data."
+            )
         from src.rectified_streamer import RectifiedContiguousPretrainStreamer
         print(f"\n📦 Initializing 100% Loss-Bearing Rectified Contiguous Streamer [{dataset_source.upper()}]...")
         print(f"   • Stage:          PURE CONTIGUOUS PRETRAIN")
@@ -329,9 +335,7 @@ def build_data_stream(
         )
         return streamer, None
 
-    if dataset_source in ("local", "offline") or not HAS_DATASETS:
-        if dataset_source not in ("local", "offline") and not HAS_DATASETS:
-            print(f"⚠️ [DataStreamer] 'datasets' library not found. Falling back to high-throughput local corpus.")
+    if dataset_source in ("local", "offline"):
         print(f"📦 Initializing background linguistic streaming queue (Local Corpus in data/)...")
         streamer = LinguisticDataStreamer(
             batch_size=batch_size,
@@ -341,6 +345,13 @@ def build_data_stream(
             queue_size=max(16, int(prefetch_queue_size)),
         )
         return streamer, None
+
+    if not HAS_DATASETS:
+        raise RuntimeError(
+            f"❌ [DataStreamer Fatal] 'datasets' library is required for online streaming dataset '{dataset_source}', "
+            f"but is not installed. Please install it via: pip install datasets.\n"
+            f"   Cleanly stopping training without falling back to mock data."
+        )
 
     # Multi-corpus online streaming
     print(f"\n📦 Initializing Online Streaming Dataset: [{dataset_source.upper()}]...")
@@ -382,50 +393,10 @@ def build_data_stream(
         return None, prefetched
 
     except Exception as e:
-        if dataset_source != "autonomous":
-            print(
-                f"⚠️ [DataStreamer] Online dataset '{dataset_source}' initialization failed: {e}.\n"
-                f"   🌐 Automatically falling back to canonical 'autonomous' foundational curriculum (FineWeb-Edu + Cosmopedia-v2 + Math + Code)..."
-            )
-            try:
-                raw_iter = build_online_dataset_iterator(
-                    dataset_source="autonomous",
-                    step_getter=step_getter,
-                    total_steps=total_steps,
-                )
-                first_row = next(raw_iter)
-                data_iter = itertools.chain([first_row], raw_iter)
-
-                if use_elastic_window:
-                    buckets = get_default_elastic_buckets(total_window)
-                    batcher = ElasticBucketBatcher(
-                        tokenizer, data_iter, batch_size=batch_size, total_window=total_window, buckets=buckets, framework="numpy", return_feedback=True
-                    )
-                else:
-                    buckets = [("static", prompt_len, target_len)]
-                    batcher = ElasticBucketBatcher(
-                        tokenizer, data_iter, batch_size=batch_size, total_window=prompt_len + target_len, buckets=buckets, framework="numpy", return_feedback=True
-                    )
-
-                q_depth = max(16, int(prefetch_queue_size))
-                if not prefetch:
-                    return None, batcher
-                prefetched = PrefetchedBatcher(batcher, queue_size=q_depth)
-                print(f"⚡ Background Asynchronous Batch Prefetcher Active for 'autonomous' (Queue Depth: {q_depth} batches)")
-                return None, prefetched
-            except Exception as e_auto:
-                print(f"⚠️ [DataStreamer] 'autonomous' curriculum initialization failed: {e_auto}. Falling back to local corpus.")
-        else:
-            print(f"⚠️ [DataStreamer] Online dataset initialization failed: {e}. Falling back to local corpus.")
-
-        streamer = LinguisticDataStreamer(
-            batch_size=batch_size,
-            prompt_len=prompt_len,
-            target_len=target_len,
-            vocab_size=vocab_size,
-            queue_size=max(16, int(prefetch_queue_size)),
-        )
-        return streamer, None
+        raise RuntimeError(
+            f"❌ [DataStreamer Fatal] Online dataset '{dataset_source}' failed to initialize: {e}.\n"
+            f"   Cleanly stopping training without falling back to mock data."
+        ) from e
 
 
 def main(args=None):
@@ -1694,8 +1665,19 @@ def main(args=None):
             batcher.set_tokens_by_dataset(loaded_ds_tokens)
             print(f"📦 [Checkpoint Restore] Restored per-dataset token stats: {loaded_ds_tokens}")
 
+    last_successful_step = step
+    training_error: Optional[Exception] = None
+    target_token_budget = getattr(args, "target_tokens", None)
+
     try:
         while step < args.total_steps and not shutdown_requested:
+            if target_token_budget is not None and cumulative_tokens >= target_token_budget:
+                print(
+                    f"\n🎯 [Budget Target Reached] Cumulative tokens ({cumulative_tokens:,}) "
+                    f"reached configured target budget ({target_token_budget:,}). Cleanly stopping training."
+                )
+                break
+
             prev_step = step
             step += step_stride
             current_step_holder[0] = step
@@ -2250,15 +2232,19 @@ def main(args=None):
                     print(f"\n⏰ Reached maximum training time limit of {args.max_hours:.2f} hours.")
                     break
 
+            # Record step as fully verified and completed
+            last_successful_step = step
+
     except KeyboardInterrupt:
         print("\n⚠️ Training interrupted by user.")
     except Exception as e:
-        print(f"\n⚠️ Encountered training exception: {e}")
+        training_error = e
+        print(f"\n❌ [Fatal Error] Training encountered exception: {e}")
         import traceback
         traceback.print_exc()
     finally:
-        step_val = step if "step" in locals() else start_step
-        print(f"\n💾 Flushing final checkpoint state for Step {step_val:,}...")
+        step_val = last_successful_step if "last_successful_step" in locals() else (step if "step" in locals() else start_step)
+        print(f"\n💾 Flushing final checkpoint state for last verified Step {step_val:,}...")
         final_fname = f"{args.preset}_latest.pt"
         b_ref = batcher if ("batcher" in locals() and batcher is not None) else (elastic_batcher if ("elastic_batcher" in locals() and elastic_batcher is not None) else None)
         ds_stats = b_ref.get_tokens_by_dataset() if (b_ref is not None and hasattr(b_ref, "get_tokens_by_dataset")) else {}
@@ -2309,7 +2295,11 @@ def main(args=None):
                 b_ref.stop()
             elif hasattr(b_ref, "shutdown"):
                 b_ref.shutdown()
-        print(f"🎉 Training session completed at Step {step:,}!")
+        if "training_error" in locals() and training_error is not None:
+            print(f"❌ Training aborted due to fatal error at Step {step_val:,}: {training_error}")
+            raise training_error
+        else:
+            print(f"🎉 Training session completed at Step {step_val:,}!")
 
 
 def run_training(**kwargs):

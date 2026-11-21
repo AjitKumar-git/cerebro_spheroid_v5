@@ -120,13 +120,15 @@ def main():
     from training.train_v5_tpu_jax import run_training
 
     # Launch with verified production configuration
-    from_scratch = os.environ.get("FROM_SCRATCH", "true").lower() in ("true", "1")
+    from_scratch = os.environ.get("FROM_SCRATCH", "false").lower() in ("true", "1")
+    preset = os.environ.get("PRESET", "v5_compact")
     run_training(
-        preset="v5_small",                     # 105.9M Params (16 Shells, 40 Shortcut Tracts)
+        preset=preset,                         # Model preset (default: v5_compact, 250M Params)
         from_scratch=from_scratch,             # True: Clean start from Step 0; False: Resume
         auto_tune=True,                        # Adopts verified B=32, remat=True (192,360 tok/s on TPU v5 lite)
         force_tune=False,                      # Bypasses micro-benchmarks; adopts verified config
         effective_batch_size=16,               # Effective batch size
+        save_interval=100,                     # Back up every 100 steps
         target_tokens=15_700_000_000,          # 15.70 Billion Tokens target budget
         dataset_source=os.environ.get("DATASET_SOURCE", "pretrain"),  # Pure Contiguous Pretraining (85% FineWeb 10BT + 15% The Stack v2 Code)
         elastic_window=False,                  # Pure contiguous 100% loss-bearing sequences (zero prompt masking)

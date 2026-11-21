@@ -56,7 +56,7 @@ def get_sync_token(token: Optional[str] = None) -> str:
                         return t
             except Exception:
                 pass
-    return "CerebroSpheroid_Sync_Secure_2026"
+    return ""
 
 
 DEFAULT_URL = os.environ.get("BIOFLO_SYNC_URL", "https://bioflo.in/api/cerebro/sync.php")
@@ -406,6 +406,88 @@ def _ensure_bfloat16_checkpoint(file_path: str) -> None:
 _ensure_bare_bf16_checkpoint = _ensure_bfloat16_checkpoint
 
 
+def _upload_single_chunk(
+    upload_url: str,
+    sync_token: str,
+    upload_id: str,
+    target_type: str,
+    chunk_idx: int,
+    total_chunks: int,
+    step: int,
+    loss: float,
+    node_name: str,
+    model: Optional[str],
+    file_path: str,
+    offset: int,
+    length: int,
+) -> int:
+    """Reads a chunk slice at offset and uploads via multipart/form-data with idempotent retry."""
+    with open(file_path, "rb") as f:
+        f.seek(offset)
+        chunk_data = f.read(length)
+
+    boundary = f"----WebKitFormBoundary{os.urandom(8).hex()}"
+    body = []
+
+    form_fields = [
+        ("action", "upload_chunk"),
+        ("upload_id", upload_id),
+        ("type", target_type),
+        ("chunk_index", str(chunk_idx)),
+        ("total_chunks", str(total_chunks)),
+        ("step", str(step)),
+        ("loss", f"{loss:.6f}"),
+        ("source", node_name),
+    ]
+    if model:
+        form_fields.append(("model", str(model)))
+
+    for k, v in form_fields:
+        body.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode("utf-8"))
+
+    body.append(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"chunk\"; filename=\"chunk_{chunk_idx}.bin\"\r\n"
+        f"Content-Type: application/octet-stream\r\n\r\n".encode("utf-8")
+    )
+    body.append(chunk_data)
+    body.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+
+    payload = b"".join(body)
+    req = urllib.request.Request(
+        upload_url,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {sync_token}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": "CerebroV5CloudSync/1.0",
+        },
+        method="POST",
+    )
+
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                res_data = json.loads(resp.read().decode("utf-8"))
+                status = res_data.get("status")
+                if status not in ("chunk_saved", "complete", "completed", "in_progress"):
+                    raise RuntimeError(f"Server rejected chunk {chunk_idx}: {res_data}")
+                return len(chunk_data)
+        except urllib.error.HTTPError as he:
+            err_detail = ""
+            try:
+                err_detail = f": {he.read().decode('utf-8', errors='ignore')}"
+            except Exception:
+                pass
+            if attempt == 2:
+                raise RuntimeError(f"HTTP {he.code} {he.reason}{err_detail}") from he
+            time.sleep(1.5 * (attempt + 1))
+        except Exception as e:
+            if attempt == 2:
+                raise e
+            time.sleep(1.5 * (attempt + 1))
+    return len(chunk_data)
+
+
 def push_checkpoint(
     file_path: str,
     step: int,
@@ -415,10 +497,11 @@ def push_checkpoint(
     source_node: Optional[str] = None,
     url: Optional[str] = None,
     token: Optional[str] = None,
-    chunk_size_mb: int = 25,
+    chunk_size_mb: int = 35,
+    num_workers: int = 4,
 ) -> bool:
     """
-    Uploads a checkpoint to bioflo.in using chunked streaming for a specific model tier.
+    Uploads a checkpoint to bioflo.in using parallel concurrent streaming for a specific model tier.
     Bypasses Cloudflare limits and ensures zero timeouts.
     """
     if not os.path.exists(file_path):
@@ -467,87 +550,58 @@ def push_checkpoint(
     file_size = os.path.getsize(file_path)
     chunk_size = chunk_size_mb * 1024 * 1024
     total_chunks = max(1, (file_size + chunk_size - 1) // chunk_size)
+    workers = min(num_workers, total_chunks)
 
     model_label = f"[{model}] " if model else ""
     print(f"\n🌐 [cloud_sync] Mirroring {model_label}{target_type}.pt (Step {step:,}, Loss {loss:.4f}) "
-          f"to {sync_url} across {total_chunks} chunk(s)...")
+          f"to {sync_url} across {total_chunks} chunk(s) ({workers} worker threads)...")
 
     upload_id = uuid.uuid4().hex[:12]
-    upload_url = f"{sync_url}?action=upload_chunk"
+    upload_url = f"{sync_url}?action=upload_chunk&token={sync_token}"
     t0 = time.time()
     try:
-        with open(file_path, "rb") as f:
-            for idx in range(total_chunks):
-                chunk_data = f.read(chunk_size)
-                if not chunk_data:
-                    break
+        chunk_ranges = []
+        offset = 0
+        for idx in range(total_chunks):
+            length = min(chunk_size, file_size - offset)
+            chunk_ranges.append((idx, offset, length))
+            offset += length
 
-                boundary = f"----WebKitFormBoundary{os.urandom(8).hex()}"
-                body = []
-
-                form_fields = [
-                    ("action", "upload_chunk"),
-                    ("upload_id", upload_id),
-                    ("type", target_type),
-                    ("chunk_index", str(idx)),
-                    ("total_chunks", str(total_chunks)),
-                    ("step", str(step)),
-                    ("loss", f"{loss:.6f}"),
-                    ("source", node_name),
-                ]
-                if model:
-                    form_fields.append(("model", str(model)))
-
-                for k, v in form_fields:
-                    body.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode("utf-8"))
-
-                body.append(
-                    f"--{boundary}\r\nContent-Disposition: form-data; name=\"chunk\"; filename=\"chunk_{idx}.bin\"\r\n"
-                    f"Content-Type: application/octet-stream\r\n\r\n".encode("utf-8")
-                )
-                body.append(chunk_data)
-                body.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
-
-                payload = b"".join(body)
-                req = urllib.request.Request(
+        uploaded_bytes = 0
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(
+                    _upload_single_chunk,
                     upload_url,
-                    data=payload,
-                    headers={
-                        "Authorization": f"Bearer {sync_token}",
-                        "Content-Type": f"multipart/form-data; boundary={boundary}",
-                        "User-Agent": "CerebroV5CloudSync/1.0",
-                    },
-                    method="POST",
+                    sync_token,
+                    upload_id,
+                    target_type,
+                    idx,
+                    total_chunks,
+                    step,
+                    loss,
+                    node_name,
+                    model,
+                    file_path,
+                    off,
+                    lg,
                 )
-
-                for attempt in range(3):
-                    try:
-                        with urllib.request.urlopen(req, timeout=90) as resp:
-                            res_data = json.loads(resp.read().decode("utf-8"))
-                            status = res_data.get("status")
-                            if status not in ("chunk_saved", "complete", "completed", "in_progress"):
-                                raise RuntimeError(f"Server rejected chunk: {res_data}")
-                            break
-                    except urllib.error.HTTPError as he:
-                        err_detail = ""
-                        try:
-                            err_detail = f": {he.read().decode('utf-8', errors='ignore')}"
-                        except Exception:
-                            pass
-                        if attempt == 2:
-                            raise RuntimeError(f"HTTP {he.code} {he.reason}{err_detail}") from he
-                        time.sleep(2.0)
-                    except Exception as e:
-                        if attempt == 2:
-                            raise e
-                        time.sleep(2.0)
+                for idx, off, lg in chunk_ranges
+            ]
+            for fut in as_completed(futures):
+                uploaded_bytes += fut.result()
+                pct = (uploaded_bytes / file_size) * 100
+                speed = (uploaded_bytes / 1e6) / max(time.time() - t0, 0.1)
+                print(f"\r  Uploading ({workers} threads): {uploaded_bytes / 1e6:.1f} / {file_size / 1e6:.1f} MB "
+                      f"({pct:.1f}%) | {speed:.1f} MB/s", end="", flush=True)
 
         dt = time.time() - t0
         sz_mb = file_size / 1e6
-        print(f"✅ [cloud_sync] Successfully mirrored {model_label}{target_type}.pt ({sz_mb:.1f} MB in {dt:.1f}s) to bioflo.in")
+        speed_mb_s = sz_mb / max(dt, 0.01)
+        print(f"\n✅ [cloud_sync] Successfully mirrored {model_label}{target_type}.pt ({sz_mb:.1f} MB in {dt:.1f}s | {speed_mb_s:.1f} MB/s) to bioflo.in")
         return True
     except Exception as e:
-        print(f"⚠️ [cloud_sync] Upload failed for {model_label}{target_type}.pt: {e}")
+        print(f"\n⚠️ [cloud_sync] Upload failed for {model_label}{target_type}.pt: {e}")
         return False
     finally:
         with _UPLOAD_LOCK:

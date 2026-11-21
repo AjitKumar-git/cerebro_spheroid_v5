@@ -248,6 +248,77 @@ class TestAuditRemediations(unittest.TestCase):
             self.assertIn("opt_state", local_ckpt, "Local checkpoint should preserve opt_state!")
             self.assertEqual(len(uploaded_files), 1)
 
+    def test_checkpoint_discovery_preset_isolation(self):
+        """Verifies discover_latest_checkpoint strictly isolates presets and never selects another preset's latest."""
+        from src.jax.checkpoint import discover_latest_checkpoint
+        import json
+
+        with tempfile.TemporaryDirectory() as ckpt_dir:
+            # Create a v5_small_latest.pt and sidecar json with high step
+            small_pt = os.path.join(ckpt_dir, "v5_small_latest.pt")
+            small_json = os.path.join(ckpt_dir, "v5_small_latest.json")
+            torch.save({"step": 95000}, small_pt)
+            with open(small_json, "w") as f:
+                json.dump({"step": 95000, "loss": 2.1}, f)
+
+            # Query for v5_compact: should NOT pick v5_small_latest.pt!
+            path, step, loss = discover_latest_checkpoint(ckpt_dir, preset="v5_compact")
+            self.assertIsNone(path, "v5_compact discovery should not pick up v5_small checkpoint!")
+            self.assertEqual(step, 0)
+
+            # Create a v5_compact_latest.pt
+            compact_pt = os.path.join(ckpt_dir, "v5_compact_latest.pt")
+            compact_json = os.path.join(ckpt_dir, "v5_compact_latest.json")
+            torch.save({"step": 1200}, compact_pt)
+            with open(compact_json, "w") as f:
+                json.dump({"step": 1200, "loss": 3.4}, f)
+
+            path, step, loss = discover_latest_checkpoint(ckpt_dir, preset="v5_compact")
+            self.assertEqual(path, compact_pt)
+            self.assertEqual(step, 1200)
+
+    def test_streamer_clean_stop_no_mock_fallback(self):
+        """Verifies that RectifiedContiguousPretrainStreamer cleanly stops with RuntimeError on stream failure instead of cycling mock text."""
+        from src.rectified_streamer import RectifiedContiguousPretrainStreamer
+
+        class DummyTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return [ord(c) % 32000 for c in text]
+
+        streamer = RectifiedContiguousPretrainStreamer(
+            tokenizer=DummyTokenizer(),
+            batch_size=2,
+            block_size=64,
+            stage="pretrain",
+            target_shares={"broad_web": 1.0},
+        )
+        try:
+            # Force fatal error
+            streamer.fatal_error = RuntimeError("Simulated network outage to Hugging Face")
+            with self.assertRaises(RuntimeError) as ctx:
+                next(streamer)
+            self.assertIn("Simulated network outage", str(ctx.exception))
+        finally:
+            streamer.stop()
+
+    def test_build_data_stream_clean_stop_without_fallback(self):
+        """Verifies build_data_stream raises RuntimeError on online failure instead of silently falling back."""
+        from training.train_v5_tpu_jax import build_data_stream
+
+        with patch("training.train_v5_tpu_jax.build_online_dataset_iterator", side_effect=ConnectionError("HF connection timed out")):
+            with self.assertRaises(RuntimeError) as ctx:
+                build_data_stream(
+                    dataset_source="autonomous",
+                    tokenizer=None,
+                    batch_size=2,
+                    prompt_len=1,
+                    target_len=511,
+                    total_window=512,
+                    use_elastic_window=False,
+                    vocab_size=32000,
+                )
+            self.assertIn("Cleanly stopping training without falling back", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

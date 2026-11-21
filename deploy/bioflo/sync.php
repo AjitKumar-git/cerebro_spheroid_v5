@@ -1300,43 +1300,100 @@ if ($action === 'upload_chunk') {
     $source = isset($_POST['source']) ? preg_replace('/[^a-zA-Z0-9_\-]/', '', $_POST['source']) : 'unknown';
 
     $upload_id = isset($_POST['upload_id']) ? preg_replace('/[^a-zA-Z0-9_\-]/', '', $_POST['upload_id']) : (isset($_GET['upload_id']) ? preg_replace('/[^a-zA-Z0-9_\-]/', '', $_GET['upload_id']) : '');
-    $part_file = !empty($upload_id) ? ($storage_dir . '/' . $target_filename . '.' . $upload_id . '.part') : ($storage_dir . '/' . $target_filename . '.part');
+    if (empty($upload_id)) {
+        $upload_id = 'default_' . date('Ymd_His');
+    }
+
+    $parts_dir = $storage_dir . '/parts';
+    if (!is_dir($parts_dir)) {
+        @mkdir($parts_dir, 0755, true);
+    }
+
+    $chunk_file = $parts_dir . '/' . $upload_id . '_chunk_' . $chunk_index . '.bin';
+    $part_file = $storage_dir . '/' . $target_filename . '.' . $upload_id . '.part';
     $final_file = $storage_dir . '/' . $target_filename;
 
-    // Retrieve binary chunk payload
-    $chunk_data = null;
-    if (isset($_FILES['chunk']) && is_uploaded_file($_FILES['chunk']['tmp_name'])) {
-        $chunk_data = file_get_contents($_FILES['chunk']['tmp_name']);
+    // Idempotent retry: if this chunk was already received and written with non-zero size, acknowledge immediately
+    $chunk_reused = false;
+    if (file_exists($chunk_file) && filesize($chunk_file) > 0) {
+        $chunk_reused = true;
     } else {
-        $chunk_data = file_get_contents('php://input');
+        // Zero-copy storage: if uploaded via multipart/form-data, move temp file directly without reading into PHP memory
+        if (isset($_FILES['chunk']) && is_uploaded_file($_FILES['chunk']['tmp_name'])) {
+            if (!move_uploaded_file($_FILES['chunk']['tmp_name'], $chunk_file)) {
+                http_response_code(500);
+                echo json_encode(['error' => 'Failed to move uploaded chunk file']);
+                exit;
+            }
+        } else {
+            // Stream php://input directly to chunk file without loading full payload into PHP memory
+            $in_fp = fopen('php://input', 'rb');
+            $out_fp = fopen($chunk_file, 'wb');
+            if ($in_fp && $out_fp) {
+                stream_copy_to_stream($in_fp, $out_fp);
+                fclose($in_fp);
+                fclose($out_fp);
+            } else {
+                if ($in_fp) fclose($in_fp);
+                if ($out_fp) fclose($out_fp);
+                http_response_code(400);
+                echo json_encode(['error' => 'Failed to write chunk stream']);
+                exit;
+            }
+        }
     }
 
-    if ($chunk_data === null || strlen($chunk_data) === 0) {
+    if (!file_exists($chunk_file) || filesize($chunk_file) === 0) {
         http_response_code(400);
-        echo json_encode(['error' => 'Empty chunk payload received']);
+        echo json_encode(['error' => 'Empty or missing chunk file on server']);
         exit;
     }
 
-    // Guard against out-of-order chunks
-    if ($chunk_index > 0 && !file_exists($part_file)) {
-        http_response_code(400);
-        echo json_encode(['error' => "Out-of-order chunk: cannot append chunk {$chunk_index} without existing part file"]);
+    // Check whether all chunks in this upload have arrived (supports concurrent out-of-order parallel arrivals)
+    $all_chunks_ready = true;
+    $ready_count = 0;
+    for ($i = 0; $i < $total_chunks; $i++) {
+        $c_path = $parts_dir . '/' . $upload_id . '_chunk_' . $i . '.bin';
+        if (file_exists($c_path) && filesize($c_path) > 0) {
+            $ready_count++;
+        } else {
+            $all_chunks_ready = false;
+        }
+    }
+
+    if (!$all_chunks_ready) {
+        echo json_encode([
+            'status' => 'chunk_saved',
+            'upload_id' => $upload_id,
+            'chunk_index' => $chunk_index,
+            'ready_chunks' => $ready_count,
+            'total_chunks' => $total_chunks,
+            'reused' => $chunk_reused,
+        ]);
         exit;
     }
 
-    // First chunk creates / truncates; subsequent chunks append
-    $mode = ($chunk_index === 0) ? 'wb' : 'ab';
-    $fp = fopen($part_file, $mode);
-    if (!$fp) {
+    // All chunks arrived! Assemble sequentially with zero-copy stream_copy_to_stream
+    $out_fp = fopen($part_file, 'wb');
+    if (!$out_fp) {
         http_response_code(500);
-        echo json_encode(['error' => 'Unable to open file for writing']);
+        echo json_encode(['error' => 'Unable to open assembly part file']);
         exit;
     }
-    fwrite($fp, $chunk_data);
-    fclose($fp);
 
-    // If final chunk, atomically replace the target checkpoint
-    if ($chunk_index === $total_chunks - 1) {
+    for ($i = 0; $i < $total_chunks; $i++) {
+        $c_path = $parts_dir . '/' . $upload_id . '_chunk_' . $i . '.bin';
+        $in_fp = fopen($c_path, 'rb');
+        if ($in_fp) {
+            stream_copy_to_stream($in_fp, $out_fp);
+            fclose($in_fp);
+            @unlink($c_path);
+        }
+    }
+    fclose($out_fp);
+
+    // If final chunk assembly succeeded, atomically replace the target checkpoint
+    if (true) {
         // Integrity check: verify zip archive is not truncated/corrupted before replacing target
         $is_valid_zip = false;
         if (class_exists('ZipArchive')) {

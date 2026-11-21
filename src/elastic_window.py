@@ -652,33 +652,7 @@ def build_online_dataset_iterator(
         math_it: Optional[Iterator[Any]] = None
         cosmo_it: Optional[Iterator[Any]] = None
 
-        # Load emergency offline backup reserve to prevent worker starvation during network drops
-        emergency_offline_pool: List[Dict[str, Any]] = []
-        try:
-            for cand_parquet in (
-                os.path.join(REPO_ROOT, "data", "cerebro_v5_custom_dataset", "train.parquet"),
-                os.path.join(REPO_ROOT, "data", "cerebro_v5_custom_dataset", "cerebro_v5_train_25k.parquet"),
-            ):
-                if os.path.exists(cand_parquet):
-                    import pyarrow.parquet as pq
-                    tbl = pq.read_table(cand_parquet)
-                    cols = tbl.column_names
-                    text_col = "text" if "text" in cols else ("answer" if "answer" in cols else ("response" if "response" in cols else None))
-                    if text_col:
-                        raw_list = tbl[text_col].to_pylist()
-                        for txt in raw_list[:2000]:
-                            if txt and len(str(txt).strip()) >= 50:
-                                emergency_offline_pool.append({
-                                    "prompt": "Document:\n",
-                                    "text": str(txt).strip(),
-                                    "answer": str(txt).strip(),
-                                    "_dataset": "offline_emergency_reserve",
-                                })
-                    if emergency_offline_pool:
-                        break
-        except Exception:
-            pass
-
+        # Strict zero-fallback directive: no emergency offline pool mock cycling
         def _open_english_web_stream():
             candidates = [
                 ("HuggingFaceFW/fineweb", "sample-10BT"),
@@ -842,12 +816,10 @@ def build_online_dataset_iterator(
                     }
 
                 except Exception as stream_exc:
-                    if emergency_offline_pool:
-                        import random
-                        fallback_sample = random.choice(emergency_offline_pool)
-                        yield fallback_sample
-                    else:
-                        time.sleep(0.5)
+                    raise RuntimeError(
+                        f"❌ [Autonomous Stream Fatal] Online curriculum stream failed during execution: {stream_exc}. "
+                        f"Cleanly stopping training without falling back to mock data."
+                    ) from stream_exc
                 turn += 1
 
         return _wrap_with_retrieval_injection(_autonomous_gen())

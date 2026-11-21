@@ -595,12 +595,19 @@ def discover_latest_checkpoint(
     best_path = None
     max_step = -1
     best_loss = float("inf")
+    known_presets = {"v5_compact", "v5_small", "v5_base", "v5_large"}
 
     # Priority 1: Checkpoint matching preset name
     for c in candidates:
         fname = os.path.basename(c)
-        if preset and preset not in fname and "latest" not in fname:
-            continue
+        if preset:
+            # Strictly reject candidates belonging to other known presets
+            other_presets = {p for p in known_presets if p != preset}
+            if any(other in fname for other in other_presets):
+                continue
+            # If candidate does not contain preset and is not generic latest/best, skip
+            if preset not in fname and not fname.startswith("latest") and not fname.startswith("best"):
+                continue
         step = -1
         loss = float("inf")
         # Try sidecar json first
@@ -754,8 +761,20 @@ class AsyncCheckpointManager:
         target_slot = "best" if "best" in filename else ("step" if "step_" in filename else "latest")
         is_critical = (target_slot in ("best", "step")) or block_if_busy
         last_fut = self._last_futures.get(target_slot)
-        if not is_critical and (last_fut is not None and not last_fut.done()):
-            return False
+        if last_fut is not None and not last_fut.done():
+            if is_critical or block_if_busy:
+                try:
+                    last_fut.result(timeout=30.0)
+                except Exception:
+                    pass
+            else:
+                # For non-critical latest checkpoints, wait briefly (up to 5s) for previous write to settle
+                try:
+                    last_fut.result(timeout=5.0)
+                except concurrent.futures.TimeoutError:
+                    return False
+                except Exception:
+                    pass
 
         params_cpu = jax.device_get(params)
         buffers_cpu = jax.device_get(buffers)
