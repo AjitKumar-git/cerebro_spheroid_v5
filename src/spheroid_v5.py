@@ -2245,10 +2245,6 @@ class CerebroSpheroidV5(nn.Module):
 
             generated_tokens.append(next_tok)
             flat_tok = next_tok.squeeze(-1)
-            for sid in stop_ids:
-                finished = finished | (flat_tok == sid)
-            if finished.all():
-                break
 
             # Thought re-afference & update causal KV buffer at position L_prompt + t + 1
             prev_thought, (tok_k, tok_v) = self.sensory_dnn(
@@ -2258,10 +2254,27 @@ class CerebroSpheroidV5(nn.Module):
             causal_values_list.append(tok_v)
             causal_mask_list.append(torch.ones((B, 1), dtype=torch.bool, device=dev))
 
+            for sid in stop_ids:
+                finished = finished | (flat_tok == sid)
+            if finished.all():
+                break
+
             # Lightweight O(1) bounded efference copy propagation
             state = self.volumetric_core.step_efference_fast(state, efference)
 
         self.current_spheroid_state = state
+        final_causal_k = torch.cat(causal_keys_list, dim=2)
+        final_causal_v = torch.cat(causal_values_list, dim=2)
+        final_causal_mask = torch.cat(causal_mask_list, dim=1)
+        self.current_causal_kv = (final_causal_k, final_causal_v)
+        self.current_causal_mask = final_causal_mask
+        if sensory_kv is not None:
+            self.current_sensory_kv = (
+                torch.cat([sensory_kv[0], final_causal_k], dim=2),
+                torch.cat([sensory_kv[1], final_causal_v], dim=2),
+            )
+        else:
+            self.current_sensory_kv = self.current_causal_kv
         return torch.cat(generated_tokens, dim=1)
 
     @torch.no_grad()
@@ -2488,6 +2501,7 @@ class CerebroSpheroidV5(nn.Module):
         top_p: float = 0.9,
         repetition_penalty: float = 1.15,
         device: Optional[torch.device] = None,
+        phased: bool = True,
     ) -> Dict[str, str]:
         """
         Simultaneous Tri-Head Cognitive Emission:
@@ -2576,12 +2590,16 @@ class CerebroSpheroidV5(nn.Module):
 
         for t in range(max_new_tokens):
             last_tok = None
-            if not fin_ans and tokens_ans:
-                last_tok = tokens_ans[-1]
-            elif not fin_act and tokens_act:
-                last_tok = tokens_act[-1]
-            elif not fin_think and tokens_think:
-                last_tok = tokens_think[-1]
+            if phased and emit_think and not fin_think:
+                if tokens_think:
+                    last_tok = tokens_think[-1]
+            else:
+                if not fin_ans and tokens_ans:
+                    last_tok = tokens_ans[-1]
+                elif not fin_act and tokens_act:
+                    last_tok = tokens_act[-1]
+                elif tokens_think:
+                    last_tok = tokens_think[-1]
             feed = self.sensory_dnn.embedding(torch.tensor([[last_tok]], device=dev)).squeeze(1) if last_tok is not None else None
 
             # Causal KV cache for full autoregressive attention across emitted tokens
@@ -2607,46 +2625,54 @@ class CerebroSpheroidV5(nn.Module):
             l_th, l_ac, l_an = self.motor_decoder.emit_tri_head_logits(h, tied_w, temp=temperature)
 
             tok_th = None
-            if not fin_think:
+            tok_ac = None
+            tok_an = None
+
+            if phased and emit_think and not fin_think:
+                # Phase 1: Thinking scratchpad emission (populates causal KV buffer)
                 tok_th = _sample_from_logits(l_th, tokens_think)
                 if tok_th == eos_id:
                     fin_think = True
                 else:
                     tokens_think.append(tok_th)
+                emitted_tok = tok_th if (tok_th is not None and tok_th != eos_id) else None
+            else:
+                # Phase 2 (or unphased): Action & Answer emission cross-referencing prompt + scratchpad
+                if not fin_act:
+                    tok_ac = _sample_from_logits(l_ac, tokens_act)
+                    if tok_ac == eos_id:
+                        fin_act = True
+                    else:
+                        tokens_act.append(tok_ac)
 
-            tok_ac = None
-            if not fin_act:
-                tok_ac = _sample_from_logits(l_ac, tokens_act)
-                if tok_ac == eos_id:
-                    fin_act = True
-                else:
-                    tokens_act.append(tok_ac)
+                if not fin_ans:
+                    tok_an = _sample_from_logits(l_an, tokens_ans)
+                    if tok_an == eos_id:
+                        fin_ans = True
+                    else:
+                        tokens_ans.append(tok_an)
 
-            tok_an = None
-            if not fin_ans:
-                tok_an = _sample_from_logits(l_an, tokens_ans)
-                if tok_an == eos_id:
-                    fin_ans = True
-                else:
-                    tokens_ans.append(tok_an)
+                if not phased and not fin_think:
+                    tok_th = _sample_from_logits(l_th, tokens_think)
+                    if tok_th == eos_id:
+                        fin_think = True
+                    else:
+                        tokens_think.append(tok_th)
 
-            if fin_think and fin_act and fin_ans:
-                break
-
-            # Autoregressively append emitted token to causal KV cache
-            emitted_tok = (
-                tok_an
-                if not fin_ans and tok_an is not None and tok_an != eos_id
-                else (
-                    tok_ac
-                    if not fin_act and tok_ac is not None and tok_ac != eos_id
+                emitted_tok = (
+                    tok_an
+                    if not fin_ans and tok_an is not None and tok_an != eos_id
                     else (
-                        tok_th
-                        if not fin_think and tok_th is not None and tok_th != eos_id
-                        else None
+                        tok_ac
+                        if not fin_act and tok_ac is not None and tok_ac != eos_id
+                        else (
+                            tok_th
+                            if not fin_think and tok_th is not None and tok_th != eos_id
+                            else None
+                        )
                     )
                 )
-            )
+
             if emitted_tok is not None:
                 _, (tok_k, tok_v) = self.sensory_dnn(
                     torch.tensor([[emitted_tok]], device=dev),
@@ -2656,6 +2682,9 @@ class CerebroSpheroidV5(nn.Module):
                 causal_keys_list.append(tok_k)
                 causal_values_list.append(tok_v)
                 causal_mask_list.append(torch.ones((B, 1), dtype=torch.bool, device=dev))
+
+            if fin_think and fin_act and fin_ans:
+                break
 
             # Advance state manifold
             state = self.volumetric_core.step_efference_fast(state, efference)

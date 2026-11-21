@@ -1573,6 +1573,7 @@ def generate_tri_stream_jax(
     max_new_tokens: int = 128,
     temperature: float = 0.6,
     repetition_penalty: float = 1.15,
+    phased: bool = True,
 ) -> Dict[str, Any]:
     """
     Simultaneous Tri-Head Cognitive Emission in JAX:
@@ -1675,12 +1676,16 @@ def generate_tri_stream_jax(
         step_mask = all_valid
 
         last_tok = None
-        if not fin_ans and tokens_ans:
-            last_tok = tokens_ans[-1]
-        elif not fin_act and tokens_act:
-            last_tok = tokens_act[-1]
-        elif not fin_think and tokens_think:
-            last_tok = tokens_think[-1]
+        if phased and emit_think and not fin_think:
+            if tokens_think:
+                last_tok = tokens_think[-1]
+        else:
+            if not fin_ans and tokens_ans:
+                last_tok = tokens_ans[-1]
+            elif not fin_act and tokens_act:
+                last_tok = tokens_act[-1]
+            elif tokens_think:
+                last_tok = tokens_think[-1]
         feed = params["sensory.embedding.weight"][jnp.array([last_tok])] if last_tok is not None else None
 
         _, next_state, refractory, plan, h = emit_step(
@@ -1701,47 +1706,71 @@ def generate_tri_stream_jax(
 
         l_th, l_ac, l_an = emit_tri_head_logits_jax(params, h, temp=temperature)
 
-        if not fin_think:
+        tok_th = None
+        tok_ac = None
+        tok_an = None
+
+        if phased and emit_think and not fin_think:
+            # Phase 1: Thinking scratchpad emission (populates causal KV buffer)
             tok_th = _sample_from_logits(l_th, tokens_think)
             if tok_th == eos_id:
                 fin_think = True
             else:
                 tokens_think.append(tok_th)
+            emitted_tok = tok_th if (tok_th is not None and tok_th != eos_id) else None
+        else:
+            # Phase 2 (or unphased): Action & Answer emission cross-referencing prompt + scratchpad
+            if not fin_act:
+                tok_ac = _sample_from_logits(l_ac, tokens_act)
+                if tok_ac == eos_id:
+                    fin_act = True
+                else:
+                    tokens_act.append(tok_ac)
 
-        if not fin_act:
-            tok_ac = _sample_from_logits(l_ac, tokens_act)
-            if tok_ac == eos_id:
-                fin_act = True
-            else:
-                tokens_act.append(tok_ac)
+            if not fin_ans:
+                tok_an = _sample_from_logits(l_an, tokens_ans)
+                if tok_an == eos_id:
+                    fin_ans = True
+                else:
+                    tokens_ans.append(tok_an)
 
-        if not fin_ans:
-            tok_an = _sample_from_logits(l_an, tokens_ans)
-            if tok_an == eos_id:
-                fin_ans = True
-            else:
-                tokens_ans.append(tok_an)
+            if not phased and not fin_think:
+                tok_th = _sample_from_logits(l_th, tokens_think)
+                if tok_th == eos_id:
+                    fin_think = True
+                else:
+                    tokens_think.append(tok_th)
+
+            emitted_tok = (
+                tok_an
+                if not fin_ans and tok_an is not None and tok_an != eos_id
+                else (
+                    tok_ac
+                    if not fin_act and tok_ac is not None and tok_ac != eos_id
+                    else (
+                        tok_th
+                        if not fin_think and tok_th is not None and tok_th != eos_id
+                        else None
+                    )
+                )
+            )
+
+        if emitted_tok is not None:
+            _, (new_k, new_v) = encode_sensory(
+                params,
+                jnp.asarray([[emitted_tok]], dtype=jnp.int32),
+                config=config,
+                pos_offset=total_prompt_L + t + 1,
+                is_causal=True,
+            )
+            causal_keys = jnp.concatenate([causal_keys, new_k], axis=2)
+            causal_values = jnp.concatenate([causal_values, new_v], axis=2)
+            all_valid = jnp.concatenate(
+                [all_valid, jnp.ones((B, 1, 1, 1), dtype=bool)], axis=-1
+            )
 
         if fin_think and fin_act and fin_ans:
             break
-
-        # The recurrent manifold is shared by the three display streams.  Its
-        # next-step feedback prioritizes answer, then action, then thought;
-        # cache exactly that same token so attention and feedback describe one
-        # coherent autoregressive trajectory.
-        emitted_tok = tok_an if not fin_ans else (tok_ac if not fin_act else tok_th)
-        _, (new_k, new_v) = encode_sensory(
-            params,
-            jnp.asarray([[emitted_tok]], dtype=jnp.int32),
-            config=config,
-            pos_offset=total_prompt_L + t + 1,
-            is_causal=True,
-        )
-        causal_keys = jnp.concatenate([causal_keys, new_k], axis=2)
-        causal_values = jnp.concatenate([causal_values, new_v], axis=2)
-        all_valid = jnp.concatenate(
-            [all_valid, jnp.ones((B, 1, 1, 1), dtype=bool)], axis=-1
-        )
 
         state = next_state
 
