@@ -1382,6 +1382,26 @@ if ($action === 'upload_chunk') {
         exit;
     }
 
+    // Prune stale assembly locks or done markers older than 30 minutes
+    $stale_locks = @glob($parts_dir . '/*.assemble.lock');
+    if (is_array($stale_locks)) {
+        $now = time();
+        foreach ($stale_locks as $slock) {
+            if ($now - @filemtime($slock) > 1800) {
+                @unlink($slock);
+            }
+        }
+    }
+    $stale_dones = @glob($parts_dir . '/*.done');
+    if (is_array($stale_dones)) {
+        $now = time();
+        foreach ($stale_dones as $sdone) {
+            if ($now - @filemtime($sdone) > 1800) {
+                @unlink($sdone);
+            }
+        }
+    }
+
     // Serialize assembly by upload ID so concurrent final-chunk requests cannot
     // read or unlink the same chunk set at the same time.
     $assembly_lock = $parts_dir . '/' . $upload_id . '.assemble.lock';
@@ -1392,9 +1412,12 @@ if ($action === 'upload_chunk') {
         exit;
     }
 
-    if (file_exists($final_file)) {
+    // If this specific upload was already assembled and marked done, acknowledge idempotently
+    $done_file = $parts_dir . '/' . $upload_id . '.done';
+    if (file_exists($done_file)) {
         flock($lock_fp, LOCK_UN);
         fclose($lock_fp);
+        @unlink($assembly_lock);
         echo json_encode([
             'status' => 'already_completed',
             'upload_id' => $upload_id,
@@ -1414,6 +1437,7 @@ if ($action === 'upload_chunk') {
     if (!$all_chunks_ready) {
         flock($lock_fp, LOCK_UN);
         fclose($lock_fp);
+        @unlink($assembly_lock);
         echo json_encode(['status' => 'chunk_saved', 'upload_id' => $upload_id, 'reused' => $chunk_reused]);
         exit;
     }
@@ -1423,6 +1447,7 @@ if ($action === 'upload_chunk') {
     if (!$out_fp) {
         flock($lock_fp, LOCK_UN);
         fclose($lock_fp);
+        @unlink($assembly_lock);
         http_response_code(500);
         echo json_encode(['error' => 'Unable to open assembly part file']);
         exit;
@@ -1465,6 +1490,7 @@ if ($action === 'upload_chunk') {
             @unlink($part_file);
             flock($lock_fp, LOCK_UN);
             fclose($lock_fp);
+            @unlink($assembly_lock);
             http_response_code(400);
             echo json_encode(['error' => 'Corrupted checkpoint upload: failed zip integrity check']);
             exit;
@@ -1473,6 +1499,7 @@ if ($action === 'upload_chunk') {
         if (!rename($part_file, $final_file)) {
             flock($lock_fp, LOCK_UN);
             fclose($lock_fp);
+            @unlink($assembly_lock);
             http_response_code(500);
             echo json_encode(['error' => 'Failed to finalize atomic checkpoint write']);
             exit;
@@ -1481,8 +1508,10 @@ if ($action === 'upload_chunk') {
         for ($i = 0; $i < $total_chunks; $i++) {
             @unlink($parts_dir . '/' . $upload_id . '_chunk_' . $i . '.bin');
         }
+        @touch($done_file);
         flock($lock_fp, LOCK_UN);
         fclose($lock_fp);
+        @unlink($assembly_lock);
 
         // Update manifest
         $manifest_file = $storage_dir . '/manifest.json';

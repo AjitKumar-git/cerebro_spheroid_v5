@@ -425,6 +425,133 @@ class TestAuditRemediations(unittest.TestCase):
 
         self.assertEqual(wt_arr.shape, (8, 4, 16, 512))
 
+    def test_async_checkpoint_zero_pause_and_latest_coalescence(self):
+        """Verifies critical saves queue without pausing training and latest saves coalesce to eliminate lag."""
+        from src.jax.checkpoint import AsyncCheckpointManager
+        import threading
+        import time
+
+        with tempfile.TemporaryDirectory() as local_dir, tempfile.TemporaryDirectory() as target_dir:
+            mgr = AsyncCheckpointManager(
+                local_dir=local_dir,
+                target_dir=target_dir,
+                cloud_sync=False,
+            )
+
+            executed_files = []
+            worker_started_event = threading.Event()
+            worker_release_event = threading.Event()
+
+            orig_worker = mgr._worker
+
+            def slow_worker(params_cpu, buffers_cpu, filename, meta_dict, force_cloud=False, opt_state_cpu=None):
+                executed_files.append((filename, meta_dict.get("step") if meta_dict else None))
+                if filename == "step100_latest.pt":
+                    worker_started_event.set()
+                    worker_release_event.wait(timeout=5.0)
+                else:
+                    orig_worker(params_cpu, buffers_cpu, filename, meta_dict, force_cloud, opt_state_cpu)
+
+            mgr._worker = slow_worker
+
+            dummy_params = {"w": np.ones((2, 2), dtype=np.float32)}
+            dummy_buffers = (np.array([0]), np.array([1]))
+
+            # 1. Dispatch first job
+            t0 = time.time()
+            res1 = mgr.dispatch(dummy_params, dummy_buffers, "step100_latest.pt", meta_dict={"step": 100}, block_if_busy=False)
+            self.assertTrue(res1)
+            self.assertTrue(worker_started_event.wait(timeout=2.0))
+
+            # 2. Dispatch critical save while worker is busy: must NOT pause/block caller!
+            t_crit_start = time.time()
+            res_crit = mgr.dispatch(dummy_params, dummy_buffers, "v5_small_best.pt", meta_dict={"step": 110}, block_if_busy=False)
+            t_crit_elapsed = time.time() - t_crit_start
+            self.assertTrue(res_crit)
+            self.assertLess(t_crit_elapsed, 0.5, "Critical save dispatch must be non-blocking (zero TPU pause)!")
+
+            # 3. Dispatch noncritical latest at step 120, then step 140 (should coalesce into step 140)
+            res_lat1 = mgr.dispatch(dummy_params, dummy_buffers, "v5_small_latest.pt", meta_dict={"step": 120}, block_if_busy=False)
+            self.assertTrue(res_lat1)
+            res_lat2 = mgr.dispatch(dummy_params, dummy_buffers, "v5_small_latest.pt", meta_dict={"step": 140}, block_if_busy=False)
+            self.assertTrue(res_lat2)
+
+            # Check that pending latest is step 140
+            with mgr._active_lock:
+                self.assertIsNotNone(mgr._pending_latest)
+                self.assertEqual(mgr._pending_latest[3]["step"], 140)
+
+            # 4. Release the slow worker
+            worker_release_event.set()
+
+            # Shutdown to let all queued jobs drain
+            mgr.shutdown(wait=True)
+
+            # Both critical best and coalesced latest step 140 must have executed
+            saved_names = [f[0] for f in executed_files]
+            saved_steps = [f[1] for f in executed_files]
+            self.assertIn("v5_small_best.pt", saved_names)
+            self.assertIn(110, saved_steps)
+            self.assertIn("v5_small_latest.pt", saved_names)
+            self.assertIn(140, saved_steps)
+
+    def test_cloud_sync_accepts_already_completed_status(self):
+        """Verifies _upload_single_chunk accepts 'already_completed' status without raising RuntimeError."""
+        from src.cloud_sync import _upload_single_chunk
+        import io
+        import json
+
+        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tmp:
+            tmp.write(b"sample_chunk_data_bytes_12345")
+            tmp_path = tmp.name
+
+        try:
+            class MockResponse:
+                def __init__(self, data_dict):
+                    self.raw = json.dumps(data_dict).encode("utf-8")
+                def read(self):
+                    return self.raw
+                def __enter__(self):
+                    return self
+                def __exit__(self, *args):
+                    pass
+
+            with patch("urllib.request.urlopen", return_value=MockResponse({"status": "already_completed", "upload_id": "up_abc"})):
+                sent = _upload_single_chunk(
+                    upload_url="http://localhost/sync.php",
+                    sync_token="test_token",
+                    upload_id="up_abc",
+                    target_type="latest",
+                    chunk_idx=0,
+                    total_chunks=1,
+                    step=100,
+                    loss=3.5,
+                    node_name="colab",
+                    model="v5_small",
+                    file_path=tmp_path,
+                    offset=0,
+                    length=len(b"sample_chunk_data_bytes_12345"),
+                )
+                self.assertEqual(sent, len(b"sample_chunk_data_bytes_12345"))
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    def test_sync_php_lock_cleanup_and_atomic_replace_invariants(self):
+        """Verifies sync.php cleans up assembly locks and does not reject existing destination files."""
+        sync_php_path = "/home/ajit/Documents/Startup/Active_Development/cerebro_spheroid_v5/deploy/bioflo/sync.php"
+        with open(sync_php_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Invariant 1: file_exists($final_file) must NOT trigger already_completed
+        self.assertNotIn("if (file_exists($final_file))", content, "sync.php must not abort assembly if final_file already exists!")
+
+        # Invariant 2: $assembly_lock must be unlinked upon completion and error exits
+        self.assertIn("@unlink($assembly_lock);", content, "sync.php must unlink assembly lock files to prevent accumulation!")
+
+        # Invariant 3: $done_file marker is used for idempotent replay of same upload_id
+        self.assertIn(".done", content, "sync.php must use per-upload done marker for idempotency!")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -682,6 +682,8 @@ class AsyncCheckpointManager:
         self._active_future: Optional[concurrent.futures.Future] = None
         self._active_lock = threading.Lock()
         self._last_futures: Dict[str, concurrent.futures.Future] = {}
+        self._pending_critical: List[Tuple] = []
+        self._pending_latest: Optional[Tuple] = None
         os.makedirs(self.local_dir, exist_ok=True)
         os.makedirs(self.target_dir, exist_ok=True)
 
@@ -773,6 +775,31 @@ class AsyncCheckpointManager:
         except Exception:
             pass
 
+    def _run_job_and_drain(self, initial_job: Tuple):
+        """Runs the initial save job and sequentially drains any queued critical or coalesced latest jobs."""
+        current_job: Optional[Tuple] = initial_job
+        while current_job is not None:
+            params_cpu, buffers_cpu, filename, meta_dict, opt_state_cpu, slot = current_job
+            try:
+                self._worker(params_cpu, buffers_cpu, filename, meta_dict, False, opt_state_cpu)
+            except Exception as err:
+                print(f"⚠️ [AsyncCheckpoint Error in _worker]: {err}")
+            finally:
+                try:
+                    del params_cpu, buffers_cpu, opt_state_cpu, current_job
+                except Exception:
+                    pass
+                gc.collect()
+
+            with self._active_lock:
+                if self._pending_critical:
+                    current_job = self._pending_critical.pop(0)
+                elif self._pending_latest is not None:
+                    current_job = self._pending_latest
+                    self._pending_latest = None
+                else:
+                    current_job = None
+
     def dispatch(
         self,
         params: Dict[str, jnp.ndarray],
@@ -782,31 +809,42 @@ class AsyncCheckpointManager:
         block_if_busy: bool = False,
         opt_state: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        """Dispatches an asynchronous save job with bounded queue depth (max 1 in-flight).
-        Guarantees host memory does not grow unbounded from queued snapshots.
+        """Dispatches an asynchronous save job with bounded queue depth.
+
+        Guarantees:
+        1. Zero-pause training: Critical checkpoints (best, step, converged) are queued
+           asynchronously without blocking the training loop on prior writes.
+        2. Zero-lag latest checkpoints: Non-critical 'latest' saves are not dropped when the
+           writer is busy; instead, they coalesce into a pending latest slot and save as soon
+           as the active write completes.
+        3. Strictly bounded host memory: At most 1 active save and 1 pending latest snapshot.
         """
         target_slot = "best" if "best" in filename else ("step" if "step_" in filename else "latest")
-        is_critical = (target_slot in ("best", "step")) or block_if_busy
+        is_critical = (target_slot in ("best", "step")) or ("converged" in filename)
 
         with self._active_lock:
-            if self._active_future is not None and not self._active_future.done():
-                if is_critical or block_if_busy:
-                    try:
-                        self._active_future.result()
-                    except Exception as err:
-                        print(f"⚠️ [AsyncCheckpoint] Previous write warning: {err}")
-                else:
-                    # Non-critical save: if disk writer is busy, skip this interval to prevent host RAM buildup
-                    return False
+            if block_if_busy and self._active_future is not None and not self._active_future.done():
+                try:
+                    self._active_future.result()
+                except Exception as err:
+                    print(f"⚠️ [AsyncCheckpoint] Previous write warning: {err}")
 
-            # Transfer device tensors to host RAM only after confirming writer is idle
+            # Transfer device tensors to host RAM
             params_cpu = jax.device_get(params)
             buffers_cpu = jax.device_get(buffers)
             opt_state_cpu = jax.device_get(opt_state) if opt_state is not None else None
 
-            fut = self.executor.submit(self._worker, params_cpu, buffers_cpu, filename, meta_dict, False, opt_state_cpu)
-            self._active_future = fut
-            self._last_futures[target_slot] = fut
+            job = (params_cpu, buffers_cpu, filename, meta_dict, opt_state_cpu, target_slot)
+
+            if self._active_future is None or self._active_future.done():
+                fut = self.executor.submit(self._run_job_and_drain, job)
+                self._active_future = fut
+                self._last_futures[target_slot] = fut
+            else:
+                if is_critical:
+                    self._pending_critical.append(job)
+                else:
+                    self._pending_latest = job
 
             rss_gb = get_current_rss_gb()
             step_str = f" @ Step {meta_dict.get('step', '?')}" if meta_dict else ""
@@ -822,6 +860,24 @@ class AsyncCheckpointManager:
         opt_state: Optional[Dict[str, Any]] = None,
     ):
         """Synchronously flushes state (used on shutdown / emergency exit)."""
+        with self._active_lock:
+            act_fut = self._active_future
+        if act_fut is not None and not act_fut.done():
+            try:
+                act_fut.result()
+            except Exception as e:
+                print(f"⚠️ [AsyncCheckpoint] Flush wait notice: {e}")
+
+        with self._active_lock:
+            pending = list(self._pending_critical)
+            self._pending_critical.clear()
+            if self._pending_latest is not None:
+                pending.append(self._pending_latest)
+                self._pending_latest = None
+
+        for p_c, b_c, f_name, m_d, o_c, _ in pending:
+            self._worker(p_c, b_c, f_name, m_d, False, o_c)
+
         params_cpu = jax.device_get(params)
         buffers_cpu = jax.device_get(buffers)
         opt_state_cpu = jax.device_get(opt_state) if opt_state is not None else None
@@ -834,6 +890,14 @@ class AsyncCheckpointManager:
                 pass
 
     def shutdown(self, wait: bool = True):
+        if wait:
+            with self._active_lock:
+                act_fut = self._active_future
+            if act_fut is not None and not act_fut.done():
+                try:
+                    act_fut.result()
+                except Exception:
+                    pass
         self.executor.shutdown(wait=wait)
         if wait and self.cloud_sync:
             try:

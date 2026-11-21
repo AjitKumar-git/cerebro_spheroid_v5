@@ -2091,10 +2091,10 @@ def main(args=None):
                         "converged": bool(converged_target_met),
                         "timestamp": time.time(),
                     }
-                    ckpt_mgr.dispatch(_get_host_params(), buffers, best_fname, meta_dict=meta_best, block_if_busy=True, opt_state=_get_host_opt_state())
+                    ckpt_mgr.dispatch(_get_host_params(), buffers, best_fname, meta_dict=meta_best, block_if_busy=False, opt_state=_get_host_opt_state())
                     if converged_target_met:
                         converged_fname = f"{args.preset}_converged_1.6.pt"
-                        ckpt_mgr.dispatch(_get_host_params(), buffers, converged_fname, meta_dict=meta_best, block_if_busy=True, opt_state=_get_host_opt_state())
+                        ckpt_mgr.dispatch(_get_host_params(), buffers, converged_fname, meta_dict=meta_best, block_if_busy=False, opt_state=_get_host_opt_state())
 
                     if args.cloud_sync:
                         try:

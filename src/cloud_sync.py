@@ -473,7 +473,7 @@ def _upload_single_chunk(
             with urllib.request.urlopen(req, timeout=90) as resp:
                 res_data = json.loads(resp.read().decode("utf-8"))
                 status = res_data.get("status")
-                if status not in ("chunk_saved", "complete", "completed", "in_progress"):
+                if status not in ("chunk_saved", "complete", "completed", "already_completed", "in_progress"):
                     raise RuntimeError(f"Server rejected chunk {chunk_idx}: {res_data}")
                 return len(chunk_data)
         except urllib.error.HTTPError as he:

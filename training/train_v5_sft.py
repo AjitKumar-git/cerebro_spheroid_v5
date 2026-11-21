@@ -801,11 +801,11 @@ def main(args=None):
                         "converged": bool(converged_target_met),
                         "timestamp": time.time(),
                     }
-                    ckpt_mgr.dispatch(params, buffers, best_fname, meta_dict=meta_best, block_if_busy=True)
+                    ckpt_mgr.dispatch(params, buffers, best_fname, meta_dict=meta_best, block_if_busy=False)
 
                     if converged_target_met:
                         conv_fname = f"{sft_model_name}_converged.pt"
-                        ckpt_mgr.dispatch(params, buffers, conv_fname, meta_dict=meta_best, block_if_busy=True)
+                        ckpt_mgr.dispatch(params, buffers, conv_fname, meta_dict=meta_best, block_if_busy=False)
 
                     if args.cloud_sync:
                         try:
