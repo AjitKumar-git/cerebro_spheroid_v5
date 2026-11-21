@@ -96,6 +96,9 @@ def _zeropower_via_newtonschulz5(
     return X
 
 
+newton_schulz5 = _zeropower_via_newtonschulz5
+
+
 def _clamp_spectral_norm(
     W: torch.Tensor,
     max_spec_norm: float = 1.0,
