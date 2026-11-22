@@ -402,6 +402,14 @@ class RectifiedContiguousPretrainStreamer:
 
     def _smollm2_shares(self) -> Dict[str, float]:
         """Return the SmolLM2 developmental mixture for cumulative training progress."""
+        if self.stage in ("deep_reasoning", "reasoning"):
+            return {
+                "math": 0.35,
+                "cosmopedia": 0.35,
+                "code": 0.20,
+                "edu_academic": 0.10,
+            }
+
         progress = 0.0
         if self.progress_getter is not None:
             try:
@@ -417,6 +425,23 @@ class RectifiedContiguousPretrainStreamer:
         if progress < 0.91:
             return {"broad_web": 0.70, "code": 0.20, "math": 0.10}
         return {"broad_web": 0.58, "code": 0.24, "math": 0.14, "cosmopedia": 0.04}
+
+    def transition_to_deep_reasoning(self, reasoning_shares: Optional[Dict[str, float]] = None) -> None:
+        """Transitions streamer from broad web pretraining to high-density mathematical & deductive reasoning."""
+        self.stage = "deep_reasoning"
+        self.shares = reasoning_shares or {
+            "math": 0.35,
+            "cosmopedia": 0.35,
+            "code": 0.20,
+            "edu_academic": 0.10,
+        }
+        self.dynamic_curriculum = False
+        self.quota_mgr = TokenQuotaManager(self.shares)
+        for domain in self.shares:
+            self.buffers.setdefault(domain, [])
+        print(f"\n🧠 [Streamer Transition] Streamer switched to DEEP REASONING curriculum mixture:")
+        for d, s in self.shares.items():
+            print(f"   • {d:<14}: {s*100:.1f}%")
 
     def _refresh_curriculum_shares(self) -> None:
         if not self.dynamic_curriculum:

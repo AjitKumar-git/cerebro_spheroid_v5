@@ -256,6 +256,9 @@ def parse_args(args_list=None):
     parser.add_argument("--from-scratch", "--from_scratch", dest="from_scratch", action="store_true", default=False, help="Start clean from Step 0 without loading any checkpoint")
     parser.add_argument("--effective-batch-size", "--effective_batch_size", dest="effective_batch_size", type=int, default=256, help="Target global effective batch size (default: 256 for TPU v5e-1, supports 128 / 126; automatically computes grad_accum)")
     parser.add_argument("--target-tokens", "--target_tokens", dest="target_tokens", type=int, default=200_000_000_000, help="Target token ingestion budget for campaign (default: 200,000,000,000 tokens)")
+    parser.add_argument("--auto-reasoning-transition", "--auto_reasoning_transition", dest="auto_reasoning_transition", action=argparse.BooleanOptionalAction, default=True, help="Automatically transition from pretraining to deep reasoning curriculum after reaching milestone tokens (default: True)")
+    parser.add_argument("--reasoning-transition-tokens", "--reasoning_transition_tokens", dest="reasoning_transition_tokens", type=int, default=15_700_000_000, help="Cumulative token milestone to trigger automatic transition to deep reasoning (default: 15,700,000,000 tokens)")
+    parser.add_argument("--final-campaign-tokens", "--final_campaign_tokens", dest="final_campaign_tokens", type=int, default=50_000_000_000, help="Extended token budget target for deep reasoning campaign (default: 50,000,000,000 tokens)")
     parser.add_argument("--init_from_checkpoint", "--init-from-checkpoint", dest="init_from_checkpoint", type=str, default=None, help="Base foundation checkpoint to load weights from (e.g. step900k)")
     parser.add_argument("--reset_step_counter", "--reset-step-counter", dest="reset_step_counter", action="store_true", default=False, help="Reset step counter to 0 after loading base weights to start new campaign from scratch")
     parser.add_argument("--target-eval-loss", "--target_eval_loss", dest="target_eval_loss", type=float, default=1.60, help="Target held-out evaluation loss for convergence early stopping (default: 1.60)")
@@ -1668,9 +1671,86 @@ def main(args=None):
     last_successful_step = step
     training_error: Optional[Exception] = None
     target_token_budget = getattr(args, "target_tokens", None)
+    in_deep_reasoning_phase = False
+    auto_reasoning_trans = getattr(args, "auto_reasoning_transition", True)
+    reasoning_trans_tokens = getattr(args, "reasoning_transition_tokens", 15_700_000_000)
+    final_campaign_budget = getattr(args, "final_campaign_tokens", 50_000_000_000)
+
+    # Check if resumed checkpoint already passed the 15.7B milestone
+    if auto_reasoning_trans and cumulative_tokens >= reasoning_trans_tokens:
+        in_deep_reasoning_phase = True
+        print("\n" + "=" * 80)
+        print(f"🧠 [Deep Reasoning Active on Resumption] Cumulative tokens ({cumulative_tokens:,}) >= {reasoning_trans_tokens/1e9:.2f}B.")
+        print(f"   Activating High-Density Reasoning Mixture (35% Math, 35% Cosmopedia v2, 20% Code, 10% Edu Academic).")
+        print("=" * 80 + "\n", flush=True)
+        if target_token_budget is not None and target_token_budget <= reasoning_trans_tokens:
+            target_token_budget = final_campaign_budget
+            args.target_tokens = final_campaign_budget
+        if local_streamer is not None and hasattr(local_streamer, "transition_to_deep_reasoning"):
+            local_streamer.transition_to_deep_reasoning()
+        elif batcher is not None and hasattr(batcher, "transition_to_deep_reasoning"):
+            batcher.transition_to_deep_reasoning()
 
     try:
         while step < args.total_steps and not shutdown_requested:
+            # ──────────────────────────────────────────────────────────────────
+            # Automatic Deep Reasoning Transition Check (Milestone: 15.7B Tokens)
+            # ──────────────────────────────────────────────────────────────────
+            if auto_reasoning_trans and not in_deep_reasoning_phase and cumulative_tokens >= reasoning_trans_tokens:
+                in_deep_reasoning_phase = True
+                print("\n" + "=" * 80)
+                print("🧠 [AUTOMATIC CURRICULUM TRANSITION: PRETRAIN -> DEEP REASONING]")
+                print("=" * 80)
+                print(f"🎯 Milestone Reached   : {cumulative_tokens:,} tokens ingested (>= {reasoning_trans_tokens/1e9:.2f}B token threshold)")
+                print(f"🌊 Phase Transition    : PRETRAIN (Broad Web) -> DEEP REASONING (High-Density Formal Reasoning)")
+                print(f"📚 Data Mixture Shift   : 35% Math (FineMath-4+) | 35% Cosmopedia v2 | 20% Python Code | 10% Edu Academic")
+                print(f"⚡ Context Horizon      : Full 4096 tokens contiguous reasoning trajectory")
+                print("=" * 80 + "\n", flush=True)
+
+                # Extend target token budget so training continues smoothly
+                if target_token_budget is not None and target_token_budget <= reasoning_trans_tokens:
+                    target_token_budget = final_campaign_budget
+                    args.target_tokens = final_campaign_budget
+                    print(f"📈 [Extended Target Budget] Target token budget extended to {final_campaign_budget/1e9:.2f}B tokens for Deep Reasoning.")
+
+                # Switch active streamer to deep reasoning mixture
+                if local_streamer is not None and hasattr(local_streamer, "transition_to_deep_reasoning"):
+                    local_streamer.transition_to_deep_reasoning()
+                elif batcher is not None and hasattr(batcher, "transition_to_deep_reasoning"):
+                    batcher.transition_to_deep_reasoning()
+
+                # Archive milestone checkpoint locally and to bioflo.in cloud
+                try:
+                    milestone_ckpt_name = f"{config_preset}_pretrain_15b_complete.pt"
+                    milestone_dest = os.path.join(args.checkpoint_dir, milestone_ckpt_name)
+                    curr_eval = last_eval_loss if last_eval_loss != float("inf") else (initial_ema_loss or 2.70)
+                    save_jax_to_torch_pt(
+                        milestone_dest,
+                        params,
+                        buffers,
+                        config,
+                        opt_state=opt_state if args.save_optimizer_state else None,
+                        extra_meta={
+                            "step": step,
+                            "eval_loss": curr_eval,
+                            "cumulative_tokens": cumulative_tokens,
+                            "phase": "pretrain_15b_complete",
+                        },
+                    )
+                    print(f"💾 [Milestone Checkpoint] Archived 15.7B pretraining completion snapshot: {milestone_dest}")
+                    if args.cloud_sync:
+                        push_checkpoint_async(
+                            milestone_dest,
+                            step,
+                            curr_eval,
+                            target_type="milestone",
+                            model=config_preset,
+                            url=args.cloud_url,
+                            token=args.cloud_token,
+                        )
+                except Exception as e_ms:
+                    print(f"ℹ️ [Milestone Archive Notice] {e_ms}")
+
             if target_token_budget is not None and cumulative_tokens >= target_token_budget:
                 print(
                     f"\n🎯 [Budget Target Reached] Cumulative tokens ({cumulative_tokens:,}) "

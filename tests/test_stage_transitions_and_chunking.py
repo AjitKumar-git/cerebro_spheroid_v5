@@ -150,3 +150,58 @@ def test_hbm_safety_guard_and_curriculum_remat():
     assert batch_size_4k <= 32
     assert batch_size_4k * seq_len_4k <= 131072
 
+
+def test_rectified_streamer_deep_reasoning_transition(monkeypatch):
+    """Verifies that streamer transitions smoothly to 35% Math, 35% Cosmopedia, 20% Code, 10% Edu."""
+    from src.rectified_streamer import RectifiedContiguousPretrainStreamer
+
+    def _mock_doc_gen():
+        while True:
+            yield "Mathematical proof of the theorem using rigorous deductive reasoning steps."
+
+    monkeypatch.setattr(RectifiedContiguousPretrainStreamer, "_open_fineweb_stream", lambda self: _mock_doc_gen())
+    monkeypatch.setattr(RectifiedContiguousPretrainStreamer, "_open_code_stream", lambda self: _mock_doc_gen())
+    monkeypatch.setattr(RectifiedContiguousPretrainStreamer, "_open_edu_stream", lambda self: _mock_doc_gen())
+    monkeypatch.setattr(RectifiedContiguousPretrainStreamer, "_open_math_stream", lambda self: _mock_doc_gen())
+    monkeypatch.setattr(RectifiedContiguousPretrainStreamer, "_open_cosmopedia_stream", lambda self: _mock_doc_gen())
+    monkeypatch.setattr(RectifiedContiguousPretrainStreamer, "_open_retrieval_stream", lambda self: _mock_doc_gen())
+
+    tok = MockTokenizer()
+    streamer = RectifiedContiguousPretrainStreamer(
+        tokenizer=tok,
+        batch_size=2,
+        block_size=256,
+        stage="pretrain",
+    )
+    try:
+        p, t = streamer.get_batch()
+        assert p.shape == (2, 1)
+        assert t.shape == (2, 256)
+        assert streamer.stage == "pretrain"
+
+        # Transition to Deep Reasoning
+        streamer.transition_to_deep_reasoning()
+        assert streamer.stage == "deep_reasoning"
+        assert streamer.shares["math"] == 0.35
+        assert streamer.shares["cosmopedia"] == 0.35
+        assert streamer.shares["code"] == 0.20
+        assert streamer.shares["edu_academic"] == 0.10
+        assert "broad_web" not in streamer.shares
+
+        p2, t2 = streamer.get_batch()
+        assert p2.shape == (2, 1)
+        assert t2.shape == (2, 256)
+    finally:
+        streamer.stop()
+
+
+def test_train_v5_auto_reasoning_transition_args():
+    """Verifies that train_v5_tpu_jax exposes auto_reasoning_transition and 15.7B defaults."""
+    from training.train_v5_tpu_jax import parse_args
+
+    args = parse_args([])
+    assert args.auto_reasoning_transition is True
+    assert args.reasoning_transition_tokens == 15_700_000_000
+    assert args.final_campaign_tokens == 50_000_000_000
+
+
