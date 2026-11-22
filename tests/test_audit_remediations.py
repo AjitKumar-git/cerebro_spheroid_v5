@@ -15,6 +15,7 @@ Verifies all 6 audit finding fixes:
 import math
 import os
 import tempfile
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -241,6 +242,35 @@ class TestAuditRemediations(unittest.TestCase):
         finally:
             if os.path.exists(valid_path):
                 os.remove(valid_path)
+
+    def test_push_checkpoint_skips_concurrent_same_slot_upload(self):
+        """Concurrent uploads to one server slot must not interleave chunk streams."""
+        import src.cloud_sync as cloud_sync
+
+        with tempfile.NamedTemporaryFile(suffix=".upload.12345.pt", delete=False) as tmp:
+            staged_path = tmp.name
+        try:
+            torch.save({"model_state": {"layer.weight": torch.ones((2, 2), dtype=torch.bfloat16)}}, staged_path)
+            slot_key = "v5_small_latest"
+            old_uploads = dict(cloud_sync._IN_FLIGHT_UPLOADS)
+            old_times = dict(cloud_sync._IN_FLIGHT_UPLOAD_TIMES)
+            try:
+                cloud_sync._IN_FLIGHT_UPLOADS[slot_key] = 100
+                cloud_sync._IN_FLIGHT_UPLOAD_TIMES[slot_key] = time.time()
+                result = cloud_sync.push_checkpoint(
+                    staged_path, step=101, loss=1.0, target_type="latest", model="v5_small"
+                )
+                self.assertFalse(result)
+                self.assertEqual(cloud_sync._IN_FLIGHT_UPLOADS.get(slot_key), 100)
+                self.assertFalse(os.path.exists(staged_path), "Skipped staged upload should be removed")
+            finally:
+                cloud_sync._IN_FLIGHT_UPLOADS.clear()
+                cloud_sync._IN_FLIGHT_UPLOADS.update(old_uploads)
+                cloud_sync._IN_FLIGHT_UPLOAD_TIMES.clear()
+                cloud_sync._IN_FLIGHT_UPLOAD_TIMES.update(old_times)
+        finally:
+            if os.path.exists(staged_path):
+                os.remove(staged_path)
 
     def test_finding_9_cloud_weights_only_option_a(self):
         """Verifies Option A: cloud_weights_only=True uploads pure weights while keeping local checkpoints intact."""

@@ -235,7 +235,33 @@ def test_scmer_optimizer_e2e_train_step():
         params, opt_state, loss_val = train_step(params, opt_state, q_batch, r_batch, 0.005)
         assert jnp.isfinite(loss_val)
         assert "scmer_loss" in opt_state["diag"]
-    assert opt_state["step"] == 4
+    assert int(opt_state["step"]) == 4
+
+
+def test_replica_merge_preserves_scmer_scan_carry_structure():
+    """Replica merging must retain every optimizer diag key needed by the next local-SGD scan."""
+    from src.jax.spheroid_optimizer import merge_spheroid_replicas
+
+    key = "sensory.embedding.weight"
+    params = {key: jnp.ones((1, 4, 3), dtype=jnp.float32)}
+    zeros = {key: jnp.zeros((1, 4, 3), dtype=jnp.float32)}
+    diag_keys = (
+        "grad_norm", "was_clipped", "was_skipped", "u_ratio_manifold",
+        "u_ratio_vocab", "u_ratio_1d", "replica_drift", "scmer_loss", "neg_cov_loss",
+    )
+    opt_state = {
+        "step": jnp.array([1], dtype=jnp.int32),
+        "m": zeros,
+        "v": zeros,
+        "master_p": params,
+        "power_v": {},
+        "diag": {name: jnp.zeros((1,), dtype=jnp.float32) for name in diag_keys},
+    }
+
+    merge = jax.pmap(lambda p, o: merge_spheroid_replicas(p, o, axis_name="dp"), axis_name="dp")
+    _, merged_opt = merge(params, opt_state)
+
+    assert set(merged_opt["diag"]) == set(diag_keys)
 
 
 def test_pytorch_scmer_optimizer():

@@ -685,8 +685,12 @@ def merge_spheroid_replicas(
         "u_ratio_vocab": lax.pmean(prev_diag.get("u_ratio_vocab", jnp.array(0.0, dtype=jnp.float32)), axis_name=axis_name),
         "u_ratio_1d": lax.pmean(prev_diag.get("u_ratio_1d", jnp.array(0.0, dtype=jnp.float32)), axis_name=axis_name),
         "replica_drift": mean_drift,
+        "scmer_loss": lax.pmean(prev_diag.get("scmer_loss", jnp.array(0.0, dtype=jnp.float32)), axis_name=axis_name),
         "neg_cov_loss": lax.pmean(prev_diag.get("neg_cov_loss", jnp.array(0.0, dtype=jnp.float32)), axis_name=axis_name),
     }
+    for k, v in prev_diag.items():
+        if k not in merged_diag:
+            merged_diag[k] = lax.pmean(v, axis_name=axis_name)
 
     merged_opt_state = {
         "step": opt_s["step"],

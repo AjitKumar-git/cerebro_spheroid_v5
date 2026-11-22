@@ -531,17 +531,30 @@ def push_checkpoint(
     slot_key = f"{model}_{target_type}" if model else target_type
 
     global _IN_FLIGHT_UPLOADS, _IN_FLIGHT_UPLOAD_TIMES, _LAST_BEST_UPLOAD_TIME
+
+    def _discard_staged_upload() -> None:
+        if ".upload." in file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+
     with _UPLOAD_LOCK:
         now = time.time()
         if target_type == "best":
             elapsed = now - _LAST_BEST_UPLOAD_TIME
             if elapsed < _BEST_COOLDOWN_SECONDS and _IN_FLIGHT_UPLOADS.get(slot_key) != step:
+                _discard_staged_upload()
                 return False
 
-        if slot_key in _IN_FLIGHT_UPLOADS and _IN_FLIGHT_UPLOADS[slot_key] != step:
-            start_t = _IN_FLIGHT_UPLOAD_TIMES.get(slot_key, now)
-            if now - start_t < 180.0:
-                return False
+        # The server assembles chunks by model/slot. Concurrent uploads to the
+        # same slot (including duplicate saves of the same step) can interleave
+        # their part files and produce "out-of-order chunk" failures.
+        if slot_key in _IN_FLIGHT_UPLOADS:
+            active_step = _IN_FLIGHT_UPLOADS[slot_key]
+            print(f"⏭️ [cloud_sync] Skipping duplicate {slot_key} upload at Step {step:,}; Step {active_step:,} is still in flight.")
+            _discard_staged_upload()
+            return False
 
         _IN_FLIGHT_UPLOADS[slot_key] = step
         _IN_FLIGHT_UPLOAD_TIMES[slot_key] = now
