@@ -35,6 +35,15 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 
+try:
+    from src.identity_sanitizer import is_identity_contaminated
+except ImportError:
+    try:
+        from identity_sanitizer import is_identity_contaminated
+    except ImportError:
+        def is_identity_contaminated(text: str):
+            return False, None
+
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
@@ -378,6 +387,7 @@ class RectifiedContiguousPretrainStreamer:
         min_edu_score: float = 3.0,
         domain_loss_weights: Optional[Dict[str, float]] = None,
         reasoning_weight: float = 1.0,
+        filter_model_leaks: bool = True,
     ):
         self.tokenizer = tokenizer
         self.batch_size = batch_size
@@ -388,6 +398,7 @@ class RectifiedContiguousPretrainStreamer:
         self.min_edu_score = float(min_edu_score)
         self.domain_loss_weights = domain_loss_weights or {}
         self.reasoning_weight = float(reasoning_weight)
+        self.filter_model_leaks = filter_model_leaks
         self.progress_getter = progress_getter
         self.total_steps = max(1, int(total_steps))
         self.dynamic_curriculum = target_shares is None
@@ -702,6 +713,12 @@ class RectifiedContiguousPretrainStreamer:
                             doc_text = next(stream_it)
                         except StopIteration:
                             raise RuntimeError(f"❌ [Streamer Fatal] Online stream for domain '{chosen_domain}' exhausted unexpectedly.")
+
+                        # Online Third-Party Model Leak Sanitization
+                        if self.filter_model_leaks:
+                            is_bad, _ = is_identity_contaminated(doc_text)
+                            if is_bad:
+                                continue
 
                         # Tokenize in bounded character chunks (<= 16k chars) to prevent HF >100k sequence length warnings
                         CHUNK_CHAR_SIZE = 16384
