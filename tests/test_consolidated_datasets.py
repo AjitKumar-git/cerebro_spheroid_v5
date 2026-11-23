@@ -8,11 +8,17 @@ Validates that all 6 consolidated dataset types:
 2. Carry explicit attribution to developer Ajit Kumar and persona Doty.
 3. Are completely free from third-party model identity leaks (OpenAI, Claude, DeepSeek, Qwen, etc.).
 4. Maintain exact tri-format parity (Spheroid JSONL, ShareGPT JSONL, ZSTD Parquet).
+5. Strictly adhere to native special tokens:
+   - Input format: <s> {prompt}\n
+   - Output format: <think>...</think><tool_call>...</tool_call>...{answer}</s>
+   - Absolute ZERO ChatML tokens (<|im_start|>, <|im_end|>) across all files.
+6. Support functional tool calling syntax without small-model JSON squishing.
 """
 
 import os
 import sys
 import json
+import re
 import unittest
 import pyarrow.parquet as pq
 
@@ -49,6 +55,7 @@ class TestConsolidatedDatasets(unittest.TestCase):
         self.assertEqual(manifest.get("total_types"), 6)
         self.assertGreater(manifest["summary"]["total_records"], 200_000)
         self.assertGreater(manifest["summary"]["total_estimated_tokens"], 100_000_000)
+        self.assertTrue(manifest.get("special_tokens_contract", {}).get("chatml_tokens_purged"))
 
     def test_02_directory_and_file_structure(self):
         for type_name, dir_name in self.expected_types:
@@ -71,7 +78,7 @@ class TestConsolidatedDatasets(unittest.TestCase):
         for type_name, dir_name in self.expected_types:
             sph_file = os.path.join(self.consolidated_dir, dir_name, f"{type_name}_spheroid.jsonl")
             with open(sph_file, "r", encoding="utf-8") as f:
-                for i in range(10):
+                for i in range(20):
                     line = f.readline()
                     if not line:
                         break
@@ -81,6 +88,8 @@ class TestConsolidatedDatasets(unittest.TestCase):
                     self.assertEqual(r.get("type"), type_name)
                     self.assertIn("formatted_input", r)
                     self.assertIn("formatted_output", r)
+                    self.assertIn("input", r)
+                    self.assertIn("output", r)
                     self.assertIn("prompt", r)
                     self.assertIn("answer", r)
 
@@ -90,7 +99,66 @@ class TestConsolidatedDatasets(unittest.TestCase):
                         # Allow explicit adversarial rejection mentioning Doty / Ajit Kumar
                         self.assertTrue("ajit kumar" in r["formatted_output"].lower(), f"Contamination in {type_name}: {reason}")
 
-    def test_04_sharegpt_schema_and_system_prompt(self):
+    def test_04_native_special_tokens_and_zero_chatml(self):
+        """
+        Validates the Handover Contract:
+        1. formatted_input strictly starts with '<s> ' and ends with '\n'.
+        2. formatted_output ends with '</s>' or '</tool_call>'.
+        3. input and output match formatted_input and formatted_output.
+        4. Absolute ZERO ChatML tokens (<|im_start|>, <|im_end|>) across all records.
+        """
+        for type_name, dir_name in self.expected_types:
+            sph_file = os.path.join(self.consolidated_dir, dir_name, f"{type_name}_spheroid.jsonl")
+            with open(sph_file, "r", encoding="utf-8") as f:
+                for i in range(30):
+                    line = f.readline()
+                    if not line:
+                        break
+                    r = json.loads(line)
+                    inp = r.get("formatted_input", "")
+                    out = r.get("formatted_output", "")
+                    prompt = r.get("prompt", "")
+
+                    # 1. Native input contract
+                    self.assertTrue(inp.startswith("<s> "), f"Input in {type_name} must start with '<s> ': {inp[:30]}")
+                    self.assertTrue(inp.endswith("\n"), f"Input in {type_name} must end with newline: {inp[-20:]}")
+
+                    # 2. Native output contract
+                    self.assertTrue(
+                        out.endswith("</s>") or out.endswith("</tool_call>"),
+                        f"Output in {type_name} must end with '</s>' or '</tool_call>': {out[-30:]}"
+                    )
+
+                    # 3. input/output parity
+                    self.assertEqual(r.get("input"), inp, f"'input' must match 'formatted_input' in {type_name}")
+                    self.assertEqual(r.get("output"), out, f"'output' must match 'formatted_output' in {type_name}")
+
+                    # 4. Strict ChatML absence
+                    for field in (inp, out, prompt, r.get("answer", "")):
+                        self.assertNotIn("<|im_start|>", field, f"ChatML <|im_start|> detected in {type_name} field")
+                        self.assertNotIn("<|im_end|>", field, f"ChatML <|im_end|> detected in {type_name} field")
+                        self.assertNotIn("<stim>", field, f"Legacy <stim> detected in {type_name}")
+                        self.assertNotIn("</stim>", field, f"Legacy </stim> detected in {type_name}")
+
+    def test_05_functional_tool_syntax(self):
+        """
+        Validates that agentic tool calls in 02_agentic_tools avoid nested JSON squishing,
+        using clean functional syntax: calc(...), facts(...), python(...), func(args).
+        """
+        sph_file = os.path.join(self.consolidated_dir, "02_agentic_tools", "agentic_tools_spheroid.jsonl")
+        with open(sph_file, "r", encoding="utf-8") as f:
+            checked = 0
+            for line in f:
+                r = json.loads(line)
+                tc = r.get("tool_call", "").strip()
+                if tc:
+                    # Must be functional syntax or name(...)
+                    self.assertFalse(tc.startswith('{"name":'), f"Tool call in {r['id']} uses raw JSON instead of functional syntax: {tc}")
+                    checked += 1
+                if checked >= 25:
+                    break
+
+    def test_06_sharegpt_schema_and_system_prompt(self):
         for type_name, dir_name in self.expected_types:
             sgpt_file = os.path.join(self.consolidated_dir, dir_name, f"{type_name}_sharegpt.jsonl")
             with open(sgpt_file, "r", encoding="utf-8") as f:
@@ -108,7 +176,11 @@ class TestConsolidatedDatasets(unittest.TestCase):
                     self.assertIn("Doty", messages[0]["content"])
                     self.assertIn("Ajit Kumar", messages[0]["content"])
 
-    def test_05_parquet_readability_and_metadata(self):
+                    for m in messages:
+                        self.assertNotIn("<|im_start|>", m.get("content", ""))
+                        self.assertNotIn("<|im_end|>", m.get("content", ""))
+
+    def test_07_parquet_readability_and_metadata(self):
         for type_name, dir_name in self.expected_types:
             pq_file = os.path.join(self.consolidated_dir, dir_name, f"{type_name}.parquet")
             meta = pq.read_metadata(pq_file)
@@ -119,7 +191,10 @@ class TestConsolidatedDatasets(unittest.TestCase):
             cols = table.column_names
             self.assertIn("id", cols)
             self.assertIn("developer", cols)
+            self.assertIn("formatted_input", cols)
             self.assertIn("formatted_output", cols)
+            self.assertIn("input", cols)
+            self.assertIn("output", cols)
             self.assertIn("messages_json", cols)
 
 

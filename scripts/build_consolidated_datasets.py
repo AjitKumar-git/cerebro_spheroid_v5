@@ -13,7 +13,19 @@ for each of the 6 core curriculum types of CerebroSpheroid V5:
   5. anti_sycophancy     (Anti-sycophancy, Epistemic Humility, Counterfactuals)
   6. lexical_dictionary  (Webster's 111k unabridged lexicon & rare-token anchors)
 
-Each consolidated type is exported with tri-format parity:
+Key Architectural Refinements (from Handover Specification):
+  • Complete elimination of ChatML tokens (<|im_start|>, <|im_end|>):
+    Prevents tokenizer sub-token fragmentation [529, 29989, 326, ...] ("im" token hallucination).
+  • Native special tokens contract:
+    - Input: <s> {prompt}\\n
+    - Output: <think>...</think><tool_call>...</tool_call>\\n<tool_response>...</tool_response>\\n{answer}</s>
+  • Functional tool syntax normalization:
+    Converts nested JSON calls into functional syntax: calc(...), facts(...), python(...), func(k=v)
+    to eliminate small-model JSON squishing hallucinations.
+  • Pointer-copy sensory grounding & closed-loop agentic trajectories.
+  • Parity across (formatted_input, formatted_output) and (input, output) fields.
+
+Tri-Format Parity:
   • <type>_spheroid.jsonl : CerebroSpheroid 3-tier format (<think>, <tool_call>, answer)
   • <type>_sharegpt.jsonl : Industry ShareGPT / OpenAI chat messages format
   • <type>.parquet        : Fast columnar storage with ZSTD level 7 compression
@@ -71,8 +83,57 @@ PARQUET_SCHEMA = pa.schema([
     ("answer", pa.string()),
     ("formatted_input", pa.string()),
     ("formatted_output", pa.string()),
+    ("input", pa.string()),
+    ("output", pa.string()),
     ("messages_json", pa.string()),
 ])
+
+
+def json_tool_call_to_functional(tool_str: str) -> str:
+    """
+    Converts nested JSON function calls into clean functional syntax:
+    e.g. [{"name": "facts", "arguments": {"query": "atomic mass"}}] -> facts("atomic mass")
+    calc, facts, python, and arbitrary APIs are converted to func(k=v) or func(arg).
+    """
+    raw = str(tool_str or "").strip()
+    if not raw or raw in ("None", "null", "{}"):
+        return ""
+
+    # If already functional syntax like calc(...) or facts(...)
+    if re.match(r"^[a-zA-Z0-9_]+\(.*?\)$", raw, re.DOTALL):
+        return raw
+
+    try:
+        data = json.loads(raw)
+
+        def _fmt(item: Any) -> str:
+            if not isinstance(item, dict):
+                return str(item)
+            name = item.get("name") or item.get("tool") or "tool"
+            args = item.get("arguments") or item.get("parameters") or {}
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    return f'{name}("{args}")'
+            if not isinstance(args, dict):
+                return f"{name}({args})"
+            if len(args) == 1:
+                k, v = next(iter(args.items()))
+                if isinstance(v, str):
+                    return f'{name}("{v}")'
+                return f"{name}({v})"
+            parts = [f'{k}="{v}"' if isinstance(v, str) else f"{k}={v}" for k, v in args.items()]
+            return f"{name}({', '.join(parts)})"
+
+        if isinstance(data, list):
+            return "\n".join(_fmt(x) for x in data if x)
+        elif isinstance(data, dict):
+            return _fmt(data)
+    except Exception:
+        pass
+
+    return raw
 
 
 def parse_model_tiers(text: str) -> Dict[str, str]:
@@ -106,8 +167,12 @@ def parse_model_tiers(text: str) -> Dict[str, str]:
     clean_text = re.sub(r"<(?:tool_call|act)>.*?(?:</(?:tool_call|act)>|$)", "", clean_text, flags=re.DOTALL)
     clean_text = re.sub(r"<tool_response>.*?(?:</tool_response>|$)", "", clean_text, flags=re.DOTALL)
 
-    # Strip legacy tokens
-    for stray in ("<|im_end|>", "<|im_start|>", "</s>", "<s>", "<stim>", "</stim>"):
+    # Strip legacy and ChatML tokens
+    for stray in (
+        "<|im_end|>", "<|im_start|>", "</s>", "<s>",
+        "<|im_start|>user\n", "<|im_start|>assistant\n", "<|im_start|>system\n",
+        "<stim>", "</stim>", "[INST]", "[/INST]"
+    ):
         clean_text = clean_text.replace(stray, "")
 
     answer = clean_text.strip()
@@ -117,6 +182,27 @@ def parse_model_tiers(text: str) -> Dict[str, str]:
         "tool_response": tool_response,
         "answer": answer if answer else (raw if not thinking and not tool_call else "")
     }
+
+
+def clean_raw_prompt(prompt: str) -> str:
+    """Strips all ChatML and legacy tokens from the prompt."""
+    if not isinstance(prompt, str):
+        prompt = str(prompt or "")
+    for stray in (
+        "<|im_start|>user\n", "<|im_start|>assistant\n", "<|im_start|>system\n",
+        "<|im_start|>", "<|im_end|>",
+        "<stim>", "</stim>", "[INST]", "[/INST]"
+    ):
+        prompt = prompt.replace(stray, "")
+
+    prompt = prompt.strip()
+    # Strip leading <s> so we don't duplicate
+    if prompt.startswith("<s>"):
+        prompt = prompt[len("<s>"):].strip()
+    # Strip trailing </s>
+    if prompt.endswith("</s>"):
+        prompt = prompt[:-len("</s>")].strip()
+    return prompt.strip()
 
 
 def standardize_record(
@@ -135,20 +221,20 @@ def standardize_record(
     prompt = (
         raw_item.get("prompt")
         or raw_item.get("question")
+        or raw_item.get("input")
         or raw_item.get("formatted_input")
         or ""
     )
-    if isinstance(prompt, str):
-        prompt = prompt.replace("<|im_start|>user\n", "").replace("<|im_end|>\n<|im_start|>assistant\n", "").strip()
+    prompt = clean_raw_prompt(str(prompt))
 
     # 2. Extract response
     response = (
         raw_item.get("formatted_output")
         or raw_item.get("response")
-        or raw_item.get("answer")
-        or raw_item.get("completion")
         or raw_item.get("output")
         or raw_item.get("target")
+        or raw_item.get("answer")
+        or raw_item.get("completion")
         or ""
     )
 
@@ -157,12 +243,22 @@ def standardize_record(
         user_msgs = [m.get("content", "") for m in raw_item["messages"] if m.get("role") in ("user", "human")]
         asst_msgs = [m.get("content", "") for m in raw_item["messages"] if m.get("role") in ("assistant", "gpt", "model")]
         if user_msgs and not prompt:
-            prompt = "\n".join(user_msgs).strip()
+            prompt = clean_raw_prompt("\n".join(user_msgs))
         if asst_msgs and not response:
             response = asst_msgs[-1].strip()
 
     if not prompt or not response:
         return None
+
+    # Strip ChatML from response
+    if isinstance(response, str):
+        for stray in (
+            "<|im_start|>assistant\n", "<|im_start|>user\n", "<|im_start|>system\n",
+            "<|im_start|>", "<|im_end|>",
+            "<stim>", "</stim>", "[INST]", "[/INST]"
+        ):
+            response = response.replace(stray, "")
+        response = response.strip()
 
     # 3. Decontaminate third-party model leaks
     clean_res = sanitize_conversation_turn(prompt, response, allow_adversarial_attribution=True)
@@ -180,6 +276,10 @@ def standardize_record(
     if not answer and not thinking and not tool_call:
         answer = sanitized_response
 
+    # Convert tool call to functional syntax
+    if tool_call:
+        tool_call = json_tool_call_to_functional(tool_call)
+
     # 5. Build canonical formatted_output
     def to_str(v: Any) -> str:
         if v is None:
@@ -188,11 +288,11 @@ def standardize_record(
             return json.dumps(v, ensure_ascii=False)
         return str(v)
 
-    thinking = to_str(thinking)
-    tool_call = to_str(tool_call)
-    tool_response = to_str(tool_response)
-    answer = to_str(answer)
-    prompt = to_str(prompt)
+    thinking = to_str(thinking).strip()
+    tool_call = to_str(tool_call).strip()
+    tool_response = to_str(tool_response).strip()
+    answer = to_str(answer).strip()
+    prompt = to_str(prompt).strip()
 
     out_parts = []
     if thinking:
@@ -205,13 +305,27 @@ def standardize_record(
         out_parts.append(answer)
     formatted_output = "\n".join(out_parts).strip()
 
-    formatted_input = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+    # Clean legacy ChatML tokens from formatted_output if any slipped through
+    for stray in ("<|im_start|>", "<|im_end|>"):
+        formatted_output = formatted_output.replace(stray, "")
+
+    # Ensure clean terminal EOS token
+    if answer or not tool_call:
+        if not formatted_output.endswith("</s>"):
+            formatted_output = formatted_output + "</s>"
+    else:
+        # Tool call emission only (Stage 1)
+        if not formatted_output.endswith("</tool_call>") and not formatted_output.endswith("</s>"):
+            formatted_output = formatted_output + "</s>"
+
+    # Native input format
+    formatted_input = f"<s> {prompt}\n"
 
     uid = f"{prefix_id}_{idx:06d}"
     category = to_str(raw_item.get("category") or raw_item.get("domain") or type_name)
     source = to_str(raw_item.get("source") or default_source)
 
-    # Spheroid record
+    # Spheroid record (both formatted_input/formatted_output and input/output for full compatibility)
     spheroid_record = {
         "id": uid,
         "type": type_name,
@@ -226,13 +340,20 @@ def standardize_record(
         "answer": answer,
         "formatted_input": formatted_input,
         "formatted_output": formatted_output,
+        "input": formatted_input,
+        "output": formatted_output,
     }
 
-    # ShareGPT record
+    # ShareGPT record (clean messages without raw <s> or ChatML tokens)
+    clean_user_content = prompt
+    if clean_user_content.startswith("<s>"):
+        clean_user_content = clean_user_content[len("<s>"):].strip()
+    clean_asst_content = formatted_output.rstrip("</s>").strip()
+
     messages = [
         {"role": "system", "content": DOTY_SYSTEM_PROMPT},
-        {"role": "user", "content": prompt},
-        {"role": "assistant", "content": formatted_output},
+        {"role": "user", "content": clean_user_content},
+        {"role": "assistant", "content": clean_asst_content},
     ]
     sharegpt_record = {
         "id": uid,
@@ -258,6 +379,8 @@ def standardize_record(
         "answer": answer,
         "formatted_input": formatted_input,
         "formatted_output": formatted_output,
+        "input": formatted_input,
+        "output": formatted_output,
         "messages_json": json.dumps(messages, ensure_ascii=False),
     }
 
@@ -273,7 +396,7 @@ def export_consolidated_type(
 ) -> Dict[str, Any]:
     """
     Consolidates multiple input sources into a single validated type directory
-    using streaming I/O and low-memory batched Parquet writing.
+    using streaming I/O, atomic tmp replacement, and low-memory batched Parquet writing.
     """
     target_dir = os.path.join(OUTPUT_BASE_DIR, dir_name)
     os.makedirs(target_dir, exist_ok=True)
@@ -282,38 +405,18 @@ def export_consolidated_type(
     sharegpt_path = os.path.join(target_dir, f"{type_name}_sharegpt.jsonl")
     parquet_path = os.path.join(target_dir, f"{type_name}.parquet")
 
-    # If skip_existing and all files exist with size > 0:
-    if skip_existing and os.path.exists(spheroid_path) and os.path.exists(sharegpt_path) and os.path.exists(parquet_path):
-        if os.path.getsize(spheroid_path) > 0 and os.path.getsize(parquet_path) > 0:
-            rec_cnt = 0
-            with open(spheroid_path, "r", encoding="utf-8") as f:
-                for _ in f:
-                    rec_cnt += 1
-            sph_mb = os.path.getsize(spheroid_path) / (1024 * 1024)
-            sgpt_mb = os.path.getsize(sharegpt_path) / (1024 * 1024)
-            pq_mb = os.path.getsize(parquet_path) / (1024 * 1024)
-            print(f"⏩ [Consolidator] Skipping existing {type_name}: {rec_cnt:,} records, {pq_mb:.2f} MB parquet.")
-            return {
-                "type": type_name,
-                "directory": dir_name,
-                "records": rec_cnt,
-                "estimated_tokens": int(sph_mb * 1024 * 1024 // 4),
-                "spheroid_path": os.path.relpath(spheroid_path, PROJECT_ROOT),
-                "sharegpt_path": os.path.relpath(sharegpt_path, PROJECT_ROOT),
-                "parquet_path": os.path.relpath(parquet_path, PROJECT_ROOT),
-                "spheroid_size_mb": round(sph_mb, 2),
-                "sharegpt_size_mb": round(sgpt_mb, 2),
-                "parquet_size_mb": round(pq_mb, 2),
-                "categories": {},
-            }
+    # Temp files for atomic write
+    spheroid_tmp = f"{spheroid_path}.tmp"
+    sharegpt_tmp = f"{sharegpt_path}.tmp"
+    parquet_tmp = f"{parquet_path}.tmp"
 
     print(f"\n============================================================")
-    print(f"🚀 [Consolidator] Building Type: {type_name.upper()} -> {dir_name}/")
+    print(f"🚀 [Consolidator] Processing Type: {type_name.upper()} -> {dir_name}/")
     print(f"============================================================")
 
-    f_spheroid = open(spheroid_path, "w", encoding="utf-8")
-    f_sharegpt = open(sharegpt_path, "w", encoding="utf-8")
-    pq_writer = pq.ParquetWriter(parquet_path, schema=PARQUET_SCHEMA, compression="zstd", compression_level=7)
+    f_spheroid = open(spheroid_tmp, "w", encoding="utf-8")
+    f_sharegpt = open(sharegpt_tmp, "w", encoding="utf-8")
+    pq_writer = pq.ParquetWriter(parquet_tmp, schema=PARQUET_SCHEMA, compression="zstd", compression_level=7)
 
     parquet_batch: List[Dict[str, Any]] = []
     BATCH_SIZE = 2500
@@ -404,6 +507,11 @@ def export_consolidated_type(
     f_sharegpt.close()
     pq_writer.close()
 
+    # Atomic rename tmp files to target paths
+    os.replace(spheroid_tmp, spheroid_path)
+    os.replace(sharegpt_tmp, sharegpt_path)
+    os.replace(parquet_tmp, parquet_path)
+
     # Compute metrics & sizes
     sph_mb = os.path.getsize(spheroid_path) / (1024 * 1024)
     sgpt_mb = os.path.getsize(sharegpt_path) / (1024 * 1024)
@@ -434,23 +542,9 @@ def export_consolidated_type(
         "categories": dict(category_counts),
     }
 
-    return {
-        "type": type_name,
-        "directory": dir_name,
-        "records": len(spheroid_records),
-        "estimated_tokens": est_tokens,
-        "spheroid_path": os.path.relpath(spheroid_path, PROJECT_ROOT),
-        "sharegpt_path": os.path.relpath(sharegpt_path, PROJECT_ROOT),
-        "parquet_path": os.path.relpath(parquet_path, PROJECT_ROOT),
-        "spheroid_size_mb": round(sph_mb, 2),
-        "sharegpt_size_mb": round(sgpt_mb, 2),
-        "parquet_size_mb": round(pq_mb, 2),
-        "categories": dict(category_counts),
-    }
-
 
 def main():
-    parser = argparse.ArgumentParser(description="Build consolidated datasets for each curriculum type")
+    parser = argparse.ArgumentParser(description="Build and refine consolidated datasets for each curriculum type")
     parser.add_argument("--type", type=str, help="Specific type to build (identity, tools, reasoning, knowledge, sycophancy, dictionary)")
     parser.add_argument("--all", action="store_true", help="Build all 6 consolidated dataset types")
     parser.add_argument("--skip-existing", action="store_true", help="Skip types that are already fully exported")
@@ -465,7 +559,7 @@ def main():
             "prefix_id": "doty_id",
             "sources": [
                 {
-                    "path": "data/doty_identity/doty_identity_spheroid.jsonl",
+                    "path": "data/consolidated/01_doty_identity/doty_identity_spheroid.jsonl",
                     "source_name": "cerebro_v5_doty_grounding",
                 }
             ]
@@ -476,14 +570,20 @@ def main():
             "prefix_id": "doty_tool",
             "sources": [
                 {
-                    "path": "data/frontier_100k/frontier_100k_spheroid_format.jsonl",
-                    "source_name": "frontier_function_calling",
-                    "filter_fn": lambda item: item.get("category") in ("apigen_function_calling", "hermes_function_calling")
-                                            or item.get("domain") in ("tool_calling_api", "tool_calling_conversational")
+                    "path": "data/consolidated/02_agentic_tools/closed_loop_sft_pairs.jsonl",
+                    "source_name": "closed_loop_sensory_kv_pairs",
                 },
                 {
-                    "path": "data/cerebro_v5_custom_dataset/factual_generated_1k.jsonl",
-                    "source_name": "cerebro_v5_factual_sql",
+                    "path": "data/consolidated/02_agentic_tools/closed_loop_trajectories.jsonl",
+                    "source_name": "closed_loop_trajectories",
+                },
+                {
+                    "path": "data/consolidated/02_agentic_tools/agentic_tools_sensory_grounded.jsonl",
+                    "source_name": "agentic_tools_sensory_grounded",
+                },
+                {
+                    "path": "data/consolidated/02_agentic_tools/agentic_tools_spheroid.jsonl",
+                    "source_name": "agentic_tools_spheroid",
                 }
             ]
         },
@@ -493,21 +593,8 @@ def main():
             "prefix_id": "doty_cot",
             "sources": [
                 {
-                    "path": "data/frontier_100k/frontier_100k_spheroid_format.jsonl",
-                    "source_name": "frontier_deliberation",
-                    "filter_fn": lambda item: item.get("category") in ("open_thoughts_deepseek_cot", "sky_t1_olympiad_cot", "numina_math_cot")
-                },
-                {
-                    "path": "data/gemini_golden_reasoning_sft.jsonl",
-                    "source_name": "gemini_golden_reasoning",
-                },
-                {
-                    "path": "data/gemma31_graded_reasoning_sft.jsonl",
-                    "source_name": "gemma31_graded_reasoning",
-                },
-                {
-                    "path": "data/layman_conversational_cot.jsonl",
-                    "source_name": "layman_conversational_cot",
+                    "path": "data/consolidated/03_complex_reasoning/complex_reasoning_spheroid.jsonl",
+                    "source_name": "complex_reasoning_curriculum",
                 }
             ]
         },
@@ -517,21 +604,8 @@ def main():
             "prefix_id": "doty_knw",
             "sources": [
                 {
-                    "path": "data/diverse_sft_corpus_25k.jsonl",
-                    "source_name": "diverse_sft_stem_arc",
-                },
-                {
-                    "path": "data/chat_thinking_sft_15k.jsonl",
-                    "source_name": "chat_thinking_generalist",
-                },
-                {
-                    "path": "data/cerebro_v5_custom_dataset/train.jsonl",
-                    "source_name": "cerebro_v5_custom_train",
-                    "limit": 25000,
-                },
-                {
-                    "path": "data/retrieval_curriculum_data.jsonl",
-                    "source_name": "retrieval_passkey_needle",
+                    "path": "data/consolidated/04_domain_knowledge/domain_knowledge_spheroid.jsonl",
+                    "source_name": "domain_knowledge_curriculum",
                 }
             ]
         },
@@ -541,12 +615,8 @@ def main():
             "prefix_id": "doty_syc",
             "sources": [
                 {
-                    "path": "data/anti_sycophancy_truth_dataset.jsonl",
-                    "source_name": "anti_sycophancy_truth_set",
-                },
-                {
-                    "path": "data/cerebro_cognitive_8k/cerebro_cognitive_10k.jsonl",
-                    "source_name": "cerebro_cognitive_counterfactual",
+                    "path": "data/consolidated/05_anti_sycophancy/anti_sycophancy_spheroid.jsonl",
+                    "source_name": "anti_sycophancy_curriculum",
                 }
             ]
         },
@@ -556,7 +626,7 @@ def main():
             "prefix_id": "doty_lex",
             "sources": [
                 {
-                    "path": "data/dictionary/dictionary_spheroid_format.jsonl",
+                    "path": "data/consolidated/06_lexical_dictionary/lexical_dictionary_spheroid.jsonl",
                     "source_name": "websters_unabridged_dictionary",
                 }
             ]
@@ -566,12 +636,19 @@ def main():
     selected_types = list(CONFIGS.keys()) if (args.all or not args.type) else [args.type]
 
     manifest = {
-        "manifest_version": "1.0.0",
+        "manifest_version": "1.1.0",
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "agent": "Doty",
         "developer": "Ajit Kumar",
         "architecture": "CerebroSpheroid V5",
         "cognitive_boundary": "3-Tier: <think> -> <tool_call> -> plain text",
+        "special_tokens_contract": {
+            "input_prefix": "<s> {prompt}\\n",
+            "output_suffix": "</s>",
+            "chatml_tokens_purged": True,
+            "functional_tool_syntax": True,
+            "sensory_kv_grounded": True,
+        },
         "total_types": len(selected_types),
         "types": {},
         "summary": {
