@@ -83,6 +83,24 @@
       "rstrip": true,
       "normalized": false,
       "special": true
+    },
+    {
+      "id": 27,
+      "content": "<|im_start|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 28,
+      "content": "<|im_end|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
     }
   ],
   "normalizer": {
@@ -210,8 +228,6 @@
       "<0x15>": 24,
       "<0x16>": 25,
       "<0x17>": 26,
-      "<0x18>": 27,
-      "<0x19>": 28,
       "<0x20>": 35,
       "<0x21>": 36,
       "<0x22>": 37,
@@ -32182,7 +32198,9 @@
       "<tool_response>": 33,
       "</tool_response>": 34,
       "<think>": 29,
-      "</think>": 30
+      "</think>": 30,
+      "<|im_start|>": 27,
+      "<|im_end|>": 28
     },
     "merges": [
       "\u2581 t",
