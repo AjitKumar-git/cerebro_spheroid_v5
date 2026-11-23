@@ -1,15 +1,15 @@
 # Agent Work State & Activity Tracker
 
-> **Status**: 🟢 `COMPLETED` | **Last Updated**: `2026-11-21T13:24:44.300321+05:30` | **Session**: `734a32d4-30f9-4fa4-b9c2-5336e0f58c27`
+> **Status**: 🟢 `COMPLETED` | **Last Updated**: `2026-11-23T13:24:40.870136+05:30` | **Session**: `734a32d4-30f9-4fa4-b9c2-5336e0f58c27`
 
 ## Current / Active Objective
-**Goal**: /compact
+**Goal**: purge responses from open ai, chatgpt, claude etc references that is often the case with chinese models
 
 - **Phase**: `completed`
 - **Current Task**: Idle / Awaiting next request
 
 ## Summary of Completed Work
-A **full English dictionary and lexical preservation dataset (111,651 samples)** has been constructed, formatted, and published to your Hugging Face repository to prevent rare token decay and vocabulary collapse during training.
+The identity decontamination engine has been constructed, integrated, and executed across all pretraining, SFT, cognitive reasoning, and identity corpora. All first-person model declarations, corporate boilerplates, and distillation leaks from OpenAI (ChatGPT/GPT-4), Anthropic (Claude), and major open-weights/distilled models (DeepSeek, Qwen/Tongyi, Baichuan, ChatGLM, Kimi/Moonshot, ERNIE) have been purged or sanitized.
 
 ## Modified Files
 - [`AGENTS.md`](AGENTS.md)
@@ -96,20 +96,25 @@ A **full English dictionary and lexical preservation dataset (111,651 samples)**
 - [`../../../../.gemini/antigravity/brain/1ffa7ab2-b764-480a-b597-d783c09f257d/scratch/evaluate_v5_compact_best.py`](../../../../.gemini/antigravity/brain/1ffa7ab2-b764-480a-b597-d783c09f257d/scratch/evaluate_v5_compact_best.py)
 - [`../../../../.gemini/antigravity/brain/1ffa7ab2-b764-480a-b597-d783c09f257d/scratch/evaluate_v5_small_920k.py`](../../../../.gemini/antigravity/brain/1ffa7ab2-b764-480a-b597-d783c09f257d/scratch/evaluate_v5_small_920k.py)
 - [`src/cloud_sync.py`](src/cloud_sync.py)
+- [`../../../../.gemini/antigravity/brain/734a32d4-30f9-4fa4-b9c2-5336e0f58c27/doty_100b_frontier_agent_dataset_plan.md`](../../../../.gemini/antigravity/brain/734a32d4-30f9-4fa4-b9c2-5336e0f58c27/doty_100b_frontier_agent_dataset_plan.md)
+- [`scripts/build_doty_identity_dataset.py`](scripts/build_doty_identity_dataset.py)
+- [`src/identity_sanitizer.py`](src/identity_sanitizer.py)
+- [`tests/test_identity_sanitizer.py`](tests/test_identity_sanitizer.py)
+- [`scripts/purge_third_party_model_leaks.py`](scripts/purge_third_party_model_leaks.py)
 
 ## Recent Actions (Last 10)
 | Time | Tool | Details |
 | :--- | :--- | :--- |
-| `02:02:47` | `run_command` | Run test_stage_transitions_and_chunking.py |
-| `02:02:32` | `run_command` | Check token tracker on website |
-| `02:02:24` | `edit_file` | edit_file |
-| `02:02:14` | `read_file` | read_file |
-| `02:02:08` | `edit_file` | edit_file |
-| `02:01:59` | `read_file` | read_file |
-| `02:01:53` | `manage_task` | manage_task |
-| `02:01:50` | `run_command` | Check website token tracker |
-| `02:01:39` | `run_command` | Restore correct token counter to bioflo.in |
-| `02:01:22` | `read_file` | read_file |
+| `13:24:21` | `run_command` | Commit decontamination engine |
+| `13:24:16` | `run_command` | Stage identity decontamination engine |
+| `13:24:08` | `run_command` | Check data git status |
+| `13:24:02` | `run_command` | Check git status |
+| `13:23:54` | `run_command` | Run verification test suite |
+| `13:18:36` | `run_command` | Wait 8s for test suite |
+| `13:18:16` | `run_command` | Verify parquet row count |
+| `13:18:07` | `run_command` | Wait 8s for parquet write |
+| `13:17:55` | `run_command` | Reserialize clean frontier parquet |
+| `13:17:53` | `run_command` | Wait 8s for parquet write |
 
 ---
 *This file is automatically maintained by `auto-work-tracker`. Other agents can parse `.agents/work_state.json` or inspect this file directly to resume or review progress.*

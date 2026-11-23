@@ -129,7 +129,7 @@ def parse_args(args_list=None):
     parser = argparse.ArgumentParser(description="CerebroSpheroid V5 Cloud TPU JAX Trainer")
 
     # Target steps & duration
-    parser.add_argument("--total-steps", "--steps", "--max-steps", dest="total_steps", type=int, default=1_000_000, help="Total training steps")
+    parser.add_argument("--total-steps", "--total_steps", "--steps", "--max-steps", "--max_steps", dest="total_steps", type=int, default=1_000_000, help="Total training steps")
     parser.add_argument("--max_hours", type=float, default=None, help="Maximum training wall-clock time in hours before graceful shutdown")
     parser.add_argument("--cloud_save_hours", type=float, default=None, help="Hours between asynchronous cloud checkpoint uploads to bioflo.in")
 
@@ -281,7 +281,8 @@ def parse_args(args_list=None):
         for arg in raw_args
     )
     parsed.total_steps_explicit = any(
-        arg == "--total-steps" or arg == "--total_steps" or arg.startswith("--total-steps=") or arg.startswith("--total_steps=")
+        arg in ("--total-steps", "--total_steps", "--steps", "--max-steps", "--max_steps")
+        or arg.startswith(("--total-steps=", "--total_steps=", "--steps=", "--max-steps=", "--max_steps="))
         for arg in raw_args
     )
     parsed.effective_batch_size_explicit = any(
@@ -406,6 +407,53 @@ def build_data_stream(
             f"❌ [DataStreamer Fatal] Online dataset '{dataset_source}' failed to initialize: {e}.\n"
             f"   Cleanly stopping training without falling back to mock data."
         ) from e
+
+
+def calculate_curriculum_aware_target_steps(
+    target_budget: float,
+    eff_batch_size: int,
+    base_prompt_len: int,
+    base_seq_len: int,
+    context_curriculum: bool = False,
+    context_stages: Optional[List[int]] = None,
+    context_stage_steps: int = 100_000,
+    start_step: int = 0,
+) -> int:
+    """Calculates exact steps required to ingest a target token budget,
+
+    accounting for BOS-only prompts in pretraining and expanding context
+    windows across curriculum stages.
+    """
+    if target_budget <= 0.0 or eff_batch_size <= 0:
+        return 0
+
+    if not context_curriculum or not context_stages:
+        tok_per_step = eff_batch_size * (base_prompt_len + base_seq_len)
+        return int(math.ceil(float(target_budget) / max(1.0, float(tok_per_step))))
+
+    rem = float(target_budget)
+    tot_steps = 0
+    curr_stage_idx = min(len(context_stages) - 1, start_step // max(1, context_stage_steps))
+
+    for s_idx in range(curr_stage_idx, len(context_stages)):
+        s_len = context_stages[s_idx]
+        s_tok_per_step = eff_batch_size * (base_prompt_len + s_len)
+        is_last_stage = (s_idx == len(context_stages) - 1)
+        if is_last_stage:
+            tot_steps += int(math.ceil(rem / max(1.0, float(s_tok_per_step))))
+            rem = 0.0
+            break
+        else:
+            steps_left_in_stage = context_stage_steps - ((start_step + tot_steps) % context_stage_steps)
+            stage_cap_tok = steps_left_in_stage * s_tok_per_step
+            if rem <= stage_cap_tok:
+                tot_steps += int(math.ceil(rem / max(1.0, float(s_tok_per_step))))
+                rem = 0.0
+                break
+            else:
+                tot_steps += steps_left_in_stage
+                rem -= stage_cap_tok
+    return tot_steps
 
 
 def main(args=None):
@@ -955,15 +1003,53 @@ def main(args=None):
         print(f"⚡ [Batch Scaling] Target Effective Batch Size: {eff_bs} (Micro Batch: {args.batch_size} × Grad Accum: {args.grad_accum})")
 
     eff_batch_size = args.batch_size * getattr(args, "grad_accum", 1)
-    tokens_per_opt_step = eff_batch_size * (args.prompt_len + args.seq_len)
+
+    # Honest token slot accounting:
+    # In pretraining (RectifiedContiguousPretrainStreamer), prompts are 1 token (BOS seed)
+    # and targets are 100% loss-bearing chunks of seq_len tokens.
+    # In SFT / elastic mode, prompts are prompt_len and targets are seq_len.
+    if is_pretrain_source:
+        real_prompt_slots = 1
+        real_target_slots = args.seq_len
+    else:
+        real_prompt_slots = args.prompt_len
+        real_target_slots = args.seq_len
+
+    tokens_per_opt_step = eff_batch_size * (real_prompt_slots + real_target_slots)
+
     if not getattr(args, "total_steps_explicit", False) and getattr(args, "target_tokens", None) is not None and args.target_tokens > 0:
-        calculated_steps = int(math.ceil(float(args.target_tokens) / max(1.0, float(tokens_per_opt_step))))
-        if start_step > 0 and args.total_steps <= start_step:
+        target_budget = float(args.target_tokens)
+        resumed_cum_tokens = 0
+        if "ckpt" in locals() and isinstance(ckpt, dict) and not getattr(args, "reset_step_counter", False):
+            resumed_cum_tokens = int(ckpt.get("cumulative_tokens", 0))
+
+        remaining_budget = max(0.0, target_budget - float(resumed_cum_tokens))
+
+        calculated_steps = calculate_curriculum_aware_target_steps(
+            target_budget=remaining_budget,
+            eff_batch_size=eff_batch_size,
+            base_prompt_len=real_prompt_slots,
+            base_seq_len=real_target_slots,
+            context_curriculum=getattr(args, "context_curriculum", False),
+            context_stages=context_stages if "context_stages" in locals() else None,
+            context_stage_steps=getattr(args, "context_stage_steps", 100_000),
+            start_step=start_step,
+        )
+
+        if start_step > 0:
             args.total_steps = start_step + calculated_steps
-            print(f"🎯 Resuming from Step {start_step:,} -> Extended campaign schedule to Step {args.total_steps:,} (+{calculated_steps:,} steps)")
+            print(
+                f"🎯 [Target Token Budget Resumption] Target: {target_budget/1e9:.2f}B Tokens | "
+                f"Already Ingested: {resumed_cum_tokens/1e9:.2f}B Tokens | "
+                f"Remaining: {remaining_budget/1e9:.2f}B Tokens -> Scheduled for {calculated_steps:,} additional Steps "
+                f"(Campaign Ends at Step {args.total_steps:,} at ~{tokens_per_opt_step:,} tok/step)"
+            )
         else:
             args.total_steps = calculated_steps
-            print(f"🎯 [Target Token Budget] {args.target_tokens/1e9:.2f} Billion Tokens -> Scheduled for {args.total_steps:,} Steps (at {tokens_per_opt_step:,} tok/step)")
+            print(
+                f"🎯 [Target Token Budget] {target_budget/1e9:.2f} Billion Tokens -> "
+                f"Scheduled for {args.total_steps:,} Steps (at ~{tokens_per_opt_step:,} tok/step)"
+            )
 
     # 6. Spheroid Optimizer & JIT / Multi-TPU Local-SGD Train Step Engine
     grad_accum = max(1, int(getattr(args, "grad_accum", 1)))
@@ -1393,27 +1479,48 @@ def main(args=None):
     eval_domains = []
     eval_weights = []
     is_pretrain_source = args.dataset_source in ("pretrain", "rectified", "rectified_pretrain", "clean_pretrain")
-    if is_pretrain_source:
+
+    def generate_held_out_split(stage_name: str, target_length: int):
+        nonlocal eval_batches, eval_domains, eval_weights
+        if not is_pretrain_source:
+            return
         try:
             from src.elastic_window import build_pretrain_eval_split
-            # Pretraining with RectifiedContiguousPretrainStreamer trains on contiguous document sequences
-            # seeded with a single BOS token (prompt_len=1). Align evaluation 1:1 with pretraining format.
             eval_prompt_len = 1
-            eval_batches, eval_domains, eval_weights = build_pretrain_eval_split(
+            if stage_name in ("deep_reasoning", "reasoning", "stage2", "stage_2"):
+                domains_req = ["math", "cosmopedia", "code", "edu_academic"]
+                weights_req = {"math": 0.35, "cosmopedia": 0.35, "code": 0.20, "edu_academic": 0.10}
+                desc = "Stage 2: Deep Reasoning (Math 35%, Cosmopedia 35%, Code 20%, Edu 10%)"
+            else:
+                domains_req = ["broad_web", "code"]
+                weights_req = {"broad_web": 0.85, "code": 0.15}
+                desc = "Stage 1: Pretrain (FineWeb 85%, The Stack 15%)"
+            new_batches, new_domains, new_weights = build_pretrain_eval_split(
                 tokenizer=tokenizer,
                 batch_size=args.batch_size,
                 prompt_len=eval_prompt_len,
-                target_len=args.seq_len,
+                target_len=target_length,
                 target_pad_id=-100,
                 pad_id=pad_id,
                 return_weights=True,
+                domains=domains_req,
+                domain_weights=weights_req,
             )
-            print(f"✅ Pretrain Held-Out Validation: Prepared {len(eval_batches)} pretraining domains:")
-            for d_name, d_wt in zip(eval_domains, eval_weights):
-                print(f"   ├─ Domain: {d_name} (Weight: {d_wt*100:.0f}%)")
+            if new_batches:
+                eval_batches = new_batches
+                eval_domains = new_domains
+                eval_weights = new_weights
+                print(f"✅ Held-Out Validation [{desc}]: Prepared {len(eval_batches)} domains (Target Length: {target_length}):")
+                for d_name, d_wt in zip(eval_domains, eval_weights):
+                    print(f"   ├─ Domain: {d_name} (Weight: {d_wt*100:.0f}%)")
+            else:
+                print(f"⚠️ Held-Out Validation ({stage_name}): Online streams returned 0 batches. Keeping current validation set.")
         except Exception as e:
-            print(f"⚠️ Pretrain validation setup notice: {e}. Falling back to active stream.")
-            eval_batches = []
+            print(f"⚠️ Pretrain validation setup notice ({stage_name}): {e}. Keeping current validation set.")
+
+    if is_pretrain_source:
+        # Pretraining Step 1 only tests FineWeb and The Stack Code
+        generate_held_out_split("pretrain", args.seq_len)
     else:
         try:
             from src.elastic_window import build_canonical_eval_split
@@ -1686,6 +1793,7 @@ def main(args=None):
                 pass
 
     lifetime_tokens = initial_lifetime_tokens + cumulative_tokens
+    resumed_cum_tokens = cumulative_tokens
 
     # Diagnostic Tracking for Optimizer Health & Stability
     cumulative_skips = 0
@@ -1708,6 +1816,28 @@ def main(args=None):
     reasoning_trans_tokens = getattr(args, "reasoning_transition_tokens", 15_700_000_000)
     final_campaign_budget = getattr(args, "final_campaign_tokens", 50_000_000_000)
 
+    # Recalibrate total_steps schedule on resumption if remote/checkpoint token counter was updated
+    if not getattr(args, "total_steps_explicit", False) and target_token_budget is not None and target_token_budget > 0:
+        rem_budget = max(0.0, float(target_token_budget) - float(cumulative_tokens))
+        if rem_budget <= 0.0:
+            print(f"🎯 [Target Token Budget Satisfied] Cumulative tokens ({cumulative_tokens:,}) >= budget ({int(target_token_budget):,}).")
+        else:
+            recal_steps = calculate_curriculum_aware_target_steps(
+                target_budget=rem_budget,
+                eff_batch_size=eff_batch_size,
+                base_prompt_len=real_prompt_slots,
+                base_seq_len=real_target_slots,
+                context_curriculum=getattr(args, "context_curriculum", False),
+                context_stages=context_stages if "context_stages" in locals() else None,
+                context_stage_steps=getattr(args, "context_stage_steps", 100_000),
+                start_step=step,
+            )
+            args.total_steps = step + recal_steps
+            print(
+                f"🎯 [Schedule Alignment] Adjusted campaign schedule to Step {args.total_steps:,} "
+                f"(+{recal_steps:,} remaining steps) to ingest {rem_budget/1e9:.2f}B remaining tokens."
+            )
+
     # Check if resumed checkpoint already passed the 15.7B milestone
     if auto_reasoning_trans and cumulative_tokens >= reasoning_trans_tokens:
         in_deep_reasoning_phase = True
@@ -1724,15 +1854,32 @@ def main(args=None):
             local_streamer.transition_to_deep_reasoning()
         elif batcher is not None and hasattr(batcher, "transition_to_deep_reasoning"):
             batcher.transition_to_deep_reasoning()
+        generate_held_out_split("deep_reasoning", args.seq_len)
+        if smart_mixture_controller is not None:
+            reasoning_priors = {"math": 0.35, "cosmopedia": 0.35, "code": 0.20, "edu_academic": 0.10}
+            smart_mixture_controller.prior_shares = dict(reasoning_priors)
+            smart_mixture_controller.current_shares = dict(reasoning_priors)
 
+    budget_active = (target_token_budget is not None and not getattr(args, "total_steps_explicit", False))
     try:
-        while step < args.total_steps and not shutdown_requested:
+        while not shutdown_requested:
+            if budget_active:
+                if cumulative_tokens >= target_token_budget:
+                    print(
+                        f"\n🎯 [Budget Target Reached] Cumulative tokens ({cumulative_tokens:,}) "
+                        f"reached configured target budget ({target_token_budget:,}). Cleanly stopping training."
+                    )
+                    break
+            else:
+                if step >= args.total_steps:
+                    break
             # ──────────────────────────────────────────────────────────────────
             # Automatic Deep Reasoning Transition Check (Milestone: 15.7B Tokens)
             # ──────────────────────────────────────────────────────────────────
             if auto_reasoning_trans and not in_deep_reasoning_phase and cumulative_tokens >= reasoning_trans_tokens:
                 in_deep_reasoning_phase = True
                 reasoning_transition_step = step
+                best_eval_loss = float("inf")
                 print("\n" + "=" * 80)
                 print("🧠 [AUTOMATIC CURRICULUM TRANSITION: PRETRAIN -> DEEP REASONING]")
                 print("=" * 80)
@@ -1754,6 +1901,13 @@ def main(args=None):
                     local_streamer.transition_to_deep_reasoning()
                 elif batcher is not None and hasattr(batcher, "transition_to_deep_reasoning"):
                     batcher.transition_to_deep_reasoning()
+
+                # Rebuild held-out evaluation split for Stage 2 (Deep Reasoning)
+                generate_held_out_split("deep_reasoning", args.seq_len)
+                if smart_mixture_controller is not None:
+                    reasoning_priors = {"math": 0.35, "cosmopedia": 0.35, "code": 0.20, "edu_academic": 0.10}
+                    smart_mixture_controller.prior_shares = dict(reasoning_priors)
+                    smart_mixture_controller.current_shares = dict(reasoning_priors)
 
                 # Archive milestone checkpoint locally and to bioflo.in cloud
                 try:
@@ -1822,6 +1976,7 @@ def main(args=None):
                             b_target.update_buckets(new_buckets, new_total_window=active_window)
                         elif hasattr(b_target, "batcher") and hasattr(b_target.batcher, "update_buckets"):
                             b_target.batcher.update_buckets(new_buckets, new_total_window=active_window)
+                    generate_held_out_split("deep_reasoning" if in_deep_reasoning_phase else "pretrain", active_window)
 
             # Dynamic Sequence Length Transition Check (if seq_transition_steps > 0)
             if target_seq_len is not None and target_seq_len > initial_seq_len and seq_trans_steps > 0:
@@ -2071,6 +2226,18 @@ def main(args=None):
                 elapsed_log = time.time() - t_last_log
                 steps_per_sec = step_window_count / max(elapsed_log, 1e-6)
                 tok_per_sec = step_window_tokens / max(elapsed_log, 1e-6)
+
+                # Dynamic Step Schedule Calibration: keep total_steps calibrated to true empirical tokens/step
+                if budget_active and step > start_step:
+                    steps_done = step - start_step
+                    toks_done = cumulative_tokens - resumed_cum_tokens
+                    if steps_done >= 20 and toks_done > 0:
+                        emp_tok_per_step = float(toks_done) / float(steps_done)
+                        toks_left = max(0.0, float(target_token_budget) - float(cumulative_tokens))
+                        projected_additional_steps = int(math.ceil(toks_left / max(1.0, emp_tok_per_step)))
+                        calibrated_total = step + projected_additional_steps
+                        if calibrated_total > args.total_steps:
+                            args.total_steps = calibrated_total
 
                 gov_str = f" | Gov: {alpha_gov:.2f}" if getattr(args, "loss_window_governor", True) and alpha_gov > 0.01 else ""
 
@@ -2459,8 +2626,9 @@ def run_training(**kwargs):
             setattr(args, k, v)
         elif k in ("checkpoint_dir", "ckpt_dir"):
             setattr(args, "checkpoint_dir", v)
-        elif k in ("max_steps", "total_steps"):
+        elif k in ("max_steps", "total_steps", "steps"):
             setattr(args, "total_steps", v)
+            args.total_steps_explicit = True
         elif k == "remat":
             setattr(args, "remat", str(v).lower())
     return main(args)

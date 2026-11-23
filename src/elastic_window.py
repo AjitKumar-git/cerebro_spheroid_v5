@@ -1998,15 +1998,15 @@ def build_pretrain_eval_split(
     pad_id: int = 0,
     return_weights: bool = False,
     domains: Optional[List[str]] = None,
+    stage: Optional[str] = None,
+    domain_weights: Optional[Dict[str, float]] = None,
 ):
     """
     Constructs a multi-domain canonical held-out evaluation split aligned 1:1 with
     the CerebroSpheroid V5 Pretraining distribution:
-      1. Broad Web Text (FineWeb sample-10BT)   : broad_web
-      2. Code Repositories (The Stack v2)       : code
-      3. Mathematics & Proofs (FineMath)        : math
-      4. Synthetic Textbooks (Cosmopedia v2)    : cosmopedia
-      5. Educational & Academic (FineWeb-Edu)   : edu_academic
+      Stage 1 (Pretrain / Step 1)      : broad_web (FineWeb 85%), code (The Stack 15%)
+      Stage 2 (Deep Reasoning)        : math (35%), cosmopedia (35%), code (20%), edu_academic (10%)
+      Canonical All-Domain            : broad_web (40%), code (20%), math (15%), cosmopedia (15%), edu_academic (10%)
 
     Evaluates 100% loss-bearing contiguous next-token sequences:
     The prompt provides `prompt_len` tokens of context, and the model is evaluated
@@ -2113,7 +2113,29 @@ def build_pretrain_eval_split(
         ),
     ]
 
-    if domains is not None:
+    # Resolve stage defaults if domains and domain_weights are not explicitly specified
+    if domains is None and domain_weights is None and stage is not None:
+        stage_norm = str(stage).lower()
+        if stage_norm in ("pretrain", "stage1", "stage_1", "step1"):
+            # Stage 1: FineWeb 85% + The Stack Code 15%
+            domains = ["broad_web", "code"]
+            domain_weights = {"broad_web": 0.85, "code": 0.15}
+        elif stage_norm in ("deep_reasoning", "reasoning", "stage2", "stage_2"):
+            # Stage 2: 35% Math, 35% Cosmopedia v2, 20% Code, 10% Edu Academic
+            domains = ["math", "cosmopedia", "code", "edu_academic"]
+            domain_weights = {"math": 0.35, "cosmopedia": 0.35, "code": 0.20, "edu_academic": 0.10}
+
+    if domain_weights is not None:
+        target_domain_set = set(domain_weights.keys()) if domains is None else (set(domains) & set(domain_weights.keys()))
+        domain_configs = [
+            (cfg[0], cfg[1], cfg[2], float(domain_weights[cfg[2]]))
+            for cfg in all_domain_configs
+            if cfg[2] in target_domain_set
+        ]
+        tot_wt = sum(cfg[3] for cfg in domain_configs)
+        if tot_wt > 0:
+            domain_configs = [(cfg[0], cfg[1], cfg[2], cfg[3] / tot_wt) for cfg in domain_configs]
+    elif domains is not None:
         target_domain_set = set(domains)
         domain_configs = [cfg for cfg in all_domain_configs if cfg[2] in target_domain_set]
         tot_wt = sum(cfg[3] for cfg in domain_configs)
@@ -2135,7 +2157,7 @@ def build_pretrain_eval_split(
 
     eval_batches = []
     domain_labels = []
-    domain_weights = []
+    eval_weights_out = []
 
     for name, stream_opener, ds_tag, weight in domain_configs:
         collected_texts: List[str] = []
@@ -2245,10 +2267,10 @@ def build_pretrain_eval_split(
 
         eval_batches.append((q_arr, r_arr, fb_arr))
         domain_labels.append(name)
-        domain_weights.append(weight)
+        eval_weights_out.append(weight)
 
     if return_weights:
-        return eval_batches, domain_labels, domain_weights
+        return eval_batches, domain_labels, eval_weights_out
     return eval_batches, domain_labels
 
 
