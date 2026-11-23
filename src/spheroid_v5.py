@@ -851,7 +851,7 @@ class PremotorMotorDecoderV5(nn.Module):
             self.affine_scale = nn.Parameter(torch.ones(surface_dim))
             # Tri-Head Affine Scales for Simultaneous Multi-Head Output:
             # 1. affine_think  : Cognitive Deliberation & Scratchpad (<think>)
-            # 2. affine_act    : Non-Conversational Actions (Code, Calculator, Tools) (<act>)
+            # 2. affine_act    : Tool Actions (Code, Calculator, Tools) (<tool_call>)
             # 3. affine_answer : Conversational Speech & Dialogue (Plain Text)
             self.affine_think = nn.Parameter(torch.ones(surface_dim))
             self.affine_act = nn.Parameter(torch.ones(surface_dim))
@@ -1169,7 +1169,7 @@ class PremotorMotorDecoderV5(nn.Module):
         """
         Simultaneously computes vocabulary logits across all three cognitive tiers:
           1. logits_think : Deliberation / Reasoning scratchpad (<think>)
-          2. logits_act   : Non-conversational actions (Coding, Calculator, Tools) (<act>)
+          2. logits_act   : Tool actions (Coding, Calculator, Tools) (<tool_call>)
           3. logits_answer: Conversational dialogue / Response (Plain Text)
         """
         tau = temp if temp is not None else float(torch.clamp(self.temperature_scale, 0.1, 5.0).item())
@@ -1199,7 +1199,7 @@ class PremotorMotorDecoderV5(nn.Module):
         """
         Computes dynamic temporal emission probabilities for the three heads:
           1. gate_think  : Deliberation / Reasoning scratchpad (<think>)
-          2. gate_act    : Non-conversational Action (Code, Calculator, Tools) (<act>)
+          2. gate_act    : Tool Action (Code, Calculator, Tools) (<tool_call>)
           3. gate_answer : Conversational Speech / Response (Plain Text)
         Returns:
           (gate_think, gate_act, gate_answer) as probabilities in [0.0, 1.0]
@@ -2438,7 +2438,7 @@ class CerebroSpheroidV5(nn.Module):
     ) -> Dict[str, Any]:
         """
         Executes a 2-turn closed-loop agentic ReAct rollout:
-        Turn 1: Model emits deliberate action (<act> calc(...) </act>).
+        Turn 1: Model emits deliberate action (<tool_call> calc(...) </tool_call>).
         Execution: Safe deterministic tool execution in sandbox.
         Turn 2: Tool observation is fed back to produce final verified answer.
         """
@@ -2507,7 +2507,7 @@ class CerebroSpheroidV5(nn.Module):
         Simultaneous Tri-Head Cognitive Emission:
         Emits all 3 streams simultaneously from the shared manifold hidden state:
           - Head 1 (Think)  : Emits cognitive reasoning scratchpad (<think>)
-          - Head 2 (Act)    : Emits non-conversational code / calculator / tool actions (<act>)
+          - Head 2 (Act)    : Emits tool actions (<tool_call>)
           - Head 3 (Answer) : Emits natural conversational answer (Plain Text)
         """
         from src.corpus import format_stimulus_prompt, encode_no_special

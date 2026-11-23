@@ -421,12 +421,12 @@ class RectifiedContiguousPretrainStreamer:
 
     def _smollm2_shares(self) -> Dict[str, float]:
         """Return the SmolLM2 developmental mixture for cumulative training progress."""
-        if self.stage in ("deep_reasoning", "reasoning"):
+        if getattr(self, "stage", "pretrain") in ("deep_reasoning", "reasoning", "midtrain", "midtraining"):
             return {
-                "math": 0.35,
-                "cosmopedia": 0.35,
-                "code": 0.20,
-                "edu_academic": 0.10,
+                "edu_academic": 0.40,
+                "math": 0.30,
+                "cosmopedia": 0.15,
+                "code": 0.15,
             }
 
         progress = 0.0

@@ -1142,14 +1142,10 @@ def training_rollout(
         prev_tokens = None
 
     # Track independent tri-head affine scale specialization strictly without target leakage
-    th_start = getattr(config, "think_token_id", 29) if config is not None else 29
-    th_end = getattr(config, "think_end_token_id", 30) if config is not None else 30
-    act_start = getattr(config, "act_token_id", 31) if config is not None else 31
-    if config is not None and getattr(config, "tool_token_id", None) is not None:
-        act_start = config.tool_token_id
-    act_end = getattr(config, "act_end_token_id", 32) if config is not None else 32
-    if config is not None and getattr(config, "tool_end_token_id", None) is not None:
-        act_end = config.tool_end_token_id
+    th_start = (getattr(config, "think_token_id", None) or 29) if config is not None else 29
+    th_end = (getattr(config, "think_end_token_id", None) or 30) if config is not None else 30
+    act_start = (getattr(config, "tool_token_id", None) or getattr(config, "act_token_id", None) or 31) if config is not None else 31
+    act_end = (getattr(config, "tool_end_token_id", None) or getattr(config, "act_end_token_id", None) or 32) if config is not None else 32
 
     # Check whether prompt had unclosed think or act tokens
     if prompts is not None and prompts.ndim == 2:
@@ -1853,7 +1849,7 @@ def emit_tri_head_logits_jax(
     """
     Simultaneously computes vocabulary logits across all three cognitive tiers in JAX:
       1. logits_think : Deliberation / Reasoning scratchpad (<think>)
-      2. logits_act   : Non-conversational actions (Coding, Calculator, Tools) (<act>)
+      2. logits_act   : Tool actions (Coding, Calculator, Tools) (<tool_call>)
       3. logits_answer: Conversational dialogue / Response (Plain Text)
     """
     w_emb = params.get("motor.head.weight", params["sensory.embedding.weight"])
@@ -1908,7 +1904,7 @@ def generate_tri_stream_jax(
     Simultaneous Tri-Head Cognitive Emission in JAX:
     Emits all 3 streams simultaneously from the shared manifold hidden state:
       - Head 1 (Think)  : Emits cognitive reasoning scratchpad (<think>)
-      - Head 2 (Act)    : Emits non-conversational code / calculator / tool actions (<act>)
+      - Head 2 (Act)    : Emits tool actions (<tool_call>)
       - Head 3 (Answer) : Emits natural conversational answer (Plain Text)
     """
     import numpy as np

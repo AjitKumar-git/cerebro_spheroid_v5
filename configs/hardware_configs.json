@@ -201,6 +201,37 @@
       "worst_case_seq_len": 16,
       "tuner_version": 2,
       "num_devices": 2
+    },
+    "NVIDIA_GeForce_RTX_3050_Laptop_GPU_4GB_seq8_dev2_remat1_prompt8_wc16_dtypeauto_objbalanced_cfg8daf9862": {
+      "preset": "v5_test",
+      "batch_size": 32,
+      "remat": true,
+      "seq_len": 8,
+      "prompt_len": 8,
+      "dtype": "auto",
+      "compile_time": 11.128899574279785,
+      "step_ms": 353.324294090271,
+      "steps_per_sec": 2.8302610851449392,
+      "tok_per_sec": 724.5468377971044,
+      "memory_gb": 0.04917614068835974,
+      "memory_utilization_pct": 1.3286640650364214,
+      "memory_type": "VRAM",
+      "vram_gb": 0.04917614068835974,
+      "vram_utilization_pct": 1.3286640650364214,
+      "initial_loss": 7.7078537940979,
+      "final_loss": 7.321523666381836,
+      "delta_loss": 0.38633012771606445,
+      "loss_reduction_per_sec": 1.0934151264938516,
+      "benchmark_steps": 2,
+      "tokens_per_step": 256,
+      "status": "PASS",
+      "tune_objective": "balanced",
+      "max_batch_size": null,
+      "worst_case_seq_len": 16,
+      "tuner_version": 2,
+      "num_devices": 2,
+      "require_remat": true,
+      "model_hash": "_cfg8daf9862"
     }
   }
 }

@@ -13,7 +13,7 @@ CerebroSpheroid V5 is a neuro-inspired, sensorimotor cognitive architecture desi
 Rather than treating language generation as flat sequence autocomplete, CerebroSpheroid V5 organizes compute into an explicit **sensorimotor cortical hierarchy**:
 1. **Sensory Afference (Input Cortical Mantle)**: Prompt inputs undergo bidirectional contextual self-attention and are injected into outer cortical shells (standard natural text or ChatML format).
 2. **Subconscious Deliberation (Concentric Laminae)**: Information recirculates across 32 concentric recurrent shells via SwiGLU intra-shell convection, bidirectional wave propagation, and 96 small-world shortcut axonal tracts.
-3. **Efferent Motor Action (Output Cortex)**: Generation proceeds via an affine-tied vocabulary head with 3-tier cognitive boundary separation (`<think>` latent deliberation, `<tool_call>` motor commands, and direct answers). Non-standard tokens like `<act>` and `<stim>` have been strictly purged in favor of industry standards.
+3. **Efferent Motor Action (Output Cortex)**: Generation proceeds via an affine-tied vocabulary head with 3-tier cognitive boundary separation (`<think>` latent deliberation, `<tool_call>` motor commands, and direct answers).
 
 ```
                          AFFERENT SENSORY FLUX
@@ -125,7 +125,7 @@ Pretraining in CerebroSpheroid V5 strictly implements the 4-stage developmental 
 
 ### Data Integrity Rules
 - **100% Loss-Bearing**: Every token in the window contributes to pretraining cross-entropy. Zero `-100` label masking.
-- **Unrestricted Tool Exploration**: Pretraining tool loss is locked at $0.0$. The model may freely generate `<act>` tokens without penalization or premature clamping.
+- **Unrestricted Tool Exploration**: Pretraining tool loss is locked at $0.0$. The model may freely generate `<tool_call>` tokens without penalization or premature clamping.
 - **Pure Contiguous Documents**: Documents are packed end-to-end to maximize token throughput and context utilization.
 
 ---
@@ -140,7 +140,6 @@ CerebroSpheroid V5 enforces a clean operational separation across cognitive moda
 2. **Discrete Tool Calling (`<tool_call> ... </tool_call>`)**:
    - Dispatches deterministic external tool calls (`CALCULATOR`, `FACTUAL_DB`, `BASH`, `PYTHON`).
    - Closed-loop re-afference feeds external tool outputs back as `<tool_response> ... </tool_response>`.
-   - Legacy custom biological tokens (`<act>`, `</act>`, `<stim>`, `</stim>`) have been completely purged.
 3. **Direct Natural Language Response**:
    - Clean, objective final answer generated after deliberation completes.
 
@@ -189,7 +188,7 @@ Standard autoregressive language models suffer from over-agreement with erroneou
 1. **Pre-Emission Deliberation ($T \ge 4$)**:
    The model executes 4 complete recurrent passes through the 32 shells before the motor head produces its first token. Semantic truth values are verified in latent space before lexical emission.
 2. **Biological Refractory Clamping**:
-   Tokens in the prompt `<stim>` are registered into an inhibition-of-return refractory buffer:
+   Tokens in the prompt are registered into an inhibition-of-return refractory buffer:
    $$\text{Logits}[k] \leftarrow \text{Logits}[k] - \alpha_{\text{prompt}} \cdot \text{refractory}[k]$$
    This prevents the model from parroting back false statements verbatim.
 3. **Flattery Clamping in Teacher Digestion**:
@@ -216,7 +215,7 @@ All active components of the V5 architecture, curriculum, optimizer, and cogniti
 | Test Suite | Coverage | Status |
 | :--- | :--- | :--- |
 | `tests/test_autonomous_smollm2_curriculum.py` | SmolLM2 4-stage ratios, dataset mixtures, 100% loss-bearing tokens | **PASS** (6/6) |
-| `tests/test_act_tool_calling_boundary.py` | `<think>`, `<act>`, plain text boundary enforcement & tool isolation | **PASS** (8/8) |
+| `tests/test_act_tool_calling_boundary.py` | `<think>`, `<tool_call>`, plain text boundary enforcement & tool isolation | **PASS** (8/8) |
 | `tests/test_stage_transitions_and_chunking.py` | Sequence bucketing, continuous windowing, transition smoothness | **PASS** (4/4) |
 | `tests/test_graded_curriculum.py` | Multi-dataset ingestion, Parquet streaming, token rate tracking | **PASS** (4/4) |
 | `tests/test_jax_scmer.py` | SCMER analytic gradients, centering, anti-anisotropy penalty | **PASS** |

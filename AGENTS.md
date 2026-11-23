@@ -54,7 +54,7 @@ Autonomous pretraining (`src/elastic_window.py`, `scripts/run_autonomous_trainin
 ### Critical Pretraining Rules:
 - **100% Loss-Bearing Tokens**: Every token in pretraining windows must contribute to cross-entropy loss. Never mask tokens with `-100` label masking during pretraining.
 - **Zero SFT Contamination**: Pretraining streams pure contiguous documents. Do NOT inject conversational SFT Q&A templates or prompt-response boundaries into pretraining.
-- **Unrestricted Tool Exploration**: Pretraining tool loss is strictly **`0.0`**. Allow the model to freely explore tool tokens (`<act>`) without loss penalties.
+- **Unrestricted Tool Exploration**: Pretraining tool loss is strictly **`0.0`**. Allow the model to freely explore tool tokens (`<tool_call>`) without loss penalties.
 
 ---
 
@@ -66,9 +66,8 @@ CerebroSpheroid V5 enforces an industry-standard **3-tier cognitive boundary**:
 3. Plain text: Direct, objective response after deliberation completes.
 
 ### Token Standardization Invariants:
-- **PURGE NON-STANDARD TOKENS**: Custom non-standard pseudo-biological tokens (`<act>`, `</act>`, `<stim>`, `</stim>`) are strictly purged from all new outputs, data formatting, and generation pipelines.
-- Prompts are ingested as clean natural language or standard ChatML (`<|im_start|>user\n...<|im_end|>`), NEVER wrapped in `<stim> ... </stim>`.
-- Python code generation is emitted in standard Markdown code fences (````python\n...````), NOT wrapped in tool or action tags.
+- Prompts are ingested as clean natural language or standard ChatML (`<|im_start|>user\n...<|im_end|>`).
+- Python code generation is emitted in standard Markdown code fences (````python\n...````), NOT wrapped in custom tags.
 
 ---
 

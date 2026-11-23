@@ -29,7 +29,7 @@ Planned improvements tracked for future development cycles and scaling phases.
 ## 3. Post-Pretraining Cognitive & Tool Dispatch Evaluation
 
 - **Current State**:
-  - Strict 3-tier boundary (`<think>`, `<act>`, plain text response) enforced with zero tool loss penalty during pretraining.
+  - Strict 3-tier boundary (`<think>`, `<tool_call>`, plain text response) enforced with zero tool loss penalty during pretraining.
   - Test suites verify tool isolation and syntactic boundary emission.
 - **Planned Upgrades**:
   1. **Standardized Tool Benchmark Suite**: Implement an automated evaluation benchmark scoring discrete action accuracy across `CALCULATOR`, `FACTUAL_DB`, and `PYTHON` execution on holdout task splits.

@@ -321,7 +321,7 @@ def build_data_stream(
         pass
 
     # 100% Loss-Bearing Rectified Contiguous Pretraining Streamer
-    if dataset_source in ("pretrain", "rectified", "rectified_pretrain", "clean_pretrain"):
+    if dataset_source in ("pretrain", "rectified", "rectified_pretrain", "clean_pretrain", "midtrain", "midtraining", "deep_reasoning"):
         if not HAS_DATASETS:
             raise RuntimeError(
                 f"❌ [DataStreamer Fatal] 'datasets' library is required for online pretraining dataset '{dataset_source}', "
@@ -329,16 +329,22 @@ def build_data_stream(
                 f"   Cleanly stopping training without falling back to mock data."
             )
         from src.rectified_streamer import RectifiedContiguousPretrainStreamer
+        is_mid = dataset_source in ("midtrain", "midtraining", "deep_reasoning")
+        stage_name = "midtrain" if is_mid else "pretrain"
         print(f"\n📦 Initializing 100% Loss-Bearing Rectified Contiguous Streamer [{dataset_source.upper()}]...")
-        print(f"   • Stage:          SmolLM2 4-stage developmental curriculum")
-        print(f"   • Mixture:        90/10 -> 75/20/5 -> 70/20/10 -> 58/24/14/4")
+        if is_mid:
+            print(f"   • Stage:          Mid-Training (Deep Reasoning & STEM)")
+            print(f"   • Mixture:        40% FineWeb-Edu (>=3.5) | 30% FineMath | 15% Cosmopedia v2 | 15% Code [ZERO SFT]")
+        else:
+            print(f"   • Stage:          SmolLM2 4-stage developmental curriculum")
+            print(f"   • Mixture:        90/10 -> 75/20/5 -> 70/20/10 -> 58/24/14/4")
         print(f"   • Context Window: {total_window} tokens (contiguous unbroken next-token loss)")
         print(f"   • Global Batch:   {batch_size} sequences/step")
         streamer = RectifiedContiguousPretrainStreamer(
             tokenizer=tokenizer,
             batch_size=batch_size,
             block_size=total_window,
-            stage="pretrain",
+            stage=stage_name,
             queue_size=max(16, int(prefetch_queue_size)),
             progress_getter=step_getter,
             total_steps=total_steps,

@@ -1,13 +1,13 @@
 # CerebroSpheroid V5: Architectural & Biological Sensorimotor Specification
 
-## 1. Core Principle: Strategy A (Step 0 Sensorimotor Invariants)
+## 1. Core Principle: Sensorimotor Cognitive Architecture
 
 CerebroSpheroid V5 models diverge fundamentally from monolithic decoder-only transformers. Rather than treating prompts and responses as arbitrary slices of a flat autoregressive sequence, V5 is built on an explicit **sensorimotor cognitive architecture**:
 
 ```
                          AFFERENT SENSORY FLUX
                      ┌────────────────────────────┐
-                     │  <stim> {prompt} </stim>   │
+                     │     Prompt / Input Text    │
                      └─────────────┬──────────────┘
                                    │
                                    ▼
@@ -30,22 +30,24 @@ CerebroSpheroid V5 models diverge fundamentally from monolithic decoder-only tra
                                    │
                                    ▼
                      ┌────────────────────────────┐
-                     │   <act> {response} </act>  │
+                     │ <think> ... </think>       │
+                     │ <tool_call> ...            │
+                     │ Grounded Motor Answer      │
                      └────────────────────────────┘
                          EFFERENT MOTOR ACTIONS
 ```
 
-### Invariants Enforced Under Strategy A:
-1. **Sensory Afference (`<stim> ... </stim>`)**:
-   - Every input prompt, instruction, educational query, or contextual situation is strictly enclosed within `<stim>` and `</stim>`.
-   - Seeded exclusively into the outer concentric cortical shell (Shell 15) via masked centroid pooling.
-2. **Motor Efference (`<act> ... </act>`)**:
-   - Every response, derivation, chain-of-thought, or agentic tool invocation is strictly enclosed within `<act>` and `</act>`.
-   - Motor emission terminates when `</act>` (or EOS) is discharged.
+### Sensorimotor Principles:
+1. **Sensory Afference**:
+   - Input prompts, instructions, educational queries, or contextual problems are ingested directly as clean natural text.
+   - Seeded into the outer concentric cortical shell (Shell 15) via masked centroid pooling and sensory projection.
+2. **Motor Efference & Cognitive Boundaries**:
+   - Motor emissions proceed through explicit cognitive boundaries: `<think> ... </think>` for internal latent deliberation, `<tool_call> ... </tool_call>` for tool dispatch, and grounded natural language answers.
+   - Motor emission terminates when `</s>` (EOS) is discharged.
    - Efference copies of active motor emissions are projected back into Shell 0 (Subcortical Core) to maintain causal feedback.
-3. **Step 0 Grounding**:
-   - Both online streaming (`dense_edu`, `ElasticBucketBatcher`) and offline prefetching (`LinguisticDataStreamer`) apply biological delimiters from the very first gradient step (Step 0).
-   - This eliminates format shift shock when transitioning from pretraining to instruction/tool tuning.
+3. **Standard Cognitive Delimiters**:
+   - Training operates cleanly on native standard delimiters (`<s>`, `</s>`, `<think>`, `</think>`, `<tool_call>`, `</tool_call>`, `<tool_response>`, `</tool_response>`).
+   - All input queries, educational prompts, and instructions use natural text without wrapper tags.
 
 ---
 
@@ -55,13 +57,14 @@ CerebroSpheroid V5 models diverge fundamentally from monolithic decoder-only tra
 | :--- | :--- | :--- |
 | **Tokenizer Architecture** | Byte-Fallback BPE | Strictly 32,000 Vocabulary |
 | **Tokenizer Source** | `data/tokenizer/` | Fully bundled, 100% offline |
-| **Special Tokens** | PAD=0, BOS=1, EOS=2 | Zero `<unk>` due to byte-level fallback |
-| **`<stim>` Encoding** | Subword sequence | `[529, 303, 326, 29958]` (`<`, `st`, `im`, `>`) |
-| **`</stim>` Encoding** | Subword sequence | `[1533, 303, 326, 29958]` (`</`, `st`, `im`, `>`) |
-| **`<act>` Encoding** | Subword sequence | `[529, 627, 29958]` (`<`, `act`, `>`) |
-| **`</act>` Encoding** | Subword sequence | `[1533, 627, 29958]` (`</`, `act`, `>`) |
+| **Special Tokens** | PAD=0, BOS=1 (`<s>`), EOS=2 (`</s>`) | Zero `<unk>` due to byte-level fallback |
+| **`<|im_start|>` / `<|im_end|>`** | ChatML Delimiter Tokens | ID 27 / ID 28 |
+| **`<think>` / `</think>`** | Dedicated Cognitive Tokens | ID 29 / ID 30 |
+| **`<tool_call>` / `</tool_call>`** | Dedicated Motor Action Tokens | ID 31 / ID 32 |
+| **`<tool_response>` / `</tool_response>`** | Dedicated Sensory Feedback Tokens | ID 33 / ID 34 |
 
 ### Strict Prohibition of Legacy Artifacts:
+* **Standard Input Representation**: All prompts and inputs use clean natural text without artificial wrapper envelopes.
 * **Zero GPT-2 Artifacts**: The 50,257-vocabulary GPT-2 tokenizer, legacy token IDs (`20436`, `1044`), and GPT-2 configurations are completely deprecated and barred from V5. Calling `build_tokenizer("gpt2")` raises a `ValueError`.
 * **Zero Hardcoded Paths**: No `/home/user/` or absolute machine-specific cache paths are permitted in active source or scripts. All tokenizer and data paths resolve relative to the repository root (`data/tokenizer/`).
 

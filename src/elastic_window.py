@@ -104,7 +104,7 @@ class DatasetTelemetry:
 GLOBAL_TELEMETRY = DatasetTelemetry()
 
 
-def _normalize_3tier_response(r_txt: str, q_txt: str = "", strip_scratchpad: bool = True) -> str:
+def _normalize_3tier_response(r_txt: str, q_txt: str = "", strip_scratchpad: bool = False) -> str:
     """
     Enforces the Cognitive Output Architecture:
       1. Latent Deliberation: If strip_scratchpad=True, English <think> ... </think> scratchpads
@@ -484,7 +484,7 @@ def build_online_dataset_iterator(
         source = "autonomous"
     elif source in ("fineweb_edu",):
         source = "dense_edu"
-    elif source in ("reasoning", "beat_smollm", "smollm_pass", "frontier_mix", "tri_pillar"):
+    elif source in ("reasoning", "beat_smollm", "smollm_pass", "frontier_mix", "tri_pillar", "midtrain", "midtraining"):
         source = "reasoning_anneal"
     elif source in ("agentic", "workflows"):
         source = "conversation_sft"
@@ -1057,37 +1057,28 @@ def build_online_dataset_iterator(
     if source == "dense_edu":
         cosmo_it: Optional[Iterator[Any]] = None
         fw_it: Optional[Iterator[Any]] = None
-        oh_it: Optional[Iterator[Any]] = None
 
         def _dense_gen():
-            nonlocal cosmo_it, fw_it, oh_it
+            nonlocal cosmo_it, fw_it
             turn = 0
             while True:
-                mod5 = turn % 5
+                mod2 = turn % 2
                 try:
-                    if mod5 in (0, 2):
+                    if mod2 == 0:
+                        # 50% FineWeb-Edu (Educational Score >= 3.0)
+                        row, fw_it = _next_filtered_fineweb(
+                            fw_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size), min_score=3.0
+                        )
+                        if isinstance(row, dict):
+                            row["_dataset"] = "fineweb_edu"
+                        yield row
+                    else:
+                        # 50% High-Density Pedagogical Textbooks (Cosmopedia v2)
                         row, cosmo_it = _next_or_reopen(
                             cosmo_it, lambda: _open_hf_stream("HuggingFaceTB/cosmopedia-v2", "cosmopedia-v2", rank=rank, world_size=world_size)
                         )
-                        p = (row.get("prompt") or "Explain the educational context of this topic:").strip()
-                        r = (row.get("text") or "").strip()
-                        if len(r) >= 30:
-                            yield {"conversations": [{"from": "human", "value": p}, {"from": "gpt", "value": r}]}
-                    elif mod5 in (1, 4):
-                        for _ in range(20):
-                            row, fw_it = _next_or_reopen(
-                                fw_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size)
-                            )
-                            if float(row.get("score", 0.0) or row.get("educational_score", 0.0) or row.get("int_score", 0.0)) >= 3.0:
-                                text = (row.get("text") or "").strip()
-                                if len(text) >= 50:
-                                    p, r = text.split("\n\n", 1) if "\n\n" in text else ("Explain the concept:", text)
-                                    yield {"conversations": [{"from": "human", "value": p.strip()}, {"from": "gpt", "value": r.strip()}]}
-                                    break
-                    else:
-                        row, oh_it = _next_or_reopen(
-                            oh_it, lambda: _open_hf_stream("teknium/OpenHermes-2.5", rank=rank, world_size=world_size)
-                        )
+                        if isinstance(row, dict):
+                            row["_dataset"] = "cosmopedia_v2"
                         yield row
                 except Exception:
                     time.sleep(0.5)
@@ -1130,73 +1121,87 @@ def build_online_dataset_iterator(
         return _wrap_with_retrieval_injection(_conv_gen())
 
     if source == "reasoning_anneal":
-        gsm_it: Optional[Iterator[Any]] = None
-        math_it: Optional[Iterator[Any]] = None
-        everyday_it: Optional[Iterator[Any]] = None
-        openhermes_it: Optional[Iterator[Any]] = None
+        # Mid-training / Deep Reasoning Mixture: STRICTLY ZERO SFT CONTAMINATION
+        # Exclusively 100% loss-bearing contiguous pretraining on advanced STEM, mathematical proofs,
+        # algorithmic code, and academic textbooks.
+        finemath_it: Optional[Iterator[Any]] = None
+        cosmo_it: Optional[Iterator[Any]] = None
         code_it: Optional[Iterator[Any]] = None
-        logic_it: Optional[Iterator[Any]] = None
-        know_it: Optional[Iterator[Any]] = None
+        edu_it: Optional[Iterator[Any]] = None
+
+        def _open_midtrain_math():
+            candidates = [
+                ("HuggingFaceTB/finemath", "finemath-4plus"),
+                ("HuggingFaceTB/finemath", "finemath-3plus"),
+                ("open-web-math/open-web-math", None),
+            ]
+            for c_repo, c_cfg in candidates:
+                try:
+                    return _open_hf_stream(c_repo, c_cfg, rank=rank, world_size=world_size)
+                except Exception:
+                    continue
+            return _open_hf_stream("HuggingFaceTB/finemath", "finemath-4plus", rank=rank, world_size=world_size)
+
+        def _open_midtrain_cosmo():
+            candidates = [
+                ("AjitKumar-Bio/cosmopedia-v2-digested", None),
+                ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2"),
+                ("HuggingFaceTB/cosmopedia-v2", "cosmopedia-v2"),
+            ]
+            for c_repo, c_cfg in candidates:
+                try:
+                    return _open_hf_stream(c_repo, c_cfg, rank=rank, world_size=world_size)
+                except Exception:
+                    continue
+            return _open_hf_stream("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", rank=rank, world_size=world_size)
+
+        def _open_midtrain_code():
+            candidates = [
+                ("bigcode/the-stack-dedup", "data/python"),
+                ("ajibawa-2023/Python-Code-Large", None),
+            ]
+            for c_repo, c_cfg in candidates:
+                try:
+                    return _open_hf_stream(c_repo, c_cfg, rank=rank, world_size=world_size)
+                except Exception:
+                    continue
+            return _open_hf_stream("ajibawa-2023/Python-Code-Large", None, rank=rank, world_size=world_size)
+
+        def _open_midtrain_edu():
+            return _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-10BT", rank=rank, world_size=world_size)
 
         def _reason_gen():
-            nonlocal gsm_it, math_it, everyday_it, openhermes_it, code_it, logic_it, know_it
+            nonlocal finemath_it, cosmo_it, code_it, edu_it
             turn = 0
             while True:
-                mod6 = turn % 6
+                # 40% FineWeb-Edu, 30% Math, 15% Cosmopedia, 15% Code (Cycle of 20: 8 Edu, 6 Math, 3 Cosmo, 3 Code)
+                mod20 = turn % 20
                 try:
-                    if mod6 == 0:
-                        # 1. Exact Match Math-CoT: GSM8K (with official #### anchor) + MetaMathQA proofs
-                        if (turn // 6) % 2 == 0:
-                            row, gsm_it = _next_or_reopen(
-                                gsm_it, lambda: _open_hf_stream("openai/gsm8k", "main", rank=rank, world_size=world_size)
-                            )
-                        else:
-                            row, math_it = _next_or_reopen(
-                                math_it, lambda: _open_hf_stream("meta-math/MetaMathQA", rank=rank, world_size=world_size)
-                            )
+                    if mod20 < 8:
+                        # 40% Academic Scientific Prose (FineWeb-Edu score >= 3.5)
+                        row, edu_it = _next_filtered_fineweb(edu_it, _open_midtrain_edu, min_score=3.5)
+                        if isinstance(row, dict):
+                            row["_dataset"] = "fineweb_edu_stem"
                         yield row
-                    elif mod6 in (1, 3):
-                        # 2 & 4. Science & Academic Anchor: FineWeb-Edu (score >= 3.0) -> 33.3% allocation!
-                        # Protects and locks in ARC-Challenge (40%+) and MMLU factual recall
-                        row, know_it = _next_filtered_fineweb(
-                            know_it, lambda: _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-350BT", rank=rank, world_size=world_size), min_score=3.0
-                        )
+                    elif mod20 < 14:
+                        # 30% Advanced Mathematical Deductions & Proofs (FineMath)
+                        row, finemath_it = _next_or_reopen(finemath_it, _open_midtrain_math)
+                        if isinstance(row, dict):
+                            row["_dataset"] = "finemath"
                         yield row
-                    elif mod6 == 2:
-                        # 3. Everyday Commonsense Physical Actions (SmolTalk everyday-conversations) -> Targets HellaSwag
-                        row, everyday_it = _next_or_reopen(
-                            everyday_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "everyday-conversations", rank=rank, world_size=world_size)
-                        )
-                        yield row
-                    elif mod6 == 4:
-                        # 5. Multi-Subject Academic STEM & Logic (SmolTalk openhermes-100k + smol-magpie-ultra)
-                        if (turn // 6) % 2 == 0:
-                            row, openhermes_it = _next_or_reopen(
-                                openhermes_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "openhermes-100k", rank=rank, world_size=world_size)
-                            )
-                        else:
-                            row, logic_it = _next_or_reopen(
-                                logic_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "smol-magpie-ultra", rank=rank, world_size=world_size)
-                            )
+                    elif mod20 < 17:
+                        # 15% Pedagogical Textbooks (Cosmopedia v2)
+                        row, cosmo_it = _next_or_reopen(cosmo_it, _open_midtrain_cosmo)
+                        if isinstance(row, dict):
+                            row["_dataset"] = "cosmopedia_v2"
                         yield row
                     else:
-                        # 6. Python-Edu Software Algorithms & Code Blocks (SmolTalk self-oss-instruct) -> Targets HumanEval
-                        row, code_it = _next_or_reopen(
-                            code_it, lambda: _open_hf_stream("HuggingFaceTB/smoltalk", "self-oss-instruct", rank=rank, world_size=world_size)
-                        )
+                        # 15% Algorithmic & Software Python Code
+                        row, code_it = _next_or_reopen(code_it, _open_midtrain_code)
+                        if isinstance(row, dict):
+                            row["_dataset"] = "code_python"
                         yield row
                 except Exception:
-                    try:
-                        import json
-                        base_data = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "cerebro_cognitive_8k", "cerebro_cognitive_10k.jsonl")
-                        if os.path.exists(base_data):
-                            with open(base_data, "r", encoding="utf-8") as f:
-                                for line in f:
-                                    if line.strip():
-                                        d = json.loads(line)
-                                        yield {"conversations": [{"from": "human", "value": d.get("question", "")}, {"from": "gpt", "value": d.get("answer", "")}]}
-                    except Exception:
-                        pass
                     time.sleep(0.5)
                 turn += 1
 

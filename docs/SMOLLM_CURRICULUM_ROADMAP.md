@@ -63,7 +63,7 @@ SmolLM2 demonstrates that pretraining performance is maximized by a 4-stage data
    - Multi-turn instruction tuning and conversation templates are strictly reserved for post-pretraining SFT (`training/train_v5_sft.py`).
 3. **Unrestricted Tool Exploration**:
    - During pretraining, tool loss is explicitly locked at $0.0$.
-   - The model is allowed free generation of cognitive boundaries (`<think>`, `<act>`) without penalization.
+   - The model is allowed free generation of cognitive boundaries (`<think>`, `<tool_call>`) without penalization.
 
 ---
 

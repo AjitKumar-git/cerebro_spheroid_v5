@@ -47,8 +47,9 @@ python colab/train_v5_small_colab_tpu.py \
 ```
 
 ### Stage 2: (Optional) Mid-training (~4B Tokens)
-- **Objective:** Deep STEM reasoning, math proofs, and 4k associative retrieval memory.
-- **Mix:** 45% FineWeb-Edu ($\ge 3.5$) + 25% FineMath + 15% Code + 15% Multi-position 4k retrieval needles.
+- **Objective:** Deep STEM reasoning, mathematical proofs, algorithmic code, pedagogical textbooks, and 4k associative retrieval memory.
+- **Mix:** 40% FineWeb-Edu ($\ge 3.5$) + 30% FineMath + 15% Cosmopedia v2 + 15% Python Code.
+- **Supervision:** 100% loss-bearing contiguous sequences. **Strictly ZERO SFT contamination** (no conversational wrappers, no chat templates, no prompt masking).
 ```bash
 python colab/train_v5_small_colab_tpu.py \
     --mode contiguous_pretrain \
@@ -60,7 +61,7 @@ python colab/train_v5_small_colab_tpu.py \
 ```
 
 ### Stage 3: (Optional) SFT & Tool Calling (~50M Tokens)
-- **Objective:** `<think>` deliberation formatting, plain conversational answers, and strict `<act> calc(...) </act>` tool execution.
+- **Objective:** `<think>` deliberation formatting, plain conversational answers, and strict `<tool_call> calc(...) </tool_call>` tool execution.
 - **Mix:** Curated SmolTalk, OpenHermes, and verified tool execution trajectories.
 - **Supervision:** Prompt-masked (loss applies strictly to thinking, answers, and tool calls).
 ```bash

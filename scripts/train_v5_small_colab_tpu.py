@@ -438,7 +438,12 @@ def main(args=None):
     if args.mode == "contiguous_pretrain":
         print(f"\n🌊 Rectified Contiguous Pretraining Engine Active (100% Loss-Bearing Tokens):")
         print(f"   - Curriculum Stage:     {args.stage.upper()}")
-        print(f"   - Target Token Mixture: 85% Broad Web (FineWeb 10BT) | 15% Pretraining Code (The Stack v2)")
+        if args.stage.lower() == "pretrain":
+            print(f"   - Target Token Mixture: 85% Broad Web (FineWeb 10BT) | 15% Pretraining Code (The Stack v2)")
+        elif args.stage.lower() in ("midtrain", "midtraining", "deep_reasoning", "reasoning"):
+            print(f"   - Target Token Mixture: 40% FineWeb-Edu (>=3.5) | 30% FineMath | 15% Cosmopedia v2 | 15% Code [ZERO SFT]")
+        else:
+            print(f"   - Target Token Mixture: Dynamic SmolLM2 Multi-Stage Pretraining Curriculum")
         print(f"   - Block Size:           {args.total_window} contiguous tokens per sequence")
         print(f"   - Prompt Input:         1 token (BOS seed)")
         print(f"   - Target Supervision:   {args.total_window} tokens with cross-entropy next-token loss")

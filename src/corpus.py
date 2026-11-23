@@ -972,6 +972,8 @@ def encode_no_special(tokenizer, text: str, max_length: Optional[int] = None) ->
 def get_special_token_ids(tokenizer, include_thinking: bool = True) -> Dict[str, Optional[int]]:
     """Resolve single-token IDs for structured cognitive tokens (<tool_call>, <think>, etc.)."""
     tags = {
+        "im_start": "<|im_start|>",
+        "im_end": "<|im_end|>",
         "tool_call": "<tool_call>",
         "tool_call_end": "</tool_call>",
         "tool_response": "<tool_response>",
