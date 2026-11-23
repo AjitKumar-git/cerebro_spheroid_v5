@@ -9,6 +9,8 @@ Pareto-optimal parameter selection with fast bisection & theoretical HBM bounds.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import sys
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -29,6 +31,55 @@ from .cache import (
 )
 from .benchmark import BenchmarkRunner
 from .memory import estimate_peak_hbm
+
+
+def extract_model_shape_hash(
+    model_config: Optional[Any] = None,
+    config_overrides: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Computes a deterministic hash of model geometry to prevent cache collisions across model shapes."""
+    d_shape = {}
+    if model_config is not None:
+        for k in ("surface_dim", "radial_dim", "num_shells", "num_shortcut_tracts", "num_heads", "vocab_size"):
+            val = getattr(model_config, k, None) or (model_config.get(k) if isinstance(model_config, dict) else None)
+            if val is not None:
+                d_shape[k] = val
+    if config_overrides:
+        d_shape.update({k: v for k, v in config_overrides.items() if isinstance(v, (int, float, str, bool))})
+    if d_shape:
+        s_repr = json.dumps(d_shape, sort_keys=True)
+        return f"_cfg{hashlib.sha256(s_repr.encode('utf-8')).hexdigest()[:8]}"
+    return ""
+
+
+def build_cache_signature(
+    hardware_sig: str,
+    seq_len: int = 256,
+    prompt_len: int = 256,
+    max_batch_size: Optional[int] = None,
+    num_devices: int = 1,
+    require_remat: bool = False,
+    worst_case_seq_len: Optional[int] = None,
+    dtype: str = "auto",
+    tune_objective: str = "balanced",
+    model_config: Optional[Any] = None,
+    config_overrides: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Builds a deterministic unique cache signature capturing all architectural and hardware dimensions."""
+    dev_suffix = f"_dev{num_devices}" if num_devices > 1 else ""
+    seq_suffix = f"_seq{seq_len}" if seq_len != 256 else ""
+    cap_suffix = f"_cap{int(max_batch_size)}" if max_batch_size is not None else ""
+    remat_suffix = "_remat1" if require_remat else ""
+    prompt_suffix = f"_prompt{prompt_len}"
+    worst_suffix = f"_wc{worst_case_seq_len}" if worst_case_seq_len else ""
+    dtype_suffix = f"_dtype{str(dtype).lower().replace(' ', '')}"
+    objective_suffix = f"_obj{tune_objective}"
+    model_hash = extract_model_shape_hash(model_config, config_overrides)
+
+    return (
+        f"{hardware_sig}{seq_suffix}{cap_suffix}{dev_suffix}{remat_suffix}"
+        f"{prompt_suffix}{worst_suffix}{dtype_suffix}{objective_suffix}{model_hash}"
+    )
 
 
 class AutoTuner:
@@ -76,6 +127,7 @@ class AutoTuner:
         hardware_sig: Optional[str] = None,
         seq_len: int = 256,
         max_batch_size: Optional[int] = None,
+        device_signature: Optional[str] = None,
     ) -> bool:
         """Determines if the given architecture needs auto-tuning on this hardware."""
         arch_info = extract_architecture_signature(architecture, seq_len=seq_len)
@@ -88,6 +140,7 @@ class AutoTuner:
             seq_len=seq_len,
             max_batch_size=max_batch_size,
             tune_objective=self.objective.value,
+            device_signature=device_signature,
         )
 
     def tune_if_new(
@@ -112,19 +165,25 @@ class AutoTuner:
         hw = self.hardware_info if self.hardware_info is not None else self.get_hardware_info_fn()
         sig = hw["hardware_signature"]
 
+        cache_sig = build_cache_signature(
+            hardware_sig=sig,
+            seq_len=seq_len,
+            prompt_len=prompt_len,
+            max_batch_size=max_batch_size,
+            dtype=dtype,
+            tune_objective=self.objective.value,
+        )
+
         is_new = force_tune or self.architecture_detector.is_new_architecture(
             arch_info=arch_info,
             hardware_sig=sig,
             seq_len=seq_len,
             max_batch_size=max_batch_size,
             tune_objective=self.objective.value,
+            device_signature=cache_sig,
         )
 
         if not is_new and self.use_cached_config:
-            seq_suffix = f"_seq{seq_len}" if seq_len != 256 else ""
-            cap_suffix = f"_cap{int(max_batch_size)}" if max_batch_size is not None else ""
-            cache_sig = f"{sig}{seq_suffix}{cap_suffix}"
-
             cached = self.cache_manager.load(arch_info.architecture_name, cache_sig)
             if cached is None and cache_sig != sig and max_batch_size is None:
                 cached = self.cache_manager.load(arch_info.architecture_name, sig)
@@ -175,6 +234,7 @@ class AutoTuner:
         obj_name: str,
         verbose: bool,
         mem_type: str,
+        required_remat: Optional[bool] = None,
         **runner_kwargs,
     ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
         """
@@ -182,17 +242,38 @@ class AutoTuner:
         Reduces exploration complexity from O(N) to O(log N), finishing in 3-5 runs.
         """
         unique_batches = sorted(list(set(c["batch_size"] for c in candidates)))
+        allowed_remat = {
+            b: {bool(c.get("remat", True)) for c in candidates if c["batch_size"] == b}
+            for b in unique_batches
+        }
         results: List[Dict[str, Any]] = []
         best_config: Optional[Dict[str, Any]] = None
         best_score = -1.0
         eval_cache: Dict[Tuple[int, bool], Dict[str, Any]] = {}
 
-        def eval_batch(b: int, remat: bool = False) -> Dict[str, Any]:
+        def candidate_remat(b: int) -> bool:
+            if required_remat is not None:
+                return bool(required_remat)
+            modes = allowed_remat.get(b, {False})
+            return False if False in modes else True
+
+        def eval_batch(b: int, remat: Optional[bool] = None) -> Dict[str, Any]:
             nonlocal best_config, best_score
-            r = remat
+            r = candidate_remat(b) if remat is None else remat
             key = (b, r)
             if key in eval_cache:
                 return eval_cache[key]
+
+            if r not in allowed_remat.get(b, set()):
+                skip_res = {
+                    "preset": preset, "batch_size": b, "remat": r,
+                    "tok_per_sec": 0.0, "steps_per_sec": 0.0,
+                    "step_ms": None, "compile_time": None,
+                    "memory_gb": 0.0, "memory_utilization_pct": 0.0,
+                    "status": "SKIPPED (Not in candidate set)",
+                }
+                eval_cache[key] = skip_res
+                return skip_res
 
             if ladder.should_skip(b, r):
                 skip_res = {
@@ -259,12 +340,12 @@ class AutoTuner:
         mid = (low + high) // 2
         anchor_batch = unique_batches[mid]
 
-        res_anchor = eval_batch(anchor_batch, remat=False)
+        res_anchor = eval_batch(anchor_batch)
 
         if res_anchor.get("status") == "PASS":
             best_pass_idx = mid
             # Probe highest candidate to find upper bound
-            res_high = eval_batch(unique_batches[high], remat=False)
+            res_high = eval_batch(unique_batches[high])
             if res_high.get("status") == "PASS":
                 best_pass_idx = high
             else:
@@ -272,7 +353,7 @@ class AutoTuner:
                 l, r = mid, high
                 while r - l > 1:
                     m = (l + r) // 2
-                    res_m = eval_batch(unique_batches[m], remat=False)
+                    res_m = eval_batch(unique_batches[m])
                     if res_m.get("status") == "PASS":
                         l = m
                         best_pass_idx = m
@@ -284,20 +365,20 @@ class AutoTuner:
             l, r = low, mid
             while r - l > 1:
                 m = (l + r) // 2
-                res_m = eval_batch(unique_batches[m], remat=False)
+                res_m = eval_batch(unique_batches[m])
                 if res_m.get("status") == "PASS":
                     l = m
                     best_pass_idx = m
                 else:
                     r = m
             if best_pass_idx is None:
-                res_low = eval_batch(unique_batches[low], remat=False)
+                res_low = eval_batch(unique_batches[low])
                 if res_low.get("status") == "PASS":
                     best_pass_idx = low
 
         # 2. Check activation rematerialization (remat=True)
         # Test if next larger batch fits with activation checkpointing and beats best score
-        if best_pass_idx is not None and best_pass_idx + 1 < len(unique_batches):
+        if required_remat is None and best_pass_idx is not None and best_pass_idx + 1 < len(unique_batches):
             next_b = unique_batches[best_pass_idx + 1]
             res_remat = eval_batch(next_b, remat=True)
             if res_remat.get("status") == "PASS":
@@ -309,7 +390,7 @@ class AutoTuner:
                         curr_idx += 1
                     else:
                         break
-        elif best_pass_idx is None:
+        elif required_remat is None and best_pass_idx is None:
             # If all remat=False OOMed, bisect with remat=True
             l, r = low, high
             while l <= r:
@@ -346,6 +427,7 @@ class AutoTuner:
         model_config: Optional[Any] = None,
         config_overrides: Optional[Dict[str, Any]] = None,
         num_devices: Optional[int] = None,
+        require_remat: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Explores candidate configurations and selects the optimal hyperparameter settings."""
@@ -375,6 +457,7 @@ class AutoTuner:
         total_gb = hw["total_gb"]
         sig = hw["hardware_signature"]
         eff_devs = int(num_devices) if num_devices and num_devices > 0 else int(hw.get("device_count", 1))
+        model_hash = extract_model_shape_hash(model_config, config_overrides)
 
         runner_kwargs = {
             "worst_case_seq_len": worst_case_seq_len,
@@ -383,10 +466,19 @@ class AutoTuner:
             "num_devices": eff_devs,
             **kwargs,
         }
-        dev_suffix = f"_dev{eff_devs}" if eff_devs > 1 else ""
-        seq_suffix = f"_seq{seq_len}" if seq_len != 256 else ""
-        cap_suffix = f"_cap{int(max_batch_size)}" if max_batch_size is not None else ""
-        cache_sig = f"{sig}{seq_suffix}{cap_suffix}{dev_suffix}"
+        cache_sig = build_cache_signature(
+            hardware_sig=sig,
+            seq_len=seq_len,
+            prompt_len=prompt_len,
+            max_batch_size=max_batch_size,
+            num_devices=eff_devs,
+            require_remat=require_remat,
+            worst_case_seq_len=worst_case_seq_len,
+            dtype=dtype,
+            tune_objective=obj_name,
+            model_config=model_config,
+            config_overrides=config_overrides,
+        )
         mem_type = hw.get("memory_type", "HBM" if is_tpu else ("VRAM" if is_gpu else "RAM"))
 
         runner = BenchmarkRunner(benchmark_fn) if benchmark_fn else self.benchmark_runner
@@ -399,6 +491,17 @@ class AutoTuner:
             if max_batch_size is not None and int(cfg.get("batch_size", 0)) > int(max_batch_size):
                 return False
             if cfg.get("num_devices", 1) != eff_devs:
+                return False
+            if require_remat and not cfg.get("remat", False):
+                return False
+            # Ensure prompt length matches if recorded in cache entry
+            if cfg.get("prompt_len") is not None and int(cfg.get("prompt_len")) != int(prompt_len):
+                return False
+            # Ensure dtype matches if recorded in cache entry
+            if cfg.get("dtype") is not None and str(cfg.get("dtype")).lower().replace(" ", "") != str(dtype).lower().replace(" ", ""):
+                return False
+            # Ensure model shape matches if recorded
+            if model_hash and cfg.get("model_hash") is not None and cfg.get("model_hash") != model_hash:
                 return False
             cfg_obj = cfg.get("tune_objective")
             if cfg_obj is not None and cfg_obj != obj_name:
@@ -423,11 +526,6 @@ class AutoTuner:
         # 1. First Priority: Check cached configs if caching is enabled
         if use_cached_config and not force_tune and candidates is None:
             cached_local = self.cache_manager.load(preset, cache_sig)
-            if cached_local is None and cache_sig != sig and max_batch_size is None and eff_devs == 1:
-                fallback_local = self.cache_manager.load(preset, sig)
-                if fallback_local and _is_cache_safe(fallback_local):
-                    cached_local = fallback_local
-
             if _is_cache_safe(cached_local):
                 if verbose:
                     steps_s = cached_local.get("steps_per_sec") or (
@@ -509,6 +607,8 @@ class AutoTuner:
                 min_batch_size=min_batch,
                 fast=fast,
             )
+        if require_remat:
+            candidates = [dict(c, remat=True) for c in candidates]
 
         ladder = CandidateLadder(
             candidates,
@@ -534,6 +634,7 @@ class AutoTuner:
                 obj_name=obj_name,
                 verbose=verbose,
                 mem_type=mem_type,
+                required_remat=True if require_remat else None,
                 **runner_kwargs,
             )
         else:
@@ -654,6 +755,12 @@ class AutoTuner:
 
             # Save locally
             best_config["num_devices"] = eff_devs
+            best_config["prompt_len"] = prompt_len
+            best_config["dtype"] = str(dtype)
+            best_config["tune_objective"] = obj_name
+            best_config["require_remat"] = require_remat
+            if model_hash:
+                best_config["model_hash"] = model_hash
             if worst_case_seq_len:
                 best_config["worst_case_seq_len"] = worst_case_seq_len
             self.cache_manager.save(preset, cache_sig, best_config)
@@ -700,6 +807,7 @@ def auto_tune_environment(
     model_config: Optional[Any] = None,
     config_overrides: Optional[Dict[str, Any]] = None,
     num_devices: Optional[int] = None,
+    require_remat: bool = False,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """Functional convenience entrypoint matching legacy CerebroSpheroid auto_tune_environment."""
@@ -730,6 +838,7 @@ def auto_tune_environment(
         model_config=model_config,
         config_overrides=config_overrides,
         num_devices=num_devices,
+        require_remat=require_remat,
         **kwargs,
     )
 

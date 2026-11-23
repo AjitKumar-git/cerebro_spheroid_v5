@@ -664,6 +664,62 @@ def clean_motor_response(text: str, strict: bool = True) -> str:
     return t
 
 
+def format_latent_tool_response(response: str, strip_scratchpad: bool = True) -> str:
+    """
+    Formats the motor target for Stage 3 Latent Deliberation SFT.
+    In accordance with architectural principles:
+      1. English scratchpads (<think> ... </think>) are stripped when strip_scratchpad=True;
+         reasoning occurs via internal recurrent deliberation rather than forced text emission.
+      2. Valid structured tool calls are preserved in <tool_call> ... </tool_call>.
+      3. The user-facing natural language answer remains clean outside tool calls.
+    """
+    r = str(response or "").strip()
+    if strip_scratchpad:
+        # Strip explicit thought blocks across standard delimiters
+        r = re.sub(r"<think>.*?</think>", "", r, flags=re.DOTALL)
+        r = re.sub(r"<\|begin_of_thought\|>.*?<\|end_of_thought\|>", "", r, flags=re.DOTALL)
+        r = re.sub(r"<thought>.*?</thought>", "", r, flags=re.DOTALL)
+        r = r.strip()
+    return format_motor_response(r)
+
+
+def build_tool_closed_loop_prompt(prompt: str, tool_call: str, tool_response: str) -> str:
+    """
+    Constructs the closed-loop multi-turn prompt containing previous context,
+    the model's structured tool invocation, and the external execution response.
+    """
+    p = str(prompt or "").strip()
+    tc = str(tool_call or "").strip()
+    tr = str(tool_response or "").strip()
+    if not tc.startswith("<tool_call>"):
+        tc = f"<tool_call> {tc} </tool_call>"
+    if not tr.startswith("<tool_response>"):
+        tr = f"<tool_response> {tr} </tool_response>"
+    return f"{p}\n{tc}\n{tr}\nAnswer:"
+
+
+def format_tool_closed_loop_turns(
+    prompt: str,
+    tool_call: str,
+    tool_response: str,
+    final_answer: str,
+) -> List[Tuple[str, str]]:
+    """
+    Decomposes a tool-using reasoning interaction into two supervised training pairs:
+      Turn 1: (prompt, <tool_call> tool </tool_call>) -> Teaches tool-selection and syntax.
+      Turn 2: (prompt + <tool_call>...</tool_call> + <tool_response>...</tool_response>, final_answer)
+              -> Teaches answer synthesis conditioned on verified tool results.
+    """
+    p = str(prompt or "").strip()
+    tc = str(tool_call or "").strip()
+    if not tc.startswith("<tool_call>"):
+        tc = f"<tool_call> {tc} </tool_call>"
+    turn1 = (p, tc)
+    turn2_prompt = build_tool_closed_loop_prompt(p, tc, tool_response)
+    turn2_answer = clean_motor_response(final_answer)
+    return [turn1, (turn2_prompt, turn2_answer)]
+
+
 def extract_strict_act_tokens(
     tokens: Sequence[int],
     tokenizer: Any = None,

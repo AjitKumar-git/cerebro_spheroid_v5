@@ -1752,6 +1752,99 @@ def generate_text_jax(
     return parsed["answer"] if parsed["answer"] else (parsed["thinking"] if parsed["thinking"] else clean_motor_response(decoded))
 
 
+def generate_closed_loop_tool_jax(
+    params: Dict[str, jnp.ndarray],
+    buffers: Tuple[jnp.ndarray, jnp.ndarray],
+    config: ModelConfigV5,
+    prompt: str,
+    tokenizer: Any,
+    tool_executor: Optional[Any] = None,
+    max_new_tokens: int = 128,
+    temperature: float = 0.7,
+    repetition_penalty: float = 1.2,
+    key: Optional[jax.Array] = None,
+) -> Dict[str, Any]:
+    """
+    Executes the closed-loop tool interaction specified in Section 4.2 of the plan:
+      1. Prompt enters sensory encoding and initial latent deliberation (deliberate_cycles_jax).
+      2. Model generates initial motor output (direct answer or structured <tool_call>).
+      3. If a <tool_call> is emitted and a tool executor is provided:
+         a. Host executes tool -> tool_result
+         b. Closed-loop context feedback: prompt + <tool_call> ... </tool_call> + <tool_response> ... </tool_response>
+         c. Model ingests updated context and generates the final natural language answer.
+      4. If no tool is emitted, returns the direct answer immediately.
+    """
+    from src.corpus import build_tool_closed_loop_prompt, clean_motor_response, parse_model_output
+
+    if tool_executor is None:
+        try:
+            from src.agentic_harness import execute_agentic_tool
+            tool_executor = execute_agentic_tool
+        except Exception:
+            tool_executor = None
+
+    rng1, rng2 = jax.random.split(key if key is not None else jax.random.PRNGKey(42))
+
+    # Step 1: Initial Generation (Latent Deliberation -> Direct Answer or Tool Call)
+    step1_parsed = generate_text_jax(
+        params=params,
+        buffers=buffers,
+        config=config,
+        prompt=prompt,
+        tokenizer=tokenizer,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        repetition_penalty=repetition_penalty,
+        return_parsed=True,
+        key=rng1,
+    )
+
+    tool_calls = step1_parsed.get("tool_calls", [])
+    if not tool_calls or tool_executor is None:
+        # Direct answer or tool execution not available
+        final_answer = step1_parsed.get("answer") or clean_motor_response(step1_parsed.get("raw", ""))
+        return {
+            "has_tool_call": False,
+            "tool_call": None,
+            "tool_response": None,
+            "answer": final_answer,
+            "step1_raw": step1_parsed.get("raw", ""),
+        }
+
+    # Step 2: Host Tool Execution
+    tool_call = tool_calls[0]
+    try:
+        tool_result = str(tool_executor(tool_call))
+    except Exception as e:
+        tool_result = f"Error executing tool: {e}"
+
+    # Step 3: Context Feedback Loop & Final Supervised Answer Generation
+    feedback_prompt = build_tool_closed_loop_prompt(prompt, tool_call, tool_result)
+    step2_parsed = generate_text_jax(
+        params=params,
+        buffers=buffers,
+        config=config,
+        prompt=feedback_prompt,
+        tokenizer=tokenizer,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        repetition_penalty=repetition_penalty,
+        return_parsed=True,
+        key=rng2,
+    )
+
+    final_answer = step2_parsed.get("answer") or clean_motor_response(step2_parsed.get("raw", ""))
+    return {
+        "has_tool_call": True,
+        "tool_call": tool_call,
+        "tool_response": tool_result,
+        "answer": final_answer,
+        "step1_raw": step1_parsed.get("raw", ""),
+        "step2_raw": step2_parsed.get("raw", ""),
+        "feedback_prompt": feedback_prompt,
+    }
+
+
 def emit_tri_head_logits_jax(
     params: Dict[str, jnp.ndarray],
     h: jnp.ndarray,

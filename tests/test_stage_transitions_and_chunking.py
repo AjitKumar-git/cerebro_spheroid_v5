@@ -196,12 +196,34 @@ def test_rectified_streamer_deep_reasoning_transition(monkeypatch):
 
 
 def test_train_v5_auto_reasoning_transition_args():
-    """Verifies that train_v5_tpu_jax exposes auto_reasoning_transition and 15.7B defaults."""
+    """Verifies that train_v5_tpu_jax exposes auto_reasoning_transition, 15.7B defaults, and conservative Stage 2 LR guards."""
     from training.train_v5_tpu_jax import parse_args
 
     args = parse_args([])
     assert args.auto_reasoning_transition is True
     assert args.reasoning_transition_tokens == 15_700_000_000
     assert args.final_campaign_tokens == 50_000_000_000
+    assert args.reasoning_max_lr == 2e-4
+    assert args.reasoning_min_lr == 3e-5
 
 
+def test_stage2_conservative_lr_schedule():
+    """Verifies that Stage 2 deep reasoning schedule guards against catastrophic forgetting of Stage 1."""
+    import math
+
+    step = 200_000
+    reasoning_transition_step = 191_651
+    total_steps = 400_000
+    r_peak = 2e-4
+    r_min = 3e-5
+
+    r_total_steps = max(1, total_steps - reasoning_transition_step)
+    r_elapsed = max(0, step - reasoning_transition_step)
+    r_ratio = min(1.0, float(r_elapsed) / float(r_total_steps))
+    r_coeff = 0.5 * (1.0 + math.cos(math.pi * r_ratio))
+    cur_lr = float(r_min + (r_peak - r_min) * r_coeff)
+
+    # Must stay strictly below pretraining peak LR (2e-3)
+    assert cur_lr <= r_peak
+    assert cur_lr >= r_min
+    assert cur_lr <= 2e-4

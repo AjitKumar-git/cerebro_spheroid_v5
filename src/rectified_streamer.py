@@ -264,6 +264,14 @@ class TokenQuotaManager:
         self.counts: Dict[str, int] = collections.defaultdict(int)
         self.lock = threading.Lock()
 
+    def update_target_shares(self, new_shares: Dict[str, float]) -> None:
+        """Dynamically updates target shares across domains without clearing historical token counts."""
+        with self.lock:
+            total_share = sum(max(0.0, float(v)) for v in new_shares.values())
+            if total_share <= 0.0:
+                return
+            self.target_shares = {k: max(0.0, float(v)) / total_share for k, v in new_shares.items()}
+
     def record_tokens(self, domain: str, num_tokens: int):
         with self.lock:
             self.counts[domain] += int(num_tokens)
@@ -436,12 +444,22 @@ class RectifiedContiguousPretrainStreamer:
             "edu_academic": 0.10,
         }
         self.dynamic_curriculum = False
-        self.quota_mgr = TokenQuotaManager(self.shares)
+        self.quota_mgr.update_target_shares(self.shares)
         for domain in self.shares:
             self.buffers.setdefault(domain, [])
         print(f"\n🧠 [Streamer Transition] Streamer switched to DEEP REASONING curriculum mixture:")
         for d, s in self.shares.items():
             print(f"   • {d:<14}: {s*100:.1f}%")
+
+    def update_shares(self, new_shares: Dict[str, float]) -> None:
+        """Dynamically rebalances target domain quotas in-flight without worker interruption."""
+        tot = sum(max(0.0, float(v)) for v in new_shares.values())
+        if tot <= 0.0:
+            return
+        self.shares = {k: max(0.0, float(v)) / tot for k, v in new_shares.items()}
+        self.quota_mgr.update_target_shares(self.shares)
+        for domain in self.shares:
+            self.buffers.setdefault(domain, [])
 
     def _refresh_curriculum_shares(self) -> None:
         if not self.dynamic_curriculum:
@@ -449,7 +467,7 @@ class RectifiedContiguousPretrainStreamer:
         new_shares = self._smollm2_shares()
         if new_shares != self.shares:
             self.shares = new_shares
-            self.quota_mgr = TokenQuotaManager(self.shares)
+            self.quota_mgr.update_target_shares(self.shares)
             for domain in new_shares:
                 self.buffers.setdefault(domain, [])
 

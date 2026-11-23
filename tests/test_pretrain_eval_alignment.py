@@ -16,6 +16,7 @@ class TestPretrainEvalAlignment(unittest.TestCase):
             prompt_len=1,
             target_len=target_len,
             return_weights=True,
+            domains=["broad_web", "code"],
         )
 
         self.assertEqual(len(eval_batches), 2)
@@ -43,6 +44,7 @@ class TestPretrainEvalAlignment(unittest.TestCase):
             prompt_len=prompt_len,
             target_len=target_len,
             return_weights=True,
+            domains=["broad_web", "code"],
         )
 
         self.assertEqual(len(eval_batches), 2)

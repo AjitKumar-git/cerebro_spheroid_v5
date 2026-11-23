@@ -259,6 +259,8 @@ def parse_args(args_list=None):
     parser.add_argument("--auto-reasoning-transition", "--auto_reasoning_transition", dest="auto_reasoning_transition", action=argparse.BooleanOptionalAction, default=True, help="Automatically transition from pretraining to deep reasoning curriculum after reaching milestone tokens (default: True)")
     parser.add_argument("--reasoning-transition-tokens", "--reasoning_transition_tokens", dest="reasoning_transition_tokens", type=int, default=15_700_000_000, help="Cumulative token milestone to trigger automatic transition to deep reasoning (default: 15,700,000,000 tokens)")
     parser.add_argument("--final-campaign-tokens", "--final_campaign_tokens", dest="final_campaign_tokens", type=int, default=50_000_000_000, help="Extended token budget target for deep reasoning campaign (default: 50,000,000,000 tokens)")
+    parser.add_argument("--reasoning-max-lr", "--reasoning_max_lr", dest="reasoning_max_lr", type=float, default=2e-4, help="Conservative peak learning rate during Deep Reasoning Stage 2 to prevent forgetting Stage 1 foundations (default: 2e-4)")
+    parser.add_argument("--reasoning-min-lr", "--reasoning_min_lr", dest="reasoning_min_lr", type=float, default=3e-5, help="Annealed learning rate floor during Deep Reasoning Stage 2 (default: 3e-5)")
     parser.add_argument("--init_from_checkpoint", "--init-from-checkpoint", dest="init_from_checkpoint", type=str, default=None, help="Base foundation checkpoint to load weights from (e.g. step900k)")
     parser.add_argument("--reset_step_counter", "--reset-step-counter", dest="reset_step_counter", action="store_true", default=False, help="Reset step counter to 0 after loading base weights to start new campaign from scratch")
     parser.add_argument("--target-eval-loss", "--target_eval_loss", dest="target_eval_loss", type=float, default=1.60, help="Target held-out evaluation loss for convergence early stopping (default: 1.60)")
@@ -267,6 +269,10 @@ def parse_args(args_list=None):
     parser.add_argument("--teacher_model", "--teacher-model", dest="teacher_model", type=str, default="Qwen/Qwen2.5-1.5B-Instruct", help="HuggingFace teacher model for digestion")
     parser.add_argument("--teacher_scale", "--teacher-scale", dest="teacher_scale", type=float, default=1.5, help="Scaling factor alpha for dynamic next-token weights")
     parser.add_argument("--encephalization_warmup_steps", "--encephalization-warmup-steps", dest="encephalization_warmup_steps", type=int, default=1000, help="Steps to smoothly transition motor surface readout from core to outer mantle")
+    parser.add_argument("--smart-mixture", "--smart_mixture", dest="smart_mixture", action=argparse.BooleanOptionalAction, default=True, help="Enable dynamic DoReMi & generalization-regularized dataset mixture controller (default: True)")
+    parser.add_argument("--smart-mixture-eta", "--smart_mixture_eta", dest="smart_mixture_eta", type=float, default=0.08, help="Exponentiated gradient step size for smart mixture")
+    parser.add_argument("--smart-mixture-prior-weight", "--smart_mixture_prior_weight", dest="smart_mixture_prior_weight", type=float, default=0.20, help="Dirichlet prior smoothing weight")
+    parser.add_argument("--smart-mixture-overfit-thresh", "--smart_mixture_overfit_thresh", dest="smart_mixture_overfit_thresh", type=float, default=0.04, help="Validation loss threshold above best loss triggering overfit penalty")
 
     parsed = parser.parse_args(args_list)
     raw_args = args_list if args_list is not None else sys.argv[1:]
@@ -868,6 +874,11 @@ def main(args=None):
     worst_case_seq = max(args.seq_len, args.total_window, getattr(args, "target_seq_len", 0) or 0)
     if getattr(args, "context_curriculum", False) and "context_stages" in locals():
         worst_case_seq = max(worst_case_seq, max(context_stages))
+    require_tuned_remat = (
+        args.seq_len >= 1024
+        or args.total_window >= 1024
+        or getattr(args, "context_curriculum", False)
+    )
 
     if args.auto_tune:
         best_cfg = run_auto_tuner(
@@ -886,6 +897,7 @@ def main(args=None):
             worst_case_seq_len=worst_case_seq,
             model_config=config,
             num_devices=num_devices,
+            require_remat=require_tuned_remat,
         )
         if not getattr(args, "batch_size_explicit", False):
             args.batch_size = best_cfg["batch_size"]
@@ -897,13 +909,16 @@ def main(args=None):
             v_pct = best_cfg.get("memory_utilization_pct", best_cfg.get("vram_utilization_pct", 0))
             sps = best_cfg.get("steps_per_sec", 0.0)
             sps_str = f"{sps:.2f} steps/s | " if sps and sps > 0 else ""
-            print(f"⚡ Target Benchmark Speed: {sps_str}{best_cfg['tok_per_sec']:,.0f} tok/s ({m_type}: {v_gb:.1f} GB, {v_pct:.1f}% utilization)")
+            print(f"⚡ Advisory Single-Device Benchmark Speed: {sps_str}{best_cfg['tok_per_sec']:,.0f} tok/s ({m_type}: {v_gb:.1f} GB, {v_pct:.1f}% utilization)")
+            print(f"   ℹ️ [Notice] Throughput is an advisory single-device micro-benchmark proxy. Production multi-device rate is governed by Multi-TPU Local-SGD execution.")
+            if getattr(args, "context_curriculum", False):
+                print(f"   ℹ️ [Curriculum Notice] Benchmark measured initial stage ({args.seq_len} tokens). Worst-case memory ceiling was guarded at {worst_case_seq} tokens.")
     elif max_bs is not None:
         args.batch_size = min(int(args.batch_size), int(max_bs))
 
     # Strict HBM Safety Enforcement for Long-Context Horizons
-    if (args.seq_len >= 1024 or args.total_window >= 1024 or getattr(args, "context_curriculum", False)) and not remat_choice:
-        print(f"🛡️ [HBM Safety Guard] Sequence window {max(args.seq_len, args.total_window)} >= 1024 requires activation rematerialization to prevent HBM OOM on 16GB accelerators. Enabling remat=True.")
+    if require_tuned_remat and not remat_choice:
+        print(f"🛡️ [HBM Safety Guard] Sequence window {max(args.seq_len, args.total_window)} >= 1024 requires activation rematerialization. Enabling remat=True.")
         remat_choice = True
 
     # Scale micro-batch if necessary to keep micro-batch tokens bounded
@@ -1454,6 +1469,22 @@ def main(args=None):
         except Exception as e_inner:
             print(f"⚠️ Fallback validation setup notice: {e_inner}")
 
+    # 9b. Smart Dynamic Multi-Domain Mixture Controller
+    smart_mixture_controller = None
+    if getattr(args, "smart_mixture", False) and hasattr(batcher, "update_shares"):
+        try:
+            from src.smart_mixture import SmartMixtureController
+            smart_mixture_controller = SmartMixtureController(
+                initial_shares=getattr(batcher, "shares", {}),
+                eta=getattr(args, "smart_mixture_eta", 0.08),
+                prior_weight=getattr(args, "smart_mixture_prior_weight", 0.20),
+                overfit_threshold=getattr(args, "smart_mixture_overfit_thresh", 0.04),
+            )
+            print(f"⚖️ [Smart Mixture Engine] Initialized dynamic multi-domain mixture controller across {len(smart_mixture_controller.current_shares)} domains.")
+        except Exception as e_mix:
+            print(f"⚠️ [Smart Mixture Engine] Setup notice: {e_mix}")
+            smart_mixture_controller = None
+
     @jax.jit
     def eval_step_loss(p, q_b, r_b, fb_b=None, enc_alpha: float = 1.0):
         return training_rollout(
@@ -1672,6 +1703,7 @@ def main(args=None):
     training_error: Optional[Exception] = None
     target_token_budget = getattr(args, "target_tokens", None)
     in_deep_reasoning_phase = False
+    reasoning_transition_step = None
     auto_reasoning_trans = getattr(args, "auto_reasoning_transition", True)
     reasoning_trans_tokens = getattr(args, "reasoning_transition_tokens", 15_700_000_000)
     final_campaign_budget = getattr(args, "final_campaign_tokens", 50_000_000_000)
@@ -1679,9 +1711,11 @@ def main(args=None):
     # Check if resumed checkpoint already passed the 15.7B milestone
     if auto_reasoning_trans and cumulative_tokens >= reasoning_trans_tokens:
         in_deep_reasoning_phase = True
+        reasoning_transition_step = step
         print("\n" + "=" * 80)
         print(f"🧠 [Deep Reasoning Active on Resumption] Cumulative tokens ({cumulative_tokens:,}) >= {reasoning_trans_tokens/1e9:.2f}B.")
         print(f"   Activating High-Density Reasoning Mixture (35% Math, 35% Cosmopedia v2, 20% Code, 10% Edu Academic).")
+        print(f"   Applying Conservative Stage 2 Learning Rate ({args.reasoning_max_lr:g} -> {args.reasoning_min_lr:g}) to protect Stage 1 foundations.")
         print("=" * 80 + "\n", flush=True)
         if target_token_budget is not None and target_token_budget <= reasoning_trans_tokens:
             target_token_budget = final_campaign_budget
@@ -1698,6 +1732,7 @@ def main(args=None):
             # ──────────────────────────────────────────────────────────────────
             if auto_reasoning_trans and not in_deep_reasoning_phase and cumulative_tokens >= reasoning_trans_tokens:
                 in_deep_reasoning_phase = True
+                reasoning_transition_step = step
                 print("\n" + "=" * 80)
                 print("🧠 [AUTOMATIC CURRICULUM TRANSITION: PRETRAIN -> DEEP REASONING]")
                 print("=" * 80)
@@ -1705,6 +1740,7 @@ def main(args=None):
                 print(f"🌊 Phase Transition    : PRETRAIN (Broad Web) -> DEEP REASONING (High-Density Formal Reasoning)")
                 print(f"📚 Data Mixture Shift   : 35% Math (FineMath-4+) | 35% Cosmopedia v2 | 20% Python Code | 10% Edu Academic")
                 print(f"⚡ Context Horizon      : Full 4096 tokens contiguous reasoning trajectory")
+                print(f"🛡️ Learning Rate Guard  : Conservative Stage 2 Schedule ({args.reasoning_max_lr:g} -> {args.reasoning_min_lr:g}) active to prevent catastrophic forgetting.")
                 print("=" * 80 + "\n", flush=True)
 
                 # Extend target token budget so training continues smoothly
@@ -1800,7 +1836,17 @@ def main(args=None):
                     if elastic_batcher is not None and hasattr(elastic_batcher, "update_target_len"):
                         elastic_batcher.update_target_len(args.seq_len)
 
-            cur_lr = get_learning_rate(step, args.total_steps, args.lr, args.min_lr, args.warmup_steps)
+            if in_deep_reasoning_phase and reasoning_transition_step is not None:
+                # Conservative Stage 2 Learning Rate: guards against catastrophic forgetting of Stage 1
+                r_peak = getattr(args, "reasoning_max_lr", 2e-4)
+                r_min = getattr(args, "reasoning_min_lr", 3e-5)
+                r_total_steps = max(1, args.total_steps - reasoning_transition_step)
+                r_elapsed = max(0, step - reasoning_transition_step)
+                r_ratio = min(1.0, float(r_elapsed) / float(r_total_steps))
+                r_coeff = 0.5 * (1.0 + math.cos(math.pi * r_ratio))
+                cur_lr = float(r_min + (r_peak - r_min) * r_coeff)
+            else:
+                cur_lr = get_learning_rate(step, args.total_steps, args.lr, args.min_lr, args.warmup_steps)
 
             # Smooth resumption warmup: prevents cold-optimizer momentum shock on resume
             resume_warm_steps = int(getattr(args, "resume_warmup_steps", 100))
@@ -2115,6 +2161,32 @@ def main(args=None):
                     if ds_stats:
                         parts = [f"{k}: {v/1e9:.3f}B" for k, v in sorted(ds_stats.items())]
                         print(f"   └─ Ingested Tokens Breakdown: " + " | ".join(parts))
+
+                # Dynamic Smart Mixture Rebalancing
+                if smart_mixture_controller is not None and len(val_losses) == len(eval_domains):
+                    try:
+                        from src.smart_mixture import map_domain_label_to_tag
+                        dom_losses = {map_domain_label_to_tag(d_name): float(d_val) for d_name, d_val in zip(eval_domains, val_losses)}
+                        dom_toks = {}
+                        if hasattr(batcher, "quota_mgr"):
+                            snap = batcher.quota_mgr.get_snapshot()
+                            for k, v in snap.items():
+                                if isinstance(v, dict) and "tokens" in v:
+                                    dom_toks[k] = v["tokens"]
+                        elif hasattr(batcher, "get_tokens_by_dataset"):
+                            dom_toks = batcher.get_tokens_by_dataset()
+
+                        new_shares, mix_metrics = smart_mixture_controller.step(
+                            step=step,
+                            domain_val_losses=dom_losses,
+                            domain_tokens=dom_toks,
+                        )
+                        if hasattr(batcher, "update_shares"):
+                            batcher.update_shares(new_shares)
+
+                        print(smart_mixture_controller.format_status_report(mix_metrics))
+                    except Exception as e_mix_step:
+                        print(f"⚠️ [Smart Mixture Engine] Dynamic step update notice: {e_mix_step}")
 
                 # Convergence Early Stopping Check
                 target_eval_loss = getattr(args, "target_eval_loss", None)

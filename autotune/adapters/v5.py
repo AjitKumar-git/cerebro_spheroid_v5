@@ -10,6 +10,7 @@ Optimized with template caching, fast array generation, and zero-overhead execut
 from __future__ import annotations
 
 import gc
+import math
 import time
 from typing import Any, Dict, Optional, Tuple
 
@@ -152,9 +153,12 @@ def benchmark_v5_model(
                 "status": f"OOM (Theoretical Peak {theo_mem.peak_hbm_gb:.1f}GB exceeds {total_mem_bytes / (1024**3):.1f}GB {mem_label})",
             }
 
-        # 3. Ahead-Of-Time XLA Compilation & Warmup
-        dummy_prompts = jnp.zeros((batch_size, prompt_len), dtype=jnp.int32)
-        dummy_targets = jnp.zeros((batch_size, seq_len), dtype=jnp.int32)
+        # 3. Ahead-Of-Time XLA Compilation & Warmup. Use the same fixed
+        # synthetic batch for baseline and timed steps so loss velocity is comparable.
+        key = jax.random.PRNGKey(101)
+        key, prompt_key, target_key = jax.random.split(key, 3)
+        dummy_prompts = jax.random.randint(prompt_key, (batch_size, prompt_len), 0, config.vocab_size)
+        dummy_targets = jax.random.randint(target_key, (batch_size, seq_len), 0, config.vocab_size)
 
         t0_compile = time.time()
         params, opt_state, init_loss = train_step_fn(params, opt_state, dummy_prompts, dummy_targets, 5e-4)
@@ -163,13 +167,11 @@ def benchmark_v5_model(
         init_loss_val = float(init_loss)
 
         # 3. High-Speed Timed Benchmark Steps (zero host-allocation latency)
-        key = jax.random.PRNGKey(101)
-        key, step_key = jax.random.split(key)
-        prompt_b = jax.random.randint(step_key, (batch_size, prompt_len), 0, config.vocab_size)
-        target_b = jax.random.randint(step_key, (batch_size, seq_len), 0, config.vocab_size)
+        prompt_b, target_b = dummy_prompts, dummy_targets
         jax.block_until_ready(target_b)
 
-        tokens_per_step = batch_size * (prompt_len + seq_len)
+        # Training throughput is measured in target/loss-bearing tokens.
+        tokens_per_step = batch_size * seq_len
         step_times = []
         last_loss = init_loss
         steps_to_run = max(1, int(num_steps))
@@ -182,6 +184,10 @@ def benchmark_v5_model(
             last_loss = loss
 
         final_loss_val = float(last_loss)
+        if not math.isfinite(init_loss_val) or not math.isfinite(final_loss_val):
+            raise FloatingPointError(
+                f"Non-finite benchmark loss (initial={init_loss_val}, final={final_loss_val})"
+            )
         avg_step_sec = sum(step_times) / max(len(step_times), 1)
         steps_per_sec = 1.0 / max(avg_step_sec, 1e-6)
         tok_per_sec = tokens_per_step * steps_per_sec
@@ -237,6 +243,8 @@ def benchmark_v5_model(
             "final_loss": final_loss_val,
             "delta_loss": delta_loss,
             "loss_reduction_per_sec": loss_red_sec,
+            "benchmark_steps": steps_to_run,
+            "tokens_per_step": tokens_per_step,
             "status": "PASS",
         }
 

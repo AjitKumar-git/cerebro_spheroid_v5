@@ -104,12 +104,13 @@ class DatasetTelemetry:
 GLOBAL_TELEMETRY = DatasetTelemetry()
 
 
-def _normalize_3tier_response(r_txt: str, q_txt: str = "") -> str:
+def _normalize_3tier_response(r_txt: str, q_txt: str = "", strip_scratchpad: bool = True) -> str:
     """
-    Enforces the 3-Tier Cognitive Output Architecture:
-      1. Thinking           : <think> ... </think> -> Private scratchpad deliberation
-      2. Tool Invocations   : <tool_call> ... </tool_call> -> Structured deterministic tool calls
-      3. Talking / Answering: Unbounded Plain Text -> Natural human dialogue & explanations
+    Enforces the Cognitive Output Architecture:
+      1. Latent Deliberation: If strip_scratchpad=True, English <think> ... </think> scratchpads
+         are stripped so internal recurrent deliberation is not forced into English text.
+      2. Tool Invocations   : <tool_call> ... </tool_call> -> Structured deterministic tool calls.
+      3. Talking / Answering: Unbounded Plain Text -> Natural human dialogue & direct explanations.
     """
     if not r_txt:
         return ""
@@ -117,21 +118,23 @@ def _normalize_3tier_response(r_txt: str, q_txt: str = "") -> str:
     r_txt = r_txt.replace("<|begin_of_thought|>", "<think>").replace("<|end_of_thought|>", "</think>")
     r_txt = r_txt.replace("<thought>", "<think>").replace("</thought>", "</think>")
 
+    if strip_scratchpad and "<think>" in r_txt:
+        # Strip explicit English scratchpad to enforce pure latent deliberation
+        r_txt = re.sub(r"<think>.*?</think>", "", r_txt, flags=re.DOTALL).strip()
+
     # Normalize legacy <act> to industry-standard <tool_call>
     r_txt = r_txt.replace("<act>", "<tool_call>").replace("</act>", "</tool_call>")
 
     # 1. Arithmetic & GSM8K derivations ending in '#### <ans>'
     # Deterministic tool call goes in <tool_call>, final answer is normal text OUTSIDE <tool_call>
+    # In accordance with latent deliberation, we do NOT force intermediate English derivations into <think> tags.
     if "####" in r_txt and "<tool_call>" not in r_txt:
         # Avoid treating markdown 4th level headings (#### Header) as GSM8K delimiters
         m = re.search(r'(?:\s|^)####\s*([-+]?\$?[\d\.,]+(?:\s*[a-zA-Z%]*)?)\s*$', r_txt.strip())
         if m:
             parts = r_txt.rsplit("####", 1)
-            deriv = parts[0].strip()
             ans_str = parts[1].strip()
-            if not deriv.startswith("<think>"):
-                deriv = f"<think>\n{deriv}\n</think>"
-            return f"{deriv}\n<tool_call> calc({ans_str}) </tool_call>\nAnswer: {ans_str}"
+            return f"<tool_call> calc({ans_str}) </tool_call>\nAnswer: {ans_str}"
 
     return r_txt
 
@@ -1994,12 +1997,16 @@ def build_pretrain_eval_split(
     target_pad_id: int = -100,
     pad_id: int = 0,
     return_weights: bool = False,
+    domains: Optional[List[str]] = None,
 ):
     """
-    Constructs a 2-domain canonical held-out evaluation split aligned 1:1 with
-    the CerebroSpheroid V5 Stage 1 Pretraining distribution:
-      1. Broad Web Text (FineWeb sample-10BT)   : Weight 0.85 (85%)
-      2. Code Repositories (The Stack v2)       : Weight 0.15 (15%)
+    Constructs a multi-domain canonical held-out evaluation split aligned 1:1 with
+    the CerebroSpheroid V5 Pretraining distribution:
+      1. Broad Web Text (FineWeb sample-10BT)   : broad_web
+      2. Code Repositories (The Stack v2)       : code
+      3. Mathematics & Proofs (FineMath)        : math
+      4. Synthetic Textbooks (Cosmopedia v2)    : cosmopedia
+      5. Educational & Academic (FineWeb-Edu)   : edu_academic
 
     Evaluates 100% loss-bearing contiguous next-token sequences:
     The prompt provides `prompt_len` tokens of context, and the model is evaluated
@@ -2026,6 +2033,21 @@ def build_pretrain_eval_split(
             """import numpy as np\nfrom typing import Callable, Dict, List, Set, Tuple\n\nclass ComputationalGraphNode:\n    \"\"\"Node in an automatic differentiation topological compute DAG.\"\"\"\n    def __init__(self, data: np.ndarray, parents: Tuple[\"ComputationalGraphNode\", ...] = (), op: str = \"\"):\n        self.data: np.ndarray = np.asarray(data, dtype=np.float32)\n        self.grad: Optional[np.ndarray] = None\n        self.parents: Tuple[\"ComputationalGraphNode\", ...] = parents\n        self.op: str = op\n        self._backward: Callable[[], None] = lambda: None\n\n    def __add__(self, other: \"ComputationalGraphNode\") -> \"ComputationalGraphNode\":\n        other_node = other if isinstance(other, ComputationalGraphNode) else ComputationalGraphNode(other)\n        out = ComputationalGraphNode(self.data + other_node.data, (self, other_node), \"+\")\n        def _backward():\n            if self.grad is None:\n                self.grad = np.zeros_like(self.data)\n            if other_node.grad is None:\n                other_node.grad = np.zeros_like(other_node.data)\n            self.grad += out.grad\n            other_node.grad += out.grad\n        out._backward = _backward\n        return out\n\n    def __matmul__(self, other: \"ComputationalGraphNode\") -> \"ComputationalGraphNode\":\n        other_node = other if isinstance(other, ComputationalGraphNode) else ComputationalGraphNode(other)\n        out = ComputationalGraphNode(self.data @ other_node.data, (self, other_node), \"@\")\n        def _backward():\n            if self.grad is None:\n                self.grad = np.zeros_like(self.data)\n            if other_node.grad is None:\n                other_node.grad = np.zeros_like(other_node.data)\n            self.grad += out.grad @ other_node.data.T\n            other_node.grad += self.data.T @ out.grad\n        out._backward = _backward\n        return out\n\n    def backward(self) -> None:\n        topo: List[ComputationalGraphNode] = []\n        visited: Set[ComputationalGraphNode] = set()\n        def build_topo(v: ComputationalGraphNode):\n            if v not in visited:\n                visited.add(v)\n                for p in v.parents:\n                    build_topo(p)\n                topo.append(v)\n        build_topo(self)\n        self.grad = np.ones_like(self.data)\n        for node in reversed(topo):\n            node._backward()\n""",
             """import socket\nfrom typing import Dict, List, Optional, Tuple\n\nclass SimpleHTTPServer:\n    \"\"\"Pure standard-library non-blocking HTTP 1.1 socket server.\"\"\"\n    def __init__(self, host: str = \"127.0.0.1\", port: int = 8080):\n        self.host = host\n        self.port = port\n        self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n        self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n        self.server_sock.setblocking(False)\n\n    def start(self):\n        self.server_sock.bind((self.host, self.port))\n        self.server_sock.listen(128)\n\n    def handle_request(self, raw_data: bytes) -> bytes:\n        try:\n            req_str = raw_data.decode(\"utf-8\", errors=\"replace\")\n            lines = req_str.split(\"\\r\\n\")\n            if not lines:\n                return b\"HTTP/1.1 400 Bad Request\\r\\nContent-Length: 0\\r\\n\\r\\n\"\n            parts = lines[0].split()\n            if len(parts) < 2:\n                return b\"HTTP/1.1 400 Bad Request\\r\\nContent-Length: 0\\r\\n\\r\\n\"\n            method, path = parts[0], parts[1]\n            body = f'{{\"status\": \"ok\", \"method\": \"{method}\", \"path\": \"{path}\"}}'.encode(\"utf-8\")\n            resp = (\n                f\"HTTP/1.1 200 OK\\r\\n\"\n                f\"Content-Type: application/json\\r\\n\"\n                f\"Content-Length: {len(body)}\\r\\n\"\n                f\"Connection: close\\r\\n\\r\\n\"\n            ).encode(\"utf-8\") + body\n            return resp\n        except Exception as e:\n            err = f'{{\"error\": \"{str(e)}\"}}\\r\\n'.encode(\"utf-8\")\n            return f\"HTTP/1.1 500 Internal Server Error\\r\\nContent-Length: {len(err)}\\r\\n\\r\\n\".encode(\"utf-8\") + err\n""",
         ],
+        "math": [
+            "Theorem (Bolzano-Weierstrass in Euclidean Space R^n): Every bounded infinite sequence in R^n possesses at least one convergent subsequence. Proof: Let (x_k) be an infinite sequence contained within a closed hypercube B_0 = [a_1, b_1] x ... x [a_n, b_n] of diameter D_0 < infinity. By the bisection method, subdivide B_0 into 2^n congruent closed sub-hypercubes by bisecting each coordinate interval [a_i, b_i] at its midpoint (a_i + b_i) / 2. By the Pigeonhole Principle for infinite sets, at least one sub-hypercube B_1 must contain infinitely many terms of the sequence (x_k). Selecting an element x_{k_1} in B_1, we recursively repeat the subdivision on B_1 to obtain a nested sequence of non-empty closed hypercubes B_0 superset B_1 superset B_2 ... superset B_m with diam(B_m) = 2^{-m} D_0. By Cantor's Intersection Theorem in complete metric spaces, the intersection of all B_m consists of exactly one point x*. Choosing x_{k_{m+1}} in B_{m+1} with k_{m+1} > k_m guarantees ||x_{k_m} - x*|| <= diam(B_m) = 2^{-m} D_0 -> 0 as m -> infinity, establishing convergence of the subsequence to x*.",
+            "In spectral graph theory, let G = (V, E) be a d-regular undirected graph on n vertices with adjacency matrix A and normalized Laplacian L = I - (1/d) A. The eigenvalues of (1/d) A satisfy 1 = lambda_1 >= lambda_2 >= ... >= lambda_n >= -1. The spectral expansion of G is governed by the Cheeger inequality: (1 - lambda_2) / 2 <= h(G) <= sqrt(2 * (1 - lambda_2)), where h(G) denotes the edge expansion ratio (Cheeger constant) defined by h(G) = min_{S subset V, 0 < |S| <= n/2} |partial S| / (d * |S|). Graphs satisfying lambda_2 <= 1 - epsilon for a positive constant epsilon independent of n constitute Ramanujan expanders, exhibiting optimal pseudorandomness and rapid mixing time tau_{mix} = O(log n / (1 - lambda_2)) for lazy random walks on V.",
+            "Consider the Lebesgue integration theory on the measure space (X, Sigma, mu). Let f_n: X -> [0, infinity] be a sequence of non-negative measurable functions. Fatou's Lemma asserts that the integral of the inferior limit is bounded by the inferior limit of the integrals: integral_X (liminf_{n -> infinity} f_n) d mu <= liminf_{n -> infinity} integral_X f_n d mu. As an immediate corollary, the Dominated Convergence Theorem establishes that if f_n -> f mu-almost everywhere and there exists an integrable envelope g in L^1(mu) such that |f_n(x)| <= g(x) for all n and almost every x, then f is integrable and lim_{n -> infinity} integral_X |f_n - f| d mu = 0.",
+        ],
+        "cosmopedia": [
+            "In cellular neurobiology, the generation and propagation of the action potential across unmyelinated and myelinated axons relies upon non-linear voltage-gated ion conductances. At rest, the neuronal membrane maintains a resting potential of approximately -70 millivolts, established primarily by the selective permeability of potassium leak channels and active counter-transport by Na+/K+-ATPase pumps. Depolarization past the threshold potential (approximately -55 mV) triggers rapid conformational activation of voltage-gated sodium channels (Nav1.2/Nav1.6), initiating a regenerative inward sodium current that drives membrane voltage toward the sodium equilibrium potential (+60 mV). Within approximately one millisecond, voltage-dependent inactivation gates (the IFM peptide motif) occlude the sodium pore, while delayed-rectifier voltage-gated potassium channels (Kv2.1) open, producing an outward potassium efflux that repolarizes the membrane back toward negative potentials.",
+            "The photosynthetic light-harvesting complex II (LHCII) in eukaryotic chloroplast thylakoids operates near quantum mechanical limits in transferring excitonic energy from absorbed photons to the reaction center of Photosystem II. When chlorophyll a and b molecules absorb incident solar radiation, electronic transitions promote electrons to singlet excited states. Through resonance energy transfer (FRET) and delocalized exciton coupling among tightly packed chromophores, excitation energy migrates through the pigment network with an overall quantum efficiency exceeding 95 percent. At the P680 reaction center, charge separation oxidizes a chlorophyll cluster, driving water splitting at the oxygen-evolving manganese-calcium cluster (Mn4CaO5) and releasing protons into the thylakoid lumen.",
+            "In stellar astrophysics and nucleosynthesis, the triple-alpha process represents the primary mechanism by which red giant stars bypass the unstable mass gaps at mass numbers A=5 and A=8 to synthesize carbon-12. In the dense, degenerate helium core of a post-main-sequence star at temperatures exceeding 10^8 Kelvin, two helium-4 nuclei fuse in a rapid, reversible equilibrium to produce beryllium-8, which has a half-life of merely 10^-16 seconds. Before the beryllium-8 nucleus decays, fusion with a third alpha particle creates carbon-12 in an excited resonant 0+ state, famously predicted by Fred Hoyle at 7.654 MeV. Subsequent gamma decay drops the nucleus to the ground state.",
+        ],
+        "edu_academic": [
+            "In modern computer systems architecture, instruction-level parallelism (ILP) is achieved through out-of-order superscalar execution engines employing Tomasulo's dynamic scheduling algorithm with register renaming. By utilizing reservation stations at the inputs of functional execution units and a centralized Reorder Buffer (ROB), the processor decouples instruction decoding from execution latency. Register renaming maps architectural register specifiers to physical registers or reservation station tags, effectively eliminating write-after-read (anti-dependence) and write-after-write (output-dependence) hazards without pipeline stalls. Speculative execution proceeds based on dynamic branch predictors, such as TAGE, allowing instructions to execute speculatively while committing their architectural state strictly in program order at the head of the ROB.",
+            "In chemical thermodynamics and phase equilibria, the Gibbs-Duhem equation dictates fundamental constraints governing chemical potentials in multicomponent mixtures at thermodynamic equilibrium: S dT - V dP + sum_{i=1}^k N_i d mu_i = 0. For an isothermal, isobaric system (dT = 0, dP = 0), the relationship simplifies to sum x_i d mu_i = 0, where x_i represents mole fraction and mu_i is the partial molar Gibbs free energy. In binary solutions, the Gibbs-Duhem equation establishes that the activity coefficient gamma_1 of component 1 cannot vary independently of the activity coefficient gamma_2 of component 2, providing the theoretical foundation for the Margules and Wilson activity coefficient models.",
+            "In distributed operating systems and distributed consensus, the Raft protocol achieves state machine replication across a cluster of independent nodes in the presence of network partitions and fail-stop faults. Raft decomposes consensus into three modular subproblems: leader election, log replication, and safety. A single elected leader manages the append-only replicate log, accepting client commands, assigning monotonically increasing log indices and terms, and broadcasting AppendEntries RPCs to follower nodes. A log entry is committed once replicated across a strict majority quorum (n/2 + 1) of nodes.",
+        ],
     }
 
     def _open_fineweb_stream():
@@ -2040,20 +2062,65 @@ def build_pretrain_eval_split(
         except Exception:
             return iter([])
 
-    domain_configs = [
+    def _open_math_stream():
+        try:
+            return _open_hf_stream("HuggingFaceTB/finemath", "finemath-4plus", max_retries=1)
+        except Exception:
+            return iter([])
+
+    def _open_cosmopedia_stream():
+        try:
+            return _open_hf_stream("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", max_retries=1)
+        except Exception:
+            return iter([])
+
+    def _open_edu_stream():
+        try:
+            return _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-10BT", max_retries=1)
+        except Exception:
+            return iter([])
+
+    all_domain_configs = [
         (
             "Broad Web (FineWeb sample-10BT)",
             _open_fineweb_stream,
             "broad_web",
-            0.85,
+            0.40,
         ),
         (
             "Code Repositories (The Stack v2)",
             _open_code_stream,
             "code",
+            0.20,
+        ),
+        (
+            "Mathematics & Proofs (FineMath)",
+            _open_math_stream,
+            "math",
             0.15,
         ),
+        (
+            "Synthetic Textbooks (Cosmopedia v2)",
+            _open_cosmopedia_stream,
+            "cosmopedia",
+            0.15,
+        ),
+        (
+            "Educational & Academic (FineWeb-Edu)",
+            _open_edu_stream,
+            "edu_academic",
+            0.10,
+        ),
     ]
+
+    if domains is not None:
+        target_domain_set = set(domains)
+        domain_configs = [cfg for cfg in all_domain_configs if cfg[2] in target_domain_set]
+        tot_wt = sum(cfg[3] for cfg in domain_configs)
+        if tot_wt > 0:
+            domain_configs = [(cfg[0], cfg[1], cfg[2], cfg[3] / tot_wt) for cfg in domain_configs]
+    else:
+        domain_configs = all_domain_configs
 
     eos_id = getattr(tokenizer, "eos_token_id", 2)
     if eos_id is None:

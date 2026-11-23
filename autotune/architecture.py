@@ -147,6 +147,7 @@ class ArchitectureDetector:
         seq_len: int = 256,
         max_batch_size: Optional[int] = None,
         tune_objective: str = "balanced",
+        device_signature: Optional[str] = None,
     ) -> bool:
         """
         Determines whether the given architecture needs auto-tuning on this hardware.
@@ -158,15 +159,20 @@ class ArchitectureDetector:
         else:
             load_fn = self.cache_manager.load
 
-        seq_suffix = f"_seq{seq_len}" if seq_len != 256 else ""
-        cap_suffix = f"_cap{int(max_batch_size)}" if max_batch_size is not None else ""
-        cache_sig = f"{hardware_sig}{seq_suffix}{cap_suffix}"
+        cached = None
+        if device_signature:
+            cached = load_fn(arch_info.architecture_name, device_signature)
 
-        cached = load_fn(arch_info.architecture_name, cache_sig)
-        if cached is None and cache_sig != hardware_sig and max_batch_size is None:
-            fallback = load_fn(arch_info.architecture_name, hardware_sig)
-            if fallback and fallback.get("seq_len") == seq_len:
-                cached = fallback
+        if cached is None:
+            seq_suffix = f"_seq{seq_len}" if seq_len != 256 else ""
+            cap_suffix = f"_cap{int(max_batch_size)}" if max_batch_size is not None else ""
+            cache_sig = f"{hardware_sig}{seq_suffix}{cap_suffix}"
+
+            cached = load_fn(arch_info.architecture_name, cache_sig)
+            if cached is None and cache_sig != hardware_sig and max_batch_size is None:
+                fallback = load_fn(arch_info.architecture_name, hardware_sig)
+                if fallback and fallback.get("seq_len") == seq_len:
+                    cached = fallback
 
         if cached is None:
             return True
