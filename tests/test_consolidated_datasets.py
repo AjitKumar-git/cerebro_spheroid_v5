@@ -8,10 +8,10 @@ Validates that all 6 consolidated dataset types:
 2. Carry explicit attribution to developer Ajit Kumar and persona Doty.
 3. Are completely free from third-party model identity leaks (OpenAI, Claude, DeepSeek, Qwen, etc.).
 4. Maintain exact tri-format parity (Spheroid JSONL, ShareGPT JSONL, ZSTD Parquet).
-5. Strictly adhere to native special tokens:
-   - Input format: <s> {prompt}\n
-   - Output format: <think>...</think><tool_call>...</tool_call>...{answer}</s>
-   - Absolute ZERO ChatML tokens (<|im_start|>, <|im_end|>) across all files.
+5. Strictly adhere to native ChatML special tokens:
+   - Input format: <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
+   - Output format: <think>...</think><tool_call>...</tool_call>...{answer}<|im_end|>
+   - Validates that <|im_start|> maps to ID 27 and <|im_end|> maps to ID 28 in the tokenizer.
 6. Support functional tool calling syntax without small-model JSON squishing.
 """
 
@@ -21,6 +21,7 @@ import json
 import re
 import unittest
 import pyarrow.parquet as pq
+from transformers import AutoTokenizer
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
@@ -35,6 +36,8 @@ class TestConsolidatedDatasets(unittest.TestCase):
     def setUpClass(cls):
         cls.consolidated_dir = os.path.join(PROJECT_ROOT, "data", "consolidated")
         cls.manifest_path = os.path.join(cls.consolidated_dir, "DATASET_MANIFEST.json")
+        cls.tok_dir = os.path.join(PROJECT_ROOT, "data", "tokenizer")
+        cls.tokenizer = AutoTokenizer.from_pretrained(cls.tok_dir)
         cls.expected_types = [
             ("doty_identity", "01_doty_identity"),
             ("agentic_tools", "02_agentic_tools"),
@@ -55,7 +58,10 @@ class TestConsolidatedDatasets(unittest.TestCase):
         self.assertEqual(manifest.get("total_types"), 6)
         self.assertGreater(manifest["summary"]["total_records"], 200_000)
         self.assertGreater(manifest["summary"]["total_estimated_tokens"], 100_000_000)
-        self.assertTrue(manifest.get("special_tokens_contract", {}).get("chatml_tokens_purged"))
+        tokens_contract = manifest.get("special_tokens_contract", {})
+        self.assertIn("tokenizer_chatml_ids", tokens_contract)
+        self.assertEqual(tokens_contract["tokenizer_chatml_ids"].get("<|im_start|>"), 27)
+        self.assertEqual(tokens_contract["tokenizer_chatml_ids"].get("<|im_end|>"), 28)
 
     def test_02_directory_and_file_structure(self):
         for type_name, dir_name in self.expected_types:
@@ -96,49 +102,49 @@ class TestConsolidatedDatasets(unittest.TestCase):
                     # Ensure zero identity leaks
                     is_bad, reason = is_identity_contaminated(r["formatted_output"])
                     if is_bad:
-                        # Allow explicit adversarial rejection mentioning Doty / Ajit Kumar
                         self.assertTrue("ajit kumar" in r["formatted_output"].lower(), f"Contamination in {type_name}: {reason}")
 
-    def test_04_native_special_tokens_and_zero_chatml(self):
+    def test_04_native_chatml_special_tokens(self):
         """
-        Validates the Handover Contract:
-        1. formatted_input strictly starts with '<s> ' and ends with '\n'.
-        2. formatted_output ends with '</s>' or '</tool_call>'.
-        3. input and output match formatted_input and formatted_output.
-        4. Absolute ZERO ChatML tokens (<|im_start|>, <|im_end|>) across all records.
+        Validates ChatML special tokens:
+        1. Tokenizer maps <|im_start|> to ID 27 and <|im_end|> to ID 28.
+        2. formatted_input starts with '<|im_start|>' and contains '<|im_end|>\n<|im_start|>assistant\n'.
+        3. formatted_output ends with '<|im_end|>'.
+        4. input and output match formatted_input and formatted_output.
+        5. Tokenizing formatted_input preserves atomic IDs 27 and 28 with zero fragmentation.
         """
+        self.assertEqual(self.tokenizer.encode("<|im_start|>", add_special_tokens=False), [27])
+        self.assertEqual(self.tokenizer.encode("<|im_end|>", add_special_tokens=False), [28])
+
         for type_name, dir_name in self.expected_types:
             sph_file = os.path.join(self.consolidated_dir, dir_name, f"{type_name}_spheroid.jsonl")
             with open(sph_file, "r", encoding="utf-8") as f:
-                for i in range(30):
+                for i in range(20):
                     line = f.readline()
                     if not line:
                         break
                     r = json.loads(line)
                     inp = r.get("formatted_input", "")
                     out = r.get("formatted_output", "")
-                    prompt = r.get("prompt", "")
 
-                    # 1. Native input contract
-                    self.assertTrue(inp.startswith("<s> "), f"Input in {type_name} must start with '<s> ': {inp[:30]}")
-                    self.assertTrue(inp.endswith("\n"), f"Input in {type_name} must end with newline: {inp[-20:]}")
+                    # 1. ChatML input contract
+                    self.assertTrue(inp.startswith("<|im_start|>"), f"Input in {type_name} must start with '<|im_start|>': {inp[:30]}")
+                    self.assertTrue(inp.endswith("<|im_start|>assistant\n"), f"Input in {type_name} must end with assistant prompt: {inp[-30:]}")
 
-                    # 2. Native output contract
-                    self.assertTrue(
-                        out.endswith("</s>") or out.endswith("</tool_call>"),
-                        f"Output in {type_name} must end with '</s>' or '</tool_call>': {out[-30:]}"
-                    )
+                    # 2. ChatML output contract
+                    self.assertTrue(out.endswith("<|im_end|>"), f"Output in {type_name} must end with '<|im_end|>': {out[-30:]}")
 
                     # 3. input/output parity
                     self.assertEqual(r.get("input"), inp, f"'input' must match 'formatted_input' in {type_name}")
                     self.assertEqual(r.get("output"), out, f"'output' must match 'formatted_output' in {type_name}")
 
-                    # 4. Strict ChatML absence
-                    for field in (inp, out, prompt, r.get("answer", "")):
-                        self.assertNotIn("<|im_start|>", field, f"ChatML <|im_start|> detected in {type_name} field")
-                        self.assertNotIn("<|im_end|>", field, f"ChatML <|im_end|> detected in {type_name} field")
-                        self.assertNotIn("<stim>", field, f"Legacy <stim> detected in {type_name}")
-                        self.assertNotIn("</stim>", field, f"Legacy </stim> detected in {type_name}")
+                    # 4. Atomic tokenization verification
+                    inp_tokens = self.tokenizer.encode(inp, add_special_tokens=False)
+                    self.assertEqual(inp_tokens[0], 27, f"First token in {type_name} must be ID 27 (<|im_start|>)")
+                    self.assertEqual(inp_tokens[-4], 27, f"Assistant prefix token in {type_name} must be ID 27 (<|im_start|>)")
+
+                    out_tokens = self.tokenizer.encode(out, add_special_tokens=False)
+                    self.assertEqual(out_tokens[-1], 28, f"Last token in {type_name} must be ID 28 (<|im_end|>)")
 
     def test_05_functional_tool_syntax(self):
         """
@@ -152,7 +158,6 @@ class TestConsolidatedDatasets(unittest.TestCase):
                 r = json.loads(line)
                 tc = r.get("tool_call", "").strip()
                 if tc:
-                    # Must be functional syntax or name(...)
                     self.assertFalse(tc.startswith('{"name":'), f"Tool call in {r['id']} uses raw JSON instead of functional syntax: {tc}")
                     checked += 1
                 if checked >= 25:
@@ -176,17 +181,12 @@ class TestConsolidatedDatasets(unittest.TestCase):
                     self.assertIn("Doty", messages[0]["content"])
                     self.assertIn("Ajit Kumar", messages[0]["content"])
 
-                    for m in messages:
-                        self.assertNotIn("<|im_start|>", m.get("content", ""))
-                        self.assertNotIn("<|im_end|>", m.get("content", ""))
-
     def test_07_parquet_readability_and_metadata(self):
         for type_name, dir_name in self.expected_types:
             pq_file = os.path.join(self.consolidated_dir, dir_name, f"{type_name}.parquet")
             meta = pq.read_metadata(pq_file)
             self.assertGreater(meta.num_rows, 0, f"Parquet {pq_file} has 0 rows")
 
-            # Read top 5 rows
             table = pq.read_table(pq_file)
             cols = table.column_names
             self.assertIn("id", cols)

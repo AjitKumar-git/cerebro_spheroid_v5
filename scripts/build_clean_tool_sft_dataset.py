@@ -354,35 +354,38 @@ def main():
     print(f"✓ Saved {len(trajectories):,} trajectories to {traj_path}")
 
     # Generate teacher-forcing training pairs:
-    # Clean native prompt format aligned with tokenizer special tokens
+    # Native ChatML format aligned with tokenizer special tokens (IDs 27 & 28)
     training_pairs = []
     for t in trajectories:
         cat = t["category"]
         p = t["prompt"]
-        base_inp = f"<s> {p}\n"
+        base_inp = f"<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n"
 
         if cat == "conversational":
+            clean_out = t["step1_output"].replace("</s>", "").strip()
             training_pairs.append({
                 "type": "conversational",
                 "category": cat,
                 "input": base_inp,
-                "output": t["step1_output"],
+                "output": f"{clean_out}<|im_end|>",
             })
         else:
             # Stage 1: Learn to emit <tool_call>
+            clean_s1 = t["step1_output"].replace("</s>", "").strip()
             training_pairs.append({
                 "type": "stage1_tool_call",
                 "category": cat,
                 "input": base_inp,
-                "output": t["step1_output"],
+                "output": f"{clean_s1}<|im_end|>",
             })
             # Stage 2: Learn to assimilate <tool_response> and emit grounded final answer
-            stage2_inp = f"{base_inp}{t['step1_output']}\n<tool_response> {t['tool_response']} </tool_response>\n"
+            stage2_inp = f"{base_inp}{clean_s1}<|im_end|>\n<tool_response> {t['tool_response']} </tool_response>\n<|im_start|>assistant\n"
+            clean_s2 = t["step2_output"].replace("</s>", "").strip()
             training_pairs.append({
                 "type": "stage2_grounded_answer",
                 "category": cat,
                 "input": stage2_inp,
-                "output": t["step2_output"],
+                "output": f"{clean_s2}<|im_end|>",
             })
 
     random.shuffle(training_pairs)

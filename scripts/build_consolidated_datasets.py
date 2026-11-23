@@ -7,23 +7,22 @@ Consolidates, standardizes, decontaminates, and exports training datasets
 for each of the 6 core curriculum types of CerebroSpheroid V5:
 
   1. doty_identity       (Persona, Creator Attribution: Ajit Kumar, Architecture)
-  2. agentic_tools       (APIGen & Hermes Function Calling, Multi-turn execution)
+  2. agentic_tools       (APIGen & Hermes Function Calling, Multi-turn execution, Sensory KV)
   3. complex_reasoning   (OpenThoughts, Sky-T1 Olympiad, NuminaMath, Golden CoT)
   4. domain_knowledge    (Diverse SFT, Chat Thinking, Custom Train, Retrieval)
   5. anti_sycophancy     (Anti-sycophancy, Epistemic Humility, Counterfactuals)
   6. lexical_dictionary  (Webster's 111k unabridged lexicon & rare-token anchors)
 
-Key Architectural Refinements (from Handover Specification):
-  • Complete elimination of ChatML tokens (<|im_start|>, <|im_end|>):
-    Prevents tokenizer sub-token fragmentation [529, 29989, 326, ...] ("im" token hallucination).
-  • Native special tokens contract:
-    - Input: <s> {prompt}\\n
-    - Output: <think>...</think><tool_call>...</tool_call>\\n<tool_response>...</tool_response>\\n{answer}</s>
-  • Functional tool syntax normalization:
-    Converts nested JSON calls into functional syntax: calc(...), facts(...), python(...), func(k=v)
-    to eliminate small-model JSON squishing hallucinations.
-  • Pointer-copy sensory grounding & closed-loop agentic trajectories.
-  • Parity across (formatted_input, formatted_output) and (input, output) fields.
+Tokenization Contract:
+  • Native ChatML Special Tokens (Assigned to IDs 27 & 28 in Tokenizer):
+    - <|im_start|> : Token ID 27 (Single atomic token)
+    - <|im_end|>   : Token ID 28 (Single atomic token)
+  • Standard Input Format:
+    <|im_start|>user\\n{prompt}<|im_end|>\\n<|im_start|>assistant\\n
+  • Standard Output Format:
+    <think>...</think><tool_call>...</tool_call>...{answer}<|im_end|>
+  • Functional Tool Syntax:
+    calc(...), facts(...), python(...), func(k=v) without nested JSON squishing.
 
 Tri-Format Parity:
   • <type>_spheroid.jsonl : CerebroSpheroid 3-tier format (<think>, <tool_call>, answer)
@@ -167,10 +166,9 @@ def parse_model_tiers(text: str) -> Dict[str, str]:
     clean_text = re.sub(r"<(?:tool_call|act)>.*?(?:</(?:tool_call|act)>|$)", "", clean_text, flags=re.DOTALL)
     clean_text = re.sub(r"<tool_response>.*?(?:</tool_response>|$)", "", clean_text, flags=re.DOTALL)
 
-    # Strip legacy and ChatML tokens
+    # Strip legacy tokens
     for stray in (
         "<|im_end|>", "<|im_start|>", "</s>", "<s>",
-        "<|im_start|>user\n", "<|im_start|>assistant\n", "<|im_start|>system\n",
         "<stim>", "</stim>", "[INST]", "[/INST]"
     ):
         clean_text = clean_text.replace(stray, "")
@@ -184,25 +182,49 @@ def parse_model_tiers(text: str) -> Dict[str, str]:
     }
 
 
-def clean_raw_prompt(prompt: str) -> str:
-    """Strips all ChatML and legacy tokens from the prompt."""
-    if not isinstance(prompt, str):
-        prompt = str(prompt or "")
+def extract_clean_prompt_and_input(raw_item: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    Extracts the clean prompt and the canonical ChatML formatted_input:
+    <|im_start|>user\\n{prompt}<|im_end|>\\n<|im_start|>assistant\\n
+    Preserves multi-turn or sensory-KV grounding if already present.
+    """
+    raw_prompt = (
+        raw_item.get("prompt")
+        or raw_item.get("question")
+        or raw_item.get("input")
+        or raw_item.get("formatted_input")
+        or ""
+    )
+    if not raw_prompt and "messages" in raw_item and isinstance(raw_item["messages"], list):
+        user_msgs = [m.get("content", "") for m in raw_item["messages"] if m.get("role") in ("user", "human")]
+        if user_msgs:
+            raw_prompt = "\n".join(user_msgs).strip()
+
+    raw_prompt = str(raw_prompt or "").strip()
+
+    # If it's already a complete multi-turn ChatML prompt (e.g. from agentic_tools_sensory_grounded)
+    if "<|im_start|>" in raw_prompt and "<|im_end|>" in raw_prompt:
+        clean_chatml = raw_prompt
+        if clean_chatml.startswith("<s>"):
+            clean_chatml = clean_chatml[len("<s>"):].strip()
+        if not clean_chatml.endswith("\n"):
+            clean_chatml = clean_chatml + "\n"
+
+        m_user = re.search(r"<\|im_start\|>user\n(.*?)(?:<\|im_end\|>|$)", clean_chatml, re.DOTALL)
+        plain_prompt = m_user.group(1).strip() if m_user else clean_chatml
+        return plain_prompt, clean_chatml
+
+    # Strip legacy and wrapping tokens
+    clean_p = raw_prompt
     for stray in (
         "<|im_start|>user\n", "<|im_start|>assistant\n", "<|im_start|>system\n",
-        "<|im_start|>", "<|im_end|>",
-        "<stim>", "</stim>", "[INST]", "[/INST]"
+        "<|im_start|>", "<|im_end|>", "<s>", "</s>", "<stim>", "</stim>", "[INST]", "[/INST]"
     ):
-        prompt = prompt.replace(stray, "")
+        clean_p = clean_p.replace(stray, "")
+    clean_p = clean_p.strip()
 
-    prompt = prompt.strip()
-    # Strip leading <s> so we don't duplicate
-    if prompt.startswith("<s>"):
-        prompt = prompt[len("<s>"):].strip()
-    # Strip trailing </s>
-    if prompt.endswith("</s>"):
-        prompt = prompt[:-len("</s>")].strip()
-    return prompt.strip()
+    formatted_input = f"<|im_start|>user\n{clean_p}<|im_end|>\n<|im_start|>assistant\n"
+    return clean_p, formatted_input
 
 
 def standardize_record(
@@ -214,21 +236,16 @@ def standardize_record(
 ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]]:
     """
     Standardizes a raw record into (spheroid_dict, sharegpt_dict, parquet_dict).
-    Applies identity decontamination and attribution to Ajit Kumar.
-    Returns None if record is contaminated or empty.
+    Applies ChatML formatting (<|im_start|>, <|im_end|>), identity decontamination,
+    and attribution to Ajit Kumar.
     """
-    # 1. Extract prompt
-    prompt = (
-        raw_item.get("prompt")
-        or raw_item.get("question")
-        or raw_item.get("input")
-        or raw_item.get("formatted_input")
-        or ""
-    )
-    prompt = clean_raw_prompt(str(prompt))
+    # 1. Extract prompt and ChatML input
+    plain_prompt, formatted_input = extract_clean_prompt_and_input(raw_item)
+    if not plain_prompt and not formatted_input:
+        return None
 
     # 2. Extract response
-    response = (
+    raw_response = (
         raw_item.get("formatted_output")
         or raw_item.get("response")
         or raw_item.get("output")
@@ -238,30 +255,23 @@ def standardize_record(
         or ""
     )
 
-    # If raw_item has messages (ShareGPT)
-    if "messages" in raw_item and isinstance(raw_item["messages"], list):
-        user_msgs = [m.get("content", "") for m in raw_item["messages"] if m.get("role") in ("user", "human")]
+    if not raw_response and "messages" in raw_item and isinstance(raw_item["messages"], list):
         asst_msgs = [m.get("content", "") for m in raw_item["messages"] if m.get("role") in ("assistant", "gpt", "model")]
-        if user_msgs and not prompt:
-            prompt = clean_raw_prompt("\n".join(user_msgs))
-        if asst_msgs and not response:
-            response = asst_msgs[-1].strip()
+        if asst_msgs:
+            raw_response = asst_msgs[-1].strip()
 
-    if not prompt or not response:
+    raw_response = str(raw_response or "").strip()
+    if not raw_response:
         return None
 
-    # Strip ChatML from response
-    if isinstance(response, str):
-        for stray in (
-            "<|im_start|>assistant\n", "<|im_start|>user\n", "<|im_start|>system\n",
-            "<|im_start|>", "<|im_end|>",
-            "<stim>", "</stim>", "[INST]", "[/INST]"
-        ):
-            response = response.replace(stray, "")
-        response = response.strip()
+    # Strip legacy tags from response before sanitizing
+    clean_resp = raw_response
+    for stray in ("<|im_end|>", "<|im_start|>", "</s>", "<s>", "<stim>", "</stim>", "[INST]", "[/INST]"):
+        clean_resp = clean_resp.replace(stray, "")
+    clean_resp = clean_resp.strip()
 
     # 3. Decontaminate third-party model leaks
-    clean_res = sanitize_conversation_turn(prompt, response, allow_adversarial_attribution=True)
+    clean_res = sanitize_conversation_turn(plain_prompt, clean_resp, allow_adversarial_attribution=True)
     if clean_res is None:
         return None  # Purged toxic leak
 
@@ -280,7 +290,7 @@ def standardize_record(
     if tool_call:
         tool_call = json_tool_call_to_functional(tool_call)
 
-    # 5. Build canonical formatted_output
+    # 5. Build canonical formatted_output with ChatML <|im_end|>
     def to_str(v: Any) -> str:
         if v is None:
             return ""
@@ -292,7 +302,6 @@ def standardize_record(
     tool_call = to_str(tool_call).strip()
     tool_response = to_str(tool_response).strip()
     answer = to_str(answer).strip()
-    prompt = to_str(prompt).strip()
 
     out_parts = []
     if thinking:
@@ -305,27 +314,16 @@ def standardize_record(
         out_parts.append(answer)
     formatted_output = "\n".join(out_parts).strip()
 
-    # Clean legacy ChatML tokens from formatted_output if any slipped through
-    for stray in ("<|im_start|>", "<|im_end|>"):
-        formatted_output = formatted_output.replace(stray, "")
-
-    # Ensure clean terminal EOS token
-    if answer or not tool_call:
-        if not formatted_output.endswith("</s>"):
-            formatted_output = formatted_output + "</s>"
-    else:
-        # Tool call emission only (Stage 1)
-        if not formatted_output.endswith("</tool_call>") and not formatted_output.endswith("</s>"):
-            formatted_output = formatted_output + "</s>"
-
-    # Native input format
-    formatted_input = f"<s> {prompt}\n"
+    # Strip stray </s> before appending canonical <|im_end|>
+    formatted_output = formatted_output.replace("</s>", "").strip()
+    if not formatted_output.endswith("<|im_end|>"):
+        formatted_output = f"{formatted_output}<|im_end|>"
 
     uid = f"{prefix_id}_{idx:06d}"
     category = to_str(raw_item.get("category") or raw_item.get("domain") or type_name)
     source = to_str(raw_item.get("source") or default_source)
 
-    # Spheroid record (both formatted_input/formatted_output and input/output for full compatibility)
+    # Spheroid record
     spheroid_record = {
         "id": uid,
         "type": type_name,
@@ -333,7 +331,7 @@ def standardize_record(
         "source": source,
         "persona": "Doty",
         "developer": "Ajit Kumar",
-        "prompt": prompt,
+        "prompt": plain_prompt,
         "thinking": thinking,
         "tool_call": tool_call,
         "tool_response": tool_response,
@@ -344,15 +342,11 @@ def standardize_record(
         "output": formatted_output,
     }
 
-    # ShareGPT record (clean messages without raw <s> or ChatML tokens)
-    clean_user_content = prompt
-    if clean_user_content.startswith("<s>"):
-        clean_user_content = clean_user_content[len("<s>"):].strip()
-    clean_asst_content = formatted_output.rstrip("</s>").strip()
-
+    # ShareGPT record
+    clean_asst_content = formatted_output.replace("<|im_end|>", "").strip()
     messages = [
         {"role": "system", "content": DOTY_SYSTEM_PROMPT},
-        {"role": "user", "content": clean_user_content},
+        {"role": "user", "content": plain_prompt},
         {"role": "assistant", "content": clean_asst_content},
     ]
     sharegpt_record = {
@@ -372,7 +366,7 @@ def standardize_record(
         "source": source,
         "persona": "Doty",
         "developer": "Ajit Kumar",
-        "prompt": prompt,
+        "prompt": plain_prompt,
         "thinking": thinking,
         "tool_call": tool_call,
         "tool_response": tool_response,
@@ -405,7 +399,6 @@ def export_consolidated_type(
     sharegpt_path = os.path.join(target_dir, f"{type_name}_sharegpt.jsonl")
     parquet_path = os.path.join(target_dir, f"{type_name}.parquet")
 
-    # Temp files for atomic write
     spheroid_tmp = f"{spheroid_path}.tmp"
     sharegpt_tmp = f"{sharegpt_path}.tmp"
     parquet_tmp = f"{parquet_path}.tmp"
@@ -471,13 +464,12 @@ def export_consolidated_type(
 
                 sph, sgpt, pq_row = std
 
-                # Exact prompt deduplication using 8-byte hash (low RAM)
+                # Exact prompt deduplication using 8-byte hash
                 p_hash = hashlib.md5(" ".join(sph["prompt"].lower().split()).encode("utf-8")).digest()[:8]
                 if p_hash in seen_prompts:
                     continue
                 seen_prompts.add(p_hash)
 
-                # Write directly to stream
                 f_spheroid.write(json.dumps(sph, ensure_ascii=False) + "\n")
                 f_sharegpt.write(json.dumps(sgpt, ensure_ascii=False) + "\n")
                 parquet_batch.append(pq_row)
@@ -570,16 +562,16 @@ def main():
             "prefix_id": "doty_tool",
             "sources": [
                 {
+                    "path": "data/consolidated/02_agentic_tools/agentic_tools_sensory_grounded.jsonl",
+                    "source_name": "cerebro_sensory_grounded_verified",
+                },
+                {
                     "path": "data/consolidated/02_agentic_tools/closed_loop_sft_pairs.jsonl",
                     "source_name": "closed_loop_sensory_kv_pairs",
                 },
                 {
                     "path": "data/consolidated/02_agentic_tools/closed_loop_trajectories.jsonl",
                     "source_name": "closed_loop_trajectories",
-                },
-                {
-                    "path": "data/consolidated/02_agentic_tools/agentic_tools_sensory_grounded.jsonl",
-                    "source_name": "agentic_tools_sensory_grounded",
                 },
                 {
                     "path": "data/consolidated/02_agentic_tools/agentic_tools_spheroid.jsonl",
@@ -636,16 +628,25 @@ def main():
     selected_types = list(CONFIGS.keys()) if (args.all or not args.type) else [args.type]
 
     manifest = {
-        "manifest_version": "1.1.0",
+        "manifest_version": "2.0.0",
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "agent": "Doty",
         "developer": "Ajit Kumar",
         "architecture": "CerebroSpheroid V5",
         "cognitive_boundary": "3-Tier: <think> -> <tool_call> -> plain text",
         "special_tokens_contract": {
-            "input_prefix": "<s> {prompt}\\n",
-            "output_suffix": "</s>",
-            "chatml_tokens_purged": True,
+            "tokenizer_chatml_ids": {
+                "<|im_start|>": 27,
+                "<|im_end|>": 28,
+                "<think>": 29,
+                "</think>": 30,
+                "<tool_call>": 31,
+                "</tool_call>": 32,
+                "<tool_response>": 33,
+                "</tool_response>": 34
+            },
+            "input_format": "<|im_start|>user\\n{prompt}<|im_end|>\\n<|im_start|>assistant\\n",
+            "output_format": "{content}<|im_end|>",
             "functional_tool_syntax": True,
             "sensory_kv_grounded": True,
         },
@@ -684,7 +685,7 @@ def main():
 
     elapsed = time.time() - t0
     print("\n" + "=" * 60)
-    print(f"🎉 MASTER CONSOLIDATION PIPELINE COMPLETE ({elapsed:.1f}s)")
+    print(f"🎉 MASTER CHATML CONSOLIDATION PIPELINE COMPLETE ({elapsed:.1f}s)")
     print(f"   • Total Types Consolidated: {len(manifest['types'])}")
     print(f"   • Grand Total Records:       {manifest['summary']['total_records']:,}")
     print(f"   • Estimated Token Volume:    ~{manifest['summary']['total_estimated_tokens']:,} tokens ({manifest['summary']['total_estimated_tokens']/1e9:.3f}B)")
