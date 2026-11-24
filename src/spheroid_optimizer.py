@@ -184,7 +184,7 @@ class SpheroidOptimizer(Optimizer):
         neg_cov_enabled: bool = False,
         neg_cov_mode: str = "cosine_asymmetric",
         neg_cov_lambda: float = 0.05,
-        neg_cov_margin: float = 0.10,
+        neg_cov_margin: float = 0.12,
         neg_cov_subsample: int = 512,
         neg_cov_interval: int = 8,
         neg_cov_center: str = "global",
@@ -457,7 +457,7 @@ def create_spheroid_param_groups(
     neg_cov_enabled: bool = False,
     neg_cov_mode: str = "cosine_asymmetric",
     neg_cov_lambda: float = 0.05,
-    neg_cov_margin: float = 0.10,
+    neg_cov_margin: float = 0.12,
     neg_cov_subsample: int = 512,
     neg_cov_interval: int = 8,
     neg_cov_center: str = "global",
@@ -559,6 +559,14 @@ def create_spheroid_param_groups(
             "is_adamw": True,
             "spectral_clamp": None,
             "half_precision_moments": False,
+            "neg_cov_enabled": neg_cov_enabled,
+            "neg_cov_mode": neg_cov_mode,
+            "neg_cov_lambda": neg_cov_lambda,
+            "neg_cov_margin": neg_cov_margin,
+            "neg_cov_subsample": neg_cov_subsample,
+            "neg_cov_interval": neg_cov_interval,
+            "neg_cov_center": neg_cov_center,
+            "neg_cov_normalize": neg_cov_normalize,
         })
     if scalar_params:
         groups.append({
@@ -697,6 +705,11 @@ def build_scmer_optimizer(
         spectral_clamp=spectral_clamp,
         half_precision_moments=half_precision_moments,
         orthogonal_embeddings=orthogonal_embeddings,
+        neg_cov_enabled=True,
+        neg_cov_lambda=scmer_lambda,
+        neg_cov_margin=scmer_margin,
+        neg_cov_subsample=scmer_subsample,
+        neg_cov_interval=scmer_interval,
     )
     return SCMEROptimizer(
         params=groups,

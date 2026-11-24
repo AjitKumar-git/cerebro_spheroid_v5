@@ -1394,11 +1394,12 @@ def main(args=None):
     t0_compile = time.time()
     dummy_prompt_len = 1 if is_pretrain_source else args.prompt_len
     dummy_target_len = args.total_window if is_pretrain_source else args.seq_len
+    dummy_fb_fill = pad_id if is_pretrain_source else -100
     if use_multi_tpu_local_sgd:
         dummy_prompts = np.zeros((eff_num_devices, eff_local_steps, args.batch_size, dummy_prompt_len), dtype=np.int32)
         dummy_targets = np.zeros((eff_num_devices, eff_local_steps, args.batch_size, dummy_target_len), dtype=np.int32)
         dummy_feedback = (
-            np.full((eff_num_devices, eff_local_steps, args.batch_size, dummy_target_len), -100, dtype=np.int32)
+            np.full((eff_num_devices, eff_local_steps, args.batch_size, dummy_target_len), dummy_fb_fill, dtype=np.int32)
             if (elastic_batcher is not None or is_pretrain_source)
             else None
         )
@@ -1424,7 +1425,7 @@ def main(args=None):
             dummy_prompts = jnp.zeros((args.batch_size, dummy_prompt_len), dtype=jnp.int32)
             dummy_targets = jnp.zeros((args.batch_size, dummy_target_len), dtype=jnp.int32)
             dummy_feedback = (
-                jnp.full((args.batch_size, dummy_target_len), -100, dtype=jnp.int32)
+                jnp.full((args.batch_size, dummy_target_len), dummy_fb_fill, dtype=jnp.int32)
                 if (elastic_batcher is not None or is_pretrain_source)
                 else None
             )
@@ -1506,7 +1507,7 @@ def main(args=None):
                 batch_size=args.batch_size,
                 prompt_len=eval_prompt_len,
                 target_len=target_length,
-                target_pad_id=-100,
+                target_pad_id=pad_id,
                 pad_id=pad_id,
                 return_weights=True,
                 domains=domains_req,
@@ -1567,7 +1568,7 @@ def main(args=None):
                     target_len=args.seq_len,
                     vocab_size=config.vocab_size,
                     queue_size=4,
-                    target_pad_id=-100,
+                    target_pad_id=pad_id if is_pretrain_source else -100,
                 )
                 try:
                     for _ in range(4):

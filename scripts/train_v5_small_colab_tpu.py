@@ -423,7 +423,9 @@ def main(args=None):
             step = meta.get("step", 0)
             best_eval_loss = meta.get("eval_loss", float("inf"))
             from src.jax.checkpoint import restore_spheroid_opt_state
-            opt_state = restore_spheroid_opt_state(latest_pt, params)
+            opt_pt = latest_pt.replace(".pt", "_opt.pt")
+            opt_src = opt_pt if os.path.exists(opt_pt) else latest_pt
+            opt_state = restore_spheroid_opt_state(opt_src, params)
             print(f"✓ Resumed at Step {step:,} (Best Eval Loss: {best_eval_loss:.4f})")
         else:
             print(f"ℹ️  No checkpoint found locally or on bioflo.in. Starting clean from Step 0.")
@@ -686,12 +688,16 @@ def main(args=None):
                 "timestamp": time.time(),
             }
 
-            # 1. Save local latest checkpoint
+            # 1. Save local latest checkpoint (bare BF16 weights for upload per Directive #5)
             save_path = os.path.join(primary_ckpt_dir, "v5_small_scratch_latest.pt")
-            save_jax_to_torch_pt(active_params, buffers, save_path, meta=meta, opt_state=active_opt_state)
+            save_jax_to_torch_pt(active_params, buffers, save_path, meta=meta, opt_state=None)
             json_path = save_path.replace(".pt", ".json")
             with open(json_path, "w") as f:
                 json.dump(meta, f, indent=2)
+
+            # Save local optimizer state separately on scratch disk for seamless node resumption
+            opt_save_path = os.path.join(primary_ckpt_dir, "v5_small_scratch_latest_opt.pt")
+            save_jax_to_torch_pt(active_params, buffers, opt_save_path, meta=meta, opt_state=active_opt_state)
 
             # 2. Async Cloud Upload to bioflo.in
             if args.cloud_sync:

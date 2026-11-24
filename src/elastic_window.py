@@ -1373,7 +1373,7 @@ class ElasticBucketBatcher:
         total_window: int = 1024,
         buckets: Optional[List[Tuple[str, int, int]]] = None,
         framework: str = "jax",  # 'jax' or 'torch'
-        target_pad_id: int = -100,
+        target_pad_id: Optional[int] = None,
         return_feedback: bool = False,
         rng: Optional[random.Random] = None,
         tail_probability: float = 0.25,
@@ -1384,13 +1384,14 @@ class ElasticBucketBatcher:
         self.total_window = total_window
         self.buckets = buckets if buckets is not None else get_default_elastic_buckets(total_window)
         self.framework = framework.lower()
-        self.target_pad_id = target_pad_id
         self.return_feedback = return_feedback
         self.rng = rng or random.Random(42)
         self.tail_probability = tail_probability
         self.max_queue_size = max(batch_size * 4, 128)
 
         self.pad_id = tokenizer.pad_token_id if (hasattr(tokenizer, "pad_token_id") and tokenizer.pad_token_id is not None) else 0
+        # Pretraining Invariant: default target padding to pad_id (100% loss-bearing tokens), reserving -100 strictly for SFT
+        self.target_pad_id = target_pad_id if target_pad_id is not None else self.pad_id
         # Queues per bucket index with bounded capacity
         self.queues: Dict[int, collections.deque] = {i: collections.deque(maxlen=self.max_queue_size) for i in range(len(self.buckets))}
         self.tokens_by_dataset: Dict[str, int] = collections.defaultdict(int)
@@ -1999,7 +2000,7 @@ def build_pretrain_eval_split(
     batch_size: int = 8,
     prompt_len: int = 256,
     target_len: int = 512,
-    target_pad_id: int = -100,
+    target_pad_id: Optional[int] = None,
     pad_id: int = 0,
     return_weights: bool = False,
     domains: Optional[List[str]] = None,
@@ -2256,8 +2257,9 @@ def build_pretrain_eval_split(
 
             if len(q_ids) < prompt_len:
                 q_ids = q_ids + [pad_id] * (prompt_len - len(q_ids))
+            eff_target_pad = target_pad_id if target_pad_id is not None else pad_id
             if len(r_ids) < target_len:
-                r_ids = r_ids + [target_pad_id] * (target_len - len(r_ids))
+                r_ids = r_ids + [eff_target_pad] * (target_len - len(r_ids))
 
             prompts_batch.append(q_ids)
             targets_batch.append(r_ids)
@@ -2265,10 +2267,11 @@ def build_pretrain_eval_split(
         q_arr = np.asarray(prompts_batch, dtype=np.int32)
         r_arr = np.asarray(targets_batch, dtype=np.int32)
 
-        fb_arr = np.full(r_arr.shape, target_pad_id, dtype=np.int32)
+        # Strictly causal teacher-forcing feedback: shifted by 1 with initial BOS/pad
+        init_fb = bos_id if bos_id is not None else pad_id
+        fb_arr = np.full(r_arr.shape, init_fb, dtype=np.int32)
         if r_arr.shape[1] > 1:
             fb_arr[:, 1:] = r_arr[:, :-1]
-        fb_arr = np.where(r_arr == target_pad_id, target_pad_id, fb_arr)
 
         eval_batches.append((q_arr, r_arr, fb_arr))
         domain_labels.append(name)

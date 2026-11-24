@@ -40,10 +40,10 @@ def _preferred_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
     return _orig_getaddrinfo(host, port, family, type, proto, flags)
 socket.getaddrinfo = _preferred_getaddrinfo
 
-DEFAULT_SYNC_TOKEN = "CerebroSpheroid_Sync_Secure_2026"
+DEFAULT_SYNC_TOKEN = os.environ.get("BIOFLO_SYNC_TOKEN", os.environ.get("CEREBRO_SYNC_TOKEN", "CerebroSpheroid_Sync_Secure_2026"))
 
 
-def get_sync_token(token: Optional[str] = None) -> str:
+def get_sync_token(token: Optional[str] = None, fail_closed: bool = False) -> str:
     """Retrieves sync token from argument, environment variables, local secret store, or default website vault."""
     if token:
         return token
@@ -59,6 +59,8 @@ def get_sync_token(token: Optional[str] = None) -> str:
                         return t
             except Exception:
                 pass
+    if fail_closed:
+        raise ValueError("Missing sync token: neither BIOFLO_SYNC_TOKEN, CEREBRO_SYNC_TOKEN, nor token file found.")
     return DEFAULT_SYNC_TOKEN
 
 

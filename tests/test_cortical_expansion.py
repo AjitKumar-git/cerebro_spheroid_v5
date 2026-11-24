@@ -19,6 +19,18 @@ from src.jax.spheroid_optimizer import build_spheroid_train_engine, init_spheroi
 from src.jax.v5_model import ModelConfigV5, PRESETS_V5, init_params_v5
 
 
+def test_directive_7_default_unlocked_all_shells():
+    """Directive #7: Default cortical expansion must have 100% unlocked shells (all mask values = 1.0)."""
+    cfg = ModelConfigV5(**PRESETS_V5["v5_test"])
+    params, buffers = init_params_v5(jax.random.PRNGKey(0), cfg)
+    masks = build_cortical_expansion_masks(params)
+    for k, v in masks.items():
+        assert np.all(np.asarray(v) == 1.0), f"Shell or parameter {k} is locked!"
+    stats = count_cortical_expansion_params(params, masks)
+    assert stats["frozen_params"] == 0
+    assert stats["trainable_pct"] == 100.0
+
+
 def test_cortical_expansion_masks_structure():
     cfg = ModelConfigV5(**PRESETS_V5["v5_compact_32shells"])
     params, buffers = init_params_v5(jax.random.PRNGKey(0), cfg)

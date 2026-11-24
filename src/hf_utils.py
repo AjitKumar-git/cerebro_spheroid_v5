@@ -86,19 +86,10 @@ def get_hf_token(explicit_token: Optional[str] = None) -> Optional[str]:
         if env_val:
             return env_val
 
-    # 3. Dynamic retrieval from bioflo.in website vault (Golden Rule)
+    # 3. Dynamic retrieval from bioflo.in website vault (Directive #6 Authority)
     web_tok = fetch_hf_token_from_website()
     if web_tok:
         return web_tok
-
-    # 4. Google Colab Secrets (Key icon in left sidebar)
-    try:
-        from google.colab import userdata
-        colab_tok = _clean_token(userdata.get("HF_TOKEN") or userdata.get("HUGGINGFACE_HUB_TOKEN"))
-        if colab_tok:
-            return colab_tok
-    except Exception:
-        pass
 
     # 4. Kaggle Secrets
     try:
@@ -108,6 +99,7 @@ def get_hf_token(explicit_token: Optional[str] = None) -> Optional[str]:
         if kaggle_tok:
             return kaggle_tok
     except Exception:
+        pass
         pass
 
     # 5. Check dotenv files (.env in CWD, repo root, or ~/.env)

@@ -4,14 +4,11 @@
 Manages progressive concentric cortical expansion from pre-trained 100M foundation
 weights into the 32-shell Compact model (166.3M parameters).
 
-Biological Architecture:
-  Concentric cortical expansion mirrors mammalian neocortical evolution:
-  The mature, stable subcortical core (Shells 0–15, thalamic projections, sensory/motor
-  headers) remains structurally frozen (101.96M params | 61.3%).
-  All training capacity is concentrated into the outer cortical mantle
-  (Shells 16–31, small-world shortcut tracts 40–95 | 64.37M params | 38.7%) to acquire
-  multi-step deliberation, deductive reasoning, and complex cognitive synthesis without
-  catastrophic forgetting of core linguistic stability.
+Directive #7 Invariant (NO LOCKED SHELLS):
+  In compliance with AGENTS.md Directive #7, all concentric shells (from Shell 0 to
+  Shell K-1), shortcut tracts, radial gains, and sensory/motor projections remain 100%
+  unlocked, active, and receive non-zero gradients across all training iterations.
+  All mask generators and anneal schedules default to 1.0 (fully active and unfrozen).
 """
 
 from __future__ import annotations
@@ -24,30 +21,34 @@ import numpy as np
 
 def build_cortical_expansion_masks(
     params: Dict[str, Any],
-    num_frozen_shells: int = 16,
-    num_frozen_tracts: int = 40,
+    num_frozen_shells: int = 0,
+    num_frozen_tracts: int = 0,
     framework: str = "jax",
-    anneal_factor: float = 0.0,
+    anneal_factor: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
-    Constructs gradient masks for progressive cortical expansion and consolidation annealing.
+    Constructs gradient masks for progressive cortical expansion.
+    In compliance with Directive #7, defaults to 1.0 (100% unlocked shells across all layers).
     
     Args:
         params: Dictionary of model parameters (JAX arrays, PyTorch tensors, or NumPy arrays).
-        num_frozen_shells: Number of innermost concentric shells in core (default: 16).
-        num_frozen_tracts: Number of primary shortcut tracts in core (default: 40).
+        num_frozen_shells: Number of innermost concentric shells to freeze (default: 0 for 100% unlocked).
+        num_frozen_tracts: Number of primary shortcut tracts to freeze (default: 0 for 100% unlocked).
         framework: 'jax', 'torch', or 'numpy' for the output mask arrays.
-        anneal_factor: Gradient multiplier for frozen core during annealing [0.0 = fully frozen, 1.0 = fully unfrozen].
+        anneal_factor: Gradient multiplier for core [default: 1.0 for unlocked default, 0.0 if shells explicitly frozen].
     
     Returns:
         Dictionary of mask arrays matching the keys and shapes of `params`.
     """
     masks: Dict[str, Any] = {}
-    anneal = float(np.clip(anneal_factor, 0.0, 1.0))
+    if anneal_factor is None:
+        anneal = 1.0 if (num_frozen_shells == 0 and num_frozen_tracts == 0) else 0.0
+    else:
+        anneal = float(np.clip(anneal_factor, 0.0, 1.0))
 
     for k, v in params.items():
         shape = tuple(v.shape)
-        # Default: initialize with anneal multiplier for core
+        # Default: initialize with anneal multiplier
         mask_np = np.full(shape, anneal, dtype=np.float32)
 
         # Core concentric shells and shortcut tracts: outer mantle is 100% trainable (1.0)
@@ -81,7 +82,6 @@ def build_cortical_expansion_masks(
             if len(shape) >= 1 and shape[0] > num_frozen_shells:
                 mask_np[num_frozen_shells:] = 1.0
         elif k.startswith("sensory.") or k.startswith("motor.") or k.startswith("perceptual.") or k.startswith("audio_stem."):
-            # Core sensory encoders, positional embeddings, motor decoders, and heads scale with anneal factor
             mask_np[...] = anneal
         elif k in ("pos_embed", "phase_embed", "affine_scale"):
             mask_np[...] = anneal
@@ -105,14 +105,15 @@ def compute_cortical_anneal_factor(
     warmup_steps: int = 2000,
     anneal_steps: int = 1000,
     cycle_length: Optional[int] = None,
+    enforce_unlocked: bool = True,
 ) -> float:
     """
-    Computes the continuous unfreezing anneal factor [0.0, 1.0] for the core and interface.
-    
-    0.0: Core is strictly frozen (only outer mantle 16..31 trains).
-    0.0 -> 1.0: Interface and core smoothly unfreeze so interface representations normalize.
-    1.0: Entire mantle is fully unfrozen for global co-adaptation.
+    Computes the continuous unfreezing anneal factor [0.0, 1.0].
+    Per Directive #7, enforce_unlocked=True guarantees 1.0 (fully active core).
     """
+    if enforce_unlocked:
+        return 1.0
+
     if cycle_length is not None and cycle_length > 0:
         cycle_step = step % cycle_length
         freeze_window = cycle_length - anneal_steps
