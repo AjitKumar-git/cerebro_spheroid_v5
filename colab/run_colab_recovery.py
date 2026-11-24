@@ -220,11 +220,13 @@ def ensure_foundation_checkpoint(ckpt_path: str, model_tier: str) -> str:
     print(f"\n📥 Base checkpoint not found locally at {ckpt_path}.")
     print(f"🌐 Querying bioflo.in to pull remote champion [{model_tier}]...")
     os.makedirs(os.path.dirname(os.path.abspath(ckpt_path)), exist_ok=True)
+    token = get_sync_token()
     try:
         pulled = pull_checkpoint(
-            model=model_tier,
-            dest_dir=os.path.dirname(os.path.abspath(ckpt_path)),
+            local_dest=ckpt_path,
             target_type="latest",
+            model=model_tier,
+            token=token,
         )
         if pulled and os.path.exists(ckpt_path):
             print(f"✅ Successfully pulled {ckpt_path} from bioflo.in cloud!")
