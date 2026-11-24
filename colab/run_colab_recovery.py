@@ -140,6 +140,14 @@ def parse_args():
         help="Local scratch directory",
     )
     parser.add_argument(
+        "--dataset-source",
+        "--dataset_source",
+        dest="dataset_source",
+        type=str,
+        default="pretrain",
+        help="Dataset source for recovery: 'pretrain' (SmolLM2 online streaming) or 'local' (default: pretrain)",
+    )
+    parser.add_argument(
         "--total-steps",
         "--total_steps",
         dest="total_steps",
@@ -312,79 +320,107 @@ def promote_graduated_checkpoint(
     print("=" * 80 + "\n")
 
 
-def main():
-    args = parse_args()
+def run_recovery(
+    preset: str = "auto",
+    init_from_checkpoint: str = "checkpoints/v5_small_latest.pt",
+    temp_model_tier: str = "v5_small_recovery",
+    main_model_tier: str = "v5_small",
+    target_loss: float = 2.85,
+    consistent_evals: int = 2,
+    checkpoint_dir: str = None,
+    scratch_dir: str = None,
+    dataset_source: str = "pretrain",
+    total_steps: int = 285_000,
+    eval_interval: int = 200,
+    save_interval: int = 500,
+    lr: float = 1.5e-4,
+    min_lr: float = 3e-5,
+    warmup_steps: int = 300,
+    effective_batch_size: int = 64,
+    batch_size: int = None,
+    cloud_sync: bool = True,
+    pull_remote: bool = False,
+):
+    """
+    Executes the attenuated recovery process directly in-process.
+    Can be invoked from interactive Colab notebooks or the CLI main runner.
+    """
+    if checkpoint_dir is None:
+        checkpoint_dir = "/content/checkpoints/recovery" if os.path.exists("/content") else "checkpoints/recovery"
+    if scratch_dir is None:
+        scratch_dir = "/content/scratch/recovery" if os.path.exists("/content") else "scratch/recovery"
 
     # Hardware Detection
-    if args.preset == "auto":
+    if preset == "auto":
         try:
             devs = jax.devices()
             dev_kind = devs[0].device_kind.lower() if devs else ""
             if "v6" in dev_kind or "trillium" in dev_kind:
-                args.preset = "tpu_v6e_1"
+                preset = "tpu_v6e_1"
             elif "v5" in dev_kind:
-                args.preset = "tpu_v5e_1"
+                preset = "tpu_v5e_1"
             else:
-                args.preset = "v5_small"
+                preset = "v5_small"
         except Exception:
-            args.preset = "v5_small"
-        print(f"⚡ Hardware auto-detected preset: {args.preset}")
+            preset = "v5_small"
+        print(f"⚡ Hardware auto-detected preset: {preset}")
 
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
-    os.makedirs(args.scratch_dir, exist_ok=True)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(scratch_dir, exist_ok=True)
 
     print("=" * 80)
     print("⚡ CEREBROSPHEROID V5: COLAB ATTENUATED RECOVERY RUNNER")
     print("=" * 80)
     print(f"  Execution Node        : {detect_source_environment().upper()} Runtime")
-    print(f"  Architecture Preset   : {args.preset}")
-    print(f"  Temporary Cloud Tier  : {args.temp_model_tier} (Isolated bioflo.in namespace)")
-    print(f"  Official Target Tier  : {args.main_model_tier} (Protected from graph pollution)")
-    print(f"  Target Graduation Loss: <= {args.target_loss:.4f} ({args.consistent_evals} cycles)")
-    print(f"  Learning Rate Profile : Warmup {args.warmup_steps} -> Peak {args.lr} -> Floor {args.min_lr}")
-    print(f"  Checkpoint Directory  : {args.checkpoint_dir}")
+    print(f"  Architecture Preset   : {preset}")
+    print(f"  Temporary Cloud Tier  : {temp_model_tier} (Isolated bioflo.in namespace)")
+    print(f"  Official Target Tier  : {main_model_tier} (Protected from graph pollution)")
+    print(f"  Dataset Source        : {dataset_source}")
+    print(f"  Target Graduation Loss: <= {target_loss:.4f} ({consistent_evals} cycles)")
+    print(f"  Learning Rate Profile : Warmup {warmup_steps} -> Peak {lr} -> Floor {min_lr}")
+    print(f"  Checkpoint Directory  : {checkpoint_dir}")
     print("=" * 80 + "\n")
 
     # Ensure Foundation Checkpoint Exists
-    base_ckpt = ensure_foundation_checkpoint(args.init_from_checkpoint, args.main_model_tier)
+    base_ckpt = ensure_foundation_checkpoint(init_from_checkpoint, main_model_tier, force_pull=pull_remote)
 
     # Check remote bioflo.in status
     try:
-        manifest = check_remote_manifest(args.main_model_tier)
-        print(f"🌐 [bioflo.in] Remote production tier status for [{args.main_model_tier}]: Connected.")
+        manifest = check_remote_manifest(main_model_tier)
+        print(f"🌐 [bioflo.in] Remote production tier status for [{main_model_tier}]: Connected.")
     except Exception as e:
         print(f"⚠️ [bioflo.in] Manifest check notice: {e}")
 
     # Build argument array for high-throughput JAX training engine
     forward_args = [
-        "--preset", args.preset,
+        "--preset", preset,
         "--init_from_checkpoint", base_ckpt,
-        "--sync_model", args.temp_model_tier,
-        "--checkpoint-dir", args.checkpoint_dir,
-        "--scratch_dir", args.scratch_dir,
+        "--sync_model", temp_model_tier,
+        "--checkpoint-dir", checkpoint_dir,
+        "--scratch_dir", scratch_dir,
         "--optimizer", "spheroid",
-        "--dataset_source", "local",
-        "--total-steps", str(args.total_steps),
-        "--eval_interval", str(args.eval_interval),
-        "--save-interval", str(args.save_interval),
-        "--target-eval-loss", str(args.target_loss),
-        "--consistent-eval-threshold", str(args.consistent_evals),
-        "--lr", str(args.lr),
-        "--min_lr", str(args.min_lr),
-        "--warmup_steps", str(args.warmup_steps),
-        "--resume_warmup_steps", str(args.warmup_steps),
+        "--dataset_source", dataset_source,
+        "--total-steps", str(total_steps),
+        "--eval_interval", str(eval_interval),
+        "--save-interval", str(save_interval),
+        "--target-eval-loss", str(target_loss),
+        "--consistent-eval-threshold", str(consistent_evals),
+        "--lr", str(lr),
+        "--min_lr", str(min_lr),
+        "--warmup_steps", str(warmup_steps),
+        "--resume_warmup_steps", str(warmup_steps),
         "--reset_best",
     ]
 
-    if not args.cloud_sync:
+    if not cloud_sync:
         forward_args.append("--no-cloud-sync")
-    if args.batch_size is not None:
-        forward_args.extend(["--batch_size", str(args.batch_size)])
+    if batch_size is not None:
+        forward_args.extend(["--batch_size", str(batch_size)])
 
     tpu_args = tpu_parse_args(forward_args)
 
-    print(f"\n🛡️  [Telemetry Shield Active] All progress synced strictly to [{args.temp_model_tier}].")
-    print(f"    Official [{args.main_model_tier}] curve on bioflo.in remains completely protected.\n")
+    print(f"\n🛡️  [Telemetry Shield Active] All progress synced strictly to [{temp_model_tier}].")
+    print(f"    Official [{main_model_tier}] curve on bioflo.in remains completely protected.\n")
 
     # Run training loop
     try:
@@ -393,8 +429,8 @@ def main():
         print("\n⚠️ Colab training interrupted by user.")
 
     # Post-training graduation check
-    best_path = os.path.join(args.checkpoint_dir, f"{args.preset}_best.pt")
-    latest_path = os.path.join(args.checkpoint_dir, f"{args.preset}_latest.pt")
+    best_path = os.path.join(checkpoint_dir, f"{preset}_best.pt")
+    latest_path = os.path.join(checkpoint_dir, f"{preset}_latest.pt")
     candidate_path = best_path if os.path.exists(best_path) else latest_path
 
     if os.path.exists(candidate_path):
@@ -403,18 +439,42 @@ def main():
         achieved_loss = float(ckpt.get("eval_loss", ckpt.get("loss", float("inf"))))
         step = int(ckpt.get("step", 0))
 
-        if achieved_loss <= args.target_loss:
+        if achieved_loss <= target_loss:
             promote_graduated_checkpoint(
                 recovery_ckpt=candidate_path,
-                main_tier=args.main_model_tier,
-                target_loss=args.target_loss,
+                main_tier=main_model_tier,
+                target_loss=target_loss,
                 achieved_loss=achieved_loss,
                 step=step,
-                cloud_sync=args.cloud_sync,
+                cloud_sync=cloud_sync,
             )
         else:
-            print(f"\nℹ️ Session complete. Best Loss: {achieved_loss:.4f} (Graduation Target: <= {args.target_loss:.4f}).")
-            print(f"   Model preserved in {candidate_path}. Telemetry securely recorded in [{args.temp_model_tier}].")
+            print(f"\nℹ️ Session complete. Best Loss: {achieved_loss:.4f} (Graduation Target: <= {target_loss:.4f}).")
+            print(f"   Model preserved in {candidate_path}. Telemetry securely recorded in [{temp_model_tier}].")
+
+
+def main():
+    args = parse_args()
+    run_recovery(
+        preset=args.preset,
+        init_from_checkpoint=args.init_from_checkpoint,
+        temp_model_tier=args.temp_model_tier,
+        main_model_tier=args.main_model_tier,
+        target_loss=args.target_loss,
+        consistent_evals=args.consistent_evals,
+        checkpoint_dir=args.checkpoint_dir,
+        scratch_dir=args.scratch_dir,
+        dataset_source=args.dataset_source,
+        total_steps=args.total_steps,
+        eval_interval=args.eval_interval,
+        save_interval=args.save_interval,
+        lr=args.lr,
+        min_lr=args.min_lr,
+        warmup_steps=args.warmup_steps,
+        batch_size=args.batch_size,
+        cloud_sync=args.cloud_sync,
+        pull_remote=getattr(args, "pull_remote", False),
+    )
 
 
 if __name__ == "__main__":
