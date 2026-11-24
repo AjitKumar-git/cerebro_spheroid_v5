@@ -211,8 +211,27 @@ def parse_args():
     return parser.parse_args()
 
 
-def ensure_foundation_checkpoint(ckpt_path: str, model_tier: str) -> str:
-    """Ensures base checkpoint exists locally, pulling from bioflo.in if missing."""
+def ensure_foundation_checkpoint(ckpt_path: str, model_tier: str, force_pull: bool = False) -> str:
+    """Ensures base checkpoint exists locally, pulling from bioflo.in if missing or force_pull is True."""
+    os.makedirs(os.path.dirname(os.path.abspath(ckpt_path)), exist_ok=True)
+    token = get_sync_token()
+
+    if force_pull:
+        print(f"\n🌐 [cloud_sync] Explicit pull requested: synchronizing champion [{model_tier}] from bioflo.in...")
+        try:
+            pulled = pull_checkpoint(
+                local_dest=ckpt_path,
+                target_type="latest",
+                model=model_tier,
+                token=token,
+            )
+            if pulled and os.path.exists(ckpt_path):
+                sz_mb = os.path.getsize(ckpt_path) / (1024 * 1024)
+                print(f"✅ Successfully pulled {model_tier} from bioflo.in: {ckpt_path} ({sz_mb:.1f} MB)")
+                return ckpt_path
+        except Exception as e:
+            print(f"⚠️ Cloud pull attempt notice: {e}")
+
     if os.path.exists(ckpt_path):
         sz_mb = os.path.getsize(ckpt_path) / (1024 * 1024)
         print(f"✅ Found local base checkpoint: {ckpt_path} ({sz_mb:.1f} MB)")
@@ -227,8 +246,6 @@ def ensure_foundation_checkpoint(ckpt_path: str, model_tier: str) -> str:
 
     print(f"\n📥 Base checkpoint not found locally at {ckpt_path}.")
     print(f"🌐 Querying bioflo.in to pull remote champion [{model_tier}]...")
-    os.makedirs(os.path.dirname(os.path.abspath(ckpt_path)), exist_ok=True)
-    token = get_sync_token()
     try:
         pulled = pull_checkpoint(
             local_dest=ckpt_path,
