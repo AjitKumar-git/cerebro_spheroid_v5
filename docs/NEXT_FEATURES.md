@@ -34,3 +34,17 @@ Planned improvements tracked for future development cycles and scaling phases.
 - **Planned Upgrades**:
   1. **Standardized Tool Benchmark Suite**: Implement an automated evaluation benchmark scoring discrete action accuracy across `CALCULATOR`, `FACTUAL_DB`, and `PYTHON` execution on holdout task splits.
   2. **Latent Pondering Energy Metric**: Track the relationship between recurrent thinking cycles ($K=4\dots 8$) and problem complexity across GSM8K and ARC-Challenge tasks.
+
+---
+
+## 4. Token-Free Dynamic Byte Chunking (BLT & H-Net Paradigms for Cerebro V6)
+
+- **Current State (V5)**:
+  - 32,000-vocabulary LLaMA BPE tokenizer with tied embedding matrix ($32k \times 768 = 24.6\text{M}$ parameters), consuming $23.2\%$ of `v5_small`'s 106M parameter budget.
+  - Active training run streaming past 11.73B tokens on TPU v5e with static BPE sequence shapes.
+- **Planned Upgrades (V6)**:
+  1. **H-Net Dynamic Chunking (DC) Layer**: Implement an end-to-end learned segmentation boundary gate (Hwang, Wang & Gu, 2025) directly within the outer sensory cortical mantle (Shell 31), replacing static BPE tokenization with $3\times\text{--}6\times$ dynamic byte compression without needing external entropy models.
+  2. **Parameter Reallocation to Cortical Shells**: Recover $\sim 24.4\text{M}$ parameters from the 32k vocabulary embedding matrix into deep concentric laminae (expanding shell count or widening radial dimensions).
+  3. **TPU Static Patch Masking**: Implement fixed-capacity patch padding ($P_{\text{max}} = 16$) via `jax.lax.associative_scan` and cumulative sum masks to retain native TPU v5e XLA graph caching and avoid compilation jitter.
+  4. **Latent Refractory Tracking**: Migrate the inhibition-of-return mechanism from discrete token ID penalties to latent patch representation distances.
+

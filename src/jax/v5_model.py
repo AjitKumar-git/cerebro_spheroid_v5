@@ -822,8 +822,10 @@ def emit_step(
     p_scaled = (phase * (p_scale_val / p_norm)).astype(st_dtype)
 
     motor_surface = surface + p_scaled
-    if auditory_feedback is not None:
-        motor_surface = motor_surface + auditory_feedback.astype(st_dtype)
+    # Note: auditory_feedback (direct t-1 token embedding) is completely detached from motor_surface
+    # to eliminate the direct bypass shortcut and prevent compounding noise during autoregressive rollout.
+    # The motor query q is strictly derived from the deliberative surface state and phase clock.
+    # (Keys and values continue to maintain the causal sequence history).
 
     # 2. Multi-Head Arcuate Fasciculus Cross-Resonance with Causal Prefix
     keys, values = sensory_kv
@@ -850,7 +852,8 @@ def emit_step(
     if getattr(config, "use_shell_tap", True):
         shell_weights = jax.nn.softmax(params["motor.shell_score"].astype(jnp.float32), axis=0)[None, :, None].astype(st_dtype)
         shell_proj = jnp.matmul(state, params["motor.shell_proj.weight"].T)
-        shell_pool = jnp.sum(shell_weights * shell_proj, axis=1) * params["motor.shell_scale"].astype(st_dtype)
+        norm_factor = math.sqrt(float(state.shape[1]))
+        shell_pool = (jnp.sum(shell_weights * shell_proj, axis=1) * (params["motor.shell_scale"].astype(st_dtype) * norm_factor)).astype(st_dtype)
     else:
         shell_pool = jnp.zeros((B, D), dtype=st_dtype)
 
@@ -921,12 +924,22 @@ def emit_step(
     else:
         adapted_logits, next_trace = raw_logits, None
 
-    # 8. Lightweight Bounded Efference Update on Shell 0 (eliminates O(T^2 * K) full deliberate_step inside emission)
+    # 8. Vectorized Depth-Decayed Efference Update across all concentric shells (O(1) overhead)
     efference = jnp.matmul(h, params["motor.efference_proj.weight"].T)
     eff_projected = jnp.matmul(jax.nn.silu(efference), params["core.efference_gate.weight"].T)
     eff_normed = rms_norm(eff_projected, params["core.radial_norm.weight"]).astype(st_dtype)
-    new_core = (0.85 * core + 0.15 * eff_normed).astype(st_dtype)
-    next_state = state.at[:, 0, :].set(new_core)
+
+    K = state.shape[1]
+    if K > 1:
+        gamma_0 = 0.15
+        gamma_end = 0.02
+        decay_rate = math.exp(math.log(gamma_end / gamma_0) / float(K - 1))
+        gammas = jnp.array([gamma_0 * (decay_rate ** k) for k in range(K)], dtype=jnp.float32)
+        gammas = gammas[None, :, None].astype(st_dtype)
+        next_state = ((1.0 - gammas) * state + gammas * eff_normed[:, None, :]).astype(st_dtype)
+    else:
+        new_core = (0.85 * core + 0.15 * eff_normed).astype(st_dtype)
+        next_state = state.at[:, 0, :].set(new_core)
 
     if return_hidden:
         return adapted_logits, next_state, next_trace, next_plan, h
@@ -1401,7 +1414,8 @@ def training_rollout(
             params.get("motor.phase_scale", jnp.array(2.0, dtype=jnp.float32)), 0.05, 5.0
         ).astype(jnp.float32)
         p_scaled_all = (phases * (p_scale_val / p_norms)).astype(target_dtype)  # [T, D]
-        motor_surface_all = surface[:, None, :] + p_scaled_all[None, :, :] + tf_flux.astype(target_dtype)
+        # tf_flux detached from motor_surface to eliminate direct token prediction bypass shortcut:
+        motor_surface_all = surface[:, None, :] + p_scaled_all[None, :, :]
 
         # 2. Vectorized Multi-Head Arcuate Cross-Resonance across all T tokens in one systolic block
         total_len = causal_keys.shape[2]
@@ -1437,17 +1451,26 @@ def training_rollout(
         res_fn = jax.checkpoint(_parallel_cross_resonance) if use_remat else _parallel_cross_resonance
         resonance_all = res_fn(motor_surface_all)  # [B, T, D]
 
-        # 3. Precompute static shell pooling for shells 1..K-1 (only shell 0 evolves inside emission)
+        # 3. Dynamic concentric shell pooling & vectorized depth-decayed efference recurrence setup
         w_shell_t = params["motor.shell_proj.weight"].T
-        if getattr(config, "use_shell_tap", True):
+        use_shell_tap = getattr(config, "use_shell_tap", True)
+        if use_shell_tap:
             shell_weights = jax.nn.softmax(params["motor.shell_score"].astype(jnp.float32), axis=0).astype(target_dtype)
-            shell_scale = params["motor.shell_scale"].astype(target_dtype)
-            static_shell_proj = jnp.matmul(state[:, 1:, :], w_shell_t)
-            static_shell_pool = jnp.sum(shell_weights[None, 1:, None] * static_shell_proj, axis=1) * shell_scale
-            w0_shell_scale = shell_weights[0] * shell_scale
+            norm_factor = math.sqrt(float(num_shells))
+            shell_scale = (params["motor.shell_scale"].astype(target_dtype) * norm_factor).astype(target_dtype)
+            w_shell_scaled = (w_shell_t * shell_scale).astype(target_dtype)
         else:
-            static_shell_pool = jnp.zeros((B, surface_dim), dtype=target_dtype)
-            w0_shell_scale = jnp.zeros((), dtype=target_dtype)
+            shell_weights = jnp.zeros(num_shells, dtype=target_dtype)
+            w_shell_scaled = jnp.zeros_like(w_shell_t)
+
+        if num_shells > 1:
+            gamma_0 = 0.15
+            gamma_end = 0.02
+            decay_rate = math.exp(math.log(gamma_end / gamma_0) / float(num_shells - 1))
+            gammas = jnp.array([gamma_0 * (decay_rate ** k) for k in range(num_shells)], dtype=jnp.float32)
+            gammas = gammas[None, :, None].astype(target_dtype)
+        else:
+            gammas = jnp.array([[[0.15]]], dtype=target_dtype)
 
         ig = jnp.clip(params.get("motor.input_gate", jnp.ones(5, dtype=jnp.float32)), -5.0, 5.0).astype(target_dtype)
         gated_ms_seq = jnp.swapaxes(ig[0] * motor_surface_all, 0, 1)  # [T, B, D]
@@ -1470,10 +1493,16 @@ def training_rollout(
         use_swiglu_motor = getattr(config, "use_swiglu", True)
 
         def _tf_motor_step(carry, xs):
-            cur_core, cur_plan = carry
+            cur_state, cur_plan = carry
             ms_t, res_t, p_scaled_t = xs
 
-            shell_pool = static_shell_pool + w0_shell_scale * jnp.matmul(cur_core, w_shell_t)
+            cur_core = cur_state[:, 0, :]
+            if use_shell_tap:
+                shell_proj = jnp.matmul(cur_state, w_shell_scaled)
+                shell_pool = jnp.sum(shell_weights[None, :, None] * shell_proj, axis=1)
+            else:
+                shell_pool = jnp.zeros((B, surface_dim), dtype=target_dtype)
+
             fused_in = jnp.concatenate([
                 ms_t,
                 ig[1] * cur_core,
@@ -1496,12 +1525,17 @@ def training_rollout(
             efference = jnp.matmul(h, eff_proj_t)
             eff_projected = jnp.matmul(jax.nn.silu(efference), eff_gate_t)
             eff_normed = rms_norm(eff_projected, radial_norm_w).astype(target_dtype)
-            nxt_core = (0.85 * cur_core + 0.15 * eff_normed).astype(target_dtype)
 
-            return (nxt_core, nxt_plan), h
+            if num_shells > 1:
+                nxt_state = ((1.0 - gammas) * cur_state + gammas * eff_normed[:, None, :]).astype(target_dtype)
+            else:
+                nxt_core = (0.85 * cur_core + 0.15 * eff_normed).astype(target_dtype)
+                nxt_state = cur_state.at[:, 0, :].set(nxt_core)
+
+            return (nxt_state, nxt_plan), h
 
         motor_scan_fn = jax.checkpoint(_tf_motor_step) if use_remat else _tf_motor_step
-        _, h_seq = lax.scan(motor_scan_fn, (init_core, init_plan), (gated_ms_seq, gated_res_seq, p_scaled_all))
+        _, h_seq = lax.scan(motor_scan_fn, (state, init_plan), (gated_ms_seq, gated_res_seq, p_scaled_all))
 
         # 4. Chunked Systolic Vocabulary Projection & Cross-Entropy Outside Sequential Scan
         temp = jnp.clip(params["motor.temperature_scale"].astype(jnp.float32), 0.1, 5.0).astype(target_dtype)

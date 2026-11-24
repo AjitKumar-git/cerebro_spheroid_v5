@@ -243,6 +243,7 @@ def parse_args(args_list=None):
         default=True,
         help="Save Spheroid optimizer moments (m, v, master_p) in local checkpoints (default: True)",
     )
+    parser.add_argument("--sync_model", "--sync-model", dest="sync_model", type=str, default=None, help="Explicit bioflo.in model namespace for cloud telemetry and checkpoints (overrides preset, e.g. v5_small_recovery)")
     parser.add_argument("--cloud_url", type=str, default="https://bioflo.in/api/cerebro/sync.php", help="bioflo.in sync endpoint")
     parser.add_argument(
         "--cloud_token",
@@ -581,7 +582,7 @@ def main(args=None):
     best_eval_loss = float("inf")
     last_eval_loss = float("inf")
     initial_ema_loss: Optional[float] = None
-    sync_model_name = "v5_small" if args.preset in ("tpu_v5e_1", "tpu_v6e_1", "tpu_v6e") else args.preset
+    sync_model_name = getattr(args, "sync_model", None) or ("v5_small" if args.preset in ("tpu_v5e_1", "tpu_v6e_1", "tpu_v6e") else args.preset)
     local_latest = os.path.join(args.checkpoint_dir, f"{args.preset}_latest.pt")
     fallback_latest = os.path.join(args.checkpoint_dir, f"{sync_model_name}_latest.pt")
 

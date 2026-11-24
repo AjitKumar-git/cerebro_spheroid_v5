@@ -1,0 +1,211 @@
+{
+  "Arm_A_Frozen_Baseline": {
+    "r_mix": 0.009,
+    "trainable": false,
+    "seeds": {},
+    "baseline_metrics": {
+      "nll": 19.28188329935074,
+      "interior_utility": 0.03060382604598999,
+      "interior_cka": 0.9770457245865647,
+      "adj_displacement": 35.756920369466144
+    }
+  },
+  "Arm_B_Coupling_Control_0.009": {
+    "r_mix": 0.009,
+    "trainable": true,
+    "seeds": {
+      "42": {
+        "step_0": {
+          "nll": 19.28188329935074,
+          "interior_utility": 0.03060382604598999,
+          "interior_cka": 0.9770457245865647,
+          "adj_displacement": 35.756920369466144
+        },
+        "step_100": {
+          "nll": 19.28188455104828,
+          "interior_utility": 0.030600428581237793,
+          "interior_cka": 0.9770456923513996,
+          "adj_displacement": 35.75692316691081
+        },
+        "step_250": {
+          "nll": 19.281919956207275,
+          "interior_utility": 0.03056567907333374,
+          "interior_cka": 0.977045688093925,
+          "adj_displacement": 35.75692392985026
+        }
+      },
+      "137": {
+        "step_0": {
+          "nll": 19.28188329935074,
+          "interior_utility": 0.03060382604598999,
+          "interior_cka": 0.9770457245865647,
+          "adj_displacement": 35.756920369466144
+        },
+        "step_100": {
+          "nll": 19.281886041164398,
+          "interior_utility": 0.030598223209381104,
+          "interior_cka": 0.9770457622956257,
+          "adj_displacement": 35.7569216410319
+        },
+        "step_250": {
+          "nll": 19.28188991546631,
+          "interior_utility": 0.030594587326049805,
+          "interior_cka": 0.9770457592545724,
+          "adj_displacement": 35.7569221496582
+        }
+      },
+      "2026": {
+        "step_0": {
+          "nll": 19.28188329935074,
+          "interior_utility": 0.03060382604598999,
+          "interior_cka": 0.9770457245865647,
+          "adj_displacement": 35.756920369466144
+        },
+        "step_100": {
+          "nll": 19.281863391399384,
+          "interior_utility": 0.03062140941619873,
+          "interior_cka": 0.9770457896651054,
+          "adj_displacement": 35.756919860839844
+        },
+        "step_250": {
+          "nll": 19.281830608844757,
+          "interior_utility": 0.030655205249786377,
+          "interior_cka": 0.9770458194674277,
+          "adj_displacement": 35.75692087809245
+        }
+      }
+    }
+  },
+  "Arm_C_Low_Coupling_0.10": {
+    "r_mix": 0.1,
+    "trainable": true,
+    "seeds": {
+      "42": {
+        "step_0": {
+          "nll": 19.331343412399292,
+          "interior_utility": -0.017452239990234375,
+          "interior_cka": 0.9766860391412463,
+          "adj_displacement": 35.923943583170576
+        },
+        "step_100": {
+          "nll": 19.33143436908722,
+          "interior_utility": -0.017553329467773438,
+          "interior_cka": 0.9766862878994066,
+          "adj_displacement": 35.92394917805989
+        },
+        "step_250": {
+          "nll": 19.33175539970398,
+          "interior_utility": -0.017872750759124756,
+          "interior_cka": 0.9766864849596607,
+          "adj_displacement": 35.923911794026694
+        }
+      },
+      "137": {
+        "step_0": {
+          "nll": 19.331343412399292,
+          "interior_utility": -0.017452239990234375,
+          "interior_cka": 0.9766860391412463,
+          "adj_displacement": 35.923943583170576
+        },
+        "step_100": {
+          "nll": 19.331309139728546,
+          "interior_utility": -0.017425358295440674,
+          "interior_cka": 0.9766863669667926,
+          "adj_displacement": 35.92394434611003
+        },
+        "step_250": {
+          "nll": 19.331168293952942,
+          "interior_utility": -0.01727849245071411,
+          "interior_cka": 0.9766869155728087,
+          "adj_displacement": 35.923834482828774
+        }
+      },
+      "2026": {
+        "step_0": {
+          "nll": 19.331343412399292,
+          "interior_utility": -0.017452239990234375,
+          "interior_cka": 0.9766860391412463,
+          "adj_displacement": 35.923943583170576
+        },
+        "step_100": {
+          "nll": 19.331077337265015,
+          "interior_utility": -0.01718306541442871,
+          "interior_cka": 0.9766862167387592,
+          "adj_displacement": 35.923936462402345
+        },
+        "step_250": {
+          "nll": 19.33066314458847,
+          "interior_utility": -0.016787052154541016,
+          "interior_cka": 0.976686780550042,
+          "adj_displacement": 35.923876698811846
+        }
+      }
+    }
+  },
+  "Arm_D_Moderate_Coupling_0.20": {
+    "r_mix": 0.2,
+    "trainable": true,
+    "seeds": {
+      "42": {
+        "step_0": {
+          "nll": 19.34019124507904,
+          "interior_utility": -0.024744272232055664,
+          "interior_cka": 0.9692547078035316,
+          "adj_displacement": 36.42223866780599
+        },
+        "step_100": {
+          "nll": 19.340376138687134,
+          "interior_utility": -0.024941980838775635,
+          "interior_cka": 0.96925971216085,
+          "adj_displacement": 36.42217330932617
+        },
+        "step_250": {
+          "nll": 19.341031968593597,
+          "interior_utility": -0.025592565536499023,
+          "interior_cka": 0.9692644701928509,
+          "adj_displacement": 36.42199427286784
+        }
+      },
+      "137": {
+        "step_0": {
+          "nll": 19.34019124507904,
+          "interior_utility": -0.024744272232055664,
+          "interior_cka": 0.9692547078035316,
+          "adj_displacement": 36.42223866780599
+        },
+        "step_100": {
+          "nll": 19.339920461177826,
+          "interior_utility": -0.024475455284118652,
+          "interior_cka": 0.9692542966531248,
+          "adj_displacement": 36.42221552530925
+        },
+        "step_250": {
+          "nll": 19.339372098445892,
+          "interior_utility": -0.02392590045928955,
+          "interior_cka": 0.9692647171263792,
+          "adj_displacement": 36.42176818847656
+        }
+      },
+      "2026": {
+        "step_0": {
+          "nll": 19.34019124507904,
+          "interior_utility": -0.024744272232055664,
+          "interior_cka": 0.9692547078035316,
+          "adj_displacement": 36.42223866780599
+        },
+        "step_100": {
+          "nll": 19.33946990966797,
+          "interior_utility": -0.02401965856552124,
+          "interior_cka": 0.9692525480474744,
+          "adj_displacement": 36.42223358154297
+        },
+        "step_250": {
+          "nll": 19.33857810497284,
+          "interior_utility": -0.02314835786819458,
+          "interior_cka": 0.9692585377060637,
+          "adj_displacement": 36.42198689778646
+        }
+      }
+    }
+  }
+}

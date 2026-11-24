@@ -69,7 +69,9 @@ def is_manifold_operator(k: str, p: jnp.ndarray) -> bool:
 
 def zeropower_via_newtonschulz5_jax(G: jnp.ndarray, steps: int = 3, eps: float = 1e-7) -> jnp.ndarray:
     """Vectorized Quintic Newton-Schulz iteration mapping update matrices to the orthogonal manifold.
-    Runs strictly in float32 to prevent half-precision exponent overflow."""
+    Runs strictly in float32 to prevent half-precision exponent overflow.
+    For batched 3D tensors (e.g. concentric shell stacks), applies slice-relative trust scaling
+    to prevent noisy, low-gradient slices from taking disproportionately massive updates."""
     orig_dtype = G.dtype
     G_f32 = G.astype(jnp.float32)
     orig_shape = G_f32.shape
@@ -83,8 +85,15 @@ def zeropower_via_newtonschulz5_jax(G: jnp.ndarray, steps: int = 3, eps: float =
     if transposed:
         G_mat = jnp.swapaxes(G_mat, -2, -1)
 
-    norm = jnp.sqrt(jnp.sum(jnp.square(G_mat), axis=(-2, -1), keepdims=True) + eps)
-    X = G_mat / norm
+    slice_norms = jnp.sqrt(jnp.sum(jnp.square(G_mat), axis=(-2, -1), keepdims=True) + eps)
+    # If 3D batched tensor with multiple slices, scale polar update by relative slice confidence
+    if G_f32.ndim > 2 and orig_shape[0] > 1:
+        max_slice_norm = jnp.maximum(jnp.max(slice_norms), 1e-6)
+        slice_scale = jnp.clip(slice_norms / (0.05 * max_slice_norm + eps), 0.0, 1.0)
+    else:
+        slice_scale = 1.0
+
+    X = G_mat / slice_norms
 
     # Quintic Newton-Schulz polynomial coefficients (static unroll improves XLA pipelining)
     a, b, c = 3.4445, -4.7750, 2.0315
@@ -93,13 +102,14 @@ def zeropower_via_newtonschulz5_jax(G: jnp.ndarray, steps: int = 3, eps: float =
         B = b * A + c * jnp.matmul(A, A)
         X = a * X + jnp.matmul(B, X)
 
+    X = X * slice_scale
     if transposed:
         X = jnp.swapaxes(X, -2, -1)
     return X.reshape(orig_shape).astype(orig_dtype)
 
 
 def clamp_spectral_norm_jax(
-    W: jnp.ndarray, v: jnp.ndarray, max_spec_norm: float = 1.0, power_steps: int = 2, eps: float = 1e-6
+    W: jnp.ndarray, v: jnp.ndarray, max_spec_norm: float = 1.0, power_steps: int = 3, eps: float = 1e-6
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Contractive spectral guard via persistent power iteration. Enforces sigma_max <= 1.0."""
     orig_dtype = W.dtype
@@ -124,7 +134,8 @@ def clamp_spectral_norm_jax(
 
     u_final = jnp.matmul(W_mat, v_final)
     sigma = jnp.sqrt(jnp.sum(jnp.square(u_final), axis=1, keepdims=True) + eps)
-    scale = jnp.minimum(1.0, max_spec_norm / (sigma * 1.08 + eps))
+    # Calibrated 1.05 safety factor accounts for power iteration underestimation of exact SVD
+    scale = jnp.minimum(1.0, max_spec_norm / (sigma * 1.05 + eps))
     W_clamped = (W_mat * scale).reshape(orig_shape).astype(orig_dtype)
     return W_clamped, v_final.astype(v.dtype)
 
@@ -397,7 +408,9 @@ def _apply_spheroid_grads(
                 m_new = 0.95 * m_prev + 0.05 * g
                 new_m[k] = m_new.astype(opt_s["m"][k].dtype)
 
-                p_decayed = p_f32 * (1.0 - base_lr * weight_decay)
+                # Recurrent manifold weights are bounded by contractive spectral clamp; exempt from weight decay
+                decay_factor = 0.0 if k in RECURRENT_KEYS else weight_decay
+                p_decayed = p_f32 * (1.0 - base_lr * decay_factor)
                 O = zeropower_via_newtonschulz5_jax(m_new, steps=3).astype(jnp.float32)
 
                 rows = param.shape[-2]
@@ -445,6 +458,16 @@ def _apply_spheroid_grads(
                 v_hat = v_new / (1.0 - jnp.power(0.95, cur_step))
                 step_dir = m_hat / (jnp.sqrt(v_hat) + 1e-6)
                 p_updated = p_f32 - lr_1d * step_dir
+
+                # Guard structural coupling scalars and shell gains from collapsing to zero
+                if "radial_mix_scale" in k:
+                    p_updated = jnp.clip(p_updated, 0.02, 1.0)
+                elif "shortcut_mix_scale" in k:
+                    p_updated = jnp.clip(p_updated, 0.01, 1.0)
+                elif "shell_scale" in k:
+                    p_updated = jnp.clip(p_updated, 0.05, 5.0)
+                elif "shell_gains" in k:
+                    p_updated = jnp.clip(p_updated, 0.02, 2.0)
 
                 sq_diff_1d = sq_diff_1d + jnp.sum(jnp.square(p_updated - p_f32))
                 sq_norm_1d = sq_norm_1d + jnp.sum(jnp.square(p_f32))

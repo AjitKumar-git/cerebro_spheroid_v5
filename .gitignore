@@ -10,6 +10,8 @@ checkpoints/
 *.onnx
 *.safetensors
 *.ckpt
+*.npz
+experiments/*_checkpoints/
 
 # IDE agent cache
 .qoder/

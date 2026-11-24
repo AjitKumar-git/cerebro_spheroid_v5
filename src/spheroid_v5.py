@@ -703,11 +703,20 @@ class VolumetricSpheroidCoreV5(nn.Module):
         return state_next
 
     def step_efference_fast(self, state: torch.Tensor, efference: torch.Tensor) -> torch.Tensor:
-        """O(1) bounded residual efference feedback onto Shell 0 without full deliberate_step."""
+        """Vectorized depth-decayed efference feedback across all concentric shells."""
         eff_projected = self.efference_gate(F.silu(efference))
         eff_normed = self.radial_norm(eff_projected).to(state.dtype)
-        new_shell0 = 0.85 * state[:, 0, :] + 0.15 * eff_normed
-        return torch.cat([new_shell0.unsqueeze(1), state[:, 1:, :]], dim=1)
+        K = state.shape[1]
+        if K > 1:
+            gamma_0 = 0.15
+            gamma_end = 0.02
+            decay_rate = math.exp(math.log(gamma_end / gamma_0) / float(K - 1))
+            gammas = gamma_0 * (decay_rate ** torch.arange(K, device=state.device, dtype=torch.float32))
+            gammas = gammas.view(1, K, 1).to(state.dtype)
+            return (1.0 - gammas) * state + gammas * eff_normed.unsqueeze(1)
+        else:
+            new_shell0 = 0.85 * state[:, 0, :] + 0.15 * eff_normed
+            return new_shell0.unsqueeze(1)
 
     def inject_efference_copy(self, state: torch.Tensor, efference: torch.Tensor) -> torch.Tensor:
         """Injects motor efference copy directly into Shell 0 out-of-place."""
@@ -1032,8 +1041,8 @@ class PremotorMotorDecoderV5(nn.Module):
         )
 
         motor_surface = surface + p_scaled
-        if auditory_feedback is not None:
-            motor_surface = motor_surface + auditory_feedback.to(motor_surface.dtype)
+        # Note: auditory_feedback (direct t-1 token embedding) detached from motor_surface
+        # to eliminate direct token bypass and prevent noise compounding during autoregressive rollout.
 
         # 2. Multi-Head Arcuate Fasciculus Cross-Resonance (with optional RoPE & Top-K Sparsity)
         if sensory_kv is not None:
@@ -1092,7 +1101,8 @@ class PremotorMotorDecoderV5(nn.Module):
         if self.use_shell_tap:
             shell_weights = F.softmax(self.shell_score.float(), dim=0).to(motor_surface.dtype).view(1, -1, 1)
             shell_proj = self.shell_proj(state)
-            shell_pool = torch.sum(shell_weights * shell_proj, dim=1) * self.shell_scale.to(motor_surface.dtype)
+            norm_factor = math.sqrt(float(state.shape[1]))
+            shell_pool = torch.sum(shell_weights * shell_proj, dim=1) * (self.shell_scale.to(motor_surface.dtype) * norm_factor)
         else:
             shell_pool = torch.zeros_like(motor_surface)
 

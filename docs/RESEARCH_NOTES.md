@@ -222,3 +222,46 @@ All active components of the V5 architecture, curriculum, optimizer, and cogniti
 | `tests/test_jax_negative_covariance.py` | Negative covariance polar gradient and optimizer step in JAX | **PASS** |
 
 All tests execute in $<1.5$ seconds, ensuring rapid and regression-free iteration.
+
+---
+
+## 11. Tokenization Architecture: Dynamic Byte Chunking vs. BPE Evaluation & V6 Roadmap
+
+### 11.1 The Parameter Tax of Static Subword Vocabularies
+In sub-200M parameter models, static subword vocabularies (e.g., LLaMA 32,000 BPE) consume a disproportionate share of the model parameter budget. For `v5_small` (`surface_dim = 768`, 106M parameters):
+- **Tied Embedding/Unembedding Table**: $32,000 \times 768 = 24,576,000$ parameters ($\approx 24.58\text{M}$).
+- **Capacity Overhead**: The static vocabulary table alone consumes **$23.2\%$ of the total parameter budget**.
+
+### 11.2 Dynamic Byte Chunking (Byte Latent Transformer / BLT Paradigm)
+Dynamic byte chunking replaces static BPE tokenization with entropy-driven byte patch segmentation:
+1. **Parameter Reallocation**: Dropping vocabulary size from 32,000 to 256 bytes reduces embedding parameters to $256 \times 768 \approx 0.196\text{M}$ ($<0.2\%$ of the model), freeing **$\sim 24.4\text{M}$ active parameters** ($+30\%$ available compute capacity) to allocate into cortical shells (e.g., expanding from 32 to 42 shells or widening radial dimensions).
+2. **Biological Congruence**: Matches sensory cortex processing where fine-grained continuous sensory signals are dynamically grouped into temporal bursts before cortical lamina recurrence.
+3. **Robustness**: Eliminates BPE token-boundary fragility across code formatting, mathematical equations, spelling mutations, and whitespace variations.
+
+### 11.3 Engineering & Execution Trade-offs
+- **TPU v5e XLA Static Shapes**: Variable-length byte patches induce ragged tensors. On Cloud TPU v5e, dynamic patches require fixed maximum patch padding ($P_{\text{max}} = 8$ or $16$) with binary attention masks to avoid XLA graph recompilations.
+- **Inference Latency**: Autoregressive byte decoding requires a local byte decoder, which exhibits lower raw generation throughput than single-step BPE token sampling unless paired with speculative multi-byte decoders.
+- **Refractory Dynamics**: The `(B, vocab_size)` inhibition-of-return refractory buffer must operate on latent chunk embeddings rather than byte-level indices to accommodate legitimate character repetitions (`"ee"`, `"ll"`).
+
+### 11.4 Operational Verdict & Staging
+- **Cerebro V5 (Current 40B Token Run)**: **Retain 32k BPE**. The model has already ingested 11.73B+ tokens on TPU v5e; swapping the input/output representation is not backwards-compatible and would invalidate existing weights.
+- **Cerebro V6 (Next Generation)**: **Designated Core Milestone**. Prototype dynamic entropy-based byte patch encoders to eliminate the 24.6M embedding tax and maximize active cortical capacity.
+
+### 11.5 H-Net Architecture Analysis (Hwang, Wang & Gu, 2025)
+A breakthrough development in tokenizer-free modeling is **H-Net** (*"Dynamic Chunking for End-to-End Hierarchical Sequence Modeling"*, Hwang, Wang & Gu, CMU/Cartesia AI, 2025). H-Net introduces an end-to-end differentiable sequence U-Net that fundamentally resolves the limitations of both static BPE and heuristic byte patchers:
+
+1. **Learned Dynamic Chunking (DC) Layer**:
+   - Unlike Meta's BLT (which relies on an auxiliary, pre-frozen byte language model to threshold cross-entropy spikes), H-Net **learns segmentation boundaries natively and jointly** within its own layers.
+   - Dynamic cuts are determined end-to-end from content and context, compressing raw byte sequences by $3\times$ to $6\times$ into coarse latent tokens without external models.
+2. **Multi-Stage Hierarchical Geometry**:
+   - Structured as: $\text{Raw Bytes} \to \text{Stage 1 Byte Encoder} \to \text{Dynamic Chunking} \to \text{Main Coarse Backbone (SSM/Transformer)} \to \text{Dynamic Upsampling} \to \text{Autoregressive Byte Decoder}$.
+   - Demonstrated up to $4\times$ data efficiency improvements over BPE Transformers on structured, tokenization-unfriendly modalities (code, Chinese text, and DNA sequences).
+3. **Topological Mapping to Cerebro Spheroid**:
+   - H-Net's U-Net layout maps directly into Cerebro's radial cortical laminae:
+     - **Sensory Afference (Shell 31 & Outer Mantle)**: Acts as the high-resolution byte-level linear encoder and Dynamic Chunking boundary predictor.
+     - **Subconscious Deliberation (Concentric Laminae 30 $\to$ 0)**: Acts as the Main Coarse Backbone, executing recurrent multi-shell deliberation and 96 small-world shortcut transfers over compressed latent chunks.
+     - **Motor Action & Efference Copy (Shell 0 $\to$ Efferent Head)**: Functions as the dynamic upsampler and autoregressive byte emission generator.
+4. **TPU v5e JAX Implementation Strategy**:
+   - To reconcile H-Net's variable-length dynamic chunks with JAX/XLA static compilation constraints on TPU v5e, chunk aggregation must be implemented via fixed maximum patch containers ($P_{\text{max}} = 16$) using `jax.lax.associative_scan` and cumulative masking (`jnp.cumsum`), preserving hardware matrix-unit (MXU) alignment and zero-recompilation guarantees.
+
+
