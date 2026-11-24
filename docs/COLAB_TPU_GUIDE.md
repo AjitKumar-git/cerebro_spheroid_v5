@@ -62,17 +62,24 @@ python colab/train_v5_small_colab_tpu.py \
     --checkpoint-dir /content/checkpoints/v5_small_midtrain
 ```
 
-### Stage 3: Agentic SFT & Latent Deliberation (~500M Tokens)
-- **Objective:** DeepSeek-R1 style `<think> ... </think>` latent deliberation formatting, direct conversational answers, and deterministic `<tool_call> ... </tool_call>` execution (`CALCULATOR`, `PYTHON`, `BASH`, `FACTUAL_DB`).
-- **Mix:** High-quality reasoning traces (OpenThoughts, NuminaMath, Bespoke-Stratos), verified tool trajectories, and curated SmolTalk.
-- **Supervision:** Prompt-masked ($-100$ on user prompts; loss applies strictly to deliberation, tool invocations, and answers).
-- **Volume:** ~100k curated trajectories (~500 Million tokens).
+### Stage 3: Agentic SFT, Tool-Use & Deliberation (4.3B Tokens)
+- **Objective:** DeepSeek-R1 style multi-step `<think> ... </think>` latent deliberation, multi-turn conversational answers, and deterministic multi-hop `<tool_call> ... </tool_call>` execution (`CALCULATOR`, `PYTHON`, `BASH`, `FACTUAL_DB`).
+- **Mix:** 
+  - 40% Latent Deliberation & Proofs (OpenThoughts, NuminaMath, Bespoke-Stratos).
+  - 35% Multi-Turn Agentic Tool Trajectories (iterative tool calling, error recovery, observation grounding).
+  - 25% Instruction Following & Dialog (curated SmolTalk, Magpie, WildChat).
+- **Supervision:** Prompt-masked ($-100$ on user prompts; loss applies strictly to `<think>`, `<tool_call>`, and final grounded responses).
+- **Volume:** ~1.2M rich trajectories (4.3 Billion tokens | ~16,400 steps).
 
-### Stage 4: Long-Context Extension & Fixed-Point Annealing (~1B Tokens)
-- **Objective:** 4k needle-in-a-haystack retrieval consolidation, multi-hop context reasoning, fixed-point attractor energy minimization, and RLVR verification.
-- **Mix:** Synthesized long-context retrieval needles (1k -> 2k -> 4k tokens), mathematical verification trajectories (GSM8k, MATH), and python execution sandboxes.
-- **Supervision:** Verification rewards (RLVR / GRPO) and learning rate cooldown to 0.0.
-- **Volume:** ~1.0 Billion tokens (~4,000 steps).
+### Stage 4: 4k Long-Context Extension & RLVR Annealing (4.3B Tokens)
+- **Objective:** 4,096-token associative memory saturation, needle-in-a-haystack retrieval across all document depths ($0\% \to 100\%$), multi-hop cross-referencing, and Reinforcement Learning via Verifiable Rewards (RLVR / GRPO) policy refinement.
+- **Mix:** 
+  - 50% Synthesized 4k retrieval needles and multi-hop associative documents (scripts/generate_retrieval_curriculum_data.py).
+  - 30% Replay Regularization (5% Phase 1 + 15% Phase 2 + 80% complex reasoning).
+  - 20% RLVR Verifiable Sandboxes (GSM8k, MATH, and sandboxed Python unit-test execution).
+- **Supervision:** Verifiable reward feedback (GRPO) and strict cosine learning rate cooldown to 0.0 with fixed-point attractor energy regularization.
+- **Volume:** ~1.05M 4k sequences (4.3 Billion tokens | ~16,400 steps).
+- **Grand Total Pipeline:** 40.0 Billion tokens across all 4 stages (~378 tokens/param).
 
 ---
 
