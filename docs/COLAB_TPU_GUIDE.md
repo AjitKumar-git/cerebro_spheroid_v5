@@ -46,32 +46,33 @@ python colab/train_v5_small_colab_tpu.py \
     --checkpoint-dir /content/checkpoints/v5_small_scratch
 ```
 
-### Stage 2: (Optional) Mid-training (~4B Tokens)
+### Stage 2: Deep STEM Reasoning Mid-training (15.7B Tokens)
 - **Objective:** Deep STEM reasoning, mathematical proofs, algorithmic code, pedagogical textbooks, and 4k associative retrieval memory.
 - **Mix:** 40% FineWeb-Edu ($\ge 3.5$) + 30% FineMath + 15% Cosmopedia v2 + 15% Python Code.
 - **Supervision:** 100% loss-bearing contiguous sequences. **Strictly ZERO SFT contamination** (no conversational wrappers, no chat templates, no prompt masking).
+- **Target Ingestion:** 15.7 Billion tokens (60,000 steps at batch 64, window 4,096).
+- **Cumulative Tokens:** ~31.4 Billion tokens total (Pretraining + Midtraining).
 ```bash
 python colab/train_v5_small_colab_tpu.py \
     --mode contiguous_pretrain \
     --stage midtrain \
     --total-window 4096 \
     --lr 5e-4 \
-    --total-steps 15000 \
+    --total-steps 60000 \
     --checkpoint-dir /content/checkpoints/v5_small_midtrain
 ```
 
-### Stage 3: (Optional) SFT & Tool Calling (~50M Tokens)
-- **Objective:** `<think>` deliberation formatting, plain conversational answers, and strict `<tool_call> calc(...) </tool_call>` tool execution.
-- **Mix:** Curated SmolTalk, OpenHermes, and verified tool execution trajectories.
-- **Supervision:** Prompt-masked (loss applies strictly to thinking, answers, and tool calls).
-```bash
-python colab/train_v5_small_colab_tpu.py \
-    --mode sft \
-    --total-window 4096 \
-    --lr 2e-4 \
-    --total-steps 2000 \
-    --checkpoint-dir /content/checkpoints/v5_small_sft
-```
+### Stage 3: Agentic SFT & Latent Deliberation (~500M Tokens)
+- **Objective:** DeepSeek-R1 style `<think> ... </think>` latent deliberation formatting, direct conversational answers, and deterministic `<tool_call> ... </tool_call>` execution (`CALCULATOR`, `PYTHON`, `BASH`, `FACTUAL_DB`).
+- **Mix:** High-quality reasoning traces (OpenThoughts, NuminaMath, Bespoke-Stratos), verified tool trajectories, and curated SmolTalk.
+- **Supervision:** Prompt-masked ($-100$ on user prompts; loss applies strictly to deliberation, tool invocations, and answers).
+- **Volume:** ~100k curated trajectories (~500 Million tokens).
+
+### Stage 4: Long-Context Extension & Fixed-Point Annealing (~1B Tokens)
+- **Objective:** 4k needle-in-a-haystack retrieval consolidation, multi-hop context reasoning, fixed-point attractor energy minimization, and RLVR verification.
+- **Mix:** Synthesized long-context retrieval needles (1k -> 2k -> 4k tokens), mathematical verification trajectories (GSM8k, MATH), and python execution sandboxes.
+- **Supervision:** Verification rewards (RLVR / GRPO) and learning rate cooldown to 0.0.
+- **Volume:** ~1.0 Billion tokens (~4,000 steps).
 
 ---
 
