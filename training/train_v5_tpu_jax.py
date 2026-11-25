@@ -26,6 +26,7 @@ import dataclasses
 import os
 import random
 import re
+import shutil
 import signal
 import sys
 import time
@@ -1528,7 +1529,7 @@ def main(args=None):
 
     if is_pretrain_source:
         # Pretraining Step 1 only tests FineWeb and The Stack Code
-        generate_held_out_split("pretrain", args.seq_len)
+        generate_held_out_split("pretrain", args.total_window)
     else:
         try:
             from src.elastic_window import build_canonical_eval_split
@@ -1614,6 +1615,8 @@ def main(args=None):
             targets=r_b,
             remat=False,
             pure_teacher_forcing=True,
+            deliberation_mode=args.deliberation_mode,
+            repetition_penalty=1.0,
             encephalization_alpha=enc_alpha,
         )
 
@@ -1911,7 +1914,7 @@ def main(args=None):
                     batcher.transition_to_deep_reasoning()
 
                 # Rebuild held-out evaluation split for Stage 2 (Deep Reasoning)
-                generate_held_out_split("deep_reasoning", args.seq_len)
+                generate_held_out_split("deep_reasoning", args.total_window if is_pretrain_source else args.seq_len)
                 if smart_mixture_controller is not None:
                     reasoning_priors = {"math": 0.35, "cosmopedia": 0.35, "code": 0.20, "edu_academic": 0.10}
                     smart_mixture_controller.prior_shares = dict(reasoning_priors)
@@ -1923,17 +1926,19 @@ def main(args=None):
                     milestone_dest = os.path.join(args.checkpoint_dir, milestone_ckpt_name)
                     curr_eval = last_eval_loss if last_eval_loss != float("inf") else (initial_ema_loss or 2.70)
                     save_jax_to_torch_pt(
-                        milestone_dest,
                         params,
                         buffers,
-                        config,
-                        opt_state=opt_state if args.save_optimizer_state else None,
-                        extra_meta={
+                        milestone_dest,
+                        meta={
                             "step": step,
                             "eval_loss": curr_eval,
                             "cumulative_tokens": cumulative_tokens,
                             "phase": "pretrain_15b_complete",
+                            "preset": config_preset,
+                            "config": dataclasses.asdict(config) if dataclasses.is_dataclass(config) else None,
                         },
+                        opt_state=opt_state if args.save_optimizer_state else None,
+                        bare_bf16=not args.save_optimizer_state,
                     )
                     print(f"💾 [Milestone Checkpoint] Archived 15.7B pretraining completion snapshot: {milestone_dest}")
                     if args.cloud_sync:
@@ -1995,9 +2000,17 @@ def main(args=None):
                 if cur_target_len != args.seq_len:
                     old_len = args.seq_len
                     args.seq_len = cur_target_len
+                    if is_pretrain_source:
+                        args.total_window = cur_target_len
+                        if local_streamer is not None and hasattr(local_streamer, "update_block_size"):
+                            local_streamer.update_block_size(cur_target_len)
                     print(f"\n🔄 [Sequence Transition] Step {step:,}: Progressing target sequence length {old_len} -> {args.seq_len} (Final Target: {target_seq_len})")
                     if elastic_batcher is not None and hasattr(elastic_batcher, "update_target_len"):
                         elastic_batcher.update_target_len(args.seq_len)
+                    generate_held_out_split(
+                        "deep_reasoning" if in_deep_reasoning_phase else "pretrain",
+                        args.total_window if is_pretrain_source else args.seq_len,
+                    )
 
             if in_deep_reasoning_phase and reasoning_transition_step is not None:
                 # Conservative Stage 2 Learning Rate: guards against catastrophic forgetting of Stage 1
@@ -2306,11 +2319,21 @@ def main(args=None):
                 t_last_log = time.time()
                 step_window_tokens = 0
                 step_window_count = 0
+                window_step_count = 0
                 window_clipped_count = 0
 
             # Held-Out Validation Evaluation
             crossed_eval = bool(eval_batches) and ((step // max(1, args.eval_interval)) > (prev_step // max(1, args.eval_interval)))
             if crossed_eval:
+                expected_eval_len = args.total_window if is_pretrain_source else args.seq_len
+                if eval_batches and eval_batches[0][1].shape[1] != expected_eval_len:
+                    if is_pretrain_source:
+                        generate_held_out_split("deep_reasoning" if in_deep_reasoning_phase else "pretrain", expected_eval_len)
+                    if eval_batches and eval_batches[0][1].shape[1] > expected_eval_len:
+                        eval_batches = [
+                            (b[0], b[1][:, :expected_eval_len], b[2][:, :expected_eval_len] if len(b) > 2 and b[2] is not None else None)
+                            for b in eval_batches
+                        ]
                 eval_p = jax.device_put(_get_host_params(), devices[0]) if use_multi_tpu_local_sgd else params
                 val_losses = [
                     float(eval_step_loss(eval_p, b[0], b[1], b[2] if len(b) > 2 else None, enc_alpha=enc_alpha))

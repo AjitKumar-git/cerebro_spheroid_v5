@@ -264,7 +264,7 @@ def generate_small_world_indices(num_shells: int, num_tracts: int) -> Tuple[jnp.
 
 def init_params_v5(key: jax.random.PRNGKey, config: ModelConfigV5) -> Tuple[Dict[str, jnp.ndarray], Tuple[jnp.ndarray, jnp.ndarray]]:
     """Initializes CerebroSpheroid V5 parameters and small-world tract buffers."""
-    keys = jax.random.split(key, 40)
+    keys = jax.random.split(key, 48)
     s_dim = config.surface_dim
     r_dim = config.radial_dim
     K = config.num_shells
@@ -338,7 +338,7 @@ def init_params_v5(key: jax.random.PRNGKey, config: ModelConfigV5) -> Tuple[Dict
         "motor.affine_act": jnp.ones(s_dim, dtype=jnp.float32),
         "motor.affine_answer": jnp.ones(s_dim, dtype=jnp.float32),
         # Temporal Output Router (Decides when to activate Think, Act, Answer)
-        "motor.temporal_router.weight": jax.random.normal(keys[28] if len(keys) > 28 else keys[0], (3, s_dim)) * 0.01,
+        "motor.temporal_router.weight": jax.random.normal(keys[38], (3, s_dim)) * 0.01,
         "motor.temporal_router.bias": jnp.array([0.5, -0.8, 1.0], dtype=jnp.float32),
         "motor.temperature_scale": jnp.array(1.0, dtype=jnp.float32),
         "motor.efference_proj.weight": jax.random.normal(keys[23], (s_dim, s_dim)) * (1.0 / math.sqrt(s_dim)),
@@ -346,18 +346,18 @@ def init_params_v5(key: jax.random.PRNGKey, config: ModelConfigV5) -> Tuple[Dict
         "motor.refractory_strength": jnp.array(1.2, dtype=jnp.float32),
 
         # Persona Steering Basis & Scale
-        "motor.persona_embeddings": jax.random.normal(keys[27], (4, s_dim)) * 0.05,
+        "motor.persona_embeddings": jax.random.normal(keys[37], (4, s_dim)) * 0.05,
         "motor.persona_scale": jnp.array(0.5, dtype=jnp.float32),
     }
 
     # Optional untied vocabulary output projection
     if not getattr(config, "use_tied_embeddings", True):
-        params["motor.head.weight"] = jax.random.normal(keys[29] if len(keys) > 29 else keys[0], (V, s_dim)) * (1.0 / math.sqrt(s_dim))
+        params["motor.head.weight"] = jax.random.normal(keys[39], (V, s_dim)) * (1.0 / math.sqrt(s_dim))
 
     # Optional Multi-Token Prediction (MTP) auxiliary heads
     if getattr(config, "num_mtp_heads", 1) > 1:
         for m in range(1, config.num_mtp_heads):
-            m_key = jax.random.fold_in(keys[30] if len(keys) > 30 else keys[1], m)
+            m_key = jax.random.fold_in(keys[40], m)
             sub_k = jax.random.split(m_key, 4)
             params[f"motor.mtp.{m}.fc_gate.weight"] = jax.random.normal(sub_k[0], (s_dim * 2, s_dim * 2)) * (1.0 / math.sqrt(s_dim * 2))
             params[f"motor.mtp.{m}.fc_val.weight"] = jax.random.normal(sub_k[1], (s_dim * 2, s_dim * 2)) * (1.0 / math.sqrt(s_dim * 2))
@@ -381,14 +381,14 @@ def init_params_v5(key: jax.random.PRNGKey, config: ModelConfigV5) -> Tuple[Dict
     if getattr(config, "enable_multimodal", False):
         v_dim = getattr(config, "visual_dim", s_dim)
         p_size = getattr(config, "image_patch_size", 16)
-        params["image_stem.conv.weight"] = jax.random.normal(keys[28], (v_dim, 3, p_size, p_size)) * (1.0 / math.sqrt(3 * p_size * p_size))
+        params["image_stem.conv.weight"] = jax.random.normal(keys[41], (v_dim, 3, p_size, p_size)) * (1.0 / math.sqrt(3 * p_size * p_size))
         params["image_stem.norm.weight"] = jnp.ones(v_dim, dtype=jnp.float32)
 
-        params["audio_stem.conv.weight"] = jax.random.normal(keys[29], (v_dim, 1, 400)) * (1.0 / math.sqrt(400))
+        params["audio_stem.conv.weight"] = jax.random.normal(keys[42], (v_dim, 1, 400)) * (1.0 / math.sqrt(400))
         params["audio_stem.norm.weight"] = jnp.ones(v_dim, dtype=jnp.float32)
 
         params["perceptual.norm_in.weight"] = jnp.ones(v_dim, dtype=jnp.float32)
-        params["perceptual.linear.weight"] = jax.random.normal(keys[30], (s_dim, v_dim)) * (1.0 / math.sqrt(v_dim))
+        params["perceptual.linear.weight"] = jax.random.normal(keys[43], (s_dim, v_dim)) * (1.0 / math.sqrt(v_dim))
         params["perceptual.swiglu.fc_gate.weight"] = jax.random.normal(keys[31], (s_dim * 2, s_dim)) * (1.0 / math.sqrt(s_dim))
         params["perceptual.swiglu.fc_val.weight"] = jax.random.normal(keys[32], (s_dim * 2, s_dim)) * (1.0 / math.sqrt(s_dim))
         params["perceptual.swiglu.fc_down.weight"] = jax.random.normal(keys[33], (s_dim, s_dim * 2)) * (1.0 / math.sqrt(s_dim * 2))
@@ -396,7 +396,7 @@ def init_params_v5(key: jax.random.PRNGKey, config: ModelConfigV5) -> Tuple[Dict
 
     num_sens_layers = getattr(config, "num_sensory_layers", 1)
     if num_sens_layers > 1:
-        extra_keys = jax.random.split(keys[34], (num_sens_layers - 1) * 6)
+        extra_keys = jax.random.split(keys[44], (num_sens_layers - 1) * 6)
         for idx in range(num_sens_layers - 1):
             pfx = f"sensory_dnn.extra_layers.{idx}."
             k_base = idx * 6
@@ -822,14 +822,13 @@ def emit_step(
     p_scaled = (phase * (p_scale_val / p_norm)).astype(st_dtype)
 
     motor_surface = surface + p_scaled
-    # Note: auditory_feedback (direct t-1 token embedding) is completely detached from motor_surface
-    # to eliminate the direct bypass shortcut and prevent compounding noise during autoregressive rollout.
-    # The motor query q is strictly derived from the deliberative surface state and phase clock.
-    # (Keys and values continue to maintain the causal sequence history).
+    # Route auditory_feedback (causal contextual flux) strictly to the Cross-Resonance query q,
+    # keeping it detached from motor_surface / fused_in so there is no direct token-prediction bypass.
+    query_surface = (motor_surface + auditory_feedback.astype(st_dtype)) if auditory_feedback is not None else motor_surface
 
     # 2. Multi-Head Arcuate Fasciculus Cross-Resonance with Causal Prefix
     keys, values = sensory_kv
-    q = jnp.matmul(motor_surface, params["motor.q_proj.weight"].T).reshape(B, 1, num_heads, head_dim)
+    q = jnp.matmul(query_surface, params["motor.q_proj.weight"].T).reshape(B, 1, num_heads, head_dim)
     q = jnp.swapaxes(q, 1, 2)  # [B, H, 1, head_dim]
     if config is not None and config.use_rope:
         q_pos = step_idx if query_position is None else query_position
@@ -933,9 +932,11 @@ def emit_step(
     if K > 1:
         gamma_0 = 0.15
         gamma_end = 0.02
-        decay_rate = math.exp(math.log(gamma_end / gamma_0) / float(K - 1))
-        gammas = jnp.array([gamma_0 * (decay_rate ** k) for k in range(K)], dtype=jnp.float32)
-        gammas = gammas[None, :, None].astype(st_dtype)
+        decay_rate = math.exp(math.log(gamma_end / gamma_0) / float(max(K - 2, 1)))
+        gamma_vals = [gamma_0 * (decay_rate ** k) for k in range(K - 1)] + [0.0]
+        if K > 16:
+            gamma_vals[15] = 0.0
+        gammas = jnp.array(gamma_vals, dtype=jnp.float32)[None, :, None].astype(st_dtype)
         next_state = ((1.0 - gammas) * state + gammas * eff_normed[:, None, :]).astype(st_dtype)
     else:
         new_core = (0.85 * core + 0.15 * eff_normed).astype(st_dtype)
@@ -1386,11 +1387,10 @@ def training_rollout(
     is_pure_tf = (
         (targets is not None)
         and (num_shells >= 2)
-        and (deliberation_mode in ("teacher_forcing", "pure_tf"))
         and (
             pure_teacher_forcing is True
             or (
-                pure_teacher_forcing is None
+                (deliberation_mode in ("teacher_forcing", "pure_tf"))
                 and (not isinstance(sampling_p, jax.Array))
                 and (float(sampling_p) >= 1.0 - 1e-4)
             )
@@ -1414,8 +1414,10 @@ def training_rollout(
             params.get("motor.phase_scale", jnp.array(2.0, dtype=jnp.float32)), 0.05, 5.0
         ).astype(jnp.float32)
         p_scaled_all = (phases * (p_scale_val / p_norms)).astype(target_dtype)  # [T, D]
-        # tf_flux detached from motor_surface to eliminate direct token prediction bypass shortcut:
+        # tf_flux is kept detached from motor_surface / fused_in to prevent direct token-prediction shortcuts,
+        # and routed strictly to Cross-Resonance query formation so q_t remains content-conditioned.
         motor_surface_all = surface[:, None, :] + p_scaled_all[None, :, :]
+        query_surface_all = motor_surface_all + tf_flux.astype(target_dtype)
 
         # 2. Vectorized Multi-Head Arcuate Cross-Resonance across all T tokens in one systolic block
         total_len = causal_keys.shape[2]
@@ -1449,7 +1451,7 @@ def training_rollout(
             )
 
         res_fn = jax.checkpoint(_parallel_cross_resonance) if use_remat else _parallel_cross_resonance
-        resonance_all = res_fn(motor_surface_all)  # [B, T, D]
+        resonance_all = res_fn(query_surface_all)  # [B, T, D]
 
         # 3. Dynamic concentric shell pooling & vectorized depth-decayed efference recurrence setup
         w_shell_t = params["motor.shell_proj.weight"].T
@@ -1466,9 +1468,11 @@ def training_rollout(
         if num_shells > 1:
             gamma_0 = 0.15
             gamma_end = 0.02
-            decay_rate = math.exp(math.log(gamma_end / gamma_0) / float(num_shells - 1))
-            gammas = jnp.array([gamma_0 * (decay_rate ** k) for k in range(num_shells)], dtype=jnp.float32)
-            gammas = gammas[None, :, None].astype(target_dtype)
+            decay_rate = math.exp(math.log(gamma_end / gamma_0) / float(max(num_shells - 2, 1)))
+            gamma_vals = [gamma_0 * (decay_rate ** k) for k in range(num_shells - 1)] + [0.0]
+            if num_shells > 16:
+                gamma_vals[15] = 0.0
+            gammas = jnp.array(gamma_vals, dtype=jnp.float32)[None, :, None].astype(target_dtype)
         else:
             gammas = jnp.array([[[0.15]]], dtype=target_dtype)
 
@@ -1933,6 +1937,7 @@ def generate_tri_stream_jax(
     temperature: float = 0.6,
     repetition_penalty: float = 1.15,
     phased: bool = True,
+    rng_key: Optional[jax.Array] = None,
 ) -> Dict[str, Any]:
     """
     Simultaneous Tri-Head Cognitive Emission in JAX:
@@ -2015,18 +2020,19 @@ def generate_tri_stream_jax(
         jnp.zeros((B, 1, 1, 1), dtype=bool)
     ], axis=-1)
 
+    sample_key = rng_key if rng_key is not None else jax.random.PRNGKey(0)
+
     def _sample_from_logits(lg: jnp.ndarray, prev_toks: List[int]) -> int:
-        lg_np = np.array(lg[0], dtype=np.float32)
+        nonlocal sample_key
+        lg_f32 = lg[0].astype(jnp.float32)
         if prev_toks:
-            for pt in set(prev_toks):
-                if lg_np[pt] > 0:
-                    lg_np[pt] /= repetition_penalty
-                else:
-                    lg_np[pt] *= repetition_penalty
-        lg_np = lg_np / max(temperature, 1e-4)
-        exp_lg = np.exp(lg_np - np.max(lg_np))
-        probs = exp_lg / np.sum(exp_lg)
-        return int(np.random.choice(len(probs), p=probs))
+            pt_idx = jnp.array(sorted(set(prev_toks)), dtype=jnp.int32)
+            pt_vals = lg_f32[pt_idx]
+            adj_vals = jnp.where(pt_vals > 0, pt_vals / repetition_penalty, pt_vals * repetition_penalty)
+            lg_f32 = lg_f32.at[pt_idx].set(adj_vals)
+        lg_scaled = lg_f32 / max(temperature, 1e-4)
+        sample_key, sub_key = jax.random.split(sample_key)
+        return int(jax.random.categorical(sub_key, lg_scaled))
 
     for t in range(max_new_tokens):
         # The cache contains the prompt plus *previous* generated tokens.

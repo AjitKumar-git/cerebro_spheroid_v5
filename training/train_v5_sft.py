@@ -551,9 +551,12 @@ def main(args=None):
     # 6. SFT Multi-Corpus Data Ingestion & Prefetching
     print(f"\n📦 Initializing Curated Reasoning & Conversational SFT Streamer (Source: {args.dataset_source})...")
     sft_data_iter = build_online_dataset_iterator(dataset_source=args.dataset_source, total_steps=args.total_steps)
-    first_row = next(sft_data_iter)
     import itertools
-    sft_chain_iter = itertools.chain([first_row], sft_data_iter)
+    try:
+        first_row = next(sft_data_iter)
+        sft_chain_iter = itertools.chain([first_row], sft_data_iter)
+    except StopIteration:
+        sft_chain_iter = sft_data_iter
 
     buckets = [("sft_static", args.prompt_len, args.seq_len)]
     batcher = ElasticBucketBatcher(
@@ -603,6 +606,8 @@ def main(args=None):
             targets=r_b,
             remat=False,
             pure_teacher_forcing=True,
+            deliberation_mode="teacher_forcing",
+            repetition_penalty=1.0,
         )
 
     # 8. Learning Rate Schedule for SFT
@@ -634,13 +639,14 @@ def main(args=None):
     ema_loss: Optional[float] = None
     consecutive_target_evals = 0
     converged_target_met = False
+    lr_damp_factor = 1.0
 
     try:
         while step < args.total_steps and not shutdown_requested:
             prev_step = step
             step += 1
 
-            cur_lr = get_sft_lr(step)
+            cur_lr = get_sft_lr(step) * lr_damp_factor
 
             # SFT Loss Window Governor Dynamic Damping
             if getattr(args, "loss_window_governor", True) and ema_loss is not None:
@@ -731,7 +737,7 @@ def main(args=None):
             else:
                 print(f"\n⚠️ [SFT Divergence Watchdog] Non-finite or elevated loss ({loss_val}) at Step {step:,}! Stabilizing optimizer momentum...")
                 ema_loss = last_eval_loss if math.isfinite(last_eval_loss) else 2.50
-                cur_lr = cur_lr * 0.75
+                lr_damp_factor = max(0.1, lr_damp_factor * 0.75)
 
             step_window_tokens += step_tokens
             step_window_count += 1
