@@ -270,7 +270,7 @@ def test_explicit_total_steps_flag_recognition():
 def test_stage_1_pretrain_held_out_domains(monkeypatch):
     """
     Verifies that Stage 1 (Pretrain / Step 1) only evaluates FineWeb (broad_web)
-    and The Stack (code), with 85% / 15% canonical weights.
+    and The Stack (code), with 90% / 10% developmental curriculum weights.
     """
     from src.corpus import build_tokenizer
     import src.elastic_window as ew
@@ -299,9 +299,9 @@ def test_stage_1_pretrain_held_out_domains(monkeypatch):
     assert not any("Cosmopedia" in lbl for lbl in domain_labels)
     assert not any("Edu" in lbl for lbl in domain_labels)
 
-    # Verify normalized weights 85% / 15%
-    assert math.isclose(domain_weights[0], 0.85, abs_tol=1e-4)
-    assert math.isclose(domain_weights[1], 0.15, abs_tol=1e-4)
+    # Verify normalized weights 90% / 10%
+    assert math.isclose(domain_weights[0], 0.90, abs_tol=1e-4)
+    assert math.isclose(domain_weights[1], 0.10, abs_tol=1e-4)
     assert math.isclose(sum(domain_weights), 1.0, abs_tol=1e-4)
 
 
