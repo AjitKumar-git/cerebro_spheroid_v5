@@ -1125,11 +1125,12 @@ class PremotorMotorDecoderV5(nn.Module):
         )
 
         if getattr(self, "use_centralized_readout", True):
-            query_surface = core_transformed + p_scaled
+            core_phase = core_transformed + p_scaled
+            query_surface = (core_phase + auditory_feedback.to(state.dtype)) if auditory_feedback is not None else core_phase
             motor_surface = torch.zeros_like(query_surface)
         else:
             motor_surface = surface + p_scaled
-            query_surface = motor_surface
+            query_surface = (motor_surface + auditory_feedback.to(state.dtype)) if auditory_feedback is not None else motor_surface
         # Note: auditory_feedback (direct t-1 token embedding) detached from motor_surface
         # to eliminate direct token bypass and prevent noise compounding during autoregressive rollout.
 
@@ -1960,6 +1961,10 @@ class CerebroSpheroidV5(nn.Module):
         delib_decay = getattr(self.config, "contractive_delib_decay", 0.75)
         init_scale = state.norm(p=2, dim=-1, keepdim=True) + 1e-8
 
+        if use_adapt:
+            accum_state = torch.zeros_like(state)
+            cum_p = torch.zeros((B,), device=dev, dtype=torch.float32)
+
         prev_delta = None
         for cycle in range(cycles):
             state_prev = state.clone() if self.config.use_energy_regularization else None
@@ -1979,9 +1984,15 @@ class CerebroSpheroidV5(nn.Module):
 
             if use_adapt:
                 core_state = next_state[:, 0, :] if getattr(self.config, "use_core_halting", True) else next_state.mean(dim=1)
-                halt_prob = torch.sigmoid(self.halting_gate(core_state))
+                halt_prob = torch.sigmoid(self.halting_gate(core_state)).squeeze(-1)  # [B]
                 halt_loss = halt_loss + halt_prob.mean()
-                if not self.training and (halt_prob > self.config.thinking_halt_threshold).all():
+                is_last = (cycle == cycles - 1)
+                rem_p = (1.0 - cum_p).clamp(min=0.0)
+                early_halt_gate = (not self.training) and bool((halt_prob > self.config.thinking_halt_threshold).all().item())
+                step_weight = rem_p if (is_last or early_halt_gate) else torch.minimum(halt_prob.float(), rem_p)
+                cum_p = cum_p + step_weight
+                accum_state = accum_state + step_weight.view(B, 1, 1).to(state.dtype) * next_state
+                if early_halt_gate:
                     state = next_state
                     break
 
@@ -2008,6 +2019,13 @@ class CerebroSpheroidV5(nn.Module):
                 prev_delta = next_state[:, 0, :] - state[:, 0, :]
 
             state = next_state
+
+        if use_adapt:
+            norm_factor = cum_p.view(B, 1, 1).clamp(min=1e-6)
+            state = (accum_state / norm_factor.to(accum_state.dtype)).to(state.dtype)
+            if use_contract:
+                norm_final = state.norm(p=2, dim=-1, keepdim=True) + 1e-8
+                state = (state / norm_final) * init_scale
 
         # Pre-embed aligned previous-token feedback (prev_tokens[:, t] feeds step t predicting targets[:, t])
         prev_tokens = None

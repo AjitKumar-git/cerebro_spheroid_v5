@@ -720,8 +720,8 @@ def test_jax_to_pytorch_numerical_loss_parity_and_config_preservation():
     assert cfg.use_sensory_self_attn is False
     assert cfg.use_rope is False
     assert cfg.top_k_resonance == 0
-    assert cfg.use_deliberation_probe is False
-    assert cfg.use_adaptive_thinking is False
+    assert cfg.use_deliberation_probe is True
+    assert cfg.use_adaptive_thinking is True
     assert cfg.use_sparse_mot is False
     assert cfg.use_energy_regularization is False
 
