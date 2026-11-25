@@ -731,3 +731,28 @@ def test_train_v5_tpu_jax_multi_tpu_local_sgd_cli_smoke(tmp_path):
     assert "Multi-TPU Engine : Local-SGD (2 TPUs x 2 local steps = +4 steps/round)" in proc.stdout
     saved_ckpts = list(ckpt_dir.glob("*.pt"))
     assert len(saved_ckpts) >= 1, f"Expected saved .pt checkpoint in {ckpt_dir}, got {saved_ckpts}"
+
+
+def test_jax_spectral_core_readout_orthonormality_and_forward():
+    """Verifies that JAX Core Spectral Readout preserves Parseval energy and trains cleanly."""
+    from src.jax.v5_model import create_dct_matrix_jax, training_rollout, emit_step
+    cfg = ModelConfigV5(**PRESETS_V5["v5_test"])
+    assert cfg.use_spectral_core_readout is True
+    assert cfg.use_centralized_readout is True
+
+    # 1. Orthonormality error in JAX
+    dct_mat = create_dct_matrix_jax(cfg.surface_dim)
+    identity = jnp.eye(cfg.surface_dim, dtype=jnp.float32)
+    err = float(jnp.max(jnp.abs(jnp.matmul(dct_mat, dct_mat.T) - identity)))
+    assert err < 1e-4, f"JAX DCT orthonormality error too high: {err}"
+
+    # 2. Forward pass with loss
+    params, buffers = init_params_v5(jax.random.PRNGKey(99), cfg)
+    assert "motor.spectral_band_gains" in params
+    assert "motor.spectral_residual_gate" in params
+
+    prompts = jnp.ones((2, 8), dtype=jnp.int32)
+    targets = jnp.ones((2, 6), dtype=jnp.int32)
+    loss = training_rollout(params=params, prompts=prompts, target_len=6, buffers=buffers, config=cfg, targets=targets)
+    assert jnp.isfinite(loss)
+

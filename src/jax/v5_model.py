@@ -54,6 +54,8 @@ class ModelConfigV5:
     use_contractive_deliberation: bool = True
     contractive_delib_decay: float = 0.75
     deliberation_early_halt_thresh: float = 0.025
+    use_spectral_core_readout: bool = True
+    spectral_band_splits: Optional[Tuple[int, int, int]] = None
     use_adaptive_thinking: bool = True
     max_thinking_cycles: int = 8
     thinking_halt_threshold: float = 0.75
@@ -237,6 +239,42 @@ def apply_rope(
     return jnp.stack((x_even * cos - x_odd * sin, x_even * sin + x_odd * cos), axis=-1).reshape(x.shape)
 
 
+def create_dct_matrix_jax(dim: int) -> jnp.ndarray:
+    """Orthonormal Discrete Cosine Transform (DCT-II) matrix in JAX (Parseval energy-conserving)."""
+    n = jnp.arange(dim, dtype=jnp.float32)
+    k = jnp.arange(dim, dtype=jnp.float32)[:, None]
+    M = jnp.cos(math.pi / float(dim) * (n + 0.5) * k)
+    M = M.at[0, :].multiply(1.0 / math.sqrt(float(dim)))
+    M = M.at[1:, :].multiply(math.sqrt(2.0 / float(dim)))
+    return M
+
+
+def transform_spectral_core_jax(core: jnp.ndarray, params: dict, config: Any) -> jnp.ndarray:
+    """Transforms deliberated Shell 0 via orthonormal DCT basis, multi-band filtering, and residual gating in JAX."""
+    use_spec = getattr(config, "use_spectral_core_readout", True) if config is not None else False
+    if not use_spec or "motor.spectral_band_gains" not in params:
+        return core
+    D = core.shape[-1]
+    splits = getattr(config, "spectral_band_splits", None)
+    if splits is not None and sum(splits) == D:
+        low_d, mid_d, high_d = splits
+    else:
+        low_d = D // 4
+        mid_d = D // 2
+        high_d = D - (low_d + mid_d)
+    dt = core.dtype
+    dct_mat = create_dct_matrix_jax(D).astype(dt)
+    s_hat = jnp.matmul(core, dct_mat.T)
+    gains = params["motor.spectral_band_gains"].astype(dt)
+    z_low = s_hat[..., :low_d] * gains[0]
+    z_mid = s_hat[..., low_d : low_d + mid_d] * gains[1]
+    z_high = s_hat[..., low_d + mid_d :] * gains[2]
+    filtered = jnp.concatenate([z_low, z_mid, z_high], axis=-1)
+    beta = jnp.tanh(params.get("motor.spectral_residual_gate", jnp.zeros(1, dtype=jnp.float32))).astype(dt)
+    norm_w = params.get("motor.spectral_norm.weight", jnp.ones(D, dtype=jnp.float32))
+    return rms_norm(core + beta * filtered, norm_w)
+
+
 def generate_small_world_indices(num_shells: int, num_tracts: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Generates deterministic small-world axonal shortcut wiring in JAX."""
     srcs, dsts = [], []
@@ -348,6 +386,12 @@ def init_params_v5(key: jax.random.PRNGKey, config: ModelConfigV5) -> Tuple[Dict
     # Optional untied vocabulary output projection
     if not getattr(config, "use_tied_embeddings", True):
         params["motor.head.weight"] = jax.random.normal(keys[39], (V, s_dim)) * (1.0 / math.sqrt(s_dim))
+
+    # Core Spectral Readout parameters (Parseval orthonormal DCT-II decomposition)
+    if getattr(config, "use_spectral_core_readout", True):
+        params["motor.spectral_band_gains"] = jnp.ones(3, dtype=jnp.float32)
+        params["motor.spectral_residual_gate"] = jnp.zeros(1, dtype=jnp.float32)
+        params["motor.spectral_norm.weight"] = jnp.ones(s_dim, dtype=jnp.float32)
 
     # Optional Multi-Token Prediction (MTP) auxiliary heads
     if getattr(config, "num_mtp_heads", 1) > 1:
@@ -837,8 +881,9 @@ def emit_step(
     p_scaled = (phase * (p_scale_val / p_norm)).astype(st_dtype)
 
     use_cent_readout = getattr(config, "use_centralized_readout", True) if config is not None else False
+    eff_core = transform_spectral_core_jax(core, params, config) if use_cent_readout else core
     if use_cent_readout:
-        core_phase = core + p_scaled
+        core_phase = eff_core + p_scaled
         query_surface = (core_phase + auditory_feedback.astype(st_dtype)) if auditory_feedback is not None else core_phase
         motor_surface = jnp.zeros_like(query_surface)
     else:
@@ -880,7 +925,7 @@ def emit_step(
     ig = jnp.clip(params.get("motor.input_gate", jnp.ones(5, dtype=jnp.float32)), -5.0, 5.0).astype(st_dtype)
     fused_in = jnp.concatenate([
         ig[0] * motor_surface,
-        ig[1] * core,
+        ig[1] * eff_core,
         ig[2] * resonance,
         ig[3] * shell_pool,
         ig[4] * (plan if use_plan else jnp.zeros_like(plan)),
@@ -1437,8 +1482,9 @@ def training_rollout(
         ).astype(jnp.float32)
         p_scaled_all = (phases * (p_scale_val / p_norms)).astype(target_dtype)  # [T, D]
         use_cent_readout = getattr(config, "use_centralized_readout", True)
+        eff_core = transform_spectral_core_jax(init_core, params, config) if use_cent_readout else init_core
         if use_cent_readout:
-            core_t = init_core[:, None, :] + p_scaled_all[None, :, :]
+            core_t = eff_core[:, None, :] + p_scaled_all[None, :, :]
             query_surface_all = core_t + tf_flux.astype(target_dtype)
             motor_surface_all = jnp.zeros_like(query_surface_all)
         else:
@@ -1569,7 +1615,8 @@ def training_rollout(
             return (nxt_state, nxt_plan), h
 
         motor_scan_fn = jax.checkpoint(_tf_motor_step) if use_remat else _tf_motor_step
-        _, h_seq = lax.scan(motor_scan_fn, (state, init_plan), (gated_ms_seq, gated_res_seq, p_scaled_all))
+        motor_init_state = state.at[:, 0, :].set(eff_core) if use_cent_readout else state
+        _, h_seq = lax.scan(motor_scan_fn, (motor_init_state, init_plan), (gated_ms_seq, gated_res_seq, p_scaled_all))
 
         # 4. Chunked Systolic Vocabulary Projection & Cross-Entropy Outside Sequential Scan
         temp = jnp.clip(params["motor.temperature_scale"].astype(jnp.float32), 0.1, 5.0).astype(target_dtype)

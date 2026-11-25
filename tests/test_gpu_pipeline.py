@@ -1142,6 +1142,41 @@ def test_hf_token_pickup_and_streamer_429_resilience(monkeypatch):
     assert dt < 0.05, f"Expected non-blocking online check, took {dt:.3f}s"
 
 
+def test_spectral_core_readout_orthonormality_and_backward():
+    """Verifies that Core Spectral Readout preserves Parseval energy, trains gradients, and generates cleanly."""
+    cfg = ModelConfigV5(**PRESETS_V5["v5_test"])
+    assert cfg.use_spectral_core_readout is True
+    assert cfg.use_centralized_readout is True
+    model = CerebroSpheroidV5(cfg)
+
+    # 1. Check DCT-II basis orthonormality (Parseval energy preservation)
+    basis = model.motor_decoder.dct_basis
+    assert basis is not None
+    identity = torch.eye(basis.shape[0], dtype=basis.dtype, device=basis.device)
+    ortho_error = (basis @ basis.T - identity).abs().max().item()
+    assert ortho_error < 1e-4, f"DCT basis orthonormality error too large: {ortho_error}"
+
+    # 2. Forward pass with loss and backward pass for gradient flow
+    prompts = torch.randint(1, cfg.vocab_size, (2, 8))
+    targets = torch.randint(1, cfg.vocab_size, (2, 6))
+
+    model.zero_grad(set_to_none=True)
+    loss, _ = model(prompts, targets=targets, pad_id=0)
+    assert torch.isfinite(loss)
+    loss.backward()
+
+    assert model.motor_decoder.spectral_band_gains.grad is not None
+    assert torch.isfinite(model.motor_decoder.spectral_band_gains.grad).all()
+    assert model.motor_decoder.spectral_residual_gate.grad is not None
+    assert torch.isfinite(model.motor_decoder.spectral_residual_gate.grad).all()
+
+    # 3. Autoregressive token rollout
+    with torch.no_grad():
+        out = model.generate(prompts, max_new_tokens=4)
+        assert out.shape == (2, 4)
+
+
+
 
 
 

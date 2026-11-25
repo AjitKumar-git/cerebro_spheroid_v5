@@ -55,6 +55,8 @@ class ModelConfigV5:
     use_contractive_deliberation: bool = True  # Enforce contractive state estimation (scale-conserving norm & step damping)
     contractive_delib_decay: float = 0.75      # Exponential decay rate for deliberation step size (alpha_c = gamma^c)
     deliberation_early_halt_thresh: float = 0.025 # Early halt threshold on Shell 0 relative innovation (c >= 1)
+    use_spectral_core_readout: bool = True     # Orthonormal DCT multi-band spectral decomposition on Shell 0
+    spectral_band_splits: Optional[Tuple[int, int, int]] = None # Optional custom Low/Mid/High band splits (defaults to D/4, D/2, D/4)
     # Frontier 2026 Architectural Upgrades
     use_adaptive_thinking: bool = True     # Dynamic halting gate during subconscious deliberation
     max_thinking_cycles: int = 8           # Upper bound for adaptive deliberation
@@ -228,6 +230,16 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, offset: in
     x2 = x[..., 1::2]
     x_rot = torch.stack([-x2, x1], dim=-1).flatten(-2)
     return x * c + x_rot * s
+
+
+def create_dct_matrix(dim: int, device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Orthonormal Discrete Cosine Transform (DCT-II) matrix (Parseval energy-conserving)."""
+    n = torch.arange(dim, device=device, dtype=torch.float32)
+    k = torch.arange(dim, device=device, dtype=torch.float32).unsqueeze(1)
+    M = torch.cos(math.pi / float(dim) * (n + 0.5) * k)
+    M[0, :] = M[0, :] * (1.0 / math.sqrt(float(dim)))
+    M[1:, :] = M[1:, :] * math.sqrt(2.0 / float(dim))
+    return M.to(dtype)
 
 
 class MTPHead(nn.Module):
@@ -822,6 +834,8 @@ class PremotorMotorDecoderV5(nn.Module):
         use_tied_embeddings: bool = True,
         use_per_token_efference: bool = False,
         use_centralized_readout: bool = True,
+        use_spectral_core_readout: bool = True,
+        spectral_band_splits: Optional[Tuple[int, int, int]] = None,
     ):
         super().__init__()
         self.num_shells = num_shells
@@ -838,6 +852,29 @@ class PremotorMotorDecoderV5(nn.Module):
         self.use_tied_embeddings = use_tied_embeddings
         self.use_per_token_efference = use_per_token_efference
         self.use_centralized_readout = use_centralized_readout
+        self.use_spectral_core_readout = use_spectral_core_readout
+
+        if spectral_band_splits is not None and sum(spectral_band_splits) == surface_dim:
+            self.spectral_band_splits = spectral_band_splits
+        else:
+            low_d = surface_dim // 4
+            mid_d = surface_dim // 2
+            high_d = surface_dim - (low_d + mid_d)
+            self.spectral_band_splits = (low_d, mid_d, high_d)
+
+        self.spectral_low_dim, self.spectral_mid_dim, self.spectral_high_dim = self.spectral_band_splits
+
+        if self.use_spectral_core_readout:
+            dct_mat = create_dct_matrix(surface_dim, torch.device("cpu"), torch.float32)
+            self.register_buffer("dct_basis", dct_mat, persistent=False)
+            self.spectral_band_gains = nn.Parameter(torch.ones(3, dtype=torch.float32))
+            self.spectral_residual_gate = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+            self.spectral_norm = RMSNorm(surface_dim)
+        else:
+            self.dct_basis = None
+            self.spectral_band_gains = None
+            self.spectral_residual_gate = None
+            self.spectral_norm = None
 
         # Precompute RoPE rotary frequency cache for 32k+ token horizons
         cos, sin = precompute_rope_freqs(self.head_dim, max_seq_len=max_seq_len, theta=rope_theta)
@@ -1014,6 +1051,19 @@ class PremotorMotorDecoderV5(nn.Module):
         res = res.transpose(1, 2).contiguous().view(B, T_q, D)
         return self.resonance_norm(self.out_proj(res).to(motor_surface.dtype))
 
+    def transform_spectral_core(self, core: torch.Tensor) -> torch.Tensor:
+        """Transforms deliberated Shell 0 via orthonormal DCT basis, multi-band filtering, and residual gating."""
+        if not getattr(self, "use_spectral_core_readout", True) or getattr(self, "dct_basis", None) is None:
+            return core
+        dt = core.dtype
+        s_hat = F.linear(core, self.dct_basis.to(dt))
+        z_low = s_hat[..., :self.spectral_low_dim] * self.spectral_band_gains[0].to(dt)
+        z_mid = s_hat[..., self.spectral_low_dim:self.spectral_low_dim + self.spectral_mid_dim] * self.spectral_band_gains[1].to(dt)
+        z_high = s_hat[..., self.spectral_low_dim + self.spectral_mid_dim:] * self.spectral_band_gains[2].to(dt)
+        filtered = torch.cat([z_low, z_mid, z_high], dim=-1)
+        beta = torch.tanh(self.spectral_residual_gate).to(dt)
+        return self.spectral_norm(core + beta * filtered)
+
     def forward(
         self,
         state: torch.Tensor,
@@ -1041,6 +1091,7 @@ class PremotorMotorDecoderV5(nn.Module):
         B, K, D = state.shape
         surface = state[:, -1, :]  # Cortical boundary (Shell K-1)
         core = state[:, 0, :]      # Subcortical core (Shell 0)
+        core_transformed = self.transform_spectral_core(core) if getattr(self, "use_centralized_readout", True) else core
 
         if plan is None and self.use_plan:
             plan = self.init_plan(B, state.device)
@@ -1052,7 +1103,7 @@ class PremotorMotorDecoderV5(nn.Module):
         )
 
         if getattr(self, "use_centralized_readout", True):
-            query_surface = core + p_scaled
+            query_surface = core_transformed + p_scaled
             motor_surface = torch.zeros_like(query_surface)
         else:
             motor_surface = surface + p_scaled
@@ -1126,7 +1177,7 @@ class PremotorMotorDecoderV5(nn.Module):
         gate = torch.clamp(self.input_gate, -5.0, 5.0).to(motor_surface.dtype)
         fused_components = [
             motor_surface * gate[0],
-            core * gate[1],
+            core_transformed * gate[1],
             resonance * gate[2],
             shell_pool * gate[3],
         ]
@@ -1269,6 +1320,7 @@ class PremotorMotorDecoderV5(nn.Module):
         surface = state[:, -1, :]
         cur_core = state[:, 0, :]
         dt = surface.dtype
+        eff_core = self.transform_spectral_core(cur_core) if getattr(self, "use_centralized_readout", True) else cur_core
 
         if plan is None and self.use_plan:
             plan = self.init_plan(B, state.device)
@@ -1276,8 +1328,9 @@ class PremotorMotorDecoderV5(nn.Module):
 
         p_scaled = self._prepare_phase_vectors(torch.arange(T_seq, device=state.device), dt)
         if getattr(self, "use_centralized_readout", True):
-            query_input = cur_core.unsqueeze(1) + p_scaled.unsqueeze(0) + target_feedback.to(dt)
+            query_input = eff_core.unsqueeze(1) + p_scaled.unsqueeze(0) + target_feedback.to(dt)
             motor_surface = torch.zeros_like(query_input)
+            cur_core = eff_core
         else:
             motor_surface = surface.unsqueeze(1) + p_scaled.unsqueeze(0) + target_feedback.to(dt)
             query_input = motor_surface
@@ -1577,6 +1630,8 @@ class CerebroSpheroidV5(nn.Module):
             use_tied_embeddings=getattr(self.config, "use_tied_embeddings", True),
             use_per_token_efference=getattr(self.config, "use_per_token_efference", False),
             use_centralized_readout=getattr(self.config, "use_centralized_readout", True),
+            use_spectral_core_readout=getattr(self.config, "use_spectral_core_readout", True),
+            spectral_band_splits=getattr(self.config, "spectral_band_splits", None),
         )
 
         # 4. Deliberative Episodic Memory Probing (Subconscious sensory recall)
@@ -2883,18 +2938,20 @@ def infer_v5_config_from_state_dict(
     ckpt_or_state: Dict[str, Any],
     default_preset: str = "v5_small",
     vocab_size_override: Optional[int] = None,
+    preset_name: Optional[str] = None,
     **overrides: Any,
 ) -> ModelConfigV5:
     """Infers a compatible ModelConfigV5 from either a PyTorch or JAX V5 checkpoint state dict."""
     raw_state, meta = _extract_raw_v5_state(ckpt_or_state)
     inner_meta = meta.get("meta", {}) if isinstance(meta.get("meta"), dict) else {}
-    preset_name = (
-        meta.get("model_preset")
-        or meta.get("preset")
-        or inner_meta.get("target_config")
-        or meta.get("target_config")
-        or default_preset
-    )
+    if preset_name is None:
+        preset_name = (
+            meta.get("model_preset")
+            or meta.get("preset")
+            or inner_meta.get("target_config")
+            or meta.get("target_config")
+            or default_preset
+        )
     if preset_name in ("tpu_v5e_1", "tpu_v6e_1", "tpu_v6e", "tpu", "v5_tpu"):
         preset_name = "v5_small"
     cfg_kwargs = PRESETS_V5.get(preset_name, PRESETS_V5.get(default_preset, PRESETS_V5["v5_small"])).copy()
