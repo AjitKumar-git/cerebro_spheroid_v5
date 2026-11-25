@@ -1232,6 +1232,42 @@ def test_adaptive_deliberation_depth_and_multi_criteria_halting():
         assert out.shape == (2, 4)
 
 
+def test_laminar_transport_dynamics_and_backward():
+    """Verifies that Phase 5 laminar transport preserves exact zero-init parity and trains cleanly."""
+    cfg = ModelConfigV5(**PRESETS_V5["v5_test"])
+    cfg.use_laminar_transport = True
+    model = CerebroSpheroidV5(cfg)
+
+    K = cfg.num_shells
+    assert model.volumetric_core.laminar_in_gate is not None
+    assert model.volumetric_core.laminar_out_gate is not None
+    assert model.volumetric_core.laminar_in_gate.shape == (K - 1,)
+    assert model.volumetric_core.laminar_out_gate.shape == (K - 1,)
+
+    # 1. Exact zero-init numerical parity
+    state = torch.randn(2, K, cfg.surface_dim)
+    with torch.no_grad():
+        step_laminar = model.volumetric_core.deliberate_step(state)
+        model.volumetric_core.use_laminar_transport = False
+        step_base = model.volumetric_core.deliberate_step(state)
+        model.volumetric_core.use_laminar_transport = True
+        diff = (step_laminar - step_base).abs().max().item()
+        assert diff < 1e-6, f"Laminar transport broken at init: diff={diff}"
+
+    # 2. Backward gradients
+    model.train()
+    prompts = torch.randint(1, cfg.vocab_size, (2, 8))
+    targets = torch.randint(1, cfg.vocab_size, (2, 6))
+    loss, _ = model(prompts, targets=targets, pad_id=0)
+    assert torch.isfinite(loss)
+    loss.backward()
+
+    assert model.volumetric_core.laminar_in_gate.grad is not None
+    assert torch.isfinite(model.volumetric_core.laminar_in_gate.grad).all()
+    assert model.volumetric_core.laminar_out_gate.grad is not None
+    assert torch.isfinite(model.volumetric_core.laminar_out_gate.grad).all()
+
+
 
 
 

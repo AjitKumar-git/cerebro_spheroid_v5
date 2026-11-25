@@ -61,6 +61,7 @@ class ModelConfigV5:
     sensory_evidence_core_scale: float = 0.05
     use_core_halting: bool = True
     deliberation_oscillation_halt: bool = True
+    use_laminar_transport: bool = True
     use_adaptive_thinking: bool = True
     max_thinking_cycles: int = 8
     thinking_halt_threshold: float = 0.75
@@ -460,6 +461,11 @@ def init_params_v5(key: jax.random.PRNGKey, config: ModelConfigV5) -> Tuple[Dict
         params["core.halting_gate.weight"] = jnp.zeros((1, s_dim), dtype=jnp.float32)
         params["core.halting_gate.bias"] = jnp.array([-1.5], dtype=jnp.float32)
 
+    # 6. Laminar-specific directional transport gates (zero-initialized for exact baseline parity)
+    if getattr(config, "use_laminar_transport", True):
+        params["core.laminar_in_gate"] = jnp.zeros(K - 1, dtype=jnp.float32)
+        params["core.laminar_out_gate"] = jnp.zeros(K - 1, dtype=jnp.float32)
+
     src_idx, dst_idx = generate_small_world_indices(K, T)
     buffers = (src_idx, dst_idx)
     return params, buffers
@@ -696,8 +702,14 @@ def deliberate_step(
     out_flux = jnp.einsum("bkd,kde->bke", rad_out, params["core.w_radial_out"])
     out_up = jnp.matmul(out_flux, w_up_out.T)
 
-    state_radial = state_intra.at[:, :-1, :].add(r_mix * in_up)
-    state_radial = state_radial.at[:, 1:, :].add(r_mix * out_up)
+    if getattr(config, "use_laminar_transport", True) and "core.laminar_in_gate" in params:
+        tau_in = 2.0 * jax.nn.sigmoid(params["core.laminar_in_gate"])[None, :, None].astype(st_dtype) * r_mix
+        tau_out = 2.0 * jax.nn.sigmoid(params["core.laminar_out_gate"])[None, :, None].astype(st_dtype) * r_mix
+        state_radial = state_intra.at[:, :-1, :].add(tau_in * in_up)
+        state_radial = state_radial.at[:, 1:, :].add(tau_out * out_up)
+    else:
+        state_radial = state_intra.at[:, :-1, :].add(r_mix * in_up)
+        state_radial = state_radial.at[:, 1:, :].add(r_mix * out_up)
 
     # 4. Small-world hierarchical axonal shortcut tracts in 1 vectorized step
     conductances = jax.nn.sigmoid(params["core.shortcut_gate"]).astype(st_dtype)

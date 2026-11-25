@@ -804,3 +804,39 @@ def test_jax_centralized_core_halting_gate_and_act():
     assert jnp.isfinite(grads["core.halting_gate.weight"]).all()
 
 
+def test_jax_laminar_transport_dynamics():
+    """Verifies that Phase 5 laminar transport in JAX yields zero-init parity and finite gradients."""
+    from src.jax.v5_model import deliberate_step, training_rollout
+    cfg = ModelConfigV5(**PRESETS_V5["v5_test"])
+    cfg.use_laminar_transport = True
+
+    params, buffers = init_params_v5(jax.random.PRNGKey(105), cfg)
+    assert "core.laminar_in_gate" in params
+    assert "core.laminar_out_gate" in params
+    K = cfg.num_shells
+    assert params["core.laminar_in_gate"].shape == (K - 1,)
+    assert params["core.laminar_out_gate"].shape == (K - 1,)
+
+    # 1. Zero-init parity
+    state = jax.random.normal(jax.random.PRNGKey(106), (2, K, cfg.surface_dim))
+    step_laminar = deliberate_step(params, state, buffers, config=cfg)
+    params_no_laminar = {k: v for k, v in params.items() if "laminar" not in k}
+    step_base = deliberate_step(params_no_laminar, state, buffers, config=cfg)
+    diff = float(jnp.max(jnp.abs(step_laminar - step_base)))
+    assert diff < 1e-6, f"JAX laminar transport broken at init: diff={diff}"
+
+    # 2. Gradient flow
+    prompts = jnp.ones((2, 8), dtype=jnp.int32)
+    targets = jnp.ones((2, 6), dtype=jnp.int32)
+
+    def loss_fn(p):
+        return training_rollout(params=p, prompts=prompts, target_len=6, buffers=buffers, config=cfg, targets=targets)
+
+    loss, grads = jax.value_and_grad(loss_fn)(params)
+    assert jnp.isfinite(loss)
+    assert "core.laminar_in_gate" in grads
+    assert jnp.isfinite(grads["core.laminar_in_gate"]).all()
+    assert "core.laminar_out_gate" in grads
+    assert jnp.isfinite(grads["core.laminar_out_gate"]).all()
+
+

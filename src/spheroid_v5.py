@@ -62,6 +62,7 @@ class ModelConfigV5:
     sensory_evidence_core_scale: float = 0.05  # Evidence injection step scale
     use_core_halting: bool = True              # Centralize halting gate evaluation on Shell 0 (S0)
     deliberation_oscillation_halt: bool = True # Detect limit cycle / oscillation in deliberation trajectory
+    use_laminar_transport: bool = True         # Learned depth-dependent inter-shell laminar transport gates
     # Frontier 2026 Architectural Upgrades
     use_adaptive_thinking: bool = True     # Dynamic halting gate during subconscious deliberation
     max_thinking_cycles: int = 8           # Upper bound for adaptive deliberation
@@ -577,6 +578,7 @@ class VolumetricSpheroidCoreV5(nn.Module):
         dropout: float = 0.0,
         use_sparse_mot: bool = True,
         top_k_tracts: int = 24,
+        use_laminar_transport: bool = True,
     ):
         super().__init__()
         self.num_shells = num_shells
@@ -585,6 +587,7 @@ class VolumetricSpheroidCoreV5(nn.Module):
         self.num_shortcut_tracts = num_shortcut_tracts
         self.use_sparse_mot = use_sparse_mot
         self.top_k_tracts = min(top_k_tracts, num_shortcut_tracts)
+        self.use_laminar_transport = use_laminar_transport
 
         # Mixture-of-Axonal-Tracts (MoT) dynamic routing gate
         if use_sparse_mot:
@@ -614,6 +617,14 @@ class VolumetricSpheroidCoreV5(nn.Module):
         # Inter-shell transition matrices (subject to contractive spectral guard)
         self.w_radial_in = nn.Parameter(torch.randn(num_shells - 1, radial_dim, radial_dim) * (1.0 / math.sqrt(radial_dim)))
         self.w_radial_out = nn.Parameter(torch.randn(num_shells - 1, radial_dim, radial_dim) * (1.0 / math.sqrt(radial_dim)))
+
+        # Laminar-specific directional transport gates (zero-initialized for exact baseline parity)
+        if self.use_laminar_transport:
+            self.laminar_in_gate = nn.Parameter(torch.zeros(num_shells - 1, dtype=torch.float32))
+            self.laminar_out_gate = nn.Parameter(torch.zeros(num_shells - 1, dtype=torch.float32))
+        else:
+            self.laminar_in_gate = None
+            self.laminar_out_gate = None
 
         # Hierarchical axonal shortcut tracts (small-world wiring)
         src_idx, dst_idx = self._generate_small_world_tracts(num_shells, num_shortcut_tracts)
@@ -695,8 +706,14 @@ class VolumetricSpheroidCoreV5(nn.Module):
 
         # Assemble radial deltas out-of-place (zero in-place modifications)
         rad_scale = torch.clamp(self.radial_mix_scale, 0.01, 1.0).to(state_intra.dtype)
-        delta_in = F.pad(rad_scale * in_up, (0, 0, 0, 1))    # [B, K, D], zero padded on Shell K-1
-        delta_out = F.pad(rad_scale * out_up, (0, 0, 1, 0))  # [B, K, D], zero padded on Shell 0
+        if getattr(self, "use_laminar_transport", True) and hasattr(self, "laminar_in_gate") and self.laminar_in_gate is not None:
+            tau_in = 2.0 * torch.sigmoid(self.laminar_in_gate).view(1, K - 1, 1).to(state_intra.dtype) * rad_scale
+            tau_out = 2.0 * torch.sigmoid(self.laminar_out_gate).view(1, K - 1, 1).to(state_intra.dtype) * rad_scale
+            delta_in = F.pad(tau_in * in_up, (0, 0, 0, 1))
+            delta_out = F.pad(tau_out * out_up, (0, 0, 1, 0))
+        else:
+            delta_in = F.pad(rad_scale * in_up, (0, 0, 0, 1))    # [B, K, D], zero padded on Shell K-1
+            delta_out = F.pad(rad_scale * out_up, (0, 0, 1, 0))  # [B, K, D], zero padded on Shell 0
         state_radial = state_intra + delta_in + delta_out
 
         # 3. Mixture-of-Axonal-Tracts (MoT Sparse Small-World Routing)
@@ -1615,6 +1632,7 @@ class CerebroSpheroidV5(nn.Module):
             dropout=self.config.dropout,
             use_sparse_mot=self.config.use_sparse_mot,
             top_k_tracts=self.config.top_k_tracts,
+            use_laminar_transport=getattr(self.config, "use_laminar_transport", True),
         )
 
         # 3. Premotor Motor Decoder with Affine-Tied Head
