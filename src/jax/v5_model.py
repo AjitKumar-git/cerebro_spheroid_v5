@@ -50,6 +50,7 @@ class ModelConfigV5:
     top_k_resonance: int = 16
     use_deliberation_probe: bool = True
     use_per_token_efference: bool = False
+    use_centralized_readout: bool = True
     use_adaptive_thinking: bool = True
     max_thinking_cycles: int = 8
     thinking_halt_threshold: float = 0.75
@@ -822,10 +823,14 @@ def emit_step(
     p_scale_val = jnp.clip(params.get("motor.phase_scale", jnp.array(2.0, dtype=jnp.float32)), 0.05, 5.0).astype(jnp.float32)
     p_scaled = (phase * (p_scale_val / p_norm)).astype(st_dtype)
 
-    motor_surface = surface + p_scaled
-    # Route auditory_feedback (causal contextual flux) strictly to the Cross-Resonance query q,
-    # keeping it detached from motor_surface / fused_in so there is no direct token-prediction bypass.
-    query_surface = (motor_surface + auditory_feedback.astype(st_dtype)) if auditory_feedback is not None else motor_surface
+    use_cent_readout = getattr(config, "use_centralized_readout", True) if config is not None else False
+    if use_cent_readout:
+        core_phase = core + p_scaled
+        query_surface = (core_phase + auditory_feedback.astype(st_dtype)) if auditory_feedback is not None else core_phase
+        motor_surface = jnp.zeros_like(query_surface)
+    else:
+        motor_surface = surface + p_scaled
+        query_surface = (motor_surface + auditory_feedback.astype(st_dtype)) if auditory_feedback is not None else motor_surface
 
     # 2. Multi-Head Arcuate Fasciculus Cross-Resonance with Causal Prefix
     keys, values = sensory_kv
@@ -849,7 +854,7 @@ def emit_step(
     resonance = rms_norm(jnp.matmul(res_heads, params["motor.out_proj.weight"].T), params["motor.resonance_norm.weight"])
 
     # 3. Multi-Shell Softmax Pooling
-    if getattr(config, "use_shell_tap", True):
+    if getattr(config, "use_shell_tap", True) and (not use_cent_readout):
         shell_weights = jax.nn.softmax(params["motor.shell_score"].astype(jnp.float32), axis=0)[None, :, None].astype(st_dtype)
         shell_proj = jnp.matmul(state, params["motor.shell_proj.weight"].T)
         norm_factor = math.sqrt(float(state.shape[1]))
@@ -1418,10 +1423,14 @@ def training_rollout(
             params.get("motor.phase_scale", jnp.array(2.0, dtype=jnp.float32)), 0.05, 5.0
         ).astype(jnp.float32)
         p_scaled_all = (phases * (p_scale_val / p_norms)).astype(target_dtype)  # [T, D]
-        # tf_flux is kept detached from motor_surface / fused_in to prevent direct token-prediction shortcuts,
-        # and routed strictly to Cross-Resonance query formation so q_t remains content-conditioned.
-        motor_surface_all = surface[:, None, :] + p_scaled_all[None, :, :]
-        query_surface_all = motor_surface_all + tf_flux.astype(target_dtype)
+        use_cent_readout = getattr(config, "use_centralized_readout", True)
+        if use_cent_readout:
+            core_t = init_core[:, None, :] + p_scaled_all[None, :, :]
+            query_surface_all = core_t + tf_flux.astype(target_dtype)
+            motor_surface_all = jnp.zeros_like(query_surface_all)
+        else:
+            motor_surface_all = surface[:, None, :] + p_scaled_all[None, :, :]
+            query_surface_all = motor_surface_all + tf_flux.astype(target_dtype)
 
         # 2. Vectorized Multi-Head Arcuate Cross-Resonance across all T tokens in one systolic block
         total_len = causal_keys.shape[2]
@@ -1459,7 +1468,7 @@ def training_rollout(
 
         # 3. Dynamic concentric shell pooling & vectorized depth-decayed efference recurrence setup
         w_shell_t = params["motor.shell_proj.weight"].T
-        use_shell_tap = getattr(config, "use_shell_tap", True)
+        use_shell_tap = getattr(config, "use_shell_tap", True) and (not use_cent_readout)
         if use_shell_tap:
             shell_weights = jax.nn.softmax(params["motor.shell_score"].astype(jnp.float32), axis=0).astype(target_dtype)
             norm_factor = math.sqrt(float(num_shells))

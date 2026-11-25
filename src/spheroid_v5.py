@@ -51,6 +51,7 @@ class ModelConfigV5:
     top_k_resonance: int = 16         # Top-k sparse associative retrieval (needle tethering)
     use_deliberation_probe: bool = True  # Subconscious core probe of sensory KV buffer
     use_per_token_efference: bool = False # Flag for per-token motor efference feedback into core (Default: False)
+    use_centralized_readout: bool = True  # Enforce centralized core readout (Bottleneck S0 query & prediction)
     # Frontier 2026 Architectural Upgrades
     use_adaptive_thinking: bool = True     # Dynamic halting gate during subconscious deliberation
     max_thinking_cycles: int = 8           # Upper bound for adaptive deliberation
@@ -817,6 +818,7 @@ class PremotorMotorDecoderV5(nn.Module):
         top_k_resonance: int = 16,
         use_tied_embeddings: bool = True,
         use_per_token_efference: bool = False,
+        use_centralized_readout: bool = True,
     ):
         super().__init__()
         self.num_shells = num_shells
@@ -832,6 +834,7 @@ class PremotorMotorDecoderV5(nn.Module):
         self.top_k_resonance = top_k_resonance
         self.use_tied_embeddings = use_tied_embeddings
         self.use_per_token_efference = use_per_token_efference
+        self.use_centralized_readout = use_centralized_readout
 
         # Precompute RoPE rotary frequency cache for 32k+ token horizons
         cos, sin = precompute_rope_freqs(self.head_dim, max_seq_len=max_seq_len, theta=rope_theta)
@@ -1045,7 +1048,12 @@ class PremotorMotorDecoderV5(nn.Module):
             state.dtype,
         )
 
-        motor_surface = surface + p_scaled
+        if getattr(self, "use_centralized_readout", True):
+            query_surface = core + p_scaled
+            motor_surface = torch.zeros_like(query_surface)
+        else:
+            motor_surface = surface + p_scaled
+            query_surface = motor_surface
         # Note: auditory_feedback (direct t-1 token embedding) detached from motor_surface
         # to eliminate direct token bypass and prevent noise compounding during autoregressive rollout.
 
@@ -1060,7 +1068,7 @@ class PremotorMotorDecoderV5(nn.Module):
                 keys = torch.cat([keys, c_k], dim=2)
                 values = torch.cat([values, c_v], dim=2)
             L = keys.shape[2]
-            q = self.q_proj(motor_surface).view(B, self.num_heads, 1, self.head_dim)
+            q = self.q_proj(query_surface).view(B, self.num_heads, 1, self.head_dim)
 
             if self.use_rope:
                 q_offset = min(int(prompt_len_k + int(step_idx)), self.rope_cos.shape[0] - 1)
@@ -1103,13 +1111,13 @@ class PremotorMotorDecoderV5(nn.Module):
             resonance = torch.zeros_like(motor_surface)
 
         # 3. Multi-Shell Softmax Pooling
-        if self.use_shell_tap:
+        if not getattr(self, "use_centralized_readout", True) and self.use_shell_tap:
             shell_weights = F.softmax(self.shell_score.float(), dim=0).to(motor_surface.dtype).view(1, -1, 1)
             shell_proj = self.shell_proj(state)
             norm_factor = math.sqrt(float(state.shape[1]))
             shell_pool = torch.sum(shell_weights * shell_proj, dim=1) * (self.shell_scale.to(motor_surface.dtype) * norm_factor)
         else:
-            shell_pool = torch.zeros_like(motor_surface)
+            shell_pool = torch.zeros_like(core)
 
         # 4. Deep Motor Integration via SwiGLU
         gate = torch.clamp(self.input_gate, -5.0, 5.0).to(motor_surface.dtype)
@@ -1264,10 +1272,15 @@ class PremotorMotorDecoderV5(nn.Module):
         cur_plan = plan.to(dt) if plan is not None else None
 
         p_scaled = self._prepare_phase_vectors(torch.arange(T_seq, device=state.device), dt)
-        motor_surface = surface.unsqueeze(1) + p_scaled.unsqueeze(0) + target_feedback.to(dt)
+        if getattr(self, "use_centralized_readout", True):
+            query_input = cur_core.unsqueeze(1) + p_scaled.unsqueeze(0) + target_feedback.to(dt)
+            motor_surface = torch.zeros_like(query_input)
+        else:
+            motor_surface = surface.unsqueeze(1) + p_scaled.unsqueeze(0) + target_feedback.to(dt)
+            query_input = motor_surface
 
         resonance = self._parallel_cross_resonance(
-            motor_surface=motor_surface,
+            motor_surface=query_input,
             sensory_kv=sensory_kv,
             target_kv=target_kv,
             target_kv_mask=target_kv_mask,
@@ -1275,14 +1288,14 @@ class PremotorMotorDecoderV5(nn.Module):
             chunk_offset=0,
         )
 
-        if self.use_shell_tap and K > 1:
+        if not getattr(self, "use_centralized_readout", True) and self.use_shell_tap and K > 1:
             norm_factor = math.sqrt(float(K))
             shell_weights = F.softmax(self.shell_score.float(), dim=0).to(dt)
             shell_scale = self.shell_scale.to(dt) * norm_factor
             shell_proj_rest = self.shell_proj(state[:, 1:, :])
             shell_pool_rest = torch.sum(shell_weights[1:].view(1, -1, 1) * shell_proj_rest, dim=1) * shell_scale
             w0s = shell_weights[0] * shell_scale
-        elif self.use_shell_tap:
+        elif not getattr(self, "use_centralized_readout", True) and self.use_shell_tap:
             norm_factor = math.sqrt(float(K))
             shell_weights = F.softmax(self.shell_score.float(), dim=0).to(dt)
             shell_pool_rest = torch.zeros_like(surface)
@@ -1560,6 +1573,7 @@ class CerebroSpheroidV5(nn.Module):
             top_k_resonance=self.config.top_k_resonance,
             use_tied_embeddings=getattr(self.config, "use_tied_embeddings", True),
             use_per_token_efference=getattr(self.config, "use_per_token_efference", False),
+            use_centralized_readout=getattr(self.config, "use_centralized_readout", True),
         )
 
         # 4. Deliberative Episodic Memory Probing (Subconscious sensory recall)

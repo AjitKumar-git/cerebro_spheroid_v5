@@ -782,6 +782,7 @@ def test_jax_to_pytorch_numerical_loss_parity_and_config_preservation():
 def test_step_efference_fast_uses_gate_and_fp16_autocast_backward_finite():
     """Verifies step_efference_fast updates efference_gate and FP16 autocast backward stays NaN-free."""
     cfg = ModelConfigV5(**PRESETS_V5["v5_test"])
+    cfg.use_per_token_efference = True
     model = CerebroSpheroidV5(cfg)
     model.force_sequential = True
     prompts = torch.randint(1, cfg.vocab_size, (2, 8))
@@ -807,6 +808,32 @@ def test_step_efference_fast_uses_gate_and_fp16_autocast_backward_finite():
         for name, param in m_cuda.named_parameters():
             if param.grad is not None:
                 assert torch.isfinite(param.grad).all(), f"Non-finite gradient in {name}"
+
+
+def test_centralized_readout_bottleneck_and_backward():
+    """Verifies centralized core readout routes Arcuate resonance through core, mutes bypasses, and trains cleanly."""
+    cfg = ModelConfigV5(**PRESETS_V5["v5_test"])
+    assert cfg.use_centralized_readout is True
+    model = CerebroSpheroidV5(cfg)
+    prompts = torch.randint(1, cfg.vocab_size, (2, 8))
+    targets = torch.randint(1, cfg.vocab_size, (2, 6))
+
+    # Test parallel forward & backward
+    model.zero_grad(set_to_none=True)
+    loss, _ = model(prompts, targets=targets, pad_id=0)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert model.motor_decoder.q_proj.weight.grad is not None
+    assert torch.isfinite(model.motor_decoder.q_proj.weight.grad).all()
+
+    # Test sequential forward & backward
+    model.force_sequential = True
+    model.zero_grad(set_to_none=True)
+    seq_loss, _ = model(prompts, targets=targets, pad_id=0)
+    assert torch.isfinite(seq_loss)
+    seq_loss.backward()
+    assert model.motor_decoder.q_proj.weight.grad is not None
+    assert torch.isfinite(model.motor_decoder.q_proj.weight.grad).all()
 
 
 def test_graded_curriculum_eval_tracking_and_checkpoint_eval_loss(tmp_path):
