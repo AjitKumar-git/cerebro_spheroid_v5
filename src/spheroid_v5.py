@@ -78,6 +78,10 @@ class ModelConfigV5:
     image_patch_size: int = 16             # Pixel patch size (16x16)
     tool_token_id: Optional[int] = None    # Token ID for tool execution trigger (optional)
     act_token_id: Optional[int] = None     # Backward-compatible alias for tool_token_id
+    use_selective_loss: bool = False       # Noise-capped selective token weighting (maximizes compute per token)
+    selective_focal_gamma: float = 0.5     # Mild focal exponent (1 - p_t)^gamma on mastered tokens
+    selective_noise_cap: float = 8.5       # Soft CE cap attenuating unlearnable web-noise spikes
+    z_loss_weight: float = 0.0             # Logit Z-loss regularizer (z_loss_weight * logsumexp^2)
 
 
 PRESETS_V5: Dict[str, Dict[str, Any]] = {
@@ -639,22 +643,32 @@ class VolumetricSpheroidCoreV5(nn.Module):
 
     @staticmethod
     def _generate_small_world_tracts(num_shells: int, num_tracts: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Constructs small-world hierarchical axonal wiring between distant concentric shells."""
+        """Constructs bidirectional small-world hierarchical axonal wiring between distant concentric shells."""
         srcs, dsts = [], []
+        deep_span = max(1, num_shells // 4)
         for i in range(num_tracts):
-            # Connect deep subcortical shells (0..K//4) directly to cortical mantle (3K//4..K-1)
+            m = i // 3
             if i % 3 == 0:
-                s = i % max(1, num_shells // 4)
-                d = num_shells - 1 - (i % max(1, num_shells // 4))
+                # Bidirectional subcortical <-> cortical mantle tracts (even m outward, odd m corticofugal return)
+                s_deep = (m // 2) % deep_span
+                d_mantle = num_shells - 1 - s_deep
+                if d_mantle == s_deep and num_shells > 1:
+                    d_mantle = (s_deep + 1) % num_shells
+                s, d = (s_deep, d_mantle) if (m % 2 == 0) else (d_mantle, s_deep)
             elif i % 3 == 1:
-                # Long-range intermediate skip tracts
-                s = (i * 2) % num_shells
-                d = (s + num_shells // 2) % num_shells
+                # Hierarchical outer-to-inner corticofugal funnel across all shell parities
+                s = (num_shells - 1 - m) % num_shells
+                if s > 0:
+                    d = (s - 1) // 4
+                else:
+                    d = (num_shells // 2) % num_shells
+                    if d == s and num_shells > 1:
+                        d = (s + 1) % num_shells
             else:
-                # Random long-range axonal connections
+                # Pseudo-random long-range axonal connections
                 s = (i * 7) % num_shells
                 d = (i * 13) % num_shells
-                if s == d:
+                if s == d and num_shells > 1:
                     d = (s + 1) % num_shells
             srcs.append(s)
             dsts.append(d)

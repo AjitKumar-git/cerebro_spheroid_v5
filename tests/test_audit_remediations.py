@@ -701,13 +701,13 @@ class TestAuditRemediations(unittest.TestCase):
         out_no_swiglu = deliberate_step(params_s, state, buffers_s, config=cfg_no_swiglu)
         self.assertGreater(float(jnp.linalg.norm(out_swiglu - out_no_swiglu)), 1e-5)
 
-        # 5. use_shell_tap must affect emission
+        # 5. use_shell_tap must affect emission when centralized core bottleneck is disabled
         k_val = jax.random.normal(jax.random.PRNGKey(1), (2, 4, 8, 8))
         v_val = jax.random.normal(jax.random.PRNGKey(2), (2, 4, 8, 8))
         plan = jnp.zeros((2, 32))
         trace = jnp.zeros((2, 64))
-        cfg_tap = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, use_shell_tap=True)
-        cfg_no_tap = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, use_shell_tap=False)
+        cfg_tap = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, use_centralized_readout=False, use_shell_tap=True)
+        cfg_no_tap = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, use_centralized_readout=False, use_shell_tap=False)
         logits_tap, _, _, _ = emit_step(params_s, state, (k_val, v_val), plan, trace, 0, buffers_s, config=cfg_tap)
         logits_no_tap, _, _, _ = emit_step(params_s, state, (k_val, v_val), plan, trace, 0, buffers_s, config=cfg_no_tap)
         self.assertGreater(float(jnp.linalg.norm(logits_tap - logits_no_tap)), 1e-5)
@@ -810,13 +810,20 @@ class TestAuditRemediations(unittest.TestCase):
         cfg = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32, thinking_cycles=1)
         params, buffers = init_params_v5(jax.random.PRNGKey(42), cfg)
 
-        # Perturb affine_think: when seed_token_id is <think> (29), subsequent generation must be altered by affine_think
+        # Perturb affine_think with a non-uniform directional scale across channels:
+        # a uniform scalar factor preserves argmax at temperature=0.0, whereas directional scaling changes emission.
         params_perturbed = dict(params)
-        params_perturbed["motor.affine_think"] = params["motor.affine_think"] * 5.0
+        dir_scale = jnp.where((jnp.arange(cfg.surface_dim) % 2) == 0, 5.0, -5.0).astype(params["motor.affine_think"].dtype)
+        params_perturbed["motor.affine_think"] = params["motor.affine_think"] * dir_scale
 
         out_base = generate_text_jax(params, buffers, cfg, "Hello", tok, max_new_tokens=8, seed_token_id=29, temperature=0.0)
         out_pert = generate_text_jax(params_perturbed, buffers, cfg, "Hello", tok, max_new_tokens=8, seed_token_id=29, temperature=0.0)
         self.assertNotEqual(out_base, out_pert, "affine_think perturbation had no effect on generation seeded with <think>!")
+
+        # Conversely, unseeded answer generation must remain invariant to affine_think perturbation
+        out_ans_base = generate_text_jax(params, buffers, cfg, "Hello", tok, max_new_tokens=8, seed_token_id=None, temperature=0.0)
+        out_ans_pert = generate_text_jax(params_perturbed, buffers, cfg, "Hello", tok, max_new_tokens=8, seed_token_id=None, temperature=0.0)
+        self.assertEqual(out_ans_base, out_ans_pert, "affine_think perturbation leaked into non-think answer generation!")
 
     def test_tool_and_head_token_configuration(self):
         """Verifies configurable tool_token_id, act_token_id, think_token_id, and end tokens."""

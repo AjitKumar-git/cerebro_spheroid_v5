@@ -157,10 +157,12 @@ def test_zero_regression_step_0_equivalence():
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
     cfg16 = ModelConfigV5(**PRESETS_V5["v5_small"])
+    cfg16.use_centralized_readout = False
     params16, bufs16 = init_params_v5(jax.random.PRNGKey(42), cfg16)
     adapt_and_load_checkpoint_weights(ckpt, params16, jnp.float32, cfg16)
 
     cfg32 = ModelConfigV5(**PRESETS_V5["v5_compact_32shells"])
+    cfg32.use_centralized_readout = False
     params32, bufs32 = init_params_v5(jax.random.PRNGKey(42), cfg32)
     restored, bufs32 = adapt_and_load_checkpoint_weights(ckpt, params32, jnp.float32, cfg32, buffers=bufs32)
 

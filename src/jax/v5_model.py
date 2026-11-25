@@ -82,6 +82,10 @@ class ModelConfigV5:
     act_end_token_id: Optional[int] = 32
     router_loss_weight: float = 0.0
     energy_reg_weight: float = 0.01
+    use_selective_loss: bool = False
+    selective_focal_gamma: float = 0.5
+    selective_noise_cap: float = 8.5
+    z_loss_weight: float = 0.0
 
 
 # Register ModelConfigV5 as static PyTree node
@@ -282,19 +286,31 @@ def transform_spectral_core_jax(core: jnp.ndarray, params: dict, config: Any) ->
 
 
 def generate_small_world_indices(num_shells: int, num_tracts: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Generates deterministic small-world axonal shortcut wiring in JAX."""
+    """Generates deterministic bidirectional small-world axonal shortcut wiring in JAX."""
     srcs, dsts = [], []
+    deep_span = max(1, num_shells // 4)
     for i in range(num_tracts):
+        m = i // 3
         if i % 3 == 0:
-            s = i % max(1, num_shells // 4)
-            d = num_shells - 1 - (i % max(1, num_shells // 4))
+            # Bidirectional subcortical <-> cortical mantle tracts (even m outward, odd m corticofugal return)
+            s_deep = (m // 2) % deep_span
+            d_mantle = num_shells - 1 - s_deep
+            if d_mantle == s_deep and num_shells > 1:
+                d_mantle = (s_deep + 1) % num_shells
+            s, d = (s_deep, d_mantle) if (m % 2 == 0) else (d_mantle, s_deep)
         elif i % 3 == 1:
-            s = (i * 2) % num_shells
-            d = (s + num_shells // 2) % num_shells
+            # Hierarchical outer-to-inner corticofugal funnel across all shell parities
+            s = (num_shells - 1 - m) % num_shells
+            if s > 0:
+                d = (s - 1) // 4
+            else:
+                d = (num_shells // 2) % num_shells
+                if d == s and num_shells > 1:
+                    d = (s + 1) % num_shells
         else:
             s = (i * 7) % num_shells
             d = (i * 13) % num_shells
-            if s == d:
+            if s == d and num_shells > 1:
                 d = (s + 1) % num_shells
         srcs.append(s)
         dsts.append(d)
@@ -1048,6 +1064,35 @@ def emit_step(
     return adapted_logits, next_state, next_trace, next_plan
 
 
+def _compute_token_ce_and_z_loss(
+    ce_c: jnp.ndarray,
+    lse: jnp.ndarray,
+    mask_c: jnp.ndarray,
+    eff_w: jnp.ndarray,
+    config: Optional[ModelConfigV5],
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Computes per-token weighted CE (with optional noise-capped selective weighting) and optional Z-loss."""
+    use_sel = bool(getattr(config, "use_selective_loss", False)) if config is not None else False
+    if use_sel:
+        gamma = float(getattr(config, "selective_focal_gamma", 0.5))
+        noise_cap = float(getattr(config, "selective_noise_cap", 8.5))
+        p_t = jax.lax.stop_gradient(jnp.exp(-jnp.clip(ce_c, 0.0, 20.0)))
+        focal_w = jnp.power(jnp.maximum(1.0 - p_t, 1e-4), gamma)
+        noise_w = jnp.minimum(1.0, noise_cap / jnp.maximum(ce_c, 1e-4))
+        sel_w = jax.lax.stop_gradient(focal_w * noise_w)
+        sel_mean = jnp.sum(sel_w * mask_c) / jnp.maximum(jnp.sum(mask_c), 1.0)
+        sel_w = sel_w / jnp.maximum(sel_mean, 1e-4)
+        opt_w = eff_w * sel_w
+    else:
+        opt_w = eff_w
+
+    loss_c = ce_c * opt_w
+    z_w = float(getattr(config, "z_loss_weight", 0.0)) if config is not None else 0.0
+    if z_w > 0.0:
+        loss_c = loss_c + (z_w * jnp.square(lse) * eff_w)
+    return loss_c, opt_w
+
+
 def training_rollout(
     params: Dict[str, jnp.ndarray],
     prompts: jnp.ndarray,
@@ -1380,17 +1425,19 @@ def training_rollout(
 
         if targets is not None:
             cur_target = targets[:, step_idx]
-            log_probs = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
+            logits_f32 = logits.astype(jnp.float32)
+            lse = jax.nn.logsumexp(logits_f32, axis=-1)
             safe_targets = jnp.maximum(cur_target, 0)
-            target_log_probs = jnp.take_along_axis(log_probs, safe_targets[:, None], axis=-1).squeeze(-1)
+            tgt_logits = jnp.take_along_axis(logits_f32, safe_targets[:, None], axis=-1).squeeze(-1)
+            ce_c = lse - tgt_logits
             mask_t = (cur_target >= 0).astype(jnp.float32)
             cur_w = target_weights[:, step_idx] if target_weights is not None else mask_t
             eff_w = mask_t * cur_w
-            step_loss = -target_log_probs * eff_w
+            step_loss, opt_w = _compute_token_ce_and_z_loss(ce_c, lse, mask_t, eff_w, config)
             if deliberation_mode == "predictive_coding":
                 thought_err = jnp.mean((prev_thought.astype(jnp.float32) - lax.stop_gradient(tf_aud.astype(jnp.float32))) ** 2, axis=-1)
                 step_loss = step_loss + (0.1 * thought_err * eff_w * (step_idx > 0).astype(jnp.float32))
-            return (nxt_s, nxt_t, nxt_p, nxt_thought), (step_loss, eff_w)
+            return (nxt_s, nxt_t, nxt_p, nxt_thought), (step_loss, opt_w)
 
         return (nxt_s, nxt_t, nxt_p, nxt_thought), logits
 
@@ -1680,10 +1727,11 @@ def training_rollout(
             safe_t = jnp.maximum(t_c, 0)
             tgt_logits = jnp.take_along_axis(logits_c, safe_t[:, None], axis=-1).squeeze(-1)
             lse = jax.nn.logsumexp(logits_c, axis=-1)
+            ce_c = lse - tgt_logits
             mask_c = (t_c >= 0).astype(jnp.float32)
             eff_w = mask_c * w_c
-            loss_c = (lse - tgt_logits) * eff_w
-            return jnp.sum(loss_c), jnp.sum(eff_w)
+            loss_c, opt_w = _compute_token_ce_and_z_loss(ce_c, lse, mask_c, eff_w, config)
+            return jnp.sum(loss_c), jnp.sum(opt_w)
 
         if num_chunks == 1:
             loss_sum, mask_sum = _ce_loss_chunk(h_scaled, targets_flat, weights_flat)

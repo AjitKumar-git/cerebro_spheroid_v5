@@ -201,6 +201,10 @@ def parse_args(args_list=None):
     parser.add_argument("--loss_ceiling", type=float, default=3.25, help="Upper loss boundary: if smoothed loss exceeds this, restore full (100%%) teacher forcing to prevent loss climb (default: 3.25)")
     parser.add_argument("--loss_floor", type=float, default=2.80, help="Lower loss boundary: if smoothed loss is at/below this, permit full deliberation at min_sampling_p (default: 2.80)")
     parser.add_argument("--loss_lr_damping", action=argparse.BooleanOptionalAction, default=True, help="Damp learning rate when loss is climbing towards ceiling to prevent optimizer overshoot")
+    parser.add_argument("--selective_loss", "--selective-loss", dest="selective_loss", action=argparse.BooleanOptionalAction, default=False, help="Enable noise-capped selective token weighting to focus limited compute on learnable tokens")
+    parser.add_argument("--selective_focal_gamma", "--selective-focal-gamma", dest="selective_focal_gamma", type=float, default=0.5, help="Mild focal exponent (1-p)^gamma for downweighting mastered tokens (default: 0.5)")
+    parser.add_argument("--selective_noise_cap", "--selective-noise-cap", dest="selective_noise_cap", type=float, default=8.5, help="Per-token CE ceiling above which unlearnable web-noise spikes are attenuated (default: 8.5)")
+    parser.add_argument("--z_loss_weight", "--z-loss-weight", dest="z_loss_weight", type=float, default=0.0, help="Logit Z-loss regularizer weight (e.g., 1e-4) to stabilize bf16 logits (default: 0.0)")
 
     # Target Workload & Cognitive Steering Hyperparameters
     parser.add_argument("--num_mtp_heads", "--num-mtp-heads", dest="num_mtp_heads", type=int, default=1, choices=[1, 2, 3, 4], help="Multi-Token Prediction heads (1: standard single-token emission; 2 or 3: speculative decoding & future-token predictive training)")
@@ -685,6 +689,10 @@ def main(args=None):
         cfg_kwargs["max_thinking_cycles"] = args.max_thinking_cycles
     if getattr(args, "vocab_size", None) is not None:
         cfg_kwargs["vocab_size"] = int(args.vocab_size)
+    cfg_kwargs["use_selective_loss"] = bool(getattr(args, "selective_loss", False))
+    cfg_kwargs["selective_focal_gamma"] = float(getattr(args, "selective_focal_gamma", 0.5))
+    cfg_kwargs["selective_noise_cap"] = float(getattr(args, "selective_noise_cap", 8.5))
+    cfg_kwargs["z_loss_weight"] = float(getattr(args, "z_loss_weight", 0.0))
     config = JAXConfigV5(**cfg_kwargs)
     params, buffers = init_params_v5(jax.random.PRNGKey(42), config)
 
