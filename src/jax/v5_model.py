@@ -49,6 +49,7 @@ class ModelConfigV5:
     max_seq_len: int = 32768
     top_k_resonance: int = 16
     use_deliberation_probe: bool = True
+    use_per_token_efference: bool = False
     use_adaptive_thinking: bool = True
     max_thinking_cycles: int = 8
     thinking_halt_threshold: float = 0.75
@@ -924,23 +925,26 @@ def emit_step(
         adapted_logits, next_trace = raw_logits, None
 
     # 8. Vectorized Depth-Decayed Efference Update across all concentric shells (O(1) overhead)
-    efference = jnp.matmul(h, params["motor.efference_proj.weight"].T)
-    eff_projected = jnp.matmul(jax.nn.silu(efference), params["core.efference_gate.weight"].T)
-    eff_normed = rms_norm(eff_projected, params["core.radial_norm.weight"]).astype(st_dtype)
+    if getattr(config, "use_per_token_efference", False):
+        efference = jnp.matmul(h, params["motor.efference_proj.weight"].T)
+        eff_projected = jnp.matmul(jax.nn.silu(efference), params["core.efference_gate.weight"].T)
+        eff_normed = rms_norm(eff_projected, params["core.radial_norm.weight"]).astype(st_dtype)
 
-    K = state.shape[1]
-    if K > 1:
-        gamma_0 = 0.15
-        gamma_end = 0.02
-        decay_rate = math.exp(math.log(gamma_end / gamma_0) / float(max(K - 2, 1)))
-        gamma_vals = [gamma_0 * (decay_rate ** k) for k in range(K - 1)] + [0.0]
-        if K > 16:
-            gamma_vals[15] = 0.0
-        gammas = jnp.array(gamma_vals, dtype=jnp.float32)[None, :, None].astype(st_dtype)
-        next_state = ((1.0 - gammas) * state + gammas * eff_normed[:, None, :]).astype(st_dtype)
+        K = state.shape[1]
+        if K > 1:
+            gamma_0 = 0.15
+            gamma_end = 0.02
+            decay_rate = math.exp(math.log(gamma_end / gamma_0) / float(max(K - 2, 1)))
+            gamma_vals = [gamma_0 * (decay_rate ** k) for k in range(K - 1)] + [0.0]
+            if K > 16:
+                gamma_vals[15] = 0.0
+            gammas = jnp.array(gamma_vals, dtype=jnp.float32)[None, :, None].astype(st_dtype)
+            next_state = ((1.0 - gammas) * state + gammas * eff_normed[:, None, :]).astype(st_dtype)
+        else:
+            new_core = (0.85 * core + 0.15 * eff_normed).astype(st_dtype)
+            next_state = state.at[:, 0, :].set(new_core)
     else:
-        new_core = (0.85 * core + 0.15 * eff_normed).astype(st_dtype)
-        next_state = state.at[:, 0, :].set(new_core)
+        next_state = state
 
     if return_hidden:
         return adapted_logits, next_state, next_trace, next_plan, h
@@ -1495,6 +1499,7 @@ def training_rollout(
         radial_norm_w = params["core.radial_norm.weight"]
         use_plan = getattr(config, "use_plan", True)
         use_swiglu_motor = getattr(config, "use_swiglu", True)
+        use_per_tok_eff = getattr(config, "use_per_token_efference", False)
 
         def _tf_motor_step(carry, xs):
             cur_state, cur_plan = carry
@@ -1526,15 +1531,18 @@ def training_rollout(
             else:
                 nxt_plan = cur_plan
 
-            efference = jnp.matmul(h, eff_proj_t)
-            eff_projected = jnp.matmul(jax.nn.silu(efference), eff_gate_t)
-            eff_normed = rms_norm(eff_projected, radial_norm_w).astype(target_dtype)
+            if use_per_tok_eff:
+                efference = jnp.matmul(h, eff_proj_t)
+                eff_projected = jnp.matmul(jax.nn.silu(efference), eff_gate_t)
+                eff_normed = rms_norm(eff_projected, radial_norm_w).astype(target_dtype)
 
-            if num_shells > 1:
-                nxt_state = ((1.0 - gammas) * cur_state + gammas * eff_normed[:, None, :]).astype(target_dtype)
+                if num_shells > 1:
+                    nxt_state = ((1.0 - gammas) * cur_state + gammas * eff_normed[:, None, :]).astype(target_dtype)
+                else:
+                    nxt_core = (0.85 * cur_core + 0.15 * eff_normed).astype(target_dtype)
+                    nxt_state = cur_state.at[:, 0, :].set(nxt_core)
             else:
-                nxt_core = (0.85 * cur_core + 0.15 * eff_normed).astype(target_dtype)
-                nxt_state = cur_state.at[:, 0, :].set(nxt_core)
+                nxt_state = cur_state
 
             return (nxt_state, nxt_plan), h
 

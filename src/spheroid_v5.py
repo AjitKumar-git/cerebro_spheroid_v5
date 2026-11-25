@@ -50,6 +50,7 @@ class ModelConfigV5:
     max_seq_len: int = 4096           # Precomputed rotary horizon (curriculum scalable)
     top_k_resonance: int = 16         # Top-k sparse associative retrieval (needle tethering)
     use_deliberation_probe: bool = True  # Subconscious core probe of sensory KV buffer
+    use_per_token_efference: bool = False # Flag for per-token motor efference feedback into core (Default: False)
     # Frontier 2026 Architectural Upgrades
     use_adaptive_thinking: bool = True     # Dynamic halting gate during subconscious deliberation
     max_thinking_cycles: int = 8           # Upper bound for adaptive deliberation
@@ -747,6 +748,7 @@ def _motor_recur_block(
     eff_w: torch.Tensor,
     eg_w: torch.Tensor,
     rn_w: torch.Tensor,
+    use_efference: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Executes exact per-token (cur_core, cur_plan) motor recurrence over a time block."""
     k_steps = gv_c.shape[1]
@@ -770,10 +772,11 @@ def _motor_recur_block(
         p_in = torch.cat([h_t, p_sc_c[t].unsqueeze(0).expand(batch_len, -1)], dim=-1)
         pg, pu = F.linear(p_in, w_plan_gu, b_plan_gu).chunk(2, dim=-1)
         cur_plan = torch.clamp(pd * cur_plan + pw * torch.sigmoid(pg) * pu, -50.0, 50.0)
-        eff = F.linear(F.silu(F.linear(h_t, eff_w)), eg_w)
-        eff32 = eff.float()
-        eff_normed = (eff32 * torch.rsqrt(eff32.pow(2).mean(dim=-1, keepdim=True) + 1e-6) * rn_w).to(cur_core.dtype)
-        cur_core = 0.85 * cur_core + 0.15 * eff_normed
+        if use_efference:
+            eff = F.linear(F.silu(F.linear(h_t, eff_w)), eg_w)
+            eff32 = eff.float()
+            eff_normed = (eff32 * torch.rsqrt(eff32.pow(2).mean(dim=-1, keepdim=True) + 1e-6) * rn_w).to(cur_core.dtype)
+            cur_core = 0.85 * cur_core + 0.15 * eff_normed
     return torch.stack(hs, dim=1), cur_core, cur_plan
 
 
@@ -813,6 +816,7 @@ class PremotorMotorDecoderV5(nn.Module):
         max_seq_len: int = 32768,
         top_k_resonance: int = 16,
         use_tied_embeddings: bool = True,
+        use_per_token_efference: bool = False,
     ):
         super().__init__()
         self.num_shells = num_shells
@@ -827,6 +831,7 @@ class PremotorMotorDecoderV5(nn.Module):
         self.use_rope = use_rope
         self.top_k_resonance = top_k_resonance
         self.use_tied_embeddings = use_tied_embeddings
+        self.use_per_token_efference = use_per_token_efference
 
         # Precompute RoPE rotary frequency cache for 32k+ token horizons
         cos, sin = precompute_rope_freqs(self.head_dim, max_seq_len=max_seq_len, theta=rope_theta)
@@ -1332,6 +1337,7 @@ class PremotorMotorDecoderV5(nn.Module):
             compiled_fn = _get_compiled_motor_recur_block() if use_cuda_compile else _motor_recur_block
 
             h_chunks = []
+            use_eff = getattr(self, "use_per_token_efference", False)
             for cs in range(0, T_seq, block_size):
                 ce = min(cs + block_size, T_seq)
                 blk_fn = compiled_fn if (ce - cs == block_size) else _motor_recur_block
@@ -1339,7 +1345,7 @@ class PremotorMotorDecoderV5(nn.Module):
                     hc, cur_core, cur_plan = activation_checkpoint(
                         lambda c_c, c_p, gc, sc, ps, fn=blk_fn: fn(
                             c_c, c_p, gc, sc, shell_pool_rest, gate[1], gate[3], gate[4], w0s, sh_w,
-                            wgv_dyn, w_down, nw_mid, ps, w_plan_gu, b_plan_gu, pd, pw, eff_w, eg_w, rn_w,
+                            wgv_dyn, w_down, nw_mid, ps, w_plan_gu, b_plan_gu, pd, pw, eff_w, eg_w, rn_w, use_eff,
                         ),
                         cur_core, cur_plan, gv_const[:, cs:ce, :], ss_const[:, cs:ce], p_scaled[cs:ce],
                         use_reentrant=False,
@@ -1348,7 +1354,7 @@ class PremotorMotorDecoderV5(nn.Module):
                     hc, cur_core, cur_plan = blk_fn(
                         cur_core, cur_plan, gv_const[:, cs:ce, :], ss_const[:, cs:ce], shell_pool_rest,
                         gate[1], gate[3], gate[4], w0s, sh_w, wgv_dyn, w_down, nw_mid, p_scaled[cs:ce],
-                        w_plan_gu, b_plan_gu, pd, pw, eff_w, eg_w, rn_w,
+                        w_plan_gu, b_plan_gu, pd, pw, eff_w, eg_w, rn_w, use_eff,
                     )
                 h_chunks.append(hc)
             H = torch.cat(h_chunks, dim=1)
@@ -1376,9 +1382,10 @@ class PremotorMotorDecoderV5(nn.Module):
                 if self.use_plan and cur_plan is not None:
                     p_in = torch.cat([h_t, p_scaled[t].unsqueeze(0).expand(B, -1)], dim=-1)
                     cur_plan = torch.clamp(pd * cur_plan + pw * torch.sigmoid(self.plan_gate(p_in)) * self.plan_update(p_in), -50.0, 50.0)
-                eff_proj = efference_gate(F.silu(self.efference_proj(h_t)))
-                eff_normed = radial_norm(eff_proj).to(dt)
-                cur_core = 0.85 * cur_core + 0.15 * eff_normed
+                if getattr(self, "use_per_token_efference", False):
+                    eff_proj = efference_gate(F.silu(self.efference_proj(h_t)))
+                    eff_normed = radial_norm(eff_proj).to(dt)
+                    cur_core = 0.85 * cur_core + 0.15 * eff_normed
             H = torch.stack(hs, dim=1)
 
         temp = torch.clamp(self.temperature_scale.float(), 0.1, 5.0).to(dt)
@@ -1552,6 +1559,7 @@ class CerebroSpheroidV5(nn.Module):
             max_seq_len=self.config.max_seq_len,
             top_k_resonance=self.config.top_k_resonance,
             use_tied_embeddings=getattr(self.config, "use_tied_embeddings", True),
+            use_per_token_efference=getattr(self.config, "use_per_token_efference", False),
         )
 
         # 4. Deliberative Episodic Memory Probing (Subconscious sensory recall)
@@ -1995,7 +2003,8 @@ class CerebroSpheroidV5(nn.Module):
                 soft_emb_diff = 0.2 * soft_emb + 0.8 * soft_emb.detach()
                 prev_thought, _ = self.sensory_dnn(soft_emb_diff, pos_offset=prompt_pos_offset + t)
 
-                state = self.volumetric_core.step_efference_fast(state, efference)
+                if getattr(self.config, "use_per_token_efference", False):
+                    state = self.volumetric_core.step_efference_fast(state, efference)
 
             logits_stacked = torch.stack(all_logits, dim=1)
             H = torch.stack(all_h, dim=1) if need_hidden else None
@@ -2272,8 +2281,9 @@ class CerebroSpheroidV5(nn.Module):
             if finished.all():
                 break
 
-            # Lightweight O(1) bounded efference copy propagation
-            state = self.volumetric_core.step_efference_fast(state, efference)
+            # Lightweight O(1) bounded efference copy propagation (if enabled)
+            if getattr(self.config, "use_per_token_efference", False):
+                state = self.volumetric_core.step_efference_fast(state, efference)
 
         self.current_spheroid_state = state
         final_causal_k = torch.cat(causal_keys_list, dim=2)
@@ -2700,8 +2710,9 @@ class CerebroSpheroidV5(nn.Module):
             if fin_think and fin_act and fin_ans:
                 break
 
-            # Advance state manifold
-            state = self.volumetric_core.step_efference_fast(state, efference)
+            # Advance state manifold (if enabled)
+            if getattr(self.config, "use_per_token_efference", False):
+                state = self.volumetric_core.step_efference_fast(state, efference)
 
         # Decode all 3 simultaneous streams
         text_think = tokenizer.decode(tokens_think, skip_special_tokens=True).strip() if emit_think else ""
