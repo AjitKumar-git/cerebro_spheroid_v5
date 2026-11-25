@@ -2079,9 +2079,12 @@ def generate_tri_stream_jax(
     )) and not has_action_trigger
     action_intent = True if has_action_trigger else (False if is_pure_conversation else None)
 
-    # 1. Sensory encoding
-    sensory_flux, (sensory_keys, sensory_values) = encode_sensory(params, prompts_arr, config=config, pos_offset=0)
+    # 1. Sensory encoding (with prompt_valid mask matching training_rollout)
     pad_id = getattr(tokenizer, "pad_token_id", 0) or 0
+    prompt_valid = (prompts_arr != pad_id)[:, None, None, :]
+    sensory_flux, (sensory_keys, sensory_values) = encode_sensory(
+        params, prompts_arr, config=config, pos_offset=0, attn_mask=prompt_valid
+    )
     mask_2d = (prompts_arr != pad_id).astype(jnp.float32)
     pos_idx = jnp.arange(L, dtype=jnp.float32)[None, :]
     last_valid_pos = jnp.max(jnp.where(mask_2d > 0.0, pos_idx, 0.0), axis=1, keepdims=True)
@@ -2109,7 +2112,9 @@ def generate_tri_stream_jax(
 
     radial_profile = (jnp.arange(1, num_shells + 1, dtype=jnp.float32) / float(num_shells))[None, :, None]
     state = (jnp.broadcast_to(prompt_centroid[:, None, :], (B, num_shells, surface_dim)).astype(jnp.float32) * radial_profile).astype(target_dtype)
-    state, _ = deliberate_cycles_jax(params, state, buffers, config=config, is_training=False)
+    state, _ = deliberate_cycles_jax(
+        params, state, buffers, config=config, is_training=False, sensory_kv=(sensory_keys, sensory_values)
+    )
 
     plan = jnp.zeros((B, surface_dim), dtype=target_dtype)
     refractory = jnp.zeros((B, vocab_size), dtype=target_dtype)
@@ -2145,24 +2150,13 @@ def generate_tri_stream_jax(
         sample_key, sub_key = jax.random.split(sample_key)
         return int(jax.random.categorical(sub_key, lg_scaled))
 
+    prev_thought = jnp.zeros((B, surface_dim), dtype=target_dtype)
     for t in range(max_new_tokens):
         # The cache contains the prompt plus *previous* generated tokens.
         # Every valid cached key is causal at this point; the newly sampled
         # token is appended only after this emission step.
         step_mask = all_valid
-
-        last_tok = None
-        if phased and emit_think and not fin_think:
-            if tokens_think:
-                last_tok = tokens_think[-1]
-        else:
-            if not fin_ans and tokens_ans:
-                last_tok = tokens_ans[-1]
-            elif not fin_act and tokens_act:
-                last_tok = tokens_act[-1]
-            elif tokens_think:
-                last_tok = tokens_think[-1]
-        feed = params["sensory.embedding.weight"][jnp.array([last_tok])] if last_tok is not None else None
+        feed = prev_thought if t > 0 else None
 
         _, next_state, refractory, plan, h = emit_step(
             params=params,
@@ -2180,7 +2174,7 @@ def generate_tri_stream_jax(
             query_position=total_prompt_L + t,
         )
 
-        l_th, l_ac, l_an = emit_tri_head_logits_jax(params, h, temp=temperature)
+        l_th, l_ac, l_an = emit_tri_head_logits_jax(params, h, temp=1.0)
 
         tok_th = None
         tok_ac = None
@@ -2232,18 +2226,21 @@ def generate_tri_stream_jax(
             )
 
         if emitted_tok is not None:
-            _, (new_k, new_v) = encode_sensory(
+            tok_flux, (new_k, new_v) = encode_sensory(
                 params,
                 jnp.asarray([[emitted_tok]], dtype=jnp.int32),
                 config=config,
                 pos_offset=total_prompt_L + t + 1,
                 is_causal=True,
             )
+            prev_thought = tok_flux[:, 0, :].astype(target_dtype)
             causal_keys = jnp.concatenate([causal_keys, new_k], axis=2)
             causal_values = jnp.concatenate([causal_values, new_v], axis=2)
             all_valid = jnp.concatenate(
                 [all_valid, jnp.ones((B, 1, 1, 1), dtype=bool)], axis=-1
             )
+        else:
+            prev_thought = jnp.zeros((B, surface_dim), dtype=target_dtype)
 
         if fin_think and fin_act and fin_ans:
             break

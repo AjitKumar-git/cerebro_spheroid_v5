@@ -937,3 +937,87 @@ def test_data_streamer_vocab_and_error_strictness(tmp_path):
         streamer.stop()
 
 
+def test_training_rollout_vs_generate_tri_stream_tensor_parity():
+    """Verifies tensor-level alignment between training_rollout and generate_tri_stream_jax."""
+    from src.jax.v5_model import (
+        training_rollout,
+        generate_tri_stream_jax,
+        encode_sensory,
+        deliberate_cycles_jax,
+        emit_step,
+        emit_tri_head_logits_jax,
+    )
+    from src.corpus import format_stimulus_prompt, encode_no_special
+
+    cfg = ModelConfigV5(**PRESETS_V5["v5_test"])
+    cfg.use_adaptive_thinking = False
+    cfg.use_deliberation_probe = True
+    params, buffers = init_params_v5(jax.random.PRNGKey(303), cfg)
+
+    class _MockTok:
+        pad_token_id = 0
+        eos_token_id = 2
+        def encode(self, text, add_special_tokens=False):
+            return [((ord(c) + 5) % (cfg.vocab_size - 4)) + 3 for c in text[:16]]
+        def decode(self, ids, skip_special_tokens=True):
+            return " ".join(str(i) for i in ids)
+
+    tok = _MockTok()
+    prompt = "Hello"
+    formatted = format_stimulus_prompt(prompt)
+    prompt_ids = encode_no_special(tok, formatted)
+    prompts_arr = jnp.array([prompt_ids], dtype=jnp.int32)
+
+    # 1. Run training_rollout autoregressive generation
+    tr_logits, tr_toks = training_rollout(
+        params=params,
+        prompts=prompts_arr,
+        target_len=4,
+        buffers=buffers,
+        config=cfg,
+        repetition_penalty=1.0,
+        temperature=0.0,
+        return_tokens=True,
+    )
+    assert jnp.isfinite(tr_logits).all()
+
+    # 2. Verify generate_tri_stream_jax executes end-to-end with sensory_kv deliberation & tok_flux feedback
+    res = generate_tri_stream_jax(
+        params=params,
+        buffers=buffers,
+        config=cfg,
+        prompt=prompt,
+        tokenizer=tok,
+        max_new_tokens=4,
+        temperature=0.6,
+        repetition_penalty=1.0,
+    )
+    assert "answer" in res and "temporal_decisions" in res
+
+    # 3. Direct Step-0 logit parity between training_rollout and generate_tri_stream_jax's step-0 path
+    B, L = prompts_arr.shape
+    prompt_valid = (prompts_arr != 0)[:, None, None, :]
+    s_flux, (s_k, s_v) = encode_sensory(params, prompts_arr, config=cfg, pos_offset=0, attn_mask=prompt_valid)
+    pos_idx = jnp.arange(L, dtype=jnp.float32)[None, :]
+    rec_w = jnp.exp(0.05 * (pos_idx - float(L - 1)))
+    centroid = (jnp.sum(s_flux.astype(jnp.float32) * rec_w[:, :, None], axis=1) / jnp.sum(rec_w, axis=1, keepdims=True)).astype(s_flux.dtype)
+    rad = (jnp.arange(1, cfg.num_shells + 1, dtype=jnp.float32) / float(cfg.num_shells))[None, :, None]
+    st0 = (jnp.broadcast_to(centroid[:, None, :], (B, cfg.num_shells, cfg.surface_dim)).astype(jnp.float32) * rad).astype(s_flux.dtype)
+    st0, _ = deliberate_cycles_jax(params, st0, buffers, config=cfg, is_training=False, sensory_kv=(s_k, s_v))
+
+    _, (sil_k, sil_v) = encode_sensory(params, jnp.zeros((B, 1), dtype=jnp.int32), config=cfg, pos_offset=L, is_causal=True)
+    ck = jnp.concatenate([s_k, sil_k], axis=2)
+    cv = jnp.concatenate([s_v, sil_v], axis=2)
+    mask0 = jnp.concatenate([prompt_valid, jnp.zeros((B, 1, 1, 1), dtype=bool)], axis=-1)
+    _, _, _, _, h0 = emit_step(
+        params=params, state=st0, sensory_kv=(ck, cv),
+        plan=jnp.zeros((B, cfg.surface_dim), dtype=s_flux.dtype),
+        refractory_trace=jnp.zeros((B, cfg.vocab_size), dtype=s_flux.dtype),
+        step_idx=0, buffers=buffers, config=cfg, auditory_feedback=None,
+        repetition_penalty=1.0, attn_mask=mask0, return_hidden=True, query_position=L,
+    )
+    _, _, l_an0 = emit_tri_head_logits_jax(params, h0, temp=1.0)
+    step0_diff = float(jnp.max(jnp.abs(tr_logits[:, 0, :] - l_an0)))
+    assert step0_diff < 1e-4, f"Step-0 logits diverged between training_rollout and tri-stream answer head! diff={step0_diff}"
+
+
