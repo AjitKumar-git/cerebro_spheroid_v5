@@ -436,9 +436,46 @@ def build_data_stream(
         ) from e
 
 
+def _iter_curriculum_stage_segments(
+    start_step: int,
+    eff_batch_size: float,
+    base_prompt_len: int,
+    base_seq_len: int,
+    context_curriculum: bool = False,
+    context_stages: Optional[List[int]] = None,
+    context_stage_steps: int = 100_000,
+):
+    """Yield `(steps_in_segment, tok_per_step)` pairs across curriculum stages from `start_step`.
+
+    `steps_in_segment` is `None` for the final open-ended stage.
+    """
+    eff_bs = float(eff_batch_size)
+    if eff_bs <= 0.0:
+        return
+
+    if not context_curriculum or not context_stages:
+        yield None, max(1.0, eff_bs * float(base_prompt_len + base_seq_len))
+        return
+
+    stage_len_steps = max(1, int(context_stage_steps))
+    clamped_start = max(0, int(start_step))
+    curr_stage_idx = min(len(context_stages) - 1, clamped_start // stage_len_steps)
+    elapsed = 0
+
+    for s_idx in range(curr_stage_idx, len(context_stages)):
+        s_len = context_stages[s_idx]
+        s_tok_per_step = max(1.0, eff_bs * float(base_prompt_len + s_len))
+        if s_idx == len(context_stages) - 1:
+            yield None, s_tok_per_step
+            return
+        steps_left_in_stage = stage_len_steps - ((clamped_start + elapsed) % stage_len_steps)
+        yield steps_left_in_stage, s_tok_per_step
+        elapsed += steps_left_in_stage
+
+
 def calculate_curriculum_aware_target_steps(
     target_budget: float,
-    eff_batch_size: int,
+    eff_batch_size: float,
     base_prompt_len: int,
     base_seq_len: int,
     context_curriculum: bool = False,
@@ -451,36 +488,119 @@ def calculate_curriculum_aware_target_steps(
     accounting for BOS-only prompts in pretraining and expanding context
     windows across curriculum stages.
     """
-    if target_budget <= 0.0 or eff_batch_size <= 0:
+    if target_budget <= 0.0 or float(eff_batch_size) <= 0.0:
         return 0
-
-    if not context_curriculum or not context_stages:
-        tok_per_step = eff_batch_size * (base_prompt_len + base_seq_len)
-        return int(math.ceil(float(target_budget) / max(1.0, float(tok_per_step))))
 
     rem = float(target_budget)
     tot_steps = 0
-    curr_stage_idx = min(len(context_stages) - 1, start_step // max(1, context_stage_steps))
 
-    for s_idx in range(curr_stage_idx, len(context_stages)):
-        s_len = context_stages[s_idx]
-        s_tok_per_step = eff_batch_size * (base_prompt_len + s_len)
-        is_last_stage = (s_idx == len(context_stages) - 1)
-        if is_last_stage:
-            tot_steps += int(math.ceil(rem / max(1.0, float(s_tok_per_step))))
-            rem = 0.0
+    for steps_cap, s_tok_per_step in _iter_curriculum_stage_segments(
+        start_step=start_step,
+        eff_batch_size=eff_batch_size,
+        base_prompt_len=base_prompt_len,
+        base_seq_len=base_seq_len,
+        context_curriculum=context_curriculum,
+        context_stages=context_stages,
+        context_stage_steps=context_stage_steps,
+    ):
+        if steps_cap is None:
+            tot_steps += int(math.ceil(rem / s_tok_per_step))
             break
-        else:
-            steps_left_in_stage = context_stage_steps - ((start_step + tot_steps) % context_stage_steps)
-            stage_cap_tok = steps_left_in_stage * s_tok_per_step
-            if rem <= stage_cap_tok:
-                tot_steps += int(math.ceil(rem / max(1.0, float(s_tok_per_step))))
-                rem = 0.0
-                break
-            else:
-                tot_steps += steps_left_in_stage
-                rem -= stage_cap_tok
+        stage_cap_tok = float(steps_cap) * s_tok_per_step
+        if rem <= stage_cap_tok:
+            tot_steps += int(math.ceil(rem / s_tok_per_step))
+            break
+        tot_steps += steps_cap
+        rem -= stage_cap_tok
     return tot_steps
+
+
+def calculate_curriculum_window_tokens(
+    start_step: int,
+    end_step: int,
+    eff_batch_size: float,
+    base_prompt_len: int,
+    base_seq_len: int,
+    context_curriculum: bool = False,
+    context_stages: Optional[List[int]] = None,
+    context_stage_steps: int = 100_000,
+) -> float:
+    """Calculate nominal tokens ingested over `[start_step, end_step)` under the stage schedule."""
+    steps_rem = max(0, int(end_step) - int(start_step))
+    if steps_rem <= 0 or float(eff_batch_size) <= 0.0:
+        return 0.0
+
+    total_tokens = 0.0
+    for steps_cap, s_tok_per_step in _iter_curriculum_stage_segments(
+        start_step=start_step,
+        eff_batch_size=eff_batch_size,
+        base_prompt_len=base_prompt_len,
+        base_seq_len=base_seq_len,
+        context_curriculum=context_curriculum,
+        context_stages=context_stages,
+        context_stage_steps=context_stage_steps,
+    ):
+        take = steps_rem if steps_cap is None else min(steps_rem, steps_cap)
+        total_tokens += float(take) * s_tok_per_step
+        steps_rem -= take
+        if steps_rem <= 0:
+            break
+    return total_tokens
+
+
+def calibrate_curriculum_total_steps(
+    step: int,
+    start_step: int,
+    cumulative_tokens: int,
+    resumed_cum_tokens: int,
+    target_token_budget: float,
+    eff_batch_size: float,
+    base_prompt_len: int,
+    base_seq_len: int,
+    context_curriculum: bool = False,
+    context_stages: Optional[List[int]] = None,
+    context_stage_steps: int = 100_000,
+    min_empirical_steps: int = 20,
+) -> int:
+    """Recalibrate campaign `total_steps` at `step` across remaining curriculum stages.
+
+    Scales the nominal effective batch size by `observed_tokens / nominal_tokens` over
+    `[start_step, step)` once `min_empirical_steps` have elapsed, avoiding Stage-0 linear
+    overestimation across upcoming longer-context curriculum stages.
+    """
+    toks_left = max(0.0, float(target_token_budget) - float(cumulative_tokens))
+    if toks_left <= 0.0:
+        return int(step)
+
+    steps_done = max(0, int(step) - int(start_step))
+    toks_done = max(0, int(cumulative_tokens) - int(resumed_cum_tokens))
+    calibrated_eff_batch = float(eff_batch_size)
+
+    if steps_done >= min_empirical_steps and toks_done > 0:
+        nominal_done = calculate_curriculum_window_tokens(
+            start_step=start_step,
+            end_step=step,
+            eff_batch_size=eff_batch_size,
+            base_prompt_len=base_prompt_len,
+            base_seq_len=base_seq_len,
+            context_curriculum=context_curriculum,
+            context_stages=context_stages,
+            context_stage_steps=context_stage_steps,
+        )
+        if nominal_done > 0.0:
+            calibrated_eff_batch *= float(toks_done) / nominal_done
+
+    rem_steps = calculate_curriculum_aware_target_steps(
+        target_budget=toks_left,
+        eff_batch_size=calibrated_eff_batch,
+        base_prompt_len=base_prompt_len,
+        base_seq_len=base_seq_len,
+        context_curriculum=context_curriculum,
+        context_stages=context_stages,
+        context_stage_steps=context_stage_steps,
+        start_step=step,
+    )
+    return int(step) + rem_steps
 
 
 def main(args=None):
@@ -1914,6 +2034,20 @@ def main(args=None):
         if target_token_budget is not None and target_token_budget <= reasoning_trans_tokens:
             target_token_budget = final_campaign_budget
             args.target_tokens = final_campaign_budget
+            if not getattr(args, "total_steps_explicit", False):
+                args.total_steps = calibrate_curriculum_total_steps(
+                    step=step,
+                    start_step=start_step,
+                    cumulative_tokens=cumulative_tokens,
+                    resumed_cum_tokens=resumed_cum_tokens if "resumed_cum_tokens" in locals() else cumulative_tokens,
+                    target_token_budget=target_token_budget,
+                    eff_batch_size=eff_batch_size,
+                    base_prompt_len=real_prompt_slots,
+                    base_seq_len=real_target_slots,
+                    context_curriculum=getattr(args, "context_curriculum", False),
+                    context_stages=context_stages if "context_stages" in locals() else None,
+                    context_stage_steps=getattr(args, "context_stage_steps", 100_000),
+                )
         if local_streamer is not None and hasattr(local_streamer, "transition_to_deep_reasoning"):
             local_streamer.transition_to_deep_reasoning()
         elif batcher is not None and hasattr(batcher, "transition_to_deep_reasoning"):
@@ -1958,6 +2092,20 @@ def main(args=None):
                 if target_token_budget is not None and target_token_budget <= reasoning_trans_tokens:
                     target_token_budget = final_campaign_budget
                     args.target_tokens = final_campaign_budget
+                    if not getattr(args, "total_steps_explicit", False):
+                        args.total_steps = calibrate_curriculum_total_steps(
+                            step=step,
+                            start_step=start_step,
+                            cumulative_tokens=cumulative_tokens,
+                            resumed_cum_tokens=resumed_cum_tokens if "resumed_cum_tokens" in locals() else cumulative_tokens,
+                            target_token_budget=target_token_budget,
+                            eff_batch_size=eff_batch_size,
+                            base_prompt_len=real_prompt_slots,
+                            base_seq_len=real_target_slots,
+                            context_curriculum=getattr(args, "context_curriculum", False),
+                            context_stages=context_stages if "context_stages" in locals() else None,
+                            context_stage_steps=getattr(args, "context_stage_steps", 100_000),
+                        )
                     print(f"📈 [Extended Target Budget] Target token budget extended to {final_campaign_budget/1e9:.2f}B tokens for Deep Reasoning.")
 
                 # Switch active streamer to deep reasoning mixture
@@ -2302,17 +2450,22 @@ def main(args=None):
                 steps_per_sec = step_window_count / max(elapsed_log, 1e-6)
                 tok_per_sec = step_window_tokens / max(elapsed_log, 1e-6)
 
-                # Dynamic Step Schedule Calibration: keep total_steps calibrated to true empirical tokens/step
-                if budget_active and step > start_step:
-                    steps_done = step - start_step
-                    toks_done = cumulative_tokens - resumed_cum_tokens
-                    if steps_done >= 20 and toks_done > 0:
-                        emp_tok_per_step = float(toks_done) / float(steps_done)
-                        toks_left = max(0.0, float(target_token_budget) - float(cumulative_tokens))
-                        projected_additional_steps = int(math.ceil(toks_left / max(1.0, emp_tok_per_step)))
-                        calibrated_total = step + projected_additional_steps
-                        if calibrated_total > args.total_steps:
-                            args.total_steps = calibrated_total
+                # Dynamic Step Schedule Calibration: project remaining tokens across curriculum stages
+                # using empirical token density rather than extrapolating Stage-0 tokens/step linearly.
+                if budget_active and not getattr(args, "total_steps_explicit", False) and step > start_step:
+                    args.total_steps = calibrate_curriculum_total_steps(
+                        step=step,
+                        start_step=start_step,
+                        cumulative_tokens=cumulative_tokens,
+                        resumed_cum_tokens=resumed_cum_tokens,
+                        target_token_budget=target_token_budget,
+                        eff_batch_size=eff_batch_size,
+                        base_prompt_len=real_prompt_slots,
+                        base_seq_len=real_target_slots,
+                        context_curriculum=getattr(args, "context_curriculum", False),
+                        context_stages=context_stages if "context_stages" in locals() else None,
+                        context_stage_steps=getattr(args, "context_stage_steps", 100_000),
+                    )
 
                 gov_str = f" | Gov: {alpha_gov:.2f}" if getattr(args, "loss_window_governor", True) and alpha_gov > 0.01 else ""
 

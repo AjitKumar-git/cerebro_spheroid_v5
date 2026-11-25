@@ -114,6 +114,147 @@ def test_context_curriculum_step_budgeting():
     assert 244_000 <= steps <= 245_000
 
 
+def test_dynamic_calibration_preserves_curriculum_total_in_stage0():
+    """Verify dynamic step calibration during Stage 0 keeps ~243k-245k total steps instead of 474k+."""
+    from training.train_v5_tpu_jax import calibrate_curriculum_total_steps
+
+    target_budget = 15_700_000_000
+    eff_batch_size = 64
+    context_stages = [512, 1024, 2048, 4096]
+    context_stage_steps = 100_000
+    stage0_tok_per_step = eff_batch_size * (1 + 512)  # 32,832 tok/step
+
+    # Fresh run at step 1,000 in Stage 0 at exact nominal Stage-0 throughput
+    cum_tok_fresh = 1_000 * stage0_tok_per_step
+    cal_fresh = calibrate_curriculum_total_steps(
+        step=1_000,
+        start_step=0,
+        cumulative_tokens=cum_tok_fresh,
+        resumed_cum_tokens=0,
+        target_token_budget=target_budget,
+        eff_batch_size=eff_batch_size,
+        base_prompt_len=1,
+        base_seq_len=512,
+        context_curriculum=True,
+        context_stages=context_stages,
+        context_stage_steps=context_stage_steps,
+    )
+    assert cal_fresh == 244_663
+
+    # Resumed run scenario (125M tokens already ingested by step 3,800 -> ~243,711..244,655 range)
+    start_step = 3_800
+    resumed_cum = 125_000_000
+    expected_from_resume = start_step + calculate_curriculum_aware_target_steps(
+        target_budget=target_budget - resumed_cum,
+        eff_batch_size=eff_batch_size,
+        base_prompt_len=1,
+        base_seq_len=512,
+        context_curriculum=True,
+        context_stages=context_stages,
+        context_stage_steps=context_stage_steps,
+        start_step=start_step,
+    )
+    steps_after_resume = 250
+    step_now = start_step + steps_after_resume
+    cum_now = resumed_cum + steps_after_resume * stage0_tok_per_step
+    cal_resumed = calibrate_curriculum_total_steps(
+        step=step_now,
+        start_step=start_step,
+        cumulative_tokens=cum_now,
+        resumed_cum_tokens=resumed_cum,
+        target_token_budget=target_budget,
+        eff_batch_size=eff_batch_size,
+        base_prompt_len=1,
+        base_seq_len=512,
+        context_curriculum=True,
+        context_stages=context_stages,
+        context_stage_steps=context_stage_steps,
+    )
+    assert cal_resumed == expected_from_resume
+    assert 243_000 <= cal_resumed <= 245_000
+
+
+def test_dynamic_calibration_scales_empirically_and_adjusts_both_directions():
+    """Verify empirical token density scales future curriculum stages and corrects both upward and downward."""
+    from training.train_v5_tpu_jax import (
+        calibrate_curriculum_total_steps,
+        calculate_curriculum_window_tokens,
+    )
+
+    context_stages = [512, 1024, 2048, 4096]
+    context_stage_steps = 100_000
+
+    # Window tokens across a stage boundary [99,950, 100,050):
+    # 50 steps at 513 + 50 steps at 1025 with eff_batch_size=64
+    win_tokens = calculate_curriculum_window_tokens(
+        start_step=99_950,
+        end_step=100_050,
+        eff_batch_size=64,
+        base_prompt_len=1,
+        base_seq_len=512,
+        context_curriculum=True,
+        context_stages=context_stages,
+        context_stage_steps=context_stage_steps,
+    )
+    assert win_tokens == 50 * 64 * 513 + 50 * 64 * 1025
+
+    # If observed density is 50% of nominal over 1,000 Stage-0 steps, calibrated total uses
+    # half effective batch (32) across upcoming stages rather than linear Stage-0 extrapolation.
+    half_tok_done = 1_000 * 32 * 513
+    cal_half = calibrate_curriculum_total_steps(
+        step=1_000,
+        start_step=0,
+        cumulative_tokens=half_tok_done,
+        resumed_cum_tokens=0,
+        target_token_budget=15_700_000_000,
+        eff_batch_size=64,
+        base_prompt_len=1,
+        base_seq_len=512,
+        context_curriculum=True,
+        context_stages=context_stages,
+        context_stage_steps=context_stage_steps,
+    )
+    expected_half = 1_000 + calculate_curriculum_aware_target_steps(
+        target_budget=15_700_000_000 - half_tok_done,
+        eff_batch_size=32,
+        base_prompt_len=1,
+        base_seq_len=512,
+        context_curriculum=True,
+        context_stages=context_stages,
+        context_stage_steps=context_stage_steps,
+        start_step=1_000,
+    )
+    assert cal_half == expected_half
+    # Must still be much less than pure Stage-0 linear projection (~956k) because stages 1-3 expand
+    assert cal_half < 400_000
+
+    # Non-curriculum fallback reduces to exact empirical linear rate and stops once budget is met
+    cal_linear = calibrate_curriculum_total_steps(
+        step=100,
+        start_step=0,
+        cumulative_tokens=100 * 1_000,
+        resumed_cum_tokens=0,
+        target_token_budget=250_000,
+        eff_batch_size=4,
+        base_prompt_len=1,
+        base_seq_len=499,
+        context_curriculum=False,
+    )
+    assert cal_linear == 250
+
+    assert calibrate_curriculum_total_steps(
+        step=250,
+        start_step=0,
+        cumulative_tokens=250_000,
+        resumed_cum_tokens=0,
+        target_token_budget=250_000,
+        eff_batch_size=4,
+        base_prompt_len=1,
+        base_seq_len=499,
+        context_curriculum=False,
+    ) == 250
+
+
 def test_explicit_total_steps_flag_recognition():
     """Verifies that all aliases for explicit total steps are recognized."""
     for flag in ["--total-steps", "--total_steps", "--steps", "--max-steps", "--max_steps"]:
