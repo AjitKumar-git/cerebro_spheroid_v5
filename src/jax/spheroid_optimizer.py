@@ -773,20 +773,27 @@ def build_pmap_local_sgd_step_spheroid(
         if key in compiled_variants:
             return compiled_variants[key]
 
-        if has_weights:
-            in_axes = (0, 0, 0, 0, None, 0 if has_fb else None, None, 0)
+        def _make_round(with_weights: bool):
+            in_axes = (0, 0, 0, 0, None, 0 if has_fb else None, None, 0) if with_weights else (0, 0, 0, 0, None, 0 if has_fb else None, None)
 
             @partial(jax.pmap, axis_name="dp", in_axes=in_axes, devices=devices)
-            def _pmap_round_weighted(p, opt_s, q_micro, r_micro, base_lr, fb_micro, sampling_p, wt_micro):
+            def _pmap_round(p, opt_s, q_micro, r_micro, base_lr, fb_micro, sampling_p, *extra):
                 jax_buffers = tuple(jnp.asarray(b) for b in const_buffers)
+                wt_micro = extra[0] if with_weights else None
 
                 def _scan_body(carry, batch_slice):
                     cur_p, cur_opt = carry
-                    if has_fb:
+                    if has_fb and with_weights:
                         q_b, r_b, fb_b, wt_b = batch_slice
-                    else:
+                    elif has_fb:
+                        q_b, r_b, fb_b = batch_slice
+                        wt_b = None
+                    elif with_weights:
                         q_b, r_b, wt_b = batch_slice
                         fb_b = None
+                    else:
+                        q_b, r_b = batch_slice
+                        fb_b, wt_b = None, None
                     loss_k, grads_k = _compute_loss_and_grads(
                         cur_p,
                         q_b,
@@ -806,60 +813,28 @@ def build_pmap_local_sgd_step_spheroid(
                         scmer_lambda=eff_lambda, scmer_subsample=eff_subsample,
                         scmer_interval=eff_interval, scmer_margin=eff_margin,
                         scmer_pair_samples=eff_pairs,
+                        grad_clip_norm=grad_clip_norm, lr_1d_scale=lr_1d_scale,
                     )
                     return (nxt_p, nxt_opt), loss_k
 
-                scan_xs = (q_micro, r_micro, fb_micro, wt_micro) if has_fb else (q_micro, r_micro, wt_micro)
+                if has_fb and with_weights:
+                    scan_xs = (q_micro, r_micro, fb_micro, wt_micro)
+                elif has_fb:
+                    scan_xs = (q_micro, r_micro, fb_micro)
+                elif with_weights:
+                    scan_xs = (q_micro, r_micro, wt_micro)
+                else:
+                    scan_xs = (q_micro, r_micro)
                 (end_p, end_opt), losses = lax.scan(_scan_body, (p, opt_s), scan_xs)
                 merged_p, merged_opt = merge_spheroid_replicas(end_p, end_opt, axis_name="dp")
                 mean_loss = lax.pmean(jnp.mean(losses), axis_name="dp")
                 return merged_p, merged_opt, mean_loss
 
-            compiled_variants[key] = _pmap_round_weighted
-            return _pmap_round_weighted
-        else:
-            in_axes = (0, 0, 0, 0, None, 0 if has_fb else None, None)
-
-            @partial(jax.pmap, axis_name="dp", in_axes=in_axes, devices=devices)
-            def _pmap_round(p, opt_s, q_micro, r_micro, base_lr, fb_micro, sampling_p):
-                jax_buffers = tuple(jnp.asarray(b) for b in const_buffers)
-
-                def _scan_body(carry, batch_slice):
-                    cur_p, cur_opt = carry
-                    if has_fb:
-                        q_b, r_b, fb_b = batch_slice
-                    else:
-                        q_b, r_b = batch_slice
-                        fb_b = None
-                    loss_k, grads_k = _compute_loss_and_grads(
-                        cur_p,
-                        q_b,
-                        r_b,
-                        jax_buffers,
-                        config,
-                        pad_id,
-                        repetition_penalty,
-                        remat,
-                        fb_b,
-                        sampling_p,
-                        pure_tf,
-                    )
-                    nxt_p, nxt_opt = _apply_spheroid_grads(
-                        cur_p, cur_opt, grads_k, base_lr, weight_decay,
-                        scmer_lambda=eff_lambda, scmer_subsample=eff_subsample,
-                        scmer_interval=eff_interval, scmer_margin=eff_margin,
-                        scmer_pair_samples=eff_pairs,
-                    )
-                    return (nxt_p, nxt_opt), loss_k
-
-                scan_xs = (q_micro, r_micro, fb_micro) if has_fb else (q_micro, r_micro)
-                (end_p, end_opt), losses = lax.scan(_scan_body, (p, opt_s), scan_xs)
-                merged_p, merged_opt = merge_spheroid_replicas(end_p, end_opt, axis_name="dp")
-                mean_loss = lax.pmean(jnp.mean(losses), axis_name="dp")
-                return merged_p, merged_opt, mean_loss
-
-            compiled_variants[key] = _pmap_round
             return _pmap_round
+
+        fn_variant = _make_round(has_weights)
+        compiled_variants[key] = fn_variant
+        return fn_variant
 
     def train_round(p, opt_s, q_micro, r_micro, base_lr, feedback_micro=None, sampling_p=1.0, target_weights_micro=None):
         has_weights = target_weights_micro is not None

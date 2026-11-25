@@ -89,11 +89,22 @@ class ToolActionHead(nn.Module):
 class SandboxedToolExecutor:
     """Safe local sandbox for tool execution."""
 
+    _SENSITIVE_ENV_KEYS = (
+        "HF_TOKEN",
+        "HUGGINGFACE_HUB_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+        "BIOFLO_SYNC_TOKEN",
+        "CEREBRO_SYNC_TOKEN",
+    )
+
     def __init__(self, workspace_root: Optional[str] = None):
-        self.workspace_root = workspace_root or os.getcwd()
+        self.workspace_root = os.path.abspath(workspace_root or os.getcwd())
+
+    def _sanitized_env(self) -> Dict[str, str]:
+        return {k: v for k, v in os.environ.items() if k not in self._SENSITIVE_ENV_KEYS}
 
     def execute_bash(self, command: str, timeout: int = 15) -> str:
-        """Runs a shell command safely with timeout."""
+        """Runs a shell command safely with timeout and secret-stripped environment."""
         clean_cmd = command.strip().strip("`").strip()
         if clean_cmd.startswith("bash"):
             clean_cmd = clean_cmd[4:].strip()
@@ -102,6 +113,7 @@ class SandboxedToolExecutor:
                 clean_cmd,
                 shell=True,
                 cwd=self.workspace_root,
+                env=self._sanitized_env(),
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -117,7 +129,7 @@ class SandboxedToolExecutor:
             return f"[Execution Error: {e}]"
 
     def execute_python(self, code: str, timeout: int = 15) -> str:
-        """Executes Python code in a sandboxed subprocess."""
+        """Executes Python code in a secret-stripped subprocess."""
         clean_code = code.strip().strip("`").strip()
         if clean_code.startswith("python"):
             clean_code = clean_code[6:].strip()
@@ -125,6 +137,7 @@ class SandboxedToolExecutor:
             res = subprocess.run(
                 [sys.executable, "-c", clean_code],
                 cwd=self.workspace_root,
+                env=self._sanitized_env(),
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -140,10 +153,11 @@ class SandboxedToolExecutor:
             return f"[Python Error: {e}]"
 
     def execute_file_read(self, path: str, max_chars: int = 2000) -> str:
-        """Reads content of a local file safely."""
+        """Reads content of a local file strictly confined within workspace_root."""
         clean_path = path.strip().strip("\"'").strip()
-        full_path = os.path.abspath(os.path.join(self.workspace_root, clean_path))
-        if not full_path.startswith(os.path.abspath(self.workspace_root)) and not os.path.exists(full_path):
+        root_real = os.path.realpath(self.workspace_root)
+        full_path = os.path.realpath(os.path.join(root_real, clean_path))
+        if os.path.commonpath([root_real, full_path]) != root_real or not os.path.isfile(full_path):
             return f"[Access Denied / Not Found: {clean_path}]"
         try:
             with open(full_path, "r", encoding="utf-8", errors="replace") as f:

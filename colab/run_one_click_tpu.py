@@ -104,12 +104,12 @@ def main():
         from_scratch=from_scratch,             # True: Clean start from Step 0; False: Resume
         auto_tune=True,                        # Adopts verified B=32, remat=True (192,360 tok/s on TPU v5 lite)
         force_tune=False,                      # Bypasses micro-benchmarks; adopts verified config
-        effective_batch_size=16,               # Effective batch size
+        effective_batch_size=256,              # Effective batch size (gradient accumulation over optimal micro-batch)
         save_interval=100,                     # Back up every 100 steps
         target_tokens=15_700_000_000,          # 15.70 Billion Tokens target budget
-        dataset_source=os.environ.get("DATASET_SOURCE", "pretrain"),  # Pure Contiguous Pretraining (85% FineWeb 10BT + 15% The Stack v2 Code)
+        dataset_source=os.environ.get("DATASET_SOURCE", "pretrain"),  # Pure Contiguous Pretraining (SmolLM2 4-stage curriculum: 90/10 -> 75/20/5 -> 70/20/10 -> 58/24/14/4)
         elastic_window=False,                  # Pure contiguous 100% loss-bearing sequences (zero prompt masking)
-        thinking_cycles=8,                     # 8 deliberation cycles per token
+        thinking_cycles=4,                     # Matches v5_compact preset deliberation depth
         min_context_window=512,                # Stage 0: 512 tokens
         context_stage_steps=100_000,           # Curriculum stages: 512, 1024, 2048, 4096 (100k steps/stage)
         total_window=4096,                     # Max horizon

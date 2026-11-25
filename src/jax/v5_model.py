@@ -279,10 +279,12 @@ def transform_spectral_core_jax(core: jnp.ndarray, params: dict, config: Any) ->
     z_low = s_hat[..., :low_d] * gains[0]
     z_mid = s_hat[..., low_d : low_d + mid_d] * gains[1]
     z_high = s_hat[..., low_d + mid_d :] * gains[2]
-    filtered = jnp.concatenate([z_low, z_mid, z_high], axis=-1)
+    filtered_spec = jnp.concatenate([z_low, z_mid, z_high], axis=-1)
+    # Invert orthonormal DCT-II back to spatial domain (C^T) before residual addition
+    reconstructed = jnp.matmul(filtered_spec, dct_mat)
     beta = jnp.tanh(params.get("motor.spectral_residual_gate", jnp.zeros(1, dtype=jnp.float32))).astype(dt)
     norm_w = params.get("motor.spectral_norm.weight", jnp.ones(D, dtype=jnp.float32))
-    return rms_norm(core + beta * filtered, norm_w)
+    return rms_norm(core + beta * reconstructed, norm_w)
 
 
 def generate_small_world_indices(num_shells: int, num_tracts: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
@@ -1433,11 +1435,11 @@ def training_rollout(
             mask_t = (cur_target >= 0).astype(jnp.float32)
             cur_w = target_weights[:, step_idx] if target_weights is not None else mask_t
             eff_w = mask_t * cur_w
-            step_loss, opt_w = _compute_token_ce_and_z_loss(ce_c, lse, mask_t, eff_w, config)
+            step_loss, _ = _compute_token_ce_and_z_loss(ce_c, lse, mask_t, eff_w, config)
             if deliberation_mode == "predictive_coding":
                 thought_err = jnp.mean((prev_thought.astype(jnp.float32) - lax.stop_gradient(tf_aud.astype(jnp.float32))) ** 2, axis=-1)
                 step_loss = step_loss + (0.1 * thought_err * eff_w * (step_idx > 0).astype(jnp.float32))
-            return (nxt_s, nxt_t, nxt_p, nxt_thought), (step_loss, opt_w)
+            return (nxt_s, nxt_t, nxt_p, nxt_thought), (step_loss, eff_w)
 
         return (nxt_s, nxt_t, nxt_p, nxt_thought), logits
 
@@ -1730,8 +1732,8 @@ def training_rollout(
             ce_c = lse - tgt_logits
             mask_c = (t_c >= 0).astype(jnp.float32)
             eff_w = mask_c * w_c
-            loss_c, opt_w = _compute_token_ce_and_z_loss(ce_c, lse, mask_c, eff_w, config)
-            return jnp.sum(loss_c), jnp.sum(opt_w)
+            loss_c, _ = _compute_token_ce_and_z_loss(ce_c, lse, mask_c, eff_w, config)
+            return jnp.sum(loss_c), jnp.sum(eff_w)
 
         if num_chunks == 1:
             loss_sum, mask_sum = _ce_loss_chunk(h_scaled, targets_flat, weights_flat)
@@ -1861,6 +1863,72 @@ def compute_manifold_diagnostics_jax(state: jnp.ndarray) -> Dict[str, Any]:
     }
 
 
+def generate_causal_prefill_jax(
+    params: Dict[str, jnp.ndarray],
+    prompt_ids: jnp.ndarray,
+    max_new_tokens: int,
+    buffers: Tuple[jnp.ndarray, jnp.ndarray],
+    config: ModelConfigV5,
+    temperature: float = 0.3,
+    repetition_penalty: float = 1.15,
+    key: Optional[jax.Array] = None,
+) -> List[int]:
+    """Causal lax.scan prefill + decode matching RectifiedContiguousPretrainStreamer geometry."""
+    B, L = prompt_ids.shape
+    total_len = L + max_new_tokens
+    dtype = params["sensory.embedding.weight"].dtype
+    bos = prompt_ids[:, :1]
+    s_flux, (pk, pv) = encode_sensory(params, bos, config=config, pos_offset=0)
+    radial_profile = (jnp.arange(1, config.num_shells + 1, dtype=jnp.float32) / float(config.num_shells))[None, :, None]
+    state = (jnp.broadcast_to(s_flux[:, 0:1, :], (B, config.num_shells, config.surface_dim)).astype(jnp.float32) * radial_profile).astype(dtype)
+    state, _, _ = deliberate_cycles_jax(
+        params, state, buffers, config=config, is_training=False, sensory_kv=(pk, pv), return_energy=True
+    )
+
+    H, Dh = pk.shape[1], pk.shape[3]
+    k_buf = jnp.zeros((B, H, total_len, Dh), dtype=dtype).at[:, :, :1, :].set(pk.astype(dtype))
+    v_buf = jnp.zeros((B, H, total_len, Dh), dtype=dtype).at[:, :, :1, :].set(pv.astype(dtype))
+    valid_buf = jnp.zeros((B, 1, 1, total_len), dtype=bool).at[:, :, :, 0].set(True)
+
+    plan = jnp.zeros((B, config.surface_dim), dtype=dtype)
+    trace = jnp.zeros((B, config.vocab_size), dtype=dtype)
+    aff = params["motor.affine_scale"][None, :].astype(dtype)
+    if "motor.affine_answer" in params:
+        aff = aff * params["motor.affine_answer"][None, :].astype(dtype)
+
+    p_flat = prompt_ids[0]
+    gen_key = key if key is not None else jax.random.PRNGKey(42)
+
+    def _step(carry, t):
+        st, tr, pl, th, kb, vb, valb = carry
+        feed = jnp.where(t == 0, jnp.zeros_like(th), th)
+        mask = valb & (jnp.arange(total_len)[None, None, None, :] <= t)
+        logits, n_st, n_tr, n_pl = emit_step(
+            params, st, (kb, vb), pl, tr, t, buffers, config=config,
+            auditory_feedback=feed, repetition_penalty=repetition_penalty, attn_mask=mask,
+            query_position=t + 1, affine_scale=aff,
+        )
+        if temperature is not None and temperature > 1e-4:
+            step_key = jax.random.fold_in(gen_key, t)
+            pred = lax.stop_gradient(jax.random.categorical(step_key, logits.astype(jnp.float32) / float(temperature), axis=-1))
+        else:
+            pred = lax.stop_gradient(jnp.argmax(logits, axis=-1))
+        next_tok = jnp.where(t < L - 1, p_flat[jnp.minimum(t + 1, L - 1)][None], pred)
+        t_flux, (tk, tv) = encode_sensory(params, next_tok[:, None], config=config, pos_offset=t + 1)
+        slot = jnp.minimum(t + 1, total_len - 1)
+        n_kb = lax.dynamic_update_slice(kb, tk.astype(dtype), (0, 0, slot, 0))
+        n_vb = lax.dynamic_update_slice(vb, tv.astype(dtype), (0, 0, slot, 0))
+        n_valb = valb.at[:, :, :, slot].set(True)
+        return (n_st.astype(dtype), n_tr, n_pl.astype(dtype), t_flux[:, 0, :].astype(dtype), n_kb, n_vb, n_valb), pred
+
+    _, preds = jax.lax.scan(
+        _step,
+        (state, trace, plan, jnp.zeros((B, config.surface_dim), dtype=dtype), k_buf, v_buf, valid_buf),
+        jnp.arange(L - 1 + max_new_tokens, dtype=jnp.int32),
+    )
+    return [int(preds[i, 0]) for i in range(L - 1, L - 1 + max_new_tokens)]
+
+
 def generate_text_jax(
     params: Dict[str, jnp.ndarray],
     buffers: Tuple[jnp.ndarray, jnp.ndarray],
@@ -1877,6 +1945,7 @@ def generate_text_jax(
     audio: Optional[jnp.ndarray] = None,
     perceptual_inputs: Optional[jnp.ndarray] = None,
     key: Optional[jax.Array] = None,
+    raw_prompt: bool = False,
 ) -> Union[str, Dict[str, Any]]:
     """
     Generates text using the 3-tier cognitive protocol in JAX:
@@ -1919,22 +1988,35 @@ def generate_text_jax(
     effective_max_tokens = min(max_new_tokens, 48) if is_slot else max_new_tokens
 
     gen_key = key if key is not None else jax.random.PRNGKey(42)
-    logits, sampled_toks = training_rollout(
-        params=params,
-        prompts=prompts_arr,
-        target_len=effective_max_tokens,
-        buffers=buffers,
-        config=config,
-        repetition_penalty=repetition_penalty,
-        seed_token_id=seed,
-        images=images,
-        audio=audio,
-        perceptual_inputs=perceptual_inputs,
-        temperature=temperature,
-        key=gen_key,
-        return_tokens=True,
-    )
-    token_ids = [int(x) for x in sampled_toks[0]]
+    if raw_prompt and images is None and audio is None and perceptual_inputs is None:
+        raw_ids = tokenizer(prompt, return_tensors="np", add_special_tokens=True).input_ids
+        token_ids = generate_causal_prefill_jax(
+            params=params,
+            prompt_ids=jnp.array(raw_ids, dtype=jnp.int32),
+            max_new_tokens=effective_max_tokens,
+            buffers=buffers,
+            config=config,
+            temperature=temperature,
+            repetition_penalty=repetition_penalty,
+            key=gen_key,
+        )
+    else:
+        logits, sampled_toks = training_rollout(
+            params=params,
+            prompts=prompts_arr,
+            target_len=effective_max_tokens,
+            buffers=buffers,
+            config=config,
+            repetition_penalty=repetition_penalty,
+            seed_token_id=seed,
+            images=images,
+            audio=audio,
+            perceptual_inputs=perceptual_inputs,
+            temperature=temperature,
+            key=gen_key,
+            return_tokens=True,
+        )
+        token_ids = [int(x) for x in sampled_toks[0]]
 
     if strict_act:
         return extract_strict_act_payload(token_ids, tokenizer)

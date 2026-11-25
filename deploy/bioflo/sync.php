@@ -46,7 +46,7 @@ if (preg_match('/Bearer\s+(.*)$/i', $auth_header, $matches)) {
 }
 
 $action = isset($_REQUEST['action']) ? $_REQUEST['action'] : 'status';
-$public_actions = ['dashboard', 'tracker', 'view', 'get_tokens', 'tokens', 'get_config', 'config'];
+$public_actions = ['dashboard', 'tracker', 'view', 'get_tokens', 'tokens'];
 
 if (!in_array($action, $public_actions) && (!is_string($token_provided) || !hash_equals($SECRET_TOKEN, $token_provided))) {
     http_response_code(401);
@@ -300,8 +300,8 @@ if ($action === 'save_tokens' || $action === 'record_tokens') {
         if (is_array($old_tracker)) {
             $old_cum = isset($old_tracker['cumulative_tokens']) ? floatval($old_tracker['cumulative_tokens']) : 0;
             if ($old_cum > $cumulative_tokens && $step < 10000) {
-                // Same run worker restarted: accumulate on top of preserved baseline
-                $cumulative_tokens = $old_cum + $cumulative_tokens;
+                // Prevent backward regression on slightly stale restart without double-counting
+                $cumulative_tokens = max($old_cum, $cumulative_tokens);
             }
         }
     }

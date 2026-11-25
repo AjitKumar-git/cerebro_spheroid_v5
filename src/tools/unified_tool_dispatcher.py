@@ -103,16 +103,26 @@ class UnifiedToolDispatcher:
         except Exception as e:
             return f"[Calculator Error: {e}]"
 
+    _SENSITIVE_ENV_KEYS = (
+        "HF_TOKEN",
+        "HUGGINGFACE_HUB_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+        "BIOFLO_SYNC_TOKEN",
+        "CEREBRO_SYNC_TOKEN",
+    )
+
     def execute_python(self, code: str, timeout: int = 10) -> str:
-        """Executes Python code in a sandboxed subprocess."""
+        """Executes Python code in a secret-stripped subprocess."""
         clean_code = str(code).strip().strip("`").strip()
         if clean_code.startswith("python"):
             clean_code = clean_code[6:].strip()
 
+        safe_env = {k: v for k, v in os.environ.items() if k not in self._SENSITIVE_ENV_KEYS}
         try:
             res = subprocess.run(
                 [sys.executable, "-c", clean_code],
                 cwd=self.workspace_root,
+                env=safe_env,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -130,8 +140,10 @@ class UnifiedToolDispatcher:
     def execute_factual_query(self, query: str) -> str:
         """Queries relational factual database tables or curated knowledge."""
         q = str(query).strip()
-        # Direct SQL execution
+        # Direct single-statement SELECT execution
         if q.upper().startswith("SELECT"):
+            if ";" in q.rstrip(";"):
+                return "[SQL Error: Multi-statement queries are not permitted]"
             if self.factual_engine is not None:
                 try:
                     res = self.factual_engine.query(q)

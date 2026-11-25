@@ -48,7 +48,7 @@ DEFAULT_USER_AGENT = (
 )
 
 def configure_ssl_resilience() -> None:
-    """Configures environment and urllib/requests to prevent SSL handshake failures, EOF drops, and CA errors."""
+    """Configures CA certificate bundles for urllib/requests TLS verification."""
     try:
         import certifi
         ca = certifi.where()
@@ -58,29 +58,16 @@ def configure_ssl_resilience() -> None:
             os.environ.setdefault("CURL_CA_BUNDLE", ca)
     except Exception:
         pass
-    try:
-        # Prevent urllib unverified certificate rejections in restrictive or virtualized cloud environments
-        ssl._create_default_https_context = ssl._create_unverified_context
-    except Exception:
-        pass
 
 configure_ssl_resilience()
 
 def _get_resilient_ssl_context() -> ssl.SSLContext:
+    """Creates a verified TLS SSLContext backed by certifi or system trust store."""
     try:
         import certifi
-        ctx = ssl.create_default_context(cafile=certifi.where())
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        return ctx
+        return ssl.create_default_context(cafile=certifi.where())
     except Exception:
-        try:
-            return ssl._create_unverified_context()
-        except Exception:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            return ctx
+        return ssl.create_default_context()
 
 _RESILIENT_SSL_CTX = _get_resilient_ssl_context()
 

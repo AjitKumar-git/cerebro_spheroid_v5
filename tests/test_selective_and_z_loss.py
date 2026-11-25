@@ -100,3 +100,35 @@ def test_core_1d_valves_float32_and_boosted_lr():
     assert new_params["core.shortcut_gate"].dtype == jnp.float32
     assert new_params["core.intra_swiglu.w_gate"].dtype == jnp.bfloat16
 
+
+def test_spectral_core_inverse_dct_and_tool_sandbox_security():
+    """Verify inverse DCT reconstruction identity (gains=1) and workspace-confined file reads."""
+    import torch
+    from src.jax.v5_model import rms_norm, transform_spectral_core_jax
+    from src.spheroid_v5 import CerebroSpheroidV5, ModelConfigV5 as TorchCfg
+    from src.agentic_harness import SandboxedToolExecutor
+
+    cfg = ModelConfigV5(surface_dim=32, radial_dim=16, num_shells=4, num_heads=4, vocab_size=64, use_spectral_core_readout=True)
+    params, _ = init_params_v5(jax.random.PRNGKey(7), cfg)
+    params["motor.spectral_residual_gate"] = jnp.array([10.0], dtype=jnp.float32)  # tanh(10) ~ 1.0
+    core = jax.random.normal(jax.random.PRNGKey(8), (2, 32))
+    out_j = transform_spectral_core_jax(core, params, cfg)
+    # With band_gains=1, inverse DCT must reconstruct `core`, so core + beta * core = rms_norm(core * (1 + beta))
+    expected_j = rms_norm(core * (1.0 + jnp.tanh(10.0)), params["motor.spectral_norm.weight"])
+    assert jnp.allclose(out_j, expected_j, atol=1e-5)
+
+    # PyTorch transform_spectral_core matches inverse DCT reconstruction
+    t_cfg = TorchCfg(surface_dim=32, radial_dim=16, num_shells=4, num_heads=4, vocab_size=64, use_spectral_core_readout=True)
+    t_model = CerebroSpheroidV5(t_cfg).eval()
+    with torch.no_grad():
+        t_model.motor_decoder.spectral_residual_gate.fill_(10.0)
+        t_core = torch.from_numpy(jax.device_get(core))
+        t_out = t_model.motor_decoder.transform_spectral_core(t_core)
+        t_exp = t_model.motor_decoder.spectral_norm(t_core * (1.0 + float(torch.tanh(torch.tensor(10.0)))))
+        assert torch.allclose(t_out, t_exp, atol=1e-5)
+
+    # SandboxedToolExecutor must reject /etc/passwd reads outside workspace
+    executor = SandboxedToolExecutor()
+    res = executor.execute_file_read("/etc/passwd")
+    assert "Access Denied" in res
+

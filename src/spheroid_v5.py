@@ -1088,17 +1088,20 @@ class PremotorMotorDecoderV5(nn.Module):
         return self.resonance_norm(self.out_proj(res).to(motor_surface.dtype))
 
     def transform_spectral_core(self, core: torch.Tensor) -> torch.Tensor:
-        """Transforms deliberated Shell 0 via orthonormal DCT basis, multi-band filtering, and residual gating."""
+        """Transforms deliberated Shell 0 via orthonormal DCT basis, multi-band filtering, inverse DCT, and residual gating."""
         if not getattr(self, "use_spectral_core_readout", True) or getattr(self, "dct_basis", None) is None:
             return core
         dt = core.dtype
-        s_hat = F.linear(core, self.dct_basis.to(dt))
+        basis = self.dct_basis.to(dt)
+        s_hat = F.linear(core, basis)
         z_low = s_hat[..., :self.spectral_low_dim] * self.spectral_band_gains[0].to(dt)
         z_mid = s_hat[..., self.spectral_low_dim:self.spectral_low_dim + self.spectral_mid_dim] * self.spectral_band_gains[1].to(dt)
         z_high = s_hat[..., self.spectral_low_dim + self.spectral_mid_dim:] * self.spectral_band_gains[2].to(dt)
-        filtered = torch.cat([z_low, z_mid, z_high], dim=-1)
+        filtered_spec = torch.cat([z_low, z_mid, z_high], dim=-1)
+        # Invert orthonormal DCT-II back to spatial domain (C^T) before residual addition
+        reconstructed = F.linear(filtered_spec, basis.t())
         beta = torch.tanh(self.spectral_residual_gate).to(dt)
-        return self.spectral_norm(core + beta * filtered)
+        return self.spectral_norm(core + beta * reconstructed)
 
     def forward(
         self,
@@ -2213,34 +2216,53 @@ class CerebroSpheroidV5(nn.Module):
         self.current_spheroid_state = state
 
         if targets is not None:
-            # Pillar 2: Dynamic Answer-Anchor Loss Weighting (AALW)
+            # Pillar 2: Dynamic Answer-Anchor Loss Weighting (AALW) + Selective Loss & Z-Loss parity
             tgt_slice = targets[:, :t_len]
-            if target_weights is not None or use_anchor_loss:
+            use_sel = bool(getattr(self.config, "use_selective_loss", False))
+            z_w = float(getattr(self.config, "z_loss_weight", 0.0))
+            logits_f32 = logits_stacked.float()
+
+            if target_weights is not None or use_anchor_loss or use_sel or z_w > 0.0:
+                valid_mask = (tgt_slice >= 0) & (tgt_slice != -100)
                 if target_weights is not None:
                     token_weights = target_weights[:, :t_len].to(dev)
-                else:
+                elif use_anchor_loss:
                     is_anchor = (tgt_slice == anchor_token_id)
                     after_anchor = (torch.cumsum(is_anchor.long(), dim=-1) > 0)
                     has_anchor = is_anchor.any(dim=-1, keepdim=True)
-                    # If anchor present: 1.0 before anchor, anchor_weight (3.5x) from anchor onwards
-                    # If direct slot (no anchor): entire sequence gets anchor_weight (3.5x)
                     w = torch.where(has_anchor, torch.where(after_anchor, anchor_weight, 1.0), anchor_weight)
-                    valid_mask = (tgt_slice >= 0) & (tgt_slice != -100)
                     token_weights = torch.where(valid_mask, w, torch.zeros_like(w))
+                else:
+                    token_weights = valid_mask.float()
 
                 loss_2d = F.cross_entropy(
-                    logits_stacked.view(-1, self.config.vocab_size).float(),
+                    logits_f32.view(-1, self.config.vocab_size),
                     tgt_slice.contiguous().view(-1),
                     ignore_index=-100,
                     reduction="none",
                 ).view(B, t_len)
-                w_2d = token_weights.float() * (tgt_slice != -100).float()
+                w_2d = token_weights.float() * valid_mask.float()
+                if use_sel:
+                    gamma = float(getattr(self.config, "selective_focal_gamma", 0.5))
+                    noise_cap = float(getattr(self.config, "selective_noise_cap", 8.5))
+                    with torch.no_grad():
+                        m_f = valid_mask.float()
+                        p_t = torch.exp(-loss_2d.clamp(0.0, 20.0))
+                        focal_w = (1.0 - p_t).clamp(min=1e-4).pow(gamma)
+                        noise_w = (noise_cap / loss_2d.clamp(min=1e-4)).clamp(max=1.0)
+                        sel_w = focal_w * noise_w
+                        sel_mean = (sel_w * m_f).sum() / m_f.sum().clamp(min=1.0)
+                        sel_w = sel_w / sel_mean.clamp(min=1e-4)
+                    loss_2d = loss_2d * sel_w
+                if z_w > 0.0:
+                    lse_2d = torch.logsumexp(logits_f32, dim=-1)
+                    loss_2d = loss_2d + z_w * (lse_2d ** 2)
                 seq_weights = torch.clamp(w_2d.sum(dim=-1), min=1e-5)
                 seq_losses = (loss_2d * w_2d).sum(dim=-1) / seq_weights
                 loss = seq_losses.mean()
             else:
                 loss = F.cross_entropy(
-                    logits_stacked.view(-1, self.config.vocab_size).float(),
+                    logits_f32.view(-1, self.config.vocab_size),
                     tgt_slice.contiguous().view(-1),
                     ignore_index=-100,
                 )

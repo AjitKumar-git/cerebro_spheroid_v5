@@ -75,6 +75,7 @@ class TestSFTTruncationResolution(unittest.TestCase):
             buckets=buckets,
             framework="numpy",
             return_feedback=True,
+            target_pad_id=-100,
         )
 
         b_idx, b_name, p_batch, t_batch, fb_batch = batcher.get_batch()

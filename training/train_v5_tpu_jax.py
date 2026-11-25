@@ -418,12 +418,12 @@ def build_data_stream(
             for idx, (b_name, bp, bt) in enumerate(buckets):
                 print(f"   Bucket {idx}: {b_name:<18} (Prompt: {bp:4d} tok -> Target: {bt:4d} tok)")
             batcher = ElasticBucketBatcher(
-                tokenizer, data_iter, batch_size=batch_size, total_window=total_window, buckets=buckets, framework="numpy", return_feedback=True
+                tokenizer, data_iter, batch_size=batch_size, total_window=total_window, buckets=buckets, framework="numpy", return_feedback=True, target_pad_id=-100
             )
         else:
             buckets = [("static", prompt_len, target_len)]
             batcher = ElasticBucketBatcher(
-                tokenizer, data_iter, batch_size=batch_size, total_window=prompt_len + target_len, buckets=buckets, framework="numpy", return_feedback=True
+                tokenizer, data_iter, batch_size=batch_size, total_window=prompt_len + target_len, buckets=buckets, framework="numpy", return_feedback=True, target_pad_id=-100
             )
 
         q_depth = max(16, int(prefetch_queue_size))
