@@ -296,32 +296,6 @@ def _scmer_grad(
     return lax.cond((next_step % interval) == 0, _apply, _noop, operand=None)
 
 
-def _negative_covariance_grad(
-    p: Dict[str, jnp.ndarray],
-    opt_s: Dict[str, Any],
-    strength: float,
-    mode: str = "cosine_asymmetric",
-    sample_size: int = 512,
-    interval: int = 8,
-    margin: float = 0.12,
-    pair_samples: int = 8192,
-    eps: float = 1e-6,
-) -> Tuple[Dict[str, jnp.ndarray], jnp.ndarray]:
-    """Compatibility wrapper that scatters sparse gradient to (V, D) dictionary."""
-    key = "sensory.embedding.weight"
-    zero = jnp.array(0.0, dtype=jnp.float32)
-    if key not in p:
-        return {}, zero
-    empty_grad = jnp.zeros_like(p[key], dtype=jnp.float32)
-    if strength == 0.0:
-        return {key: empty_grad}, zero
-    token_ids, grad_rows, reg_loss = _scmer_grad(
-        p, opt_s, strength, sample_size, interval, margin, pair_samples, eps
-    )
-    grad_table = jnp.zeros_like(p[key], dtype=jnp.float32).at[token_ids].add(grad_rows)
-    return {key: grad_table}, reg_loss
-
-
 def _apply_spheroid_grads(
     p: Dict[str, jnp.ndarray],
     opt_s: Dict[str, Any],
@@ -340,6 +314,8 @@ def _apply_spheroid_grads(
     neg_cov_interval: Optional[int] = None,
     neg_cov_margin: Optional[float] = None,
     neg_cov_pair_samples: Optional[int] = None,
+    grad_clip_norm: float = 1.0,
+    lr_1d_scale: float = 0.2,
 ) -> Tuple[Dict[str, jnp.ndarray], Dict[str, Any]]:
     """Applies Polar Newton-Schulz, recurrent spectral clamp, and float32 master-weight AdamW."""
     eff_lambda = neg_cov_lambda if (neg_cov_lambda is not None and scmer_lambda == 0.0) else scmer_lambda
@@ -372,7 +348,7 @@ def _apply_spheroid_grads(
         sum(jnp.sum(jnp.square(g.astype(jnp.float32))) for g in grads.values() if jnp.issubdtype(g.dtype, jnp.inexact))
     )
     is_finite = jnp.isfinite(grad_norm)
-    clip_scale = jnp.where(is_finite, jnp.minimum(1.0, 1.0 / (grad_norm + 1e-6)), 0.0)
+    clip_scale = jnp.where(is_finite, jnp.minimum(1.0, grad_clip_norm / (grad_norm + 1e-6)), 0.0)
     clipped_grads = jax.tree_util.tree_map(lambda g: g * clip_scale if jnp.issubdtype(g.dtype, jnp.inexact) else g, grads)
 
     def _apply_step():
@@ -384,7 +360,7 @@ def _apply_spheroid_grads(
         new_master_p = {}
         new_power_v = dict(opt_s["power_v"])
 
-        lr_1d = 0.2 * base_lr
+        lr_1d = lr_1d_scale * base_lr
         lr_vocab = jnp.minimum(base_lr, 6.0e-4)
 
         # Track squared update and parameter norms per group for diagnostic logging
@@ -570,6 +546,8 @@ def build_spheroid_train_engine(
     neg_cov_interval: Optional[int] = None,
     neg_cov_margin: Optional[float] = None,
     neg_cov_pair_samples: Optional[int] = None,
+    grad_clip_norm: float = 1.0,
+    lr_1d_scale: float = 0.2,
 ) -> Tuple[Callable, Callable]:
     """
     Builds decoupled JIT-compiled gradient computation and optimizer application functions.
@@ -597,6 +575,7 @@ def build_spheroid_train_engine(
             scmer_lambda=eff_lambda, scmer_subsample=eff_subsample,
             scmer_interval=eff_interval, scmer_margin=eff_margin,
             scmer_pair_samples=eff_pairs,
+            grad_clip_norm=grad_clip_norm, lr_1d_scale=lr_1d_scale,
         )
 
     return compute_grad_step, apply_opt_step
@@ -622,6 +601,8 @@ def build_train_step_spheroid(
     neg_cov_interval: Optional[int] = None,
     neg_cov_margin: Optional[float] = None,
     neg_cov_pair_samples: Optional[int] = None,
+    grad_clip_norm: float = 1.0,
+    lr_1d_scale: float = 0.2,
 ) -> Callable:
     """Builds a single fused JIT-compiled train_step combining forward, backward, and SpheroidOptimizer."""
     eff_lambda = neg_cov_lambda if (neg_cov_lambda is not None and scmer_lambda == 0.0) else scmer_lambda
@@ -640,6 +621,7 @@ def build_train_step_spheroid(
             scmer_lambda=eff_lambda, scmer_subsample=eff_subsample,
             scmer_interval=eff_interval, scmer_margin=eff_margin,
             scmer_pair_samples=eff_pairs,
+            grad_clip_norm=grad_clip_norm, lr_1d_scale=lr_1d_scale,
         )
         return new_params, new_opt_s, loss_val
 
@@ -764,6 +746,8 @@ def build_pmap_local_sgd_step_spheroid(
     neg_cov_interval: Optional[int] = None,
     neg_cov_margin: Optional[float] = None,
     neg_cov_pair_samples: Optional[int] = None,
+    grad_clip_norm: float = 1.0,
+    lr_1d_scale: float = 0.2,
 ) -> Callable:
     """
     Multi-TPU pmap Local-SGD runner: each TPU replica executes `local_steps` sequential

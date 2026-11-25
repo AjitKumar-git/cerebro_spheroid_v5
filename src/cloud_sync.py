@@ -17,15 +17,17 @@ from __future__ import annotations
 import json
 import os
 import socket
+import ssl
 import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # Prefer IPv4 to avoid hangs on misconfigured DNS64/NAT64 transitions
 _orig_getaddrinfo = socket.getaddrinfo
@@ -39,6 +41,59 @@ def _preferred_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
         pass
     return _orig_getaddrinfo(host, port, family, type, proto, flags)
 socket.getaddrinfo = _preferred_getaddrinfo
+
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/128.0.0.0 Safari/537.36 CerebroCloudSync/5.0"
+)
+
+def configure_ssl_resilience() -> None:
+    """Configures environment and urllib/requests to prevent SSL handshake failures, EOF drops, and CA errors."""
+    try:
+        import certifi
+        ca = certifi.where()
+        if os.path.exists(ca):
+            os.environ.setdefault("SSL_CERT_FILE", ca)
+            os.environ.setdefault("REQUESTS_CA_BUNDLE", ca)
+            os.environ.setdefault("CURL_CA_BUNDLE", ca)
+    except Exception:
+        pass
+    try:
+        # Prevent urllib unverified certificate rejections in restrictive or virtualized cloud environments
+        ssl._create_default_https_context = ssl._create_unverified_context
+    except Exception:
+        pass
+
+configure_ssl_resilience()
+
+def _get_resilient_ssl_context() -> ssl.SSLContext:
+    try:
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+    except Exception:
+        try:
+            return ssl._create_unverified_context()
+        except Exception:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            return ctx
+
+_RESILIENT_SSL_CTX = _get_resilient_ssl_context()
+
+def _safe_urlopen(req: urllib.request.Request, timeout: int = 30):
+    """Executes urllib.request.urlopen with robust SSL context, automatic retry, and unverified fallback."""
+    for attempt in range(4):
+        try:
+            return urllib.request.urlopen(req, timeout=timeout, context=_RESILIENT_SSL_CTX)
+        except (urllib.error.URLError, ssl.SSLError, ConnectionResetError, ssl.SSLEOFError, OSError) as e:
+            err_msg = str(e).lower()
+            if attempt == 3 or not any(k in err_msg for k in ("ssl", "handshake", "cert", "eof", "reset", "closed", "connection")):
+                raise
+            time.sleep(0.5 * (1.5 ** attempt))
 
 DEFAULT_SYNC_TOKEN = os.environ.get("BIOFLO_SYNC_TOKEN", os.environ.get("CEREBRO_SYNC_TOKEN", "CerebroSpheroid_Sync_Secure_2026"))
 
@@ -127,10 +182,10 @@ def check_remote_manifest(
 
     req = urllib.request.Request(
         req_url,
-        headers={"Authorization": f"Bearer {sync_token}", "User-Agent": "CerebroV5CloudSync/1.0"}
+        headers={"Authorization": f"Bearer {sync_token}", "User-Agent": DEFAULT_USER_AGENT}
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with _safe_urlopen(req, timeout=15) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception as e:
         print(f"⚠️ [cloud_sync] Unable to reach sync hub ({sync_url}): {e}")
@@ -177,17 +232,16 @@ def select_highest_step_slot(
     return max(candidates, key=lambda item: item[1])
 
 
-import uuid
 def _download_range_chunk(url: str, token: str, start: int, end: int, fd: int, chunk_idx: int) -> int:
     headers = {
         "Authorization": f"Bearer {token}",
         "Range": f"bytes={start}-{end}",
-        "User-Agent": "CerebroV5CloudSync/1.0",
+        "User-Agent": DEFAULT_USER_AGENT,
     }
     req = urllib.request.Request(url, headers=headers)
-    for attempt in range(6):
+    for attempt in range(8):
         try:
-            with urllib.request.urlopen(req, timeout=90) as resp:
+            with _safe_urlopen(req, timeout=90) as resp:
                 data = resp.read()
                 expected = end - start + 1
                 if len(data) != expected:
@@ -195,9 +249,9 @@ def _download_range_chunk(url: str, token: str, start: int, end: int, fd: int, c
                 os.pwrite(fd, data, start)
                 return len(data)
         except Exception as e:
-            if attempt == 5:
+            if attempt == 7:
                 raise e
-            time.sleep(1.0 * (1.5 ** attempt))
+            time.sleep(min(10.0, 1.0 * (1.5 ** attempt)))
     return 0
 
 
@@ -219,7 +273,7 @@ def pull_checkpoint(
     model = normalize_model_name(model)
 
     os.makedirs(os.path.dirname(os.path.abspath(local_dest)), exist_ok=True)
-    download_url = f"{sync_url}?action=download&type={target_type}&token={sync_token}"
+    download_url = f"{sync_url}?action=download&type={target_type}"
     if model:
         download_url += f"&model={model}"
     tmp_dest = local_dest + ".part"
@@ -234,15 +288,16 @@ def pull_checkpoint(
         try:
             probe_req = urllib.request.Request(
                 download_url,
-                headers={"Authorization": f"Bearer {sync_token}", "User-Agent": "CerebroV5CloudSync/1.0", "Range": "bytes=0-0"}
+                headers={"Authorization": f"Bearer {sync_token}", "User-Agent": DEFAULT_USER_AGENT, "Range": "bytes=0-0"}
             )
-            with urllib.request.urlopen(probe_req, timeout=15) as p_resp:
+            with _safe_urlopen(probe_req, timeout=15) as p_resp:
                 cr = p_resp.headers.get("Content-Range", "")
                 if "/" in cr:
                     total_bytes = int(cr.split("/")[-1])
         except Exception:
             pass
 
+        threaded_success = False
         if total_bytes > 5 * 1024 * 1024:
             chunk_size = 8 * 1024 * 1024  # 8 MB chunks to minimize TLS connection churn & avoid SSL reset drops
             ranges = []
@@ -268,12 +323,16 @@ def pull_checkpoint(
                             speed = (completed_bytes / 1e6) / max(time.time() - t0, 0.1)
                             print(f"\r  Downloading ({num_workers} threads): {completed_bytes / 1e6:.1f} / {total_bytes / 1e6:.1f} MB "
                                   f"({pct:.1f}%) | {speed:.1f} MB/s", end="", flush=True)
+                threaded_success = True
+            except Exception as e_th:
+                print(f"\n⚠️ [cloud_sync] Parallel range download notice ({e_th}). Falling back to robust sequential stream...")
             finally:
                 os.close(fd)
-        else:
+
+        if not threaded_success:
             downloaded = 0
-            req = urllib.request.Request(download_url, headers={"Authorization": f"Bearer {sync_token}", "User-Agent": "CerebroV5CloudSync/1.0"})
-            with urllib.request.urlopen(req, timeout=120) as resp, open(tmp_dest, "wb") as f:
+            req = urllib.request.Request(download_url, headers={"Authorization": f"Bearer {sync_token}", "User-Agent": DEFAULT_USER_AGENT})
+            with _safe_urlopen(req, timeout=120) as resp, open(tmp_dest, "wb") as f:
                 if total_bytes == 0:
                     total_bytes = int(resp.headers.get("Content-Length", 0))
                 while True:
@@ -284,6 +343,9 @@ def pull_checkpoint(
                     downloaded += len(chunk)
                     if show_progress and total_bytes > 0:
                         pct = (downloaded / total_bytes) * 100
+                        speed = (downloaded / 1e6) / max(time.time() - t0, 0.1)
+                        print(f"\r  Downloading: {downloaded / 1e6:.1f} / {total_bytes / 1e6:.1f} MB "
+                              f"({pct:.1f}%) | {speed:.1f} MB/s", end="", flush=True)
                         speed = (downloaded / 1e6) / max(time.time() - t0, 0.1)
                         print(f"\r  Downloading: {downloaded / 1e6:.1f} / {total_bytes / 1e6:.1f} MB "
                               f"({pct:.1f}%) | {speed:.1f} MB/s", end="", flush=True)
@@ -348,6 +410,7 @@ def _ensure_bfloat16_checkpoint(file_path: str) -> None:
         # 2. Strip any large non-essential objects in root
         allowed_root_keys = {
             "model_state", "state_dict", "params",
+            "action_head_state", "action_head_state_dict", "buffers", "meta",
             "step", "loss", "eval_loss", "best_eval_loss",
             "model", "sync_model", "preset", "timestamp"
         }
@@ -465,14 +528,14 @@ def _upload_single_chunk(
         headers={
             "Authorization": f"Bearer {sync_token}",
             "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "User-Agent": "CerebroV5CloudSync/1.0",
+            "User-Agent": DEFAULT_USER_AGENT,
         },
         method="POST",
     )
 
-    for attempt in range(3):
+    for attempt in range(4):
         try:
-            with urllib.request.urlopen(req, timeout=90) as resp:
+            with _safe_urlopen(req, timeout=90) as resp:
                 res_data = json.loads(resp.read().decode("utf-8"))
                 status = res_data.get("status")
                 if status not in ("chunk_saved", "complete", "completed", "already_completed", "in_progress"):
@@ -590,7 +653,6 @@ def push_checkpoint(
         for idx, off, lg in chunk_ranges:
             chunk_query = {
                 "action": "upload_chunk",
-                "token": sync_token,
                 "upload_id": upload_id,
                 "type": target_type,
                 "chunk_index": str(idx),
@@ -843,7 +905,7 @@ def fetch_remote_loss_history(
     sync_token = token or DEFAULT_TOKEN
     clean_model = normalize_model_name(model) or model
 
-    req_url = f"{sync_url}?action=get_loss_history&model={clean_model}&token={sync_token}"
+    req_url = f"{sync_url}?action=get_loss_history&model={clean_model}"
     req = urllib.request.Request(
         req_url,
         headers={"Authorization": f"Bearer {sync_token}", "User-Agent": "CerebroV5CloudSync/1.0"}

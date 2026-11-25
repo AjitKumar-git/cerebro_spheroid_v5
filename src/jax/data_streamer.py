@@ -67,6 +67,7 @@ class LinguisticDataStreamer:
         self.target_pad_id = target_pad_id
         self.queue: queue.Queue = queue.Queue(maxsize=queue_size)
         self.running = True
+        self.fatal_error: Optional[Exception] = None
 
         # Locate data directories
         if data_dir is None:
@@ -220,6 +221,7 @@ class LinguisticDataStreamer:
                 pass
 
         if self.pairs_corpus:
+            random.shuffle(self.pairs_corpus)
             print(f"📚 [DataStreamer] Loaded {len(self.pairs_corpus):,} local multi-domain Strategy A (<stim>/<act>) pairs for pretraining!")
 
     def _generate_synthetic_prose(self) -> Tuple[str, str]:
@@ -243,42 +245,50 @@ class LinguisticDataStreamer:
         """Continuous background prefetch loop packing Strategy A batches into queue."""
         doc_idx = 0
 
-        while self.running:
-            p_batch = []
-            t_batch = []
+        try:
+            while self.running:
+                p_batch = []
+                t_batch = []
 
-            for _ in range(self.batch_size):
-                if self.pairs_corpus:
-                    p_txt, r_txt = self.pairs_corpus[doc_idx % len(self.pairs_corpus)]
-                    doc_idx += 1
-                else:
-                    p_txt, r_txt = self._generate_synthetic_prose()
+                for _ in range(self.batch_size):
+                    if self.pairs_corpus:
+                        if doc_idx > 0 and (doc_idx % len(self.pairs_corpus) == 0):
+                            random.shuffle(self.pairs_corpus)
+                        p_txt, r_txt = self.pairs_corpus[doc_idx % len(self.pairs_corpus)]
+                        doc_idx += 1
+                    else:
+                        p_txt, r_txt = self._generate_synthetic_prose()
 
-                # Strategy A: Encode <stim> ... </stim> prompt and <act> ... </act> response
-                p_ids = self._encode_text(p_txt)[:self.prompt_len]
-                r_ids = self._encode_text(r_txt)
-                eos_id = getattr(getattr(self, "tokenizer", None), "eos_token_id", None)
-                if eos_id is None:
-                    eos_id = 2
-                if self.target_len > 0 and (not r_ids or r_ids[-1] != eos_id):
-                    r_ids = r_ids[: max(0, self.target_len - 1)] + [eos_id]
-                r_ids = r_ids[:self.target_len]
+                    # Strategy A: Encode <stim> ... </stim> prompt and <act> ... </act> response
+                    p_ids = self._encode_text(p_txt)[:self.prompt_len]
+                    r_ids = self._encode_text(r_txt)
+                    eos_id = getattr(getattr(self, "tokenizer", None), "eos_token_id", None)
+                    if eos_id is None:
+                        eos_id = 2
+                    if self.target_len > 0 and (not r_ids or r_ids[-1] != eos_id):
+                        r_ids = r_ids[: max(0, self.target_len - 1)] + [eos_id]
+                    r_ids = r_ids[:self.target_len]
 
-                # Right-pad prompts with 0 (pad_id) and targets with target_pad_id (-100 ignore index)
-                if len(p_ids) < self.prompt_len:
-                    p_ids = p_ids + [0] * (self.prompt_len - len(p_ids))
-                if len(r_ids) < self.target_len:
-                    r_ids = r_ids + [self.target_pad_id] * (self.target_len - len(r_ids))
+                    # Right-pad prompts with 0 (pad_id) and targets with target_pad_id (-100 ignore index)
+                    if len(p_ids) < self.prompt_len:
+                        p_ids = p_ids + [0] * (self.prompt_len - len(p_ids))
+                    if len(r_ids) < self.target_len:
+                        r_ids = r_ids + [self.target_pad_id] * (self.target_len - len(r_ids))
 
-                p_batch.append(p_ids)
-                t_batch.append(r_ids)
+                    p_batch.append(p_ids)
+                    t_batch.append(r_ids)
 
-            prompts = np.array(p_batch, dtype=np.int32)
-            targets = np.array(t_batch, dtype=np.int32)
-            self.queue.put((prompts, targets))
+                prompts = np.array(p_batch, dtype=np.int32)
+                targets = np.array(t_batch, dtype=np.int32)
+                self.queue.put((prompts, targets))
+        except Exception as e:
+            self.fatal_error = e
+            self.running = False
 
     def get_batch(self) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """Retrieves next pre-tokenized batch ready for TPU MXU."""
+        if self.fatal_error is not None:
+            raise RuntimeError(f"LinguisticDataStreamer worker failed: {self.fatal_error}") from self.fatal_error
         prompts_np, targets_np = self.queue.get(timeout=30)
         return jnp.asarray(prompts_np), jnp.asarray(targets_np)
 

@@ -130,8 +130,11 @@ class CerebroV5Dataset(Dataset):
                     weights[i] = self.anchor_weight
 
                 # Weight </think> boundary higher
-                if 0 < n_think_toks <= len(weights):
-                    weights[max(0, n_think_toks - 2):n_think_toks] = [self.think_close_weight] * min(2, n_think_toks)
+                if n_think_toks > 0:
+                    end_idx = min(n_think_toks, len(weights))
+                    start_idx = max(0, end_idx - 2)
+                    for i in range(start_idx, end_idx):
+                        weights[i] = self.think_close_weight
 
             if pos_act_end != -1 and pos_think_end != -1:
                 prefix_act = out_str[:pos_act_end + len(act_end_str)]

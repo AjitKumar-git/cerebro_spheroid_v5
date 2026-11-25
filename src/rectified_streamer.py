@@ -384,6 +384,8 @@ class RectifiedContiguousPretrainStreamer:
         target_shares: Optional[Dict[str, float]] = None,
         progress_getter: Optional[Any] = None,
         total_steps: int = 1_500_000,
+        tokens_getter: Optional[Any] = None,
+        target_tokens: int = 15_700_000_000,
         min_edu_score: float = 3.0,
         domain_loss_weights: Optional[Dict[str, float]] = None,
         reasoning_weight: float = 1.0,
@@ -401,6 +403,8 @@ class RectifiedContiguousPretrainStreamer:
         self.filter_model_leaks = filter_model_leaks
         self.progress_getter = progress_getter
         self.total_steps = max(1, int(total_steps))
+        self.tokens_getter = tokens_getter
+        self.target_tokens = max(1, int(target_tokens))
         self.dynamic_curriculum = target_shares is None
         self.running = True
         self.fatal_error: Optional[Exception] = None
@@ -420,7 +424,7 @@ class RectifiedContiguousPretrainStreamer:
         self.worker_thread.start()
 
     def _smollm2_shares(self) -> Dict[str, float]:
-        """Return the SmolLM2 developmental mixture for cumulative training progress."""
+        """Return the SmolLM2 developmental mixture for cumulative training progress (strictly token-based)."""
         if getattr(self, "stage", "pretrain") in ("deep_reasoning", "reasoning", "midtrain", "midtraining"):
             return {
                 "edu_academic": 0.40,
@@ -430,9 +434,20 @@ class RectifiedContiguousPretrainStreamer:
             }
 
         progress = 0.0
-        if self.progress_getter is not None:
+        if getattr(self, "tokens_getter", None) is not None:
             try:
-                progress = float(self.progress_getter()) / float(self.total_steps)
+                tgt = float(getattr(self, "target_tokens", 15_700_000_000) or 15_700_000_000)
+                progress = float(self.tokens_getter()) / tgt
+            except Exception:
+                progress = 0.0
+        elif self.progress_getter is not None:
+            try:
+                val = float(self.progress_getter())
+                if val > 10_000_000:
+                    tgt = float(getattr(self, "target_tokens", 15_700_000_000) or 15_700_000_000)
+                    progress = val / tgt
+                else:
+                    progress = val / float(self.total_steps)
             except Exception:
                 progress = 0.0
         progress = min(1.0, max(0.0, progress))
@@ -477,10 +492,13 @@ class RectifiedContiguousPretrainStreamer:
             return
         new_shares = self._smollm2_shares()
         if new_shares != self.shares:
+            old_shares = self.shares
             self.shares = new_shares
             self.quota_mgr.update_target_shares(self.shares)
             for domain in new_shares:
                 self.buffers.setdefault(domain, [])
+            pct_str = ", ".join(f"{d}: {w*100:.0f}%" for d, w in new_shares.items())
+            print(f"\n🌊 [Dataset Mixture Transition] Ingested tokens crossed curriculum boundary: Updated target shares to {pct_str}", flush=True)
 
     def _cycle_corpus(self, corpus: List[str]) -> Iterator[str]:
         """Cycles indefinitely through a diverse list of multi-paragraph passages."""
@@ -727,6 +745,7 @@ class RectifiedContiguousPretrainStreamer:
                         else:
                             text_chunks = [doc_text[ci : ci + CHUNK_CHAR_SIZE] for ci in range(0, len(doc_text), CHUNK_CHAR_SIZE)]
 
+                        truncated_doc = False
                         for c_text in text_chunks:
                             if hasattr(self.tokenizer, "encode"):
                                 toks = self.tokenizer.encode(c_text, add_special_tokens=False)
@@ -734,8 +753,10 @@ class RectifiedContiguousPretrainStreamer:
                                 toks = [ord(c) % 32000 for c in c_text]
                             buf.extend(toks)
                             if len(buf) >= cur_block_size * 2:
+                                truncated_doc = True
                                 break
-                        buf.append(self.eos_token_id)
+                        if not truncated_doc:
+                            buf.append(self.eos_token_id)
 
                     # Extract exactly cur_block_size tokens
                     chunk = buf[:cur_block_size]

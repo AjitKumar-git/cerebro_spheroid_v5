@@ -1271,15 +1271,17 @@ class PremotorMotorDecoderV5(nn.Module):
         )
 
         if self.use_shell_tap and K > 1:
+            norm_factor = math.sqrt(float(K))
             shell_weights = F.softmax(self.shell_score.float(), dim=0).to(dt)
-            shell_scale = self.shell_scale.to(dt)
+            shell_scale = self.shell_scale.to(dt) * norm_factor
             shell_proj_rest = self.shell_proj(state[:, 1:, :])
             shell_pool_rest = torch.sum(shell_weights[1:].view(1, -1, 1) * shell_proj_rest, dim=1) * shell_scale
             w0s = shell_weights[0] * shell_scale
         elif self.use_shell_tap:
+            norm_factor = math.sqrt(float(K))
             shell_weights = F.softmax(self.shell_score.float(), dim=0).to(dt)
             shell_pool_rest = torch.zeros_like(surface)
-            w0s = shell_weights[0] * self.shell_scale.to(dt)
+            w0s = shell_weights[0] * (self.shell_scale.to(dt) * norm_factor)
         else:
             shell_pool_rest = torch.zeros_like(surface)
             w0s = torch.zeros((), device=state.device, dtype=dt)
@@ -1433,9 +1435,10 @@ class PremotorMotorDecoderV5(nn.Module):
 
         # 3. Multi-Shell Softmax Pooling
         if self.use_shell_tap:
+            norm_factor = math.sqrt(float(state.shape[1]))
             shell_weights = F.softmax(self.shell_score.float(), dim=0).to(motor_surface.dtype).view(1, -1, 1)
             shell_proj = self.shell_proj(state)
-            shell_pool = torch.sum(shell_weights * shell_proj, dim=1) * self.shell_scale.to(motor_surface.dtype)  # [B, D]
+            shell_pool = torch.sum(shell_weights * shell_proj, dim=1) * (self.shell_scale.to(motor_surface.dtype) * norm_factor)  # [B, D]
         else:
             shell_pool = torch.zeros_like(surface)
 
@@ -2512,6 +2515,7 @@ class CerebroSpheroidV5(nn.Module):
         repetition_penalty: float = 1.15,
         device: Optional[torch.device] = None,
         phased: bool = True,
+        generator: Optional[torch.Generator] = None,
     ) -> Dict[str, str]:
         """
         Simultaneous Tri-Head Cognitive Emission:
@@ -2596,7 +2600,7 @@ class CerebroSpheroidV5(nn.Module):
                 v, _ = torch.topk(lg, min(top_k, lg.size(-1)))
                 lg[lg < v[-1]] = -float("Inf")
             probs = F.softmax(lg, dim=-1)
-            return int(torch.multinomial(probs, num_samples=1).item())
+            return int(torch.multinomial(probs, num_samples=1, generator=generator).item())
 
         for t in range(max_new_tokens):
             last_tok = None

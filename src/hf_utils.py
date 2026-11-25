@@ -100,7 +100,6 @@ def get_hf_token(explicit_token: Optional[str] = None) -> Optional[str]:
             return kaggle_tok
     except Exception:
         pass
-        pass
 
     # 5. Check dotenv files (.env in CWD, repo root, or ~/.env)
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))

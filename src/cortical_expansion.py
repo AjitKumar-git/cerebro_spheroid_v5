@@ -194,7 +194,6 @@ def generate_expanded_tract_wiring(
     m_count = max(1, num_shells - m_start)
 
     for i in range(remaining_tracts):
-        tract_id = n_legacy + i
         mode = i % 3
         if mode == 0:
             # Intra-mantle shortcuts (outer laminae interconnectivity)

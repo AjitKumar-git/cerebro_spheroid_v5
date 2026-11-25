@@ -263,6 +263,35 @@
       "num_devices": 1,
       "require_remat": true,
       "model_hash": "_cfg8daf9862"
+    },
+    "NVIDIA_GeForce_RTX_3050_Laptop_GPU_4GB_seq64_prompt256_dtypeauto_objbalanced": {
+      "preset": "v5_test",
+      "batch_size": 32,
+      "remat": false,
+      "seq_len": 64,
+      "prompt_len": 256,
+      "dtype": "auto",
+      "compile_time": 8.617651224136353,
+      "step_ms": 439.27574157714844,
+      "steps_per_sec": 2.2764744449799617,
+      "tok_per_sec": 4662.2196633189615,
+      "memory_gb": 0.07698162738233805,
+      "memory_utilization_pct": 2.0799257635755715,
+      "memory_type": "VRAM",
+      "vram_gb": 0.07698162738233805,
+      "vram_utilization_pct": 2.0799257635755715,
+      "initial_loss": 7.679967880249023,
+      "final_loss": 7.585610866546631,
+      "delta_loss": 0.09435701370239258,
+      "loss_reduction_per_sec": 0.21480133039812077,
+      "benchmark_steps": 2,
+      "tokens_per_step": 2048,
+      "status": "PASS",
+      "tune_objective": "balanced",
+      "max_batch_size": null,
+      "tuner_version": 2,
+      "num_devices": 1,
+      "require_remat": false
     }
   }
 }

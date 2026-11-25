@@ -308,6 +308,8 @@ def build_data_stream(
     prefetch_queue_size: int = 16,
     step_getter: Optional[Any] = None,
     total_steps: int = 1_500_000,
+    tokens_getter: Optional[Any] = None,
+    target_tokens: int = 15_700_000_000,
     prefetch: bool = True,
     dataset_config: Optional[str] = None,
     dataset_revision: Optional[str] = None,
@@ -335,13 +337,24 @@ def build_data_stream(
         stage_name = "midtrain" if is_mid else "pretrain"
         print(f"\n📦 Initializing 100% Loss-Bearing Rectified Contiguous Streamer [{dataset_source.upper()}]...")
         if is_mid:
-            print(f"   • Stage:          Mid-Training (Deep Reasoning & STEM)")
-            print(f"   • Mixture:        40% FineWeb-Edu (>=3.5) | 30% FineMath | 15% Cosmopedia v2 | 15% Code [ZERO SFT]")
+            print(f"   • Data Mixture (Static)     : 40% FineWeb-Edu (>=3.5) | 30% FineMath | 15% Cosmopedia v2 | 15% Code [ZERO SFT]")
         else:
-            print(f"   • Stage:          SmolLM2 4-stage developmental curriculum")
-            print(f"   • Mixture:        90/10 -> 75/20/5 -> 70/20/10 -> 58/24/14/4")
-        print(f"   • Context Window: {total_window} tokens (contiguous unbroken next-token loss)")
-        print(f"   • Global Batch:   {batch_size} sequences/step")
+            tgt_tok_val = float(target_tokens or 15_700_000_000)
+            cur_tok_val = float(tokens_getter()) if tokens_getter is not None else 0.0
+            cur_pct = min(100.0, max(0.0, (cur_tok_val / max(1.0, tgt_tok_val)) * 100.0))
+            if cur_pct < 55.0:
+                phase_str = "Phase 0 (0-55% tokens: 90% Web / 10% Code)"
+            elif cur_pct < 73.0:
+                phase_str = "Phase 1 (55-73% tokens: 75% Web / 20% Code / 5% Math)"
+            elif cur_pct < 91.0:
+                phase_str = "Phase 2 (73-91% tokens: 70% Web / 20% Code / 10% Math)"
+            else:
+                phase_str = "Phase 3 (91-100% tokens: 58% Web / 24% Code / 14% Math / 4% Cosmo)"
+            print(f"   • Data Mixture (Token-Based): SmolLM2 4-phase schedule ({tgt_tok_val/1e9:.2f}B token budget)")
+            print(f"     - Phases: 90/10 (0-55%) -> 75/20/5 (55-73%) -> 70/20/10 (73-91%) -> 58/24/14/4 (91-100%)")
+            print(f"     - Active: {phase_str} @ {cur_tok_val/1e9:.3f}B/{tgt_tok_val/1e9:.2f}B tokens ({cur_pct:.1f}%)")
+        print(f"   • Input Window (Step-Based) : {total_window} tokens (contiguous unbroken next-token loss)")
+        print(f"   • Global Batch              : {batch_size} sequences/step")
         streamer = RectifiedContiguousPretrainStreamer(
             tokenizer=tokenizer,
             batch_size=batch_size,
@@ -350,6 +363,8 @@ def build_data_stream(
             queue_size=max(16, int(prefetch_queue_size)),
             progress_getter=step_getter,
             total_steps=total_steps,
+            tokens_getter=tokens_getter,
+            target_tokens=int(target_tokens or 15_700_000_000),
         )
         return streamer, None
 
@@ -912,8 +927,8 @@ def main(args=None):
         active_stage_idx = min(len(context_stages) - 1, start_step // context_stage_steps)
         args.total_window = context_stages[active_stage_idx]
         print(
-            f"🌊 [Context Curriculum Active] Stages: {context_stages} tokens | {context_stage_steps:,} steps/stage\n"
-            f"   Initial Stage {active_stage_idx}: Total Window = {args.total_window} tokens"
+            f"🌊 [Window Expansion Schedule (Step-Based)] Windows: {context_stages} tokens | {context_stage_steps:,} steps/window\n"
+            f"   Initial Window Stage {active_stage_idx}: Input Window = {args.total_window} tokens"
         )
     else:
         context_stage_steps = max(1, args.total_steps)
@@ -1352,6 +1367,7 @@ def main(args=None):
 
     # 9. Multi-Stream Ingestion & Prefetched Data Stream
     current_step_holder = [start_step]
+    cumulative_tokens_holder = [resumed_cum_tokens if "resumed_cum_tokens" in locals() else 0]
     local_streamer = None
     elastic_batcher = None
     batcher = None
@@ -1371,6 +1387,8 @@ def main(args=None):
         prefetch_queue_size=max(16, eff_num_devices * eff_local_steps * 2),
         step_getter=lambda: current_step_holder[0],
         total_steps=args.total_steps,
+        tokens_getter=lambda: cumulative_tokens_holder[0],
+        target_tokens=int(getattr(args, "target_tokens", 15_700_000_000) or 15_700_000_000),
         prefetch=not use_multi_tpu_local_sgd,
         dataset_config=args.dataset_config,
         dataset_revision=args.dataset_revision,
@@ -1513,8 +1531,9 @@ def main(args=None):
                 if local_streamer is not None and hasattr(local_streamer, "shares") and local_streamer.shares:
                     weights_req = dict(local_streamer.shares)
                 else:
-                    cur_s = current_step_holder[0] if "current_step_holder" in locals() and current_step_holder else start_step
-                    progress = min(1.0, max(0.0, float(cur_s) / float(max(1, args.total_steps))))
+                    cur_tok = cumulative_tokens_holder[0] if "cumulative_tokens_holder" in locals() and cumulative_tokens_holder else 0
+                    tgt_tok = float(getattr(args, "target_tokens", 15_700_000_000) or 15_700_000_000)
+                    progress = min(1.0, max(0.0, float(cur_tok) / max(1.0, tgt_tok)))
                     if progress < 0.55:
                         weights_req = {"broad_web": 0.90, "code": 0.10}
                     elif progress < 0.73:
@@ -1524,7 +1543,7 @@ def main(args=None):
                     else:
                         weights_req = {"broad_web": 0.58, "code": 0.24, "math": 0.14, "cosmopedia": 0.04}
                 pct_str = ", ".join(f"{d} {w*100:.0f}%" for d, w in weights_req.items())
-                desc = f"Stage 1: Pretrain Developmental Curriculum ({pct_str})"
+                desc = f"Pretrain Token-Based Mixture ({pct_str})"
             domains_req = list(weights_req.keys())
             new_batches, new_domains, new_weights = build_pretrain_eval_split(
                 tokenizer=tokenizer,
@@ -1827,6 +1846,7 @@ def main(args=None):
 
     lifetime_tokens = initial_lifetime_tokens + cumulative_tokens
     resumed_cum_tokens = cumulative_tokens
+    cumulative_tokens_holder[0] = cumulative_tokens
 
     # Diagnostic Tracking for Optimizer Health & Stability
     cumulative_skips = 0
@@ -2000,7 +2020,7 @@ def main(args=None):
                         args.seq_len = active_window
                     new_buckets = get_default_elastic_buckets(active_window)
                     print(
-                        f"\n🔄 [Context Curriculum Transition] Step {step:,}: Advancing to Stage {active_stage_idx} ({active_window} tokens)!\n"
+                        f"\n🔄 [Window Expansion Transition (Step-Based)] Step {step:,}: Advancing to Window Stage {active_stage_idx} ({active_window} tokens)!\n"
                         f"   Active Buckets: {new_buckets}\n"
                     )
                     if local_streamer is not None and hasattr(local_streamer, "update_block_size"):
@@ -2258,6 +2278,7 @@ def main(args=None):
             step_window_tokens += step_tokens
             step_window_count += step_stride
             cumulative_tokens += step_tokens
+            cumulative_tokens_holder[0] = cumulative_tokens
             cumulative_prompt_tokens += step_prompt
             cumulative_loss_tokens += step_loss
             cumulative_padded_tokens += step_pad

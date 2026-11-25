@@ -274,7 +274,7 @@ class SpheroidOptimizer(Optimizer):
             H = torch.clamp(K - margin, min=0.0) * mask.float()
             denom = float(B * (B - 1))
             loss_val = 0.5 * (H ** 2).sum().item() / denom
-            grad_X = (4.0 / (float(D) * denom)) * (H @ X_S)
+            grad_X = (2.0 / (float(D) * denom)) * (H @ X_S)
 
         # Centering derivative
         if center_mode != "global":
