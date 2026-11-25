@@ -60,6 +60,8 @@ class ModelConfigV5:
     use_core_inquiry: bool = True              # Deliberation probe inquiry driven by Shell 0
     use_dual_evidence_grounding: bool = True   # Dual evidence grounding (Core S0 + Mantle S15)
     sensory_evidence_core_scale: float = 0.05  # Evidence injection step scale
+    use_core_halting: bool = True              # Centralize halting gate evaluation on Shell 0 (S0)
+    deliberation_oscillation_halt: bool = True # Detect limit cycle / oscillation in deliberation trajectory
     # Frontier 2026 Architectural Upgrades
     use_adaptive_thinking: bool = True     # Dynamic halting gate during subconscious deliberation
     max_thinking_cycles: int = 8           # Upper bound for adaptive deliberation
@@ -1940,6 +1942,7 @@ class CerebroSpheroidV5(nn.Module):
         delib_decay = getattr(self.config, "contractive_delib_decay", 0.75)
         init_scale = state.norm(p=2, dim=-1, keepdim=True) + 1e-8
 
+        prev_delta = None
         for cycle in range(cycles):
             state_prev = state.clone() if self.config.use_energy_regularization else None
             state = self._apply_deliberation_probe(state, sensory_kv, cycle)
@@ -1957,19 +1960,34 @@ class CerebroSpheroidV5(nn.Module):
                 energy_loss = energy_loss + torch.mean((next_state - state_prev) ** 2)
 
             if use_adapt:
-                halt_prob = torch.sigmoid(self.halting_gate(next_state.mean(dim=1)))
+                core_state = next_state[:, 0, :] if getattr(self.config, "use_core_halting", True) else next_state.mean(dim=1)
+                halt_prob = torch.sigmoid(self.halting_gate(core_state))
                 halt_loss = halt_loss + halt_prob.mean()
                 if not self.training and (halt_prob > self.config.thinking_halt_threshold).all():
                     state = next_state
                     break
 
             if not self.training and use_contract and cycle >= 1:
-                delta_core = (next_state[:, 0, :] - state[:, 0, :]).norm(p=2, dim=-1)
+                cur_delta = next_state[:, 0, :] - state[:, 0, :]
+                delta_core = cur_delta.norm(p=2, dim=-1)
                 scale_core = init_scale[:, 0, 0]
+                rel_innov = delta_core / scale_core
                 thresh = getattr(self.config, "deliberation_early_halt_thresh", 0.025)
-                if (delta_core / scale_core < thresh).all():
+                converged = (rel_innov < thresh)
+
+                if getattr(self.config, "deliberation_oscillation_halt", True) and not converged.all() and cycle >= 2 and prev_delta is not None:
+                    dot = (cur_delta * prev_delta).sum(dim=-1)
+                    denom = cur_delta.norm(p=2, dim=-1) * prev_delta.norm(p=2, dim=-1) + 1e-8
+                    cos_sim = dot / denom
+                    oscillating = (rel_innov < 2.5 * thresh) & (cos_sim < -0.3)
+                    converged = converged | oscillating
+
+                prev_delta = cur_delta
+                if converged.all():
                     state = next_state
                     break
+            elif not self.training and use_contract and cycle == 0:
+                prev_delta = next_state[:, 0, :] - state[:, 0, :]
 
             state = next_state
 
@@ -2303,6 +2321,7 @@ class CerebroSpheroidV5(nn.Module):
         delib_decay = getattr(self.config, "contractive_delib_decay", 0.75)
         init_scale = state.norm(p=2, dim=-1, keepdim=True) + 1e-8
 
+        prev_delta = None
         for cycle in range(cycles):
             state = self._apply_deliberation_probe(state, sensory_kv, cycle)
 
@@ -2316,18 +2335,33 @@ class CerebroSpheroidV5(nn.Module):
                 next_state = raw_next
 
             if use_adapt:
-                halt_prob = torch.sigmoid(self.halting_gate(next_state.mean(dim=1)))
+                core_state = next_state[:, 0, :] if getattr(self.config, "use_core_halting", True) else next_state.mean(dim=1)
+                halt_prob = torch.sigmoid(self.halting_gate(core_state))
                 if (halt_prob > self.config.thinking_halt_threshold).all():
                     state = next_state
                     break
 
             if use_contract and cycle >= 1:
-                delta_core = (next_state[:, 0, :] - state[:, 0, :]).norm(p=2, dim=-1)
+                cur_delta = next_state[:, 0, :] - state[:, 0, :]
+                delta_core = cur_delta.norm(p=2, dim=-1)
                 scale_core = init_scale[:, 0, 0]
+                rel_innov = delta_core / scale_core
                 thresh = getattr(self.config, "deliberation_early_halt_thresh", 0.025)
-                if (delta_core / scale_core < thresh).all():
+                converged = (rel_innov < thresh)
+
+                if getattr(self.config, "deliberation_oscillation_halt", True) and not converged.all() and cycle >= 2 and prev_delta is not None:
+                    dot = (cur_delta * prev_delta).sum(dim=-1)
+                    denom = cur_delta.norm(p=2, dim=-1) * prev_delta.norm(p=2, dim=-1) + 1e-8
+                    cos_sim = dot / denom
+                    oscillating = (rel_innov < 2.5 * thresh) & (cos_sim < -0.3)
+                    converged = converged | oscillating
+
+                prev_delta = cur_delta
+                if converged.all():
                     state = next_state
                     break
+            elif use_contract and cycle == 0:
+                prev_delta = next_state[:, 0, :] - state[:, 0, :]
 
             state = next_state
 
@@ -2996,8 +3030,8 @@ def infer_v5_config_from_state_dict(
         # geometry instead of silently disabling it.
         cfg_kwargs["use_rope"] = bool(meta.get("use_rope", False))
         cfg_kwargs["top_k_resonance"] = 0
-        cfg_kwargs["use_deliberation_probe"] = False
-        cfg_kwargs["use_adaptive_thinking"] = False
+        cfg_kwargs["use_deliberation_probe"] = bool("core.deliberation_probe.weight" in raw_state or "deliberation_probe.weight" in raw_state)
+        cfg_kwargs["use_adaptive_thinking"] = bool("core.halting_gate.weight" in raw_state or "halting_gate.weight" in raw_state)
         cfg_kwargs["use_sparse_mot"] = False
         cfg_kwargs["use_energy_regularization"] = False
     elif saved_cfg is None and raw_state:
@@ -3008,9 +3042,9 @@ def infer_v5_config_from_state_dict(
             cfg_kwargs["use_sensory_self_attn"] = False
         if "volumetric_core.tract_router.weight" not in raw_state:
             cfg_kwargs["use_sparse_mot"] = False
-        if "deliberation_probe.weight" not in raw_state:
+        if "deliberation_probe.weight" not in raw_state and "core.deliberation_probe.weight" not in raw_state:
             cfg_kwargs["use_deliberation_probe"] = False
-        if "halting_gate.weight" not in raw_state:
+        if "halting_gate.weight" not in raw_state and "core.halting_gate.weight" not in raw_state:
             cfg_kwargs["use_adaptive_thinking"] = False
 
     emb = raw_state.get("sensory_dnn.embedding.weight", raw_state.get("sensory.embedding.weight"))

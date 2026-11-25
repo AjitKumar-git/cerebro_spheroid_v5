@@ -1201,6 +1201,37 @@ def test_sensory_kv_2_core_inquiry_and_dual_grounding():
     assert torch.isfinite(model.evidence_core_gate.grad).all()
 
 
+def test_adaptive_deliberation_depth_and_multi_criteria_halting():
+    """Verifies Phase 4 centralized core halting gate training and multi-criteria early halting in generation."""
+    cfg = ModelConfigV5(**PRESETS_V5["v5_test"])
+    cfg.use_adaptive_thinking = True
+    cfg.use_core_halting = True
+    cfg.deliberation_oscillation_halt = True
+    cfg.max_thinking_cycles = 6
+    cfg.thinking_halt_threshold = 0.70
+    cfg.deliberation_early_halt_thresh = 0.05
+
+    model = CerebroSpheroidV5(cfg)
+    prompts = torch.randint(1, cfg.vocab_size, (2, 8))
+    targets = torch.randint(1, cfg.vocab_size, (2, 6))
+
+    # 1. Training with centralized core halting gate
+    model.train()
+    model.zero_grad(set_to_none=True)
+    loss, _ = model(prompts, targets=targets, pad_id=0)
+    assert torch.isfinite(loss)
+    loss.backward()
+
+    assert model.halting_gate.weight.grad is not None
+    assert torch.isfinite(model.halting_gate.weight.grad).all()
+
+    # 2. Evaluation with multi-criteria early halting
+    model.eval()
+    with torch.no_grad():
+        out = model.generate(prompts, max_new_tokens=4)
+        assert out.shape == (2, 4)
+
+
 
 
 

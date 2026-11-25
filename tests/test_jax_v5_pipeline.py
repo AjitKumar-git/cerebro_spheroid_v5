@@ -778,3 +778,29 @@ def test_jax_sensory_kv_2_dual_evidence_grounding():
     assert jnp.isfinite(final_state).all()
     assert final_state.shape == state.shape
 
+
+def test_jax_centralized_core_halting_gate_and_act():
+    """Verifies that JAX ACT ponder cost runs through centralized Core S_0 halting gate and yields finite gradients."""
+    from src.jax.v5_model import deliberate_cycles_jax, training_rollout
+    cfg = ModelConfigV5(**PRESETS_V5["v5_test"])
+    cfg.use_adaptive_thinking = True
+    cfg.use_core_halting = True
+    cfg.deliberation_oscillation_halt = True
+    cfg.max_thinking_cycles = 6
+
+    params, buffers = init_params_v5(jax.random.PRNGKey(103), cfg)
+    assert "core.halting_gate.weight" in params
+    assert "core.halting_gate.bias" in params
+
+    prompts = jnp.ones((2, 8), dtype=jnp.int32)
+    targets = jnp.ones((2, 6), dtype=jnp.int32)
+
+    def loss_fn(p):
+        return training_rollout(params=p, prompts=prompts, target_len=6, buffers=buffers, config=cfg, targets=targets)
+
+    loss, grads = jax.value_and_grad(loss_fn)(params)
+    assert jnp.isfinite(loss)
+    assert "core.halting_gate.weight" in grads
+    assert jnp.isfinite(grads["core.halting_gate.weight"]).all()
+
+

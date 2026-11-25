@@ -59,6 +59,8 @@ class ModelConfigV5:
     use_core_inquiry: bool = True
     use_dual_evidence_grounding: bool = True
     sensory_evidence_core_scale: float = 0.05
+    use_core_halting: bool = True
+    deliberation_oscillation_halt: bool = True
     use_adaptive_thinking: bool = True
     max_thinking_cycles: int = 8
     thinking_halt_threshold: float = 0.75
@@ -823,9 +825,12 @@ def deliberate_cycles_jax(
         else:
             next_state = raw_next
 
-        # Deliberation state pooling across cortical/subcortical laminae
-        state_mean = jnp.mean(next_state.astype(jnp.float32), axis=1)  # [B, D]
-        halt_logit = jnp.squeeze(jnp.matmul(state_mean, w_gate.T), axis=-1) + b_gate[0]
+        # Centralized Core S_0 halting gate
+        if getattr(config, "use_core_halting", True):
+            core_state = next_state[:, 0, :].astype(jnp.float32)
+        else:
+            core_state = jnp.mean(next_state.astype(jnp.float32), axis=1)  # [B, D]
+        halt_logit = jnp.squeeze(jnp.matmul(core_state, w_gate.T), axis=-1) + b_gate[0]
         halt_prob = jax.nn.sigmoid(halt_logit)  # [B]
 
         # Differentiable Graves ACT ponder cost
