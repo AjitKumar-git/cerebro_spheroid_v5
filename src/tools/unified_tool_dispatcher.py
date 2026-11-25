@@ -107,8 +107,6 @@ class UnifiedToolDispatcher:
         "HF_TOKEN",
         "HUGGINGFACE_HUB_TOKEN",
         "HUGGING_FACE_HUB_TOKEN",
-        "BIOFLO_SYNC_TOKEN",
-        "CEREBRO_SYNC_TOKEN",
     )
 
     def execute_python(self, code: str, timeout: int = 10) -> str:

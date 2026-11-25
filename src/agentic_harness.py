@@ -93,8 +93,6 @@ class SandboxedToolExecutor:
         "HF_TOKEN",
         "HUGGINGFACE_HUB_TOKEN",
         "HUGGING_FACE_HUB_TOKEN",
-        "BIOFLO_SYNC_TOKEN",
-        "CEREBRO_SYNC_TOKEN",
     )
 
     def __init__(self, workspace_root: Optional[str] = None):
