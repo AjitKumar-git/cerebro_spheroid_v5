@@ -700,13 +700,32 @@ print("PMAP_LOCAL_SGD_OK")
 
 def test_train_v5_tpu_jax_multi_tpu_local_sgd_cli_smoke(tmp_path):
     """End-to-end subprocess smoke test of train_v5_tpu_jax.py with 2 virtual XLA devices and local_sgd."""
+    import json
     import os
+    import shutil
     import subprocess
     import sys
 
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ckpt_dir = tmp_path / "ckpts"
     scratch_dir = tmp_path / "scratch"
+    local_data = tmp_path / "local_data"
+    local_data.mkdir()
+
+    # Reuse the tracked 32k LLaMA tokenizer and provide a lightweight valid JSONL corpus
+    # so strict vocab validation (32k) and non-synthetic local loading run quickly.
+    tok_src = os.path.join(repo_root, "data", "tokenizer")
+    tok_dst = local_data / "tokenizer"
+    try:
+        os.symlink(tok_src, tok_dst)
+    except OSError:
+        shutil.copytree(tok_src, tok_dst)
+    rows = [
+        json.dumps({"prompt": f"Compute sum 2 + {i}.", "response": f"The sum is {2 + i}."})
+        for i in range(16)
+    ]
+    (local_data / "smoke.jsonl").write_text("\n".join(rows) + "\n", encoding="utf-8")
+
     env = os.environ.copy()
     existing_xla = env.get("XLA_FLAGS", "").strip()
     multi_flag = "--xla_force_host_platform_device_count=2"
@@ -719,6 +738,10 @@ def test_train_v5_tpu_jax_multi_tpu_local_sgd_cli_smoke(tmp_path):
         "scripts/train_v5_tpu_jax.py",
         "--preset",
         "v5_test",
+        "--vocab-size",
+        "32000",
+        "--data-dir",
+        str(local_data),
         "--dataset_source",
         "local",
         "--optimizer",

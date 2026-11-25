@@ -177,6 +177,7 @@ def parse_args(args_list=None):
 
     # Model & Precision
     parser.add_argument("--preset", type=str, default="auto", choices=["auto", "v5_small", "v5_compact_32shells", "v5_compact", "v5_base", "v5_test", "tpu_v5e_1", "tpu_v6e_1", "tpu_v6e"], help="Model preset (default: auto -> auto-detects tpu_v6e_1 / tpu_v5e_1)")
+    parser.add_argument("--vocab-size", "--vocab_size", dest="vocab_size", type=int, default=None, help="Optional model vocabulary size override (default: preset vocab_size)")
     parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bf16", "fp16", "fp32"], help="Matrix execution precision ('auto' selects bf16 on TPU)")
     parser.add_argument("--remat", type=str, default="true", choices=["true", "false", "auto"], help="Activation remat scan to minimize HBM footprint (default: true)")
     parser.add_argument("--auto_tune", "--auto-tune", dest="auto_tune", action=argparse.BooleanOptionalAction, default=True, help="Micro-benchmark candidate batch sizes at startup to maximize steps/s, tok/s, and HBM/VRAM utilization (default: True)")
@@ -213,6 +214,7 @@ def parse_args(args_list=None):
     parser.add_argument("--hf-token", "--hf_token", dest="hf_token", type=str, default=None, help="Hugging Face API token for authenticated dataset streaming")
     parser.add_argument("--dataset_source", "--dataset-source", dest="dataset_source", type=str, default="pretrain",
                         help="Data stream: 'pretrain' (SmolLM2 4-stage mixture: FineWeb, Stack-Edu, FineMath, Cosmopedia), 'rectified', 'clean_pretrain', 'local', or a Hugging Face dataset repo")
+    parser.add_argument("--data-dir", "--data_dir", dest="data_dir", type=str, default=None, help="Optional local data directory override for '--dataset_source local'")
     parser.add_argument("--dataset-config", type=str, default=None, help="Optional Hugging Face dataset config (FineWeb defaults to sample-10BT)")
     parser.add_argument("--dataset-revision", type=str, default=None, help="Optional immutable Hugging Face commit/revision override")
     parser.add_argument("--retrieval-injection", action=argparse.BooleanOptionalAction, default=False, help="Mix curated retrieval examples into online streams (disabled by default for clean pretrain baseline)")
@@ -314,6 +316,7 @@ def build_data_stream(
     dataset_config: Optional[str] = None,
     dataset_revision: Optional[str] = None,
     retrieval_injection: bool = False,
+    data_dir: Optional[str] = None,
 ):
     """Initializes multi-corpus streaming engine with background prefetching and offline fallback."""
     # Check if HuggingFace datasets library is available for online streaming
@@ -369,12 +372,13 @@ def build_data_stream(
         return streamer, None
 
     if dataset_source in ("local", "offline"):
-        print(f"📦 Initializing background linguistic streaming queue (Local Corpus in data/)...")
+        print(f"📦 Initializing background linguistic streaming queue (Local Corpus in {data_dir or 'data/'})...")
         streamer = LinguisticDataStreamer(
             batch_size=batch_size,
             prompt_len=prompt_len,
             target_len=target_len,
             vocab_size=vocab_size,
+            data_dir=data_dir,
             queue_size=max(16, int(prefetch_queue_size)),
         )
         return streamer, None
@@ -559,6 +563,8 @@ def main(args=None):
         cfg_kwargs["thinking_cycles"] = args.thinking_cycles
     if getattr(args, "max_thinking_cycles", None) is not None:
         cfg_kwargs["max_thinking_cycles"] = args.max_thinking_cycles
+    if getattr(args, "vocab_size", None) is not None:
+        cfg_kwargs["vocab_size"] = int(args.vocab_size)
     config = JAXConfigV5(**cfg_kwargs)
     params, buffers = init_params_v5(jax.random.PRNGKey(42), config)
 
@@ -572,8 +578,11 @@ def main(args=None):
     print(f"Active Compute  : {active_compute:,} (~{active_compute/1e6:.1f}M) ({active_compute/total_params*100:.2f}%)")
     print(f"Optimizer       : {args.optimizer.upper()} ({'SCMER (Polar NS-5 + Spectral Clamp + Selective Cosine Margin)' if args.optimizer in ('spheroid', 'scmer') else 'Optax AdamW'})")
 
-    # 3. Tokenizer
+    # 3. Tokenizer (validate vocabulary compatibility upfront across all data paths)
+    from src.jax.data_streamer import validate_tokenizer_vocab
+
     tokenizer = build_tokenizer(args.tokenizer_name)
+    validate_tokenizer_vocab(tokenizer, config.vocab_size)
     pad_id = getattr(tokenizer, "pad_token_id", 0) or 0
 
     # 5. Checkpoint Manager & Resumption
@@ -1393,6 +1402,7 @@ def main(args=None):
         dataset_config=args.dataset_config,
         dataset_revision=args.dataset_revision,
         retrieval_injection=args.retrieval_injection,
+        data_dir=getattr(args, "data_dir", None),
     )
     batcher = elastic_batcher
 
@@ -1610,6 +1620,7 @@ def main(args=None):
                     prompt_len=args.prompt_len,
                     target_len=args.seq_len,
                     vocab_size=config.vocab_size,
+                    data_dir=getattr(args, "data_dir", None),
                     queue_size=4,
                     target_pad_id=pad_id if is_pretrain_source else -100,
                 )

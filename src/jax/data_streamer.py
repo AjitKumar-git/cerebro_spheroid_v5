@@ -46,6 +46,20 @@ except ImportError:
 from src.corpus import format_stimulus_prompt, format_motor_response
 
 
+def validate_tokenizer_vocab(tok: Any, vocab_size: int) -> None:
+    """Validates tokenizer vocabulary size and special token IDs against model vocab_size."""
+    if hasattr(tok, "__len__") and len(tok) > vocab_size:
+        raise ValueError(
+            f"Tokenizer vocabulary ({len(tok)}) exceeds model vocab_size ({vocab_size})."
+        )
+    for attr in ("pad_token_id", "bos_token_id", "eos_token_id", "unk_token_id"):
+        tid = getattr(tok, attr, None)
+        if tid is not None and not (0 <= int(tid) < vocab_size):
+            raise ValueError(
+                f"Tokenizer {attr}={tid} is out of bounds for model vocab_size={vocab_size}."
+            )
+
+
 class LinguisticDataStreamer:
     """Multi-source continuous text token streamer for pure JAX training."""
 
@@ -90,16 +104,7 @@ class LinguisticDataStreamer:
 
     def _validate_tokenizer_vocab(self, tok: Any) -> None:
         """Validates tokenizer vocabulary size and special token IDs against model vocab_size."""
-        if hasattr(tok, "__len__") and len(tok) > self.vocab_size:
-            raise ValueError(
-                f"Tokenizer vocabulary ({len(tok)}) exceeds model vocab_size ({self.vocab_size})."
-            )
-        for attr in ("pad_token_id", "bos_token_id", "eos_token_id", "unk_token_id"):
-            tid = getattr(tok, attr, None)
-            if tid is not None and not (0 <= int(tid) < self.vocab_size):
-                raise ValueError(
-                    f"Tokenizer {attr}={tid} is out of bounds for model vocab_size={self.vocab_size}."
-                )
+        validate_tokenizer_vocab(tok, self.vocab_size)
 
     def _init_tokenizer(self):
         """Loads 32,000-vocabulary LLaMA tokenizer matching pretrained embedding matrix."""

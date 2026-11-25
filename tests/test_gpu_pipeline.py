@@ -335,7 +335,8 @@ def test_kaggle_2xt4_kernel_artifacts_valid():
     assert 'env["HF_HOME"] = "/tmp/hf_cache"' in joined
 
 
-def test_graded_curriculum_diversity_and_tpu_parity():
+def test_graded_curriculum_diversity_and_tpu_parity(tmp_path):
+    import json
     from src.corpus import build_tokenizer
     from src.graded_curriculum import CurriculumScheduleConfig, GradedCurriculumStreamer
 
@@ -344,12 +345,21 @@ def test_graded_curriculum_diversity_and_tpu_parity():
     assert cfg.prompt_len == 256
     assert cfg.seq_len == 512
 
+    fixture_rows = [
+        json.dumps({
+            "question": f"Name the capital city of synthetic region {i} and explain its trade history.",
+            "answer": f"The capital city of synthetic region {i} is Port-{i}, known for maritime trade and astronomy." * 4,
+        })
+        for i in range(32)
+    ]
+    (tmp_path / "world_knowledge_fixture.jsonl").write_text("\n".join(fixture_rows) + "\n", encoding="utf-8")
+
     tok = build_tokenizer("llama")
     s0 = GradedCurriculumStreamer(
-        tok, cfg, seed=42, mix="foundation", search_dirs=["data"], offline=True, rank=0, world_size=2
+        tok, cfg, seed=42, mix="foundation", search_dirs=[str(tmp_path)], offline=True, rank=0, world_size=2
     )
     s1 = GradedCurriculumStreamer(
-        tok, cfg, seed=42, mix="foundation", search_dirs=["data"], offline=True, rank=1, world_size=2
+        tok, cfg, seed=42, mix="foundation", search_dirs=[str(tmp_path)], offline=True, rank=1, world_size=2
     )
     try:
         buckets = [("static", 32, 256)]
@@ -565,12 +575,12 @@ def test_kaggle_tpuv5e8_kernel_artifacts_valid():
         "--local_steps",
         "--tune_objective",
         "steps_per_sec",
-        "--max_batch_size",
+        "--effective-batch-size",
         "64",
         "--cloud-sync",
         "--max_hours",
         "8.5",
-        "scripts/train_v5_tpu_jax.py",
+        '"scripts", "train_v5_tpu_jax.py"',
     ):
         assert required in src, f"Missing expected token/flag in Kaggle TPU script: {required}"
 
@@ -864,6 +874,8 @@ def test_graded_curriculum_eval_tracking_and_checkpoint_eval_loss(tmp_path):
     ckpt_dir = str(tmp_path / "ckpts")
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     script_path = os.path.join(repo_root, "scripts", "train_v5_graded_curriculum.py")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     cmd = [
         sys.executable,
         script_path,
