@@ -50,9 +50,8 @@ def run_probe(checkpoint_path: str, preset: str = "v5_small"):
         cfg = infer_v5_config_from_state_dict(state, preset_name=preset)
 
     cfg.use_sensory_self_attn = True
-    if preset == "v5_small":
-        cfg.use_rope = False
-        cfg.top_k_resonance = 0
+    if "use_rope" not in ckpt and "motor.spectral_band_gains" in state:
+        cfg.use_rope = True
 
     # 1. Load into JAX
     print("⏳ Loading checkpoint into JAX engine with sensory self-attention...")
@@ -142,8 +141,10 @@ def run_probe(checkpoint_path: str, preset: str = "v5_small"):
                 prompt=prompt,
                 tokenizer=tokenizer,
                 max_new_tokens=64,
-                repetition_penalty=1.2,
+                temperature=0.0,
+                repetition_penalty=1.15,
                 strict_act=False,
+                raw_prompt=True,
             )
             print(f"\n[JAX Engine (Deterministic Rollout)]:\n{jax_out.strip()}")
         except Exception as e:
