@@ -74,3 +74,29 @@ def test_cli_flags_parse_for_selective_and_z_loss():
     assert abs(args.selective_focal_gamma - 0.75) < 1e-6
     assert abs(args.selective_noise_cap - 7.5) < 1e-6
     assert abs(args.z_loss_weight - 1e-4) < 1e-9
+
+
+def test_core_1d_valves_float32_and_boosted_lr():
+    from src.jax.spheroid_optimizer import VOCAB_KEYS, build_train_step_spheroid, init_spheroid_opt_state, is_manifold_operator
+
+    cfg = ModelConfigV5(
+        surface_dim=64, radial_dim=32, num_shells=4, num_shortcut_tracts=8,
+        vocab_size=128, num_heads=4, thinking_cycles=2,
+    )
+    params, buffers = init_params_v5(jax.random.PRNGKey(0), cfg)
+    params = {
+        k: (v.astype(jnp.bfloat16) if (is_manifold_operator(k, v) or k in VOCAB_KEYS) else v.astype(jnp.float32))
+        for k, v in params.items()
+    }
+    opt_state = init_spheroid_opt_state(params)
+    step_fn = build_train_step_spheroid(cfg, buffers, remat=False, scmer_lambda=0.0)
+    prompts = jnp.array([[1, 5, 9, 12], [2, 6, 10, 14]], dtype=jnp.int32)
+    targets = jnp.array([[5, 9, 12, 3], [6, 10, 14, 4]], dtype=jnp.int32)
+
+    new_params, _, loss_val = step_fn(params, opt_state, prompts, targets, 1e-3)
+    assert jnp.isfinite(loss_val)
+    assert new_params["core.intra_norms.weight"].dtype == jnp.float32
+    assert new_params["core.shell_gains"].dtype == jnp.float32
+    assert new_params["core.shortcut_gate"].dtype == jnp.float32
+    assert new_params["core.intra_swiglu.w_gate"].dtype == jnp.bfloat16
+

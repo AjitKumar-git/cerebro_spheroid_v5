@@ -697,7 +697,11 @@ def main(args=None):
     params, buffers = init_params_v5(jax.random.PRNGKey(42), config)
 
     # Convert parameter arrays to target precision
-    params = {k: v.astype(target_dtype) for k, v in params.items()}
+    from src.jax.spheroid_optimizer import is_manifold_operator, VOCAB_KEYS
+    params = {
+        k: (v.astype(target_dtype) if (is_manifold_operator(k, v) or k in VOCAB_KEYS) else v.astype(jnp.float32))
+        for k, v in params.items()
+    }
 
     total_params = sum(p.size for p in params.values())
     active_compute = sum(p.size for k, p in params.items() if "embedding" not in k)
@@ -1017,6 +1021,10 @@ def main(args=None):
                     restored, buffers = adapt_res
                 else:
                     restored = adapt_res
+                params = {
+                    k: (v.astype(target_dtype) if (is_manifold_operator(k, v) or k in VOCAB_KEYS) else v.astype(jnp.float32))
+                    for k, v in params.items()
+                }
                 ema_info = f" (EMA: {initial_ema_loss:.4f})" if initial_ema_loss is not None else ""
                 print(f"✓ Resumed from {os.path.basename(discovered_ckpt)} at Step {start_step:,} (Loss: {best_eval_loss:.4f}{ema_info})")
                 if restored == len(params):

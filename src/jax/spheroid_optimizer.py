@@ -433,7 +433,11 @@ def _apply_spheroid_grads(
                 m_hat = m_new / (1.0 - jnp.power(0.9, cur_step))
                 v_hat = v_new / (1.0 - jnp.power(0.95, cur_step))
                 step_dir = m_hat / (jnp.sqrt(v_hat) + 1e-6)
-                p_updated = p_f32 - lr_1d * step_dir
+                is_core_valve = k.startswith("core.") and any(
+                    t in k for t in ("shell_gains", "shortcut_gate", "laminar_", "_mix_scale", "halting_gate")
+                )
+                eff_lr_1d = base_lr if is_core_valve else lr_1d
+                p_updated = p_f32 - eff_lr_1d * step_dir
 
                 # Guard structural coupling scalars and shell gains from collapsing to zero
                 if "radial_mix_scale" in k:
