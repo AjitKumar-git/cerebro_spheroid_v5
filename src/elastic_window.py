@@ -260,7 +260,6 @@ def extract_prompt_response_pair(row: Any) -> Tuple[str, str]:
             return q_val, str(r_val or "")
         return str(q_val or ""), _normalize_3tier_response(str(r_val or ""), str(q_val or ""))
     return "", ""
-    return "", ""
 
 
 _DEFAULT_DATASET_REVISIONS: Dict[str, str] = {
@@ -1640,7 +1639,6 @@ class ElasticBucketBatcher:
                             if len(chunk) < bt:
                                 chunk = chunk + [self.target_pad_id] * (bt - len(chunk))
                             chunks.append((chunk_prompt, chunk, ctx_tok))
-                        chunks.append((chunk_prompt, chunk, ctx_tok))
                 else:
                     chunks = [(q_padded, r_ids + [self.target_pad_id] * (bt - len(r_ids)), None)]
 
@@ -2010,7 +2008,8 @@ def build_pretrain_eval_split(
     """
     Constructs a multi-domain canonical held-out evaluation split aligned 1:1 with
     the CerebroSpheroid V5 Pretraining distribution:
-      Stage 1 (Pretrain / Step 1)      : broad_web (FineWeb 85%), code (The Stack 15%)
+      Stage 1 (Pretrain / Step 1)      : broad_web (FineWeb 90%), code (The Stack 10%)
+      Developmental Curriculum         : 90/10 -> 75/20/5 -> 70/20/10 -> 58/24/14/4
       Stage 2 (Deep Reasoning)        : math (35%), cosmopedia (35%), code (20%), edu_academic (10%)
       Canonical All-Domain            : broad_web (40%), code (20%), math (15%), cosmopedia (15%), edu_academic (10%)
 
@@ -2123,9 +2122,12 @@ def build_pretrain_eval_split(
     if domains is None and domain_weights is None and stage is not None:
         stage_norm = str(stage).lower()
         if stage_norm in ("pretrain", "stage1", "stage_1", "step1"):
-            # Stage 1: FineWeb 85% + The Stack Code 15%
+            # Stage 1: FineWeb 90% + The Stack Code 10% (SmolLM2 developmental curriculum)
             domains = ["broad_web", "code"]
-            domain_weights = {"broad_web": 0.85, "code": 0.15}
+            domain_weights = {"broad_web": 0.90, "code": 0.10}
+        elif stage_norm in ("midtrain", "midtraining"):
+            domains = ["edu_academic", "math", "cosmopedia", "code"]
+            domain_weights = {"edu_academic": 0.40, "math": 0.30, "cosmopedia": 0.15, "code": 0.15}
         elif stage_norm in ("deep_reasoning", "reasoning", "stage2", "stage_2"):
             # Stage 2: 35% Math, 35% Cosmopedia v2, 20% Code, 10% Edu Academic
             domains = ["math", "cosmopedia", "code", "edu_academic"]
@@ -2267,11 +2269,15 @@ def build_pretrain_eval_split(
         q_arr = np.asarray(prompts_batch, dtype=np.int32)
         r_arr = np.asarray(targets_batch, dtype=np.int32)
 
-        # Strictly causal teacher-forcing feedback: shifted by 1 with initial BOS/pad
-        init_fb = bos_id if bos_id is not None else pad_id
+        # Strictly causal teacher-forcing feedback: shifted by 1 with initial position masked (-100)
+        # Position 0 has no prior target token and is attended via prompt_k (BOS at pos 0).
+        init_fb = -100
         fb_arr = np.full(r_arr.shape, init_fb, dtype=np.int32)
         if r_arr.shape[1] > 1:
             fb_arr[:, 1:] = r_arr[:, :-1]
+        eff_target_pad = target_pad_id if target_pad_id is not None else pad_id
+        if eff_target_pad < 0:
+            fb_arr = np.where(r_arr == eff_target_pad, eff_target_pad, fb_arr)
 
         eval_batches.append((q_arr, r_arr, fb_arr))
         domain_labels.append(name)

@@ -1496,14 +1496,36 @@ def main(args=None):
         try:
             from src.elastic_window import build_pretrain_eval_split
             eval_prompt_len = 1
-            if stage_name in ("deep_reasoning", "reasoning", "stage2", "stage_2"):
-                domains_req = ["math", "cosmopedia", "code", "edu_academic"]
+            is_mid = stage_name in ("midtrain", "midtraining") or getattr(args, "dataset_source", "") in ("midtrain", "midtraining")
+            is_reasoning = stage_name in ("deep_reasoning", "reasoning", "stage2", "stage_2")
+            if is_reasoning:
                 weights_req = {"math": 0.35, "cosmopedia": 0.35, "code": 0.20, "edu_academic": 0.10}
                 desc = "Stage 2: Deep Reasoning (Math 35%, Cosmopedia 35%, Code 20%, Edu 10%)"
+            elif is_mid:
+                weights_req = {"edu_academic": 0.40, "math": 0.30, "cosmopedia": 0.15, "code": 0.15}
+                desc = "Mid-Training (Edu 40%, Math 30%, Cosmopedia 15%, Code 15%)"
             else:
-                domains_req = ["broad_web", "code"]
-                weights_req = {"broad_web": 0.85, "code": 0.15}
-                desc = "Stage 1: Pretrain (FineWeb 85%, The Stack 15%)"
+                if local_streamer is not None and hasattr(local_streamer, "_refresh_curriculum_shares"):
+                    try:
+                        local_streamer._refresh_curriculum_shares()
+                    except Exception:
+                        pass
+                if local_streamer is not None and hasattr(local_streamer, "shares") and local_streamer.shares:
+                    weights_req = dict(local_streamer.shares)
+                else:
+                    cur_s = current_step_holder[0] if "current_step_holder" in locals() and current_step_holder else start_step
+                    progress = min(1.0, max(0.0, float(cur_s) / float(max(1, args.total_steps))))
+                    if progress < 0.55:
+                        weights_req = {"broad_web": 0.90, "code": 0.10}
+                    elif progress < 0.73:
+                        weights_req = {"broad_web": 0.75, "code": 0.20, "math": 0.05}
+                    elif progress < 0.91:
+                        weights_req = {"broad_web": 0.70, "code": 0.20, "math": 0.10}
+                    else:
+                        weights_req = {"broad_web": 0.58, "code": 0.24, "math": 0.14, "cosmopedia": 0.04}
+                pct_str = ", ".join(f"{d} {w*100:.0f}%" for d, w in weights_req.items())
+                desc = f"Stage 1: Pretrain Developmental Curriculum ({pct_str})"
+            domains_req = list(weights_req.keys())
             new_batches, new_domains, new_weights = build_pretrain_eval_split(
                 tokenizer=tokenizer,
                 batch_size=args.batch_size,
@@ -1865,7 +1887,7 @@ def main(args=None):
             local_streamer.transition_to_deep_reasoning()
         elif batcher is not None and hasattr(batcher, "transition_to_deep_reasoning"):
             batcher.transition_to_deep_reasoning()
-        generate_held_out_split("deep_reasoning", args.seq_len)
+        generate_held_out_split("deep_reasoning", args.total_window if is_pretrain_source else args.seq_len)
         if smart_mixture_controller is not None:
             reasoning_priors = {"math": 0.35, "cosmopedia": 0.35, "code": 0.20, "edu_academic": 0.10}
             smart_mixture_controller.prior_shares = dict(reasoning_priors)
@@ -2326,9 +2348,24 @@ def main(args=None):
             crossed_eval = bool(eval_batches) and ((step // max(1, args.eval_interval)) > (prev_step // max(1, args.eval_interval)))
             if crossed_eval:
                 expected_eval_len = args.total_window if is_pretrain_source else args.seq_len
-                if eval_batches and eval_batches[0][1].shape[1] != expected_eval_len:
+                cur_stage_name = "deep_reasoning" if in_deep_reasoning_phase else ("midtrain" if getattr(args, "dataset_source", "") in ("midtrain", "midtraining") else "pretrain")
+                curriculum_shifted = False
+                if is_pretrain_source:
+                    try:
+                        from src.smart_mixture import map_domain_label_to_tag
+                        cur_eval_map = {map_domain_label_to_tag(d): w for d, w in zip(eval_domains, eval_weights)} if (eval_domains and eval_weights and len(eval_domains) == len(eval_weights)) else {}
+                    except Exception:
+                        cur_eval_map = {}
+                    if local_streamer is not None and hasattr(local_streamer, "shares") and local_streamer.shares:
+                        target_shares = dict(local_streamer.shares)
+                        if set(cur_eval_map.keys()) != set(target_shares.keys()) or any(abs(cur_eval_map.get(k, 0.0) - float(target_shares[k])) > 0.01 for k in target_shares):
+                            curriculum_shifted = True
+                    elif in_deep_reasoning_phase and set(cur_eval_map.keys()) != {"math", "cosmopedia", "code", "edu_academic"}:
+                        curriculum_shifted = True
+
+                if (eval_batches and eval_batches[0][1].shape[1] != expected_eval_len) or curriculum_shifted:
                     if is_pretrain_source:
-                        generate_held_out_split("deep_reasoning" if in_deep_reasoning_phase else "pretrain", expected_eval_len)
+                        generate_held_out_split(cur_stage_name, expected_eval_len)
                     if eval_batches and eval_batches[0][1].shape[1] > expected_eval_len:
                         eval_batches = [
                             (b[0], b[1][:, :expected_eval_len], b[2][:, :expected_eval_len] if len(b) > 2 and b[2] is not None else None)
