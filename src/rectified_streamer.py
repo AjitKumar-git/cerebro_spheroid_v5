@@ -390,12 +390,24 @@ class RectifiedContiguousPretrainStreamer:
         domain_loss_weights: Optional[Dict[str, float]] = None,
         reasoning_weight: float = 1.0,
         filter_model_leaks: bool = True,
+        vocab_size: int = 32000,
     ):
         self.tokenizer = tokenizer
         self.batch_size = batch_size
         self.block_size = block_size
+        self.vocab_size = int(vocab_size)
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
+        if not (0 <= self.bos_token_id < self.vocab_size):
+            raise ValueError(f"bos_token_id={self.bos_token_id} out of range for vocab_size={self.vocab_size}")
+        if not (0 <= self.eos_token_id < self.vocab_size):
+            raise ValueError(f"eos_token_id={self.eos_token_id} out of range for vocab_size={self.vocab_size}")
+        if self.tokenizer is not None and hasattr(self.tokenizer, "__len__"):
+            tok_len = len(self.tokenizer)
+            if tok_len > self.vocab_size:
+                raise ValueError(
+                    f"Tokenizer vocabulary size ({tok_len}) exceeds configured model vocab_size ({self.vocab_size})."
+                )
         self.stage = stage.lower()
         self.min_edu_score = float(min_edu_score)
         self.domain_loss_weights = domain_loss_weights or {}
@@ -749,8 +761,13 @@ class RectifiedContiguousPretrainStreamer:
                         for c_text in text_chunks:
                             if hasattr(self.tokenizer, "encode"):
                                 toks = self.tokenizer.encode(c_text, add_special_tokens=False)
+                                for t in toks:
+                                    if t < 0 or t >= self.vocab_size:
+                                        raise ValueError(
+                                            f"Tokenizer emitted out-of-range token ID {t} for vocab_size={self.vocab_size}."
+                                        )
                             else:
-                                toks = [ord(c) % 32000 for c in c_text]
+                                toks = [ord(c) % self.vocab_size for c in c_text]
                             buf.extend(toks)
                             if len(buf) >= cur_block_size * 2:
                                 truncated_doc = True

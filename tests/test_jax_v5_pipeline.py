@@ -147,7 +147,33 @@ def test_causal_kv_no_leakage_and_monotonic_descent():
     targets_a = jnp.array([[10, 20, 30, 40]], dtype=jnp.int32)
     targets_b = jnp.array([[10, 20, 30, 99]], dtype=jnp.int32)  # Differs only at step 3
 
-    # Step 0 loss should be IDENTICAL regardless of future token at step 3 (zero leakage)
+    # Direct causal non-leakage check: identical prefix [0..2] with different future token at step 3
+    # must produce identical logits on steps 0, 1, 2 and identical masked loss when step 3 has weight 0.
+    from src.jax.v5_model import training_rollout
+    logits_a = training_rollout(
+        params, prompts, target_len=4, buffers=buffers, config=cfg,
+        feedback_tokens=targets_a, sampling_p=1.0, pure_teacher_forcing=True,
+    )
+    logits_b = training_rollout(
+        params, prompts, target_len=4, buffers=buffers, config=cfg,
+        feedback_tokens=targets_b, sampling_p=1.0, pure_teacher_forcing=True,
+    )
+    prefix_diff = float(jnp.max(jnp.abs(logits_a[:, :3, :] - logits_b[:, :3, :])))
+    assert prefix_diff < 1e-5, f"Future token at step 3 leaked into prefix logits! max_diff={prefix_diff}"
+    step3_diff = float(jnp.max(jnp.abs(logits_a[:, 3, :] - logits_b[:, 3, :])))
+    assert step3_diff > 1e-4, f"Step 3 logits did not respond to step 3 feedback! step3_diff={step3_diff}"
+
+    prefix_mask = jnp.array([[1.0, 1.0, 1.0, 0.0]], dtype=jnp.float32)
+    loss_a = float(training_rollout(
+        params, prompts, target_len=4, buffers=buffers, config=cfg,
+        targets=targets_a, target_weights=prefix_mask, sampling_p=1.0, pure_teacher_forcing=True,
+    ))
+    loss_b = float(training_rollout(
+        params, prompts, target_len=4, buffers=buffers, config=cfg,
+        targets=targets_b, target_weights=prefix_mask, sampling_p=1.0, pure_teacher_forcing=True,
+    ))
+    assert abs(loss_a - loss_b) < 1e-5, f"Masked prefix loss leaked future token! {loss_a} vs {loss_b}"
+
     opt_state = init_spheroid_opt_state(params)
     train_step = build_train_step_spheroid(cfg, buffers, remat=False)
 
@@ -838,5 +864,76 @@ def test_jax_laminar_transport_dynamics():
     assert jnp.isfinite(grads["core.laminar_in_gate"]).all()
     assert "core.laminar_out_gate" in grads
     assert jnp.isfinite(grads["core.laminar_out_gate"]).all()
+
+
+def test_spheroid_optimizer_skip_step_preserves_power_v_and_state():
+    """Verifies that rejected/non-finite optimizer updates leave step, params, m, v, and power_v untouched."""
+    from src.jax.spheroid_optimizer import init_spheroid_opt_state, _apply_spheroid_grads
+    cfg = ModelConfigV5(**PRESETS_V5["v5_test"])
+    params, _ = init_params_v5(jax.random.PRNGKey(201), cfg)
+    opt_state = init_spheroid_opt_state(params)
+
+    # Case 1: Non-finite gradients -> _skip_step()
+    nan_grads = {
+        k: (jnp.full_like(v, jnp.nan) if k == "core.radial_in_proj.weight" else jnp.zeros_like(v))
+        for k, v in params.items()
+    }
+    new_params, new_opt_state = _apply_spheroid_grads(
+        params, opt_state, nan_grads, base_lr=jnp.array(1e-3, dtype=jnp.float32), weight_decay=0.01
+    )
+    assert float(new_opt_state["diag"]["was_skipped"]) == 1.0
+    assert int(new_opt_state["step"]) == int(opt_state["step"])
+    for k in params:
+        assert jnp.array_equal(new_params[k], params[k])
+    for k in opt_state["power_v"]:
+        assert jnp.array_equal(new_opt_state["power_v"][k], opt_state["power_v"][k])
+
+    # Case 2: Finite gradients, non-finite parameter update (base_lr=nan) -> params_finite rollback
+    zero_grads = {k: jnp.zeros_like(v) for k, v in params.items()}
+    new_params2, new_opt_state2 = _apply_spheroid_grads(
+        params, opt_state, zero_grads, base_lr=jnp.array(jnp.nan, dtype=jnp.float32), weight_decay=0.01
+    )
+    assert float(new_opt_state2["diag"]["was_skipped"]) == 1.0
+    assert int(new_opt_state2["step"]) == int(opt_state["step"])
+    for k in params:
+        assert jnp.array_equal(new_params2[k], params[k])
+    for k in opt_state["power_v"]:
+        assert jnp.array_equal(new_opt_state2["power_v"][k], opt_state["power_v"][k])
+
+
+def test_data_streamer_vocab_and_error_strictness(tmp_path):
+    """Verifies LinguisticDataStreamer rejects out-of-range token IDs and fails loudly on malformed data."""
+    import pytest
+    from src.jax.data_streamer import LinguisticDataStreamer
+
+    bad_jsonl = tmp_path / "bad.jsonl"
+    bad_jsonl.write_text("{not valid json\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="Failed to load local JSONL"):
+        LinguisticDataStreamer(batch_size=1, prompt_len=8, target_len=8, vocab_size=32000, data_dir=str(tmp_path))
+
+    # Valid empty dir with strict fallback disabled must fail loudly
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    with pytest.raises(RuntimeError, match="No valid training pairs"):
+        LinguisticDataStreamer(batch_size=1, prompt_len=8, target_len=8, vocab_size=32000, data_dir=str(empty_dir))
+
+    # Out-of-range token ID must raise ValueError instead of clamping
+    class _OverflowTokenizer:
+        pad_token_id = 0
+        def __len__(self):
+            return 32000
+        def encode(self, text, add_special_tokens=False):
+            return [1, 32005]
+
+    streamer = LinguisticDataStreamer(
+        batch_size=1, prompt_len=8, target_len=8, vocab_size=32000,
+        data_dir="__nonexistent__", allow_synthetic_fallback=True,
+    )
+    try:
+        streamer.tokenizer = _OverflowTokenizer()
+        with pytest.raises(ValueError, match="out-of-range token ID"):
+            streamer._encode_text("hello")
+    finally:
+        streamer.stop()
 
 

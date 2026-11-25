@@ -467,6 +467,7 @@ def _apply_spheroid_grads(
         safe_params = jax.tree_util.tree_map(lambda np_, op: jnp.where(params_finite, np_, op), new_params, p)
         safe_m = jax.tree_util.tree_map(lambda nm, om: jnp.where(params_finite, nm, om), new_m, opt_s["m"])
         safe_v = jax.tree_util.tree_map(lambda nv, ov: jnp.where(params_finite, nv, ov), new_v, opt_s["v"])
+        safe_power_v = jax.tree_util.tree_map(lambda npv, opv: jnp.where(params_finite, npv, opv), new_power_v, opt_s["power_v"])
         safe_step = jnp.where(params_finite, cur_step, opt_s["step"])
 
         u_ratio_m = jnp.sqrt(sq_diff_m / (sq_norm_m + 1e-8))
@@ -492,7 +493,7 @@ def _apply_spheroid_grads(
             "step": safe_step,
             "m": safe_m,
             "v": safe_v,
-            "power_v": new_power_v,
+            "power_v": safe_power_v,
             "diag": step_diag,
         })
         if has_master:

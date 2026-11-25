@@ -58,6 +58,7 @@ class LinguisticDataStreamer:
         data_dir: Optional[str] = None,
         queue_size: int = 8,
         target_pad_id: int = -100,
+        allow_synthetic_fallback: Optional[bool] = None,
     ):
         self.batch_size = batch_size
         self.prompt_len = prompt_len
@@ -65,6 +66,9 @@ class LinguisticDataStreamer:
         self.total_seq_len = prompt_len + target_len
         self.vocab_size = vocab_size
         self.target_pad_id = target_pad_id
+        self.allow_synthetic_fallback = (
+            (data_dir == "__nonexistent__") if allow_synthetic_fallback is None else bool(allow_synthetic_fallback)
+        )
         self.queue: queue.Queue = queue.Queue(maxsize=queue_size)
         self.running = True
         self.fatal_error: Optional[Exception] = None
@@ -84,19 +88,33 @@ class LinguisticDataStreamer:
         self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self.worker_thread.start()
 
+    def _validate_tokenizer_vocab(self, tok: Any) -> None:
+        """Validates tokenizer vocabulary size and special token IDs against model vocab_size."""
+        if hasattr(tok, "__len__") and len(tok) > self.vocab_size:
+            raise ValueError(
+                f"Tokenizer vocabulary ({len(tok)}) exceeds model vocab_size ({self.vocab_size})."
+            )
+        for attr in ("pad_token_id", "bos_token_id", "eos_token_id", "unk_token_id"):
+            tid = getattr(tok, attr, None)
+            if tid is not None and not (0 <= int(tid) < self.vocab_size):
+                raise ValueError(
+                    f"Tokenizer {attr}={tid} is out of bounds for model vocab_size={self.vocab_size}."
+                )
+
     def _init_tokenizer(self):
         """Loads 32,000-vocabulary LLaMA tokenizer matching pretrained embedding matrix."""
+        if self.vocab_size < 256 and self.allow_synthetic_fallback:
+            return None
+
         # 1. First priority: Local bundled LLaMA 32k tokenizer in data/tokenizer
         local_tok_dir = os.path.join(self.data_dir, "tokenizer")
         if os.path.exists(local_tok_dir) and HAS_TRANSFORMERS:
-            try:
-                tok = AutoTokenizer.from_pretrained(local_tok_dir, local_files_only=True)
-                if tok.pad_token_id is None:
-                    tok.pad_token_id = 0
-                print(f"🔤 [DataStreamer] Loaded local LLaMA-32k tokenizer from {local_tok_dir} (vocab: {len(tok)})")
-                return tok
-            except Exception as e:
-                print(f"⚠️ [DataStreamer] Notice loading local tokenizer: {e}")
+            tok = AutoTokenizer.from_pretrained(local_tok_dir, local_files_only=True)
+            if tok.pad_token_id is None:
+                tok.pad_token_id = 0
+            self._validate_tokenizer_vocab(tok)
+            print(f"🔤 [DataStreamer] Loaded local LLaMA-32k tokenizer from {local_tok_dir} (vocab: {len(tok)})")
+            return tok
 
         # 2. Second priority: Remote LLaMA candidates (strictly 32k vocab, never 50k GPT-2)
         if HAS_TRANSFORMERS:
@@ -105,26 +123,36 @@ class LinguisticDataStreamer:
                     tok = AutoTokenizer.from_pretrained(cand, local_files_only=False)
                     if tok.pad_token_id is None:
                         tok.pad_token_id = 0
+                    self._validate_tokenizer_vocab(tok)
                     print(f"🔤 [DataStreamer] Loaded remote LLaMA-32k tokenizer: {cand} (vocab: {len(tok)})")
                     return tok
+                except ValueError:
+                    raise
                 except Exception:
                     continue
         return None
 
     def _encode_text(self, text: str) -> List[int]:
-        """Encodes text to vocabulary IDs within [0, vocab_size - 1]."""
+        """Encodes text to vocabulary IDs strictly within [0, vocab_size - 1]."""
         if self.tokenizer is not None:
-            try:
-                tokens = self.tokenizer.encode(text, add_special_tokens=False)
-                return [min(t, self.vocab_size - 1) for t in tokens]
-            except Exception:
-                pass
-        # Fallback to UTF-8 byte tokens with offset
+            tokens = self.tokenizer.encode(text, add_special_tokens=False)
+            for t in tokens:
+                if t < 0 or t >= self.vocab_size:
+                    raise ValueError(
+                        f"Tokenizer emitted out-of-range token ID {t} for vocab_size={self.vocab_size}. "
+                        "Refusing to silently clamp IDs."
+                    )
+            return list(tokens)
+        # Fallback to UTF-8 byte tokens with offset (only when no tokenizer is configured)
         return [(int(b) + 3) % self.vocab_size for b in text.encode("utf-8", errors="ignore")]
 
     def _load_local_data(self):
         """Discovers and caches local parquet / jsonl text files formatted with Strategy A bio-tokens."""
         if not os.path.exists(self.data_dir):
+            if not self.allow_synthetic_fallback:
+                raise FileNotFoundError(
+                    f"Data directory '{self.data_dir}' does not exist and synthetic fallback is disabled."
+                )
             return
 
         # 1. Parquet files
@@ -168,8 +196,8 @@ class LinguisticDataStreamer:
                                         r = format_motor_response(s_val)
                                         self.pairs_corpus.append((p, r))
                                 break
-                except Exception:
-                    pass
+                except Exception as e:
+                    raise RuntimeError(f"Failed to load local Parquet file '{pf}': {e}") from e
 
         # 2. JSONL files (e.g. diverse_sft_corpus_25k.jsonl, reasoning, science, math)
         jsonl_files = glob.glob(os.path.join(self.data_dir, "**", "*.jsonl"), recursive=True)
@@ -178,24 +206,21 @@ class LinguisticDataStreamer:
                 continue
             try:
                 with open(jf, "r", encoding="utf-8") as f:
-                    for line in f:
+                    for line_idx, line in enumerate(f, 1):
                         if not line.strip():
                             continue
-                        try:
-                            obj = json.loads(line)
-                            p_val = obj.get("prompt") or obj.get("question") or obj.get("input") or obj.get("stimulus")
-                            r_val = obj.get("response") or obj.get("answer") or obj.get("output") or obj.get("articulation")
-                            if p_val and r_val:
-                                p_str = str(p_val).strip()
-                                r_str = str(r_val).strip()
-                                if len(p_str) > 2 and len(r_str) > 1:
-                                    p = format_stimulus_prompt(p_str)
-                                    r = format_motor_response(r_str)
-                                    self.pairs_corpus.append((p, r))
-                        except Exception:
-                            continue
-            except Exception:
-                pass
+                        obj = json.loads(line)
+                        p_val = obj.get("prompt") or obj.get("question") or obj.get("input") or obj.get("stimulus")
+                        r_val = obj.get("response") or obj.get("answer") or obj.get("output") or obj.get("articulation")
+                        if p_val and r_val:
+                            p_str = str(p_val).strip()
+                            r_str = str(r_val).strip()
+                            if len(p_str) > 2 and len(r_str) > 1:
+                                p = format_stimulus_prompt(p_str)
+                                r = format_motor_response(r_str)
+                                self.pairs_corpus.append((p, r))
+            except Exception as e:
+                raise RuntimeError(f"Failed to load local JSONL file '{jf}': {e}") from e
 
         # 3. JSON files (e.g. cerebro_cognitive_8k/*.json)
         json_files = glob.glob(os.path.join(self.data_dir, "**", "*.json"), recursive=True)
@@ -217,12 +242,16 @@ class LinguisticDataStreamer:
                                 p = format_stimulus_prompt(p_str)
                                 r = format_motor_response(r_str)
                                 self.pairs_corpus.append((p, r))
-            except Exception:
-                pass
+            except Exception as e:
+                raise RuntimeError(f"Failed to load local JSON file '{jf}': {e}") from e
 
         if self.pairs_corpus:
             random.shuffle(self.pairs_corpus)
             print(f"📚 [DataStreamer] Loaded {len(self.pairs_corpus):,} local multi-domain Strategy A (<stim>/<act>) pairs for pretraining!")
+        elif not self.allow_synthetic_fallback:
+            raise RuntimeError(
+                f"No valid training pairs found in '{self.data_dir}' and synthetic fallback is disabled."
+            )
 
     def _generate_synthetic_prose(self) -> Tuple[str, str]:
         """Emergency fallback: diverse cognitive reasoning questions without procedural arithmetic or static world trivia traps."""
