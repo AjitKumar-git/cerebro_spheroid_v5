@@ -51,6 +51,9 @@ class ModelConfigV5:
     use_deliberation_probe: bool = True
     use_per_token_efference: bool = False
     use_centralized_readout: bool = True
+    use_contractive_deliberation: bool = True
+    contractive_delib_decay: float = 0.75
+    deliberation_early_halt_thresh: float = 0.025
     use_adaptive_thinking: bool = True
     max_thinking_cycles: int = 8
     thinking_halt_threshold: float = 0.75
@@ -76,18 +79,8 @@ class ModelConfigV5:
 # Register ModelConfigV5 as static PyTree node
 jax.tree_util.register_pytree_node(
     ModelConfigV5,
-    lambda c: ((), (
-        c.vocab_size, c.surface_dim, c.radial_dim, c.num_shells, c.num_shortcut_tracts,
-        c.num_heads, c.max_phase_steps, c.sensory_position_steps, c.thinking_cycles, c.phase_scale,
-        c.use_tied_embeddings, c.use_swiglu, c.use_shell_tap, c.use_plan, c.use_sensory_self_attn, c.num_sensory_layers, c.use_rope,
-        c.rope_theta, c.max_seq_len, c.top_k_resonance, c.use_deliberation_probe,
-        c.use_adaptive_thinking, c.max_thinking_cycles, c.thinking_halt_threshold,
-        c.num_mtp_heads, c.use_sparse_mot, c.top_k_tracts, c.use_energy_regularization,
-        c.enable_multimodal, c.visual_dim, c.audio_dim, c.num_visual_patches, c.image_patch_size,
-        c.tool_token_id, c.act_token_id, c.think_token_id, c.think_end_token_id,
-        c.tool_end_token_id, c.act_end_token_id, c.router_loss_weight, c.energy_reg_weight,
-    )),
-    lambda aux, _: ModelConfigV5(*aux),
+    lambda c: ((), asdict(c)),
+    lambda aux, _: ModelConfigV5(**aux),
 )
 
 
@@ -689,6 +682,9 @@ def deliberate_cycles_jax(
         (final_state, ponder_cost) or (final_state, ponder_cost, energy_loss)
     """
     B, K, D = state.shape
+    init_scale = jnp.sqrt(jnp.sum(jnp.square(state.astype(jnp.float32)), axis=-1, keepdims=True) + 1e-8).astype(state.dtype)
+    use_contract = bool(getattr(config, "use_contractive_deliberation", True)) if config is not None else False
+    delib_decay = float(getattr(config, "contractive_delib_decay", 0.75)) if config is not None else 0.75
     if config is None:
         use_adapt = False
         cycles = 4
@@ -727,8 +723,15 @@ def deliberate_cycles_jax(
         def step_fn(carry, step_idx):
             curr_state, cum_energy = carry
             probed_state = _apply_probe(curr_state, step_idx)
-            next_state = deliberate_step(params, probed_state, buffers, config=config)
-            step_energy = jnp.mean((next_state.astype(jnp.float32) - probed_state.astype(jnp.float32)) ** 2)
+            raw_next = deliberate_step(params, probed_state, buffers, config=config)
+            step_energy = jnp.mean((raw_next.astype(jnp.float32) - probed_state.astype(jnp.float32)) ** 2)
+            if use_contract:
+                alpha = (delib_decay ** step_idx).astype(curr_state.dtype)
+                updated = probed_state + alpha * (raw_next - probed_state)
+                norm_up = jnp.sqrt(jnp.sum(jnp.square(updated.astype(jnp.float32)), axis=-1, keepdims=True) + 1e-8).astype(curr_state.dtype)
+                next_state = (updated / norm_up) * init_scale
+            else:
+                next_state = raw_next
             return (next_state, cum_energy + step_energy), None
 
         (final_state, total_energy), _ = lax.scan(step_fn, (state, jnp.array(0.0, dtype=jnp.float32)), jnp.arange(cycles))
@@ -749,8 +752,15 @@ def deliberate_cycles_jax(
     def scan_body(carry, step_idx):
         curr_state, accum_state, cum_p, cum_ponder, cum_energy = carry
         probed_state = _apply_probe(curr_state, step_idx)
-        next_state = deliberate_step(params, probed_state, buffers, config=config)
-        step_energy = jnp.mean((next_state.astype(jnp.float32) - probed_state.astype(jnp.float32)) ** 2)
+        raw_next = deliberate_step(params, probed_state, buffers, config=config)
+        step_energy = jnp.mean((raw_next.astype(jnp.float32) - probed_state.astype(jnp.float32)) ** 2)
+        if use_contract:
+            alpha = (delib_decay ** step_idx).astype(curr_state.dtype)
+            updated = probed_state + alpha * (raw_next - probed_state)
+            norm_up = jnp.sqrt(jnp.sum(jnp.square(updated.astype(jnp.float32)), axis=-1, keepdims=True) + 1e-8).astype(curr_state.dtype)
+            next_state = (updated / norm_up) * init_scale
+        else:
+            next_state = raw_next
 
         # Deliberation state pooling across cortical/subcortical laminae
         state_mean = jnp.mean(next_state.astype(jnp.float32), axis=1)  # [B, D]
@@ -777,6 +787,9 @@ def deliberate_cycles_jax(
 
     norm_factor = jnp.maximum(final_cum_p[:, None, None], 1e-6)
     final_state = (final_accum / norm_factor).astype(state.dtype)
+    if use_contract:
+        norm_final = jnp.sqrt(jnp.sum(jnp.square(final_state.astype(jnp.float32)), axis=-1, keepdims=True) + 1e-8).astype(state.dtype)
+        final_state = (final_state / norm_final) * init_scale
     ponder_cost = jnp.mean(cum_ponder)
 
     if return_energy:

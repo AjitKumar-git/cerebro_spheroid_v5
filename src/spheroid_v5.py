@@ -52,6 +52,9 @@ class ModelConfigV5:
     use_deliberation_probe: bool = True  # Subconscious core probe of sensory KV buffer
     use_per_token_efference: bool = False # Flag for per-token motor efference feedback into core (Default: False)
     use_centralized_readout: bool = True  # Enforce centralized core readout (Bottleneck S0 query & prediction)
+    use_contractive_deliberation: bool = True  # Enforce contractive state estimation (scale-conserving norm & step damping)
+    contractive_delib_decay: float = 0.75      # Exponential decay rate for deliberation step size (alpha_c = gamma^c)
+    deliberation_early_halt_thresh: float = 0.025 # Early halt threshold on Shell 0 relative innovation (c >= 1)
     # Frontier 2026 Architectural Upgrades
     use_adaptive_thinking: bool = True     # Dynamic halting gate during subconscious deliberation
     max_thinking_cycles: int = 8           # Upper bound for adaptive deliberation
@@ -1820,11 +1823,14 @@ class CerebroSpheroidV5(nn.Module):
         radial_profile = (torch.arange(1, self.config.num_shells + 1, device=dev, dtype=torch.float32) / float(self.config.num_shells)).view(1, -1, 1)
         state = (prompt_centroid.unsqueeze(1).repeat(1, self.config.num_shells, 1).float() * radial_profile).to(prompt_centroid.dtype)
 
-        # 3. Subconscious Deliberation Cycles with Memory Probing & Adaptive Halting
+        # 3. Subconscious Deliberation Cycles with Memory Probing, Contractive State Estimation & Adaptive Halting
         use_adapt = self.config.use_adaptive_thinking and self.halting_gate is not None
         cycles = self.config.max_thinking_cycles if use_adapt else self.config.thinking_cycles
         energy_loss = torch.tensor(0.0, device=dev)
         halt_loss = torch.tensor(0.0, device=dev)
+        use_contract = getattr(self.config, "use_contractive_deliberation", True)
+        delib_decay = getattr(self.config, "contractive_delib_decay", 0.75)
+        init_scale = state.norm(p=2, dim=-1, keepdim=True) + 1e-8
 
         for cycle in range(cycles):
             state_prev = state.clone() if self.config.use_energy_regularization else None
@@ -1846,16 +1852,34 @@ class CerebroSpheroidV5(nn.Module):
                 state_mantle = state[:, -1:, :] + 0.1 * self.deliberation_probe_norm(retrieved).unsqueeze(1)
                 state = torch.cat([state[:, :-1, :], state_mantle], dim=1)
 
-            state = self.volumetric_core.deliberate_step(state)
+            raw_next = self.volumetric_core.deliberate_step(state)
+            if use_contract:
+                alpha = float(delib_decay ** cycle)
+                updated = state + alpha * (raw_next - state)
+                norm_up = updated.norm(p=2, dim=-1, keepdim=True) + 1e-8
+                next_state = (updated / norm_up) * init_scale
+            else:
+                next_state = raw_next
 
             if state_prev is not None:
-                energy_loss = energy_loss + torch.mean((state - state_prev) ** 2)
+                energy_loss = energy_loss + torch.mean((next_state - state_prev) ** 2)
 
             if use_adapt:
-                halt_prob = torch.sigmoid(self.halting_gate(state.mean(dim=1)))
+                halt_prob = torch.sigmoid(self.halting_gate(next_state.mean(dim=1)))
                 halt_loss = halt_loss + halt_prob.mean()
                 if not self.training and (halt_prob > self.config.thinking_halt_threshold).all():
+                    state = next_state
                     break
+
+            if not self.training and use_contract and cycle >= 1:
+                delta_core = (next_state[:, 0, :] - state[:, 0, :]).norm(p=2, dim=-1)
+                scale_core = init_scale[:, 0, 0]
+                thresh = getattr(self.config, "deliberation_early_halt_thresh", 0.025)
+                if (delta_core / scale_core < thresh).all():
+                    state = next_state
+                    break
+
+            state = next_state
 
         # Pre-embed aligned previous-token feedback (prev_tokens[:, t] feeds step t predicting targets[:, t])
         prev_tokens = None
@@ -2183,6 +2207,10 @@ class CerebroSpheroidV5(nn.Module):
         radial_profile = (torch.arange(1, self.config.num_shells + 1, device=dev, dtype=torch.float32) / float(self.config.num_shells)).view(1, -1, 1)
         state = (prompt_centroid.unsqueeze(1).repeat(1, self.config.num_shells, 1).float() * radial_profile).to(prompt_centroid.dtype)
 
+        use_contract = getattr(self.config, "use_contractive_deliberation", True)
+        delib_decay = getattr(self.config, "contractive_delib_decay", 0.75)
+        init_scale = state.norm(p=2, dim=-1, keepdim=True) + 1e-8
+
         for cycle in range(cycles):
             if sensory_kv is not None and self.deliberation_probe is not None:
                 keys, values = sensory_kv
@@ -2202,12 +2230,30 @@ class CerebroSpheroidV5(nn.Module):
                 state_mantle = state[:, -1:, :] + 0.1 * self.deliberation_probe_norm(retrieved).unsqueeze(1)
                 state = torch.cat([state[:, :-1, :], state_mantle], dim=1)
 
-            state = self.volumetric_core.deliberate_step(state)
+            raw_next = self.volumetric_core.deliberate_step(state)
+            if use_contract:
+                alpha = float(delib_decay ** cycle)
+                updated = state + alpha * (raw_next - state)
+                norm_up = updated.norm(p=2, dim=-1, keepdim=True) + 1e-8
+                next_state = (updated / norm_up) * init_scale
+            else:
+                next_state = raw_next
 
             if use_adapt:
-                halt_prob = torch.sigmoid(self.halting_gate(state.mean(dim=1)))
+                halt_prob = torch.sigmoid(self.halting_gate(next_state.mean(dim=1)))
                 if (halt_prob > self.config.thinking_halt_threshold).all():
+                    state = next_state
                     break
+
+            if use_contract and cycle >= 1:
+                delta_core = (next_state[:, 0, :] - state[:, 0, :]).norm(p=2, dim=-1)
+                scale_core = init_scale[:, 0, 0]
+                thresh = getattr(self.config, "deliberation_early_halt_thresh", 0.025)
+                if (delta_core / scale_core < thresh).all():
+                    state = next_state
+                    break
+
+            state = next_state
 
         # 3. Motor generation loop
         plan = self.motor_decoder.init_plan(B, dev, persona_id=persona_id) if self.config.use_plan else None
@@ -2588,8 +2634,18 @@ class CerebroSpheroidV5(nn.Module):
         state = (prompt_centroid.unsqueeze(1).repeat(1, self.config.num_shells, 1).float() * radial_profile).to(prompt_centroid.dtype)
 
         cycles = self.config.thinking_cycles
-        for _ in range(cycles):
-            state = self.volumetric_core.deliberate_step(state)
+        use_contract = getattr(self.config, "use_contractive_deliberation", True)
+        delib_decay = getattr(self.config, "contractive_delib_decay", 0.75)
+        init_scale = state.norm(p=2, dim=-1, keepdim=True) + 1e-8
+        for cycle in range(cycles):
+            raw_next = self.volumetric_core.deliberate_step(state)
+            if use_contract:
+                alpha = float(delib_decay ** cycle)
+                updated = state + alpha * (raw_next - state)
+                norm_up = updated.norm(p=2, dim=-1, keepdim=True) + 1e-8
+                state = (updated / norm_up) * init_scale
+            else:
+                state = raw_next
 
         plan = self.motor_decoder.init_plan(B, dev) if self.config.use_plan else None
         refractory = torch.zeros(B, self.config.vocab_size, device=dev, dtype=state.dtype)

@@ -95,6 +95,20 @@ def test_spheroid_optimizer_train_step():
     assert not jnp.array_equal(new_params["core.intra_swiglu.w_gate"], params_bf16["core.intra_swiglu.w_gate"])
 
 
+def test_jax_contractive_deliberation_scale_conservation():
+    """Verifies that deliberate_cycles_jax preserves shell scale norms under contractive deliberation."""
+    from src.jax.v5_model import deliberate_cycles_jax
+    cfg = ModelConfigV5(**PRESETS_V5["v5_test"])
+    assert cfg.use_contractive_deliberation is True
+    params, buffers = init_params_v5(jax.random.PRNGKey(77), cfg)
+    state = jax.random.normal(jax.random.PRNGKey(88), (2, cfg.num_shells, cfg.surface_dim))
+    init_scales = jnp.sqrt(jnp.sum(jnp.square(state.astype(jnp.float32)), axis=-1))
+
+    final_state, _ = deliberate_cycles_jax(params, state, buffers, config=cfg)
+    final_scales = jnp.sqrt(jnp.sum(jnp.square(final_state.astype(jnp.float32)), axis=-1))
+    assert jnp.allclose(init_scales, final_scales, atol=1e-3)
+
+
 def test_checkpoint_adapter_2d_to_3d_fusion():
     cfg = ModelConfigV5(**PRESETS_V5["v5_test"])
     key = jax.random.PRNGKey(42)

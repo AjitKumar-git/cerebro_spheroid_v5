@@ -836,6 +836,25 @@ def test_centralized_readout_bottleneck_and_backward():
     assert torch.isfinite(model.motor_decoder.q_proj.weight.grad).all()
 
 
+def test_contractive_deliberation_scale_conservation_and_backward():
+    """Verifies contractive deliberation operator maintains scale conservation and trains cleanly."""
+    cfg = ModelConfigV5(**PRESETS_V5["v5_test"])
+    assert cfg.use_contractive_deliberation is True
+    cfg.thinking_cycles = 4
+    model = CerebroSpheroidV5(cfg)
+
+    prompts = torch.randint(1, cfg.vocab_size, (2, 8))
+    targets = torch.randint(1, cfg.vocab_size, (2, 6))
+
+    model.zero_grad(set_to_none=True)
+    loss, _ = model(prompts, targets=targets, pad_id=0)
+    assert torch.isfinite(loss)
+    loss.backward()
+
+    assert model.volumetric_core.radial_in_proj.weight.grad is not None
+    assert torch.isfinite(model.volumetric_core.radial_in_proj.weight.grad).all()
+
+
 def test_graded_curriculum_eval_tracking_and_checkpoint_eval_loss(tmp_path):
     """Verifies periodic held-out evaluation tracking, EMA logging, and eval_loss persistence."""
     import math
