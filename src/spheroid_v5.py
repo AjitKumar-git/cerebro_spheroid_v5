@@ -57,6 +57,9 @@ class ModelConfigV5:
     deliberation_early_halt_thresh: float = 0.025 # Early halt threshold on Shell 0 relative innovation (c >= 1)
     use_spectral_core_readout: bool = True     # Orthonormal DCT multi-band spectral decomposition on Shell 0
     spectral_band_splits: Optional[Tuple[int, int, int]] = None # Optional custom Low/Mid/High band splits (defaults to D/4, D/2, D/4)
+    use_core_inquiry: bool = True              # Deliberation probe inquiry driven by Shell 0
+    use_dual_evidence_grounding: bool = True   # Dual evidence grounding (Core S0 + Mantle S15)
+    sensory_evidence_core_scale: float = 0.05  # Evidence injection step scale
     # Frontier 2026 Architectural Upgrades
     use_adaptive_thinking: bool = True     # Dynamic halting gate during subconscious deliberation
     max_thinking_cycles: int = 8           # Upper bound for adaptive deliberation
@@ -1638,9 +1641,11 @@ class CerebroSpheroidV5(nn.Module):
         if self.config.use_deliberation_probe:
             self.deliberation_probe = nn.Linear(self.config.surface_dim, self.config.surface_dim, bias=False)
             self.deliberation_probe_norm = RMSNorm(self.config.surface_dim)
+            self.evidence_core_gate = nn.Parameter(torch.zeros(1, dtype=torch.float32))
         else:
             self.deliberation_probe = None
             self.deliberation_probe_norm = None
+            self.evidence_core_gate = None
 
         # 5. Multi-Token Prediction (MTP) Drafting Heads
         if self.config.num_mtp_heads > 1:
@@ -1737,6 +1742,54 @@ class CerebroSpheroidV5(nn.Module):
         denom = torch.sum(weights, dim=1, keepdim=True).clamp_min(1.0)
         pooled = torch.sum(flux.float() * weights.unsqueeze(-1), dim=1) / denom
         return pooled.to(flux.dtype)
+
+    def _apply_deliberation_probe(
+        self,
+        state: torch.Tensor,
+        sensory_kv: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        cycle: int,
+    ) -> torch.Tensor:
+        """Applies core-driven or mantle subconscious sensory inquiry and dual evidence grounding."""
+        if sensory_kv is None or self.deliberation_probe is None:
+            return state
+
+        keys, values = sensory_kv
+        B, K, D = state.shape
+        L_kv = keys.shape[2]
+
+        if getattr(self.config, "use_core_inquiry", True):
+            query_vec = state[:, 0, :]
+        else:
+            query_vec = state.mean(dim=1)
+
+        probe_q = self.deliberation_probe(query_vec).view(B, self.config.num_heads, 1, self.sensory_dnn.head_dim)
+        if self.motor_decoder.use_rope:
+            q_rot = apply_rope(probe_q, self.motor_decoder.rope_cos, self.motor_decoder.rope_sin, offset=cycle)
+            k_rot = apply_rope(keys, self.motor_decoder.rope_cos, self.motor_decoder.rope_sin, offset=0)
+        else:
+            q_rot, k_rot = probe_q, keys
+
+        scores = torch.matmul(q_rot.to(keys.dtype), k_rot.transpose(-1, -2)) / math.sqrt(self.sensory_dnn.head_dim)
+        if self.config.top_k_resonance > 0 and L_kv > self.config.top_k_resonance:
+            topk_v, _ = torch.topk(scores, self.config.top_k_resonance, dim=-1)
+            scores = torch.where(scores < topk_v[..., -1, None], torch.full_like(scores, -1e4), scores)
+
+        attn_p = F.softmax(scores.float(), dim=-1).to(scores.dtype)
+        retrieved = torch.matmul(attn_p, values).transpose(1, 2).contiguous().view(B, D)
+        ret_normed = self.deliberation_probe_norm(retrieved)
+
+        if getattr(self.config, "use_dual_evidence_grounding", True) and hasattr(self, "evidence_core_gate") and self.evidence_core_gate is not None:
+            beta_core = torch.tanh(self.evidence_core_gate).to(state.dtype)
+            scale = getattr(self.config, "sensory_evidence_core_scale", 0.05)
+            state_core = state[:, :1, :] + beta_core * scale * ret_normed.unsqueeze(1)
+            state_mantle = state[:, -1:, :] + scale * ret_normed.unsqueeze(1)
+            if K > 2:
+                return torch.cat([state_core, state[:, 1:-1, :], state_mantle], dim=1)
+            else:
+                return torch.cat([state_core, state_mantle], dim=1)
+        else:
+            state_mantle = state[:, -1:, :] + 0.1 * ret_normed.unsqueeze(1)
+            return torch.cat([state[:, :-1, :], state_mantle], dim=1)
 
     def forward(
         self,
@@ -1889,23 +1942,7 @@ class CerebroSpheroidV5(nn.Module):
 
         for cycle in range(cycles):
             state_prev = state.clone() if self.config.use_energy_regularization else None
-            if sensory_kv is not None and self.deliberation_probe is not None:
-                keys, values = sensory_kv
-                L_kv = keys.shape[2]
-                probe_q = self.deliberation_probe(state.mean(dim=1)).view(B, self.config.num_heads, 1, self.sensory_dnn.head_dim)
-                if self.motor_decoder.use_rope:
-                    q_rot = apply_rope(probe_q, self.motor_decoder.rope_cos, self.motor_decoder.rope_sin, offset=cycle)
-                    k_rot = apply_rope(keys, self.motor_decoder.rope_cos, self.motor_decoder.rope_sin, offset=0)
-                else:
-                    q_rot, k_rot = probe_q, keys
-                scores = torch.matmul(q_rot.to(keys.dtype), k_rot.transpose(-1, -2)) / math.sqrt(self.sensory_dnn.head_dim)
-                if self.config.top_k_resonance > 0 and L_kv > self.config.top_k_resonance:
-                    topk_v, _ = torch.topk(scores, self.config.top_k_resonance, dim=-1)
-                    scores = torch.where(scores < topk_v[..., -1, None], torch.full_like(scores, -1e4), scores)
-                attn_p = F.softmax(scores.float(), dim=-1).to(scores.dtype)
-                retrieved = torch.matmul(attn_p, values).transpose(1, 2).contiguous().view(B, self.config.surface_dim)
-                state_mantle = state[:, -1:, :] + 0.1 * self.deliberation_probe_norm(retrieved).unsqueeze(1)
-                state = torch.cat([state[:, :-1, :], state_mantle], dim=1)
+            state = self._apply_deliberation_probe(state, sensory_kv, cycle)
 
             raw_next = self.volumetric_core.deliberate_step(state)
             if use_contract:
@@ -2267,23 +2304,7 @@ class CerebroSpheroidV5(nn.Module):
         init_scale = state.norm(p=2, dim=-1, keepdim=True) + 1e-8
 
         for cycle in range(cycles):
-            if sensory_kv is not None and self.deliberation_probe is not None:
-                keys, values = sensory_kv
-                L_kv = keys.shape[2]
-                probe_q = self.deliberation_probe(state.mean(dim=1)).view(B, self.config.num_heads, 1, self.sensory_dnn.head_dim)
-                if self.motor_decoder.use_rope:
-                    q_rot = apply_rope(probe_q, self.motor_decoder.rope_cos, self.motor_decoder.rope_sin, offset=cycle)
-                    k_rot = apply_rope(keys, self.motor_decoder.rope_cos, self.motor_decoder.rope_sin, offset=0)
-                else:
-                    q_rot, k_rot = probe_q, keys
-                scores = torch.matmul(q_rot.to(keys.dtype), k_rot.transpose(-1, -2)) / math.sqrt(self.sensory_dnn.head_dim)
-                if self.config.top_k_resonance > 0 and L_kv > self.config.top_k_resonance:
-                    topk_v, _ = torch.topk(scores, self.config.top_k_resonance, dim=-1)
-                    scores = torch.where(scores < topk_v[..., -1, None], torch.full_like(scores, -1e4), scores)
-                attn_p = F.softmax(scores.float(), dim=-1).to(scores.dtype)
-                retrieved = torch.matmul(attn_p, values).transpose(1, 2).contiguous().view(B, self.config.surface_dim)
-                state_mantle = state[:, -1:, :] + 0.1 * self.deliberation_probe_norm(retrieved).unsqueeze(1)
-                state = torch.cat([state[:, :-1, :], state_mantle], dim=1)
+            state = self._apply_deliberation_probe(state, sensory_kv, cycle)
 
             raw_next = self.volumetric_core.deliberate_step(state)
             if use_contract:
@@ -3070,7 +3091,11 @@ def _adapt_jax_state_to_torch(raw_state: Dict[str, Any], target_sd: Dict[str, to
         if k.startswith("sensory."):
             dst_k = "sensory_dnn." + k[len("sensory.") :]
         elif k.startswith("core."):
-            dst_k = "volumetric_core." + k[len("core.") :]
+            sub = k[len("core.") :]
+            if sub in ("deliberation_probe.weight", "deliberation_probe_norm.weight", "evidence_core_gate", "halting_gate.weight", "halting_gate.bias"):
+                dst_k = sub
+            else:
+                dst_k = "volumetric_core." + sub
         elif k.startswith("motor."):
             sub = k[len("motor.") :]
             if sub.startswith("swiglu.") and f"motor_decoder.motor_{sub}" in target_sd:

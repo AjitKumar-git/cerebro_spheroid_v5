@@ -56,6 +56,9 @@ class ModelConfigV5:
     deliberation_early_halt_thresh: float = 0.025
     use_spectral_core_readout: bool = True
     spectral_band_splits: Optional[Tuple[int, int, int]] = None
+    use_core_inquiry: bool = True
+    use_dual_evidence_grounding: bool = True
+    sensory_evidence_core_scale: float = 0.05
     use_adaptive_thinking: bool = True
     max_thinking_cycles: int = 8
     thinking_halt_threshold: float = 0.75
@@ -415,6 +418,7 @@ def init_params_v5(key: jax.random.PRNGKey, config: ModelConfigV5) -> Tuple[Dict
         probe_key = jax.random.fold_in(key, 999)
         params["core.deliberation_probe.weight"] = jax.random.normal(probe_key, (s_dim, s_dim)) * (1.0 / math.sqrt(s_dim))
         params["core.deliberation_probe_norm.weight"] = jnp.ones(s_dim, dtype=jnp.float32)
+        params["core.evidence_core_gate"] = jnp.zeros(1, dtype=jnp.float32)
 
     # 4. Multimodal Perceptual Projections (Images, Audio, Continuous Sensors)
     if getattr(config, "enable_multimodal", False):
@@ -742,8 +746,11 @@ def deliberate_cycles_jax(
             L_kv = keys.shape[2]
             num_h = keys.shape[1]
             h_dim = keys.shape[3]
-            mean_state = jnp.mean(curr_s, axis=1)
-            probe_q = jnp.matmul(mean_state, params["core.deliberation_probe.weight"].T).reshape(B, 1, num_h, h_dim)
+            if getattr(config, "use_core_inquiry", True):
+                query_vec = curr_s[:, 0, :]
+            else:
+                query_vec = jnp.mean(curr_s, axis=1)
+            probe_q = jnp.matmul(query_vec, params["core.deliberation_probe.weight"].T).reshape(B, 1, num_h, h_dim)
             probe_q = jnp.swapaxes(probe_q, 1, 2)
             if getattr(config, "use_rope", True):
                 probe_q = apply_rope(probe_q, step_idx, theta=config.rope_theta)
@@ -759,8 +766,18 @@ def deliberate_cycles_jax(
             retrieved = jnp.matmul(attn_p, values)
             retrieved = jnp.swapaxes(retrieved, 1, 2).reshape(B, D)
             retrieved_normed = rms_norm(retrieved, params["core.deliberation_probe_norm.weight"])
-            state_mantle = curr_s[:, -1:, :] + 0.1 * retrieved_normed[:, None, :]
-            return jnp.concatenate([curr_s[:, :-1, :], state_mantle], axis=1)
+            if getattr(config, "use_dual_evidence_grounding", True) and "core.evidence_core_gate" in params:
+                beta_core = jnp.tanh(params.get("core.evidence_core_gate", jnp.zeros(1, dtype=jnp.float32))).astype(curr_s.dtype)
+                scale = float(getattr(config, "sensory_evidence_core_scale", 0.05))
+                state_core = curr_s[:, :1, :] + beta_core * scale * retrieved_normed[:, None, :]
+                state_mantle = curr_s[:, -1:, :] + scale * retrieved_normed[:, None, :]
+                if K > 2:
+                    return jnp.concatenate([state_core, curr_s[:, 1:-1, :], state_mantle], axis=1)
+                else:
+                    return jnp.concatenate([state_core, state_mantle], axis=1)
+            else:
+                state_mantle = curr_s[:, -1:, :] + 0.1 * retrieved_normed[:, None, :]
+                return jnp.concatenate([curr_s[:, :-1, :], state_mantle], axis=1)
         return curr_s
 
     if not use_adapt:

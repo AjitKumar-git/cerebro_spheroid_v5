@@ -756,3 +756,25 @@ def test_jax_spectral_core_readout_orthonormality_and_forward():
     loss = training_rollout(params=params, prompts=prompts, target_len=6, buffers=buffers, config=cfg, targets=targets)
     assert jnp.isfinite(loss)
 
+
+def test_jax_sensory_kv_2_dual_evidence_grounding():
+    """Verifies that JAX Sensory KV 2.0 applies core inquiry and dual evidence grounding under ACT/scan."""
+    from src.jax.v5_model import deliberate_cycles_jax, encode_sensory
+    cfg = ModelConfigV5(**PRESETS_V5["v5_test"])
+    cfg.use_deliberation_probe = True
+    cfg.use_core_inquiry = True
+    cfg.use_dual_evidence_grounding = True
+
+    params, buffers = init_params_v5(jax.random.PRNGKey(101), cfg)
+    assert "core.evidence_core_gate" in params
+    assert "core.deliberation_probe.weight" in params
+
+    prompts = jnp.ones((2, 8), dtype=jnp.int32)
+    w_emb = params["sensory.embedding.weight"]
+    sensory_flux, sensory_kv = encode_sensory(params, w_emb[prompts], config=cfg)
+
+    state = jax.random.normal(jax.random.PRNGKey(102), (2, cfg.num_shells, cfg.surface_dim))
+    final_state, _ = deliberate_cycles_jax(params, state, buffers, config=cfg, sensory_kv=sensory_kv)
+    assert jnp.isfinite(final_state).all()
+    assert final_state.shape == state.shape
+

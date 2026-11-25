@@ -1176,6 +1176,31 @@ def test_spectral_core_readout_orthonormality_and_backward():
         assert out.shape == (2, 4)
 
 
+def test_sensory_kv_2_core_inquiry_and_dual_grounding():
+    """Verifies that Sensory KV 2.0 core-driven inquiry and dual evidence grounding train cleanly."""
+    cfg = ModelConfigV5(**PRESETS_V5["v5_test"])
+    cfg.use_deliberation_probe = True
+    cfg.use_core_inquiry = True
+    cfg.use_dual_evidence_grounding = True
+    model = CerebroSpheroidV5(cfg)
+
+    assert model.deliberation_probe is not None
+    assert model.evidence_core_gate is not None
+
+    prompts = torch.randint(1, cfg.vocab_size, (2, 8))
+    targets = torch.randint(1, cfg.vocab_size, (2, 6))
+
+    model.zero_grad(set_to_none=True)
+    loss, _ = model(prompts, targets=targets, pad_id=0)
+    assert torch.isfinite(loss)
+    loss.backward()
+
+    assert model.deliberation_probe.weight.grad is not None
+    assert torch.isfinite(model.deliberation_probe.weight.grad).all()
+    assert model.evidence_core_gate.grad is not None
+    assert torch.isfinite(model.evidence_core_gate.grad).all()
+
+
 
 
 
