@@ -1021,3 +1021,117 @@ def test_training_rollout_vs_generate_tri_stream_tensor_parity():
     assert step0_diff < 1e-4, f"Step-0 logits diverged between training_rollout and tri-stream answer head! diff={step0_diff}"
 
 
+def test_pure_tf_vs_recurrent_tf_and_generation_all_efference_modes():
+    """Verifies Pure TF == Recurrent TF across (eff x cent) in JAX & PyTorch, plus generation parity under eff+cent."""
+    import torch
+    from src.spheroid_v5 import CerebroSpheroidV5, ModelConfigV5 as TorchCfg
+
+    prompts = jnp.array([[2, 6, 10, 14]], dtype=jnp.int32)
+    targets = jnp.array([[8, 12, 16, 20, 24]], dtype=jnp.int32)
+
+    for eff in (False, True):
+        for cent in (False, True):
+            cfg = ModelConfigV5(**PRESETS_V5["v5_test"])
+            cfg.use_adaptive_thinking = False
+            cfg.use_per_token_efference = eff
+            cfg.use_centralized_readout = cent
+            cfg.use_energy_regularization = False
+            cfg.router_loss_weight = 0.0
+            params, buffers = init_params_v5(jax.random.PRNGKey(5), cfg)
+
+            l_pure, g_pure = jax.jit(jax.value_and_grad(
+                lambda p: training_rollout(
+                    p, prompts, target_len=5, buffers=buffers, config=cfg,
+                    targets=targets, sampling_p=1.0, pure_teacher_forcing=True,
+                )
+            ))(params)
+            l_rec, g_rec = jax.jit(jax.value_and_grad(
+                lambda p: training_rollout(
+                    p, prompts, target_len=5, buffers=buffers, config=cfg,
+                    targets=targets, sampling_p=1.0, pure_teacher_forcing=False,
+                )
+            ))(params)
+            loss_diff = abs(float(l_pure - l_rec))
+            assert loss_diff < 1e-4, f"JAX Pure-TF vs Recurrent-TF loss mismatch for eff={eff}, cent={cent}: {loss_diff}"
+            max_g_diff = max(float(jnp.max(jnp.abs(g_pure[k] - g_rec[k]))) for k in params)
+            assert max_g_diff < 1e-3, f"JAX Pure-TF vs Recurrent-TF grad mismatch for eff={eff}, cent={cent}: {max_g_diff}"
+
+            # Verify PyTorch fast vs sequential parity as well
+            t_cfg = TorchCfg(**PRESETS_V5["v5_test"])
+            t_cfg.use_adaptive_thinking = False
+            t_cfg.use_per_token_efference = eff
+            t_cfg.use_centralized_readout = cent
+            t_cfg.use_energy_regularization = False
+            t_cfg.router_loss_weight = 0.0
+            torch.manual_seed(5)
+            t_model = CerebroSpheroidV5(t_cfg).eval()
+            tp = torch.tensor([[2, 6, 10, 14]], dtype=torch.long)
+            tt = torch.tensor([[8, 12, 16, 20, 24]], dtype=torch.long)
+            with torch.no_grad():
+                t_model.force_sequential = False
+                _, pt_fast_logits = t_model(tp, targets=tt, sampling_p=1.0, deliberation_mode="teacher_forcing")
+                t_model.force_sequential = True
+                _, pt_seq_logits = t_model(tp, targets=tt, sampling_p=1.0, deliberation_mode="teacher_forcing")
+            pt_logit_diff = float((pt_fast_logits - pt_seq_logits).abs().max())
+            assert pt_logit_diff < 1e-4, f"PyTorch fast vs sequential mismatch for eff={eff}, cent={cent}: {pt_logit_diff}"
+
+    # Verify token-by-token generation parity even with eff=True & cent=True
+    cfg_ec = ModelConfigV5(**PRESETS_V5["v5_test"])
+    cfg_ec.use_adaptive_thinking = False
+    cfg_ec.use_per_token_efference = True
+    cfg_ec.use_centralized_readout = True
+    params_ec, buffers_ec = init_params_v5(jax.random.PRNGKey(19), cfg_ec)
+    gen_logits, gen_toks = training_rollout(
+        params_ec, prompts, target_len=5, buffers=buffers_ec, config=cfg_ec,
+        targets=None, repetition_penalty=1.0, temperature=0.0, return_tokens=True,
+    )
+    shifted_fb = jnp.concatenate([jnp.full((1, 1), -100, dtype=jnp.int32), gen_toks[:, :-1]], axis=1)
+    tf_logits = training_rollout(
+        params_ec, prompts, target_len=5, buffers=buffers_ec, config=cfg_ec,
+        feedback_tokens=shifted_fb, feedback_is_shifted=True,
+        sampling_p=1.0, repetition_penalty=1.0, pure_teacher_forcing=True,
+    )
+    assert float(jnp.max(jnp.abs(gen_logits - tf_logits))) < 1e-4
+
+
+def test_anchor_loss_weighting_mixed_batch_analytical_parity():
+    """Verifies mixed-batch anchor weighting policy (1.0 pre-anchor, w_a post-anchor & no-anchor fallback)."""
+    cfg = ModelConfigV5(**PRESETS_V5["v5_test"])
+    cfg.use_adaptive_thinking = False
+    cfg.use_energy_regularization = False
+    cfg.router_loss_weight = 0.0
+    cfg.num_mtp_heads = 1
+    params, buffers = init_params_v5(jax.random.PRNGKey(71), cfg)
+
+    prompts = jnp.array([[2, 4, 6, 8], [3, 5, 7, 9]], dtype=jnp.int32)
+    # Row 0 has anchor_token_id=50 at index 1 -> weights [1.0, 3.5, 3.5, 0.0]
+    # Row 1 has no anchor -> fallback weight w_a=3.5 across valid tokens -> weights [3.5, 3.5, 3.5, 0.0]
+    targets = jnp.array([[10, 50, 14, -100], [11, 13, 15, -100]], dtype=jnp.int32)
+    expected_weights = jnp.array([[1.0, 3.5, 3.5, 0.0], [3.5, 3.5, 3.5, 0.0]], dtype=jnp.float32)
+
+    eval_w = jax.jit(lambda tw: training_rollout(
+        params, prompts, target_len=4, buffers=buffers, config=cfg,
+        targets=targets, target_weights=tw, sampling_p=1.0, pure_teacher_forcing=True,
+    ))
+    weighted_sum = 0.0
+    for b in range(2):
+        for t in range(3):
+            oh = jnp.zeros((2, 4), dtype=jnp.float32).at[b, t].set(1.0)
+            weighted_sum += float(expected_weights[b, t]) * float(eval_w(oh))
+    analytical_loss = weighted_sum / float(jnp.sum(expected_weights))
+
+    for pure_tf in (True, False):
+        actual_loss = float(training_rollout(
+            params, prompts, target_len=4, buffers=buffers, config=cfg,
+            targets=targets, anchor_token_id=50, anchor_weight=3.5, use_anchor_loss=True,
+            sampling_p=1.0, pure_teacher_forcing=pure_tf,
+        ))
+        assert abs(actual_loss - analytical_loss) < 1e-5, f"Anchor loss mismatch (pure_tf={pure_tf}): {actual_loss} vs {analytical_loss}"
+        explicit_w_loss = float(training_rollout(
+            params, prompts, target_len=4, buffers=buffers, config=cfg,
+            targets=targets, target_weights=expected_weights,
+            sampling_p=1.0, pure_teacher_forcing=pure_tf,
+        ))
+        assert abs(actual_loss - explicit_w_loss) < 1e-5
+
+

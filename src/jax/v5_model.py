@@ -1485,9 +1485,16 @@ def training_rollout(
 
     # Use activation checkpointing (remat) for training to reduce HBM activation memory
     use_remat = remat and (targets is not None)
+    use_per_tok_eff_cfg = bool(getattr(config, "use_per_token_efference", False)) if config is not None else False
+    use_cent_readout_cfg = bool(getattr(config, "use_centralized_readout", True)) if config is not None else False
+    # Vectorized Pure-TF precomputes cross-resonance queries before the token scan, which is
+    # valid only when the query source shell (S_{-1}/S_{15} if non-centralized, S_0 if centralized)
+    # is invariant across steps. When num_shells == 1 or (efference and centralized readout),
+    # S_0 mutates per token so cross-resonance depends serially on prior motor states -> use _emit.
     is_pure_tf = (
         (targets is not None)
         and (num_shells >= 2)
+        and (not (use_per_tok_eff_cfg and use_cent_readout_cfg))
         and (
             pure_teacher_forcing is True
             or (
@@ -1515,7 +1522,7 @@ def training_rollout(
             params.get("motor.phase_scale", jnp.array(2.0, dtype=jnp.float32)), 0.05, 5.0
         ).astype(jnp.float32)
         p_scaled_all = (phases * (p_scale_val / p_norms)).astype(target_dtype)  # [T, D]
-        use_cent_readout = getattr(config, "use_centralized_readout", True)
+        use_cent_readout = use_cent_readout_cfg
         eff_core = transform_spectral_core_jax(init_core, params, config) if use_cent_readout else init_core
         if use_cent_readout:
             core_t = eff_core[:, None, :] + p_scaled_all[None, :, :]
@@ -1532,7 +1539,7 @@ def training_rollout(
         def _parallel_cross_resonance(ms_all):
             q_all = jnp.matmul(ms_all, params["motor.q_proj.weight"].T).reshape(B, T, num_heads, head_dim)
             q_all = jnp.swapaxes(q_all, 1, 2)  # [B, H, T, head_dim]
-            if config.use_rope:
+            if config is not None and config.use_rope:
                 q_all = apply_rope(q_all, total_prompt_L + jnp.arange(T, dtype=jnp.int32), theta=config.rope_theta)
                 keys_att = apply_rope(causal_keys, jnp.arange(total_len, dtype=jnp.int32), theta=config.rope_theta)
                 keys_att_t = jnp.swapaxes(keys_att, -1, -2)

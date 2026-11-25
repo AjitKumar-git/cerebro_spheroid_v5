@@ -1355,8 +1355,8 @@ class PremotorMotorDecoderV5(nn.Module):
             motor_surface = torch.zeros_like(query_input)
             cur_core = eff_core
         else:
-            motor_surface = surface.unsqueeze(1) + p_scaled.unsqueeze(0) + target_feedback.to(dt)
-            query_input = motor_surface
+            motor_surface = surface.unsqueeze(1) + p_scaled.unsqueeze(0)
+            query_input = motor_surface + target_feedback.to(dt)
 
         resonance = self._parallel_cross_resonance(
             motor_surface=query_input,
@@ -2058,9 +2058,12 @@ class CerebroSpheroidV5(nn.Module):
         plan = self.motor_decoder.init_plan(B, dev, persona_id=persona_id) if self.config.use_plan else None
         tied_w = self.sensory_dnn.embedding.weight
 
+        use_per_tok_eff = bool(getattr(self.config, "use_per_token_efference", False))
         use_fast_tf = (
             targets is not None
             and not getattr(self, "force_sequential", False)
+            and self.config.num_shells >= 2
+            and not use_per_tok_eff
             and tf_flux is not None
             and (sampling_p >= 1.0 - 1e-6)
             and deliberation_mode in ("teacher_forcing", "scheduled")
