@@ -97,6 +97,7 @@ def run_probe(checkpoint_path: str, preset: str = "v5_small"):
                 device=device,
                 strict_act=False,
                 execute_tools=True,
+                raw_prompt=True,
             )
         print(f"\n[PyTorch Output (T=0.1, Tool-Enabled)]:\n{pt_greedy.strip()}")
 
@@ -129,6 +130,7 @@ def run_probe(checkpoint_path: str, preset: str = "v5_small"):
                 repetition_penalty=1.2,
                 device=device,
                 strict_act=False,
+                raw_prompt=True,
             )
         print(f"\n[PyTorch Sampling (T=0.7)]:\n{pt_sample.strip()}")
 

@@ -539,6 +539,7 @@ def adapt_jax_to_torch_state_dict(
         ("perceptual.swiglu.fc_down.weight", "perceptual_projector.2.fc_down.weight"),
         ("perceptual.norm_out.weight", "perceptual_projector.3.weight"),
         ("sensory.", "sensory_dnn."),
+        ("core.halting_gate.", "halting_gate."),
         ("core.", "volumetric_core."),
         ("motor.", "motor_decoder."),
     ]

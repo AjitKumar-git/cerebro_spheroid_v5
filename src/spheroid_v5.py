@@ -82,6 +82,7 @@ class ModelConfigV5:
     selective_focal_gamma: float = 0.5     # Mild focal exponent (1 - p_t)^gamma on mastered tokens
     selective_noise_cap: float = 8.5       # Soft CE cap attenuating unlearnable web-noise spikes
     z_loss_weight: float = 0.0             # Logit Z-loss regularizer (z_loss_weight * logsumexp^2)
+    use_bidirectional_tracts: bool = False # Canonical Option A wiring (False) vs bidirectional Option B (True)
 
 
 PRESETS_V5: Dict[str, Dict[str, Any]] = {
@@ -583,6 +584,7 @@ class VolumetricSpheroidCoreV5(nn.Module):
         use_sparse_mot: bool = True,
         top_k_tracts: int = 24,
         use_laminar_transport: bool = True,
+        use_bidirectional_tracts: bool = False,
     ):
         super().__init__()
         self.num_shells = num_shells
@@ -631,7 +633,7 @@ class VolumetricSpheroidCoreV5(nn.Module):
             self.laminar_out_gate = None
 
         # Hierarchical axonal shortcut tracts (small-world wiring)
-        src_idx, dst_idx = self._generate_small_world_tracts(num_shells, num_shortcut_tracts)
+        src_idx, dst_idx = self._generate_small_world_tracts(num_shells, num_shortcut_tracts, bidirectional=use_bidirectional_tracts)
         self.register_buffer("src_indices", src_idx, persistent=False)
         self.register_buffer("dst_indices", dst_idx, persistent=False)
         self.shortcut_weight = nn.Parameter(torch.randn(num_shortcut_tracts, surface_dim, surface_dim) * (0.05 / math.sqrt(surface_dim)))
@@ -642,9 +644,29 @@ class VolumetricSpheroidCoreV5(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     @staticmethod
-    def _generate_small_world_tracts(num_shells: int, num_tracts: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Constructs bidirectional small-world hierarchical axonal wiring between distant concentric shells."""
+    def _generate_small_world_tracts(num_shells: int, num_tracts: int, bidirectional: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Constructs small-world hierarchical axonal wiring between distant concentric shells.
+
+        bidirectional=False restores the canonical baseline wiring (Option A).
+        """
         srcs, dsts = [], []
+        if not bidirectional:
+            for i in range(num_tracts):
+                if i % 3 == 0:
+                    s = i % max(1, num_shells // 4)
+                    d = num_shells - 1 - (i % max(1, num_shells // 4))
+                elif i % 3 == 1:
+                    s = (i * 2) % num_shells
+                    d = (s + num_shells // 2) % num_shells
+                else:
+                    s = (i * 7) % num_shells
+                    d = (i * 13) % num_shells
+                    if s == d and num_shells > 1:
+                        d = (s + 1) % num_shells
+                srcs.append(s)
+                dsts.append(d)
+            return torch.tensor(srcs, dtype=torch.long), torch.tensor(dsts, dtype=torch.long)
+
         deep_span = max(1, num_shells // 4)
         for i in range(num_tracts):
             m = i // 3
@@ -1117,6 +1139,7 @@ class PremotorMotorDecoderV5(nn.Module):
         causal_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         causal_kv_mask: Optional[torch.Tensor] = None,
         prompt_valid_mask: Optional[torch.Tensor] = None,
+        affine_scale_override: Optional[torch.Tensor] = None,
     ) -> Union[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor], Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]]:
         """
         Executes a single motor verbalization step:
@@ -1245,7 +1268,8 @@ class PremotorMotorDecoderV5(nn.Module):
         # 6. Motor Verbalization Emission Head
         temp = torch.clamp(self.temperature_scale.float(), 0.1, 5.0).to(motor_surface.dtype)
         if self.use_tied_embeddings:
-            h_scaled = (h * self.affine_scale.to(motor_surface.dtype)) / temp
+            eff_aff = affine_scale_override.to(motor_surface.dtype) if affine_scale_override is not None else self.affine_scale.to(motor_surface.dtype)
+            h_scaled = (h * eff_aff) / temp
             raw_logits = F.linear(h_scaled, tied_embedding_weight.to(motor_surface.dtype))
         else:
             raw_logits = self.head(h) / temp
@@ -1651,6 +1675,7 @@ class CerebroSpheroidV5(nn.Module):
             use_sparse_mot=self.config.use_sparse_mot,
             top_k_tracts=self.config.top_k_tracts,
             use_laminar_transport=getattr(self.config, "use_laminar_transport", True),
+            use_bidirectional_tracts=getattr(self.config, "use_bidirectional_tracts", False),
         )
 
         # 3. Premotor Motor Decoder with Affine-Tied Head
@@ -2546,6 +2571,141 @@ class CerebroSpheroidV5(nn.Module):
         return torch.cat(generated_tokens, dim=1)
 
     @torch.no_grad()
+    def generate_causal_prefill(
+        self,
+        prompt_ids: torch.Tensor,
+        max_new_tokens: int = 128,
+        temperature: float = 0.3,
+        top_k: int = 40,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.15,
+        thinking_cycles: Optional[int] = None,
+        eos_token_id: int = 2,
+        stop_token_ids: Optional[Union[Tuple[int, ...], List[int]]] = None,
+        persona_id: Optional[Union[int, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """Causal sequential prefill + decode matching RectifiedContiguousPretrainStreamer & JAX prefill geometry."""
+        self.eval()
+        B, L = prompt_ids.shape
+        dev = prompt_ids.device
+        use_adapt = self.config.use_adaptive_thinking and self.halting_gate is not None
+        cycles = thinking_cycles if thinking_cycles is not None else (self.config.max_thinking_cycles if use_adapt else self.config.thinking_cycles)
+
+        # 1. Deliberate on [BOS] (slot 0) to match pretraining initial state
+        bos = prompt_ids[:, :1]
+        sensory_flux, sensory_kv = self.sensory_dnn(bos, pos_offset=0, is_causal=True)
+        prompt_valid_mask = torch.ones((B, 1), dtype=torch.bool, device=dev)
+        prompt_centroid = sensory_flux[:, 0, :]
+
+        radial_profile = (torch.arange(1, self.config.num_shells + 1, device=dev, dtype=torch.float32) / float(self.config.num_shells)).view(1, -1, 1)
+        state = (prompt_centroid.unsqueeze(1).repeat(1, self.config.num_shells, 1).float() * radial_profile).to(prompt_centroid.dtype)
+
+        use_contract = getattr(self.config, "use_contractive_deliberation", True)
+        delib_decay = getattr(self.config, "contractive_delib_decay", 0.75)
+        init_scale = state.norm(p=2, dim=-1, keepdim=True) + 1e-8
+        prev_delta = None
+        for cycle in range(cycles):
+            state = self._apply_deliberation_probe(state, sensory_kv, cycle)
+            raw_next = self.volumetric_core.deliberate_step(state)
+            if use_contract:
+                alpha = float(delib_decay ** cycle)
+                updated = state + alpha * (raw_next - state)
+                norm_up = updated.norm(p=2, dim=-1, keepdim=True) + 1e-8
+                next_state = (updated / norm_up) * init_scale
+            else:
+                next_state = raw_next
+            if use_adapt:
+                core_state = next_state[:, 0, :] if getattr(self.config, "use_core_halting", True) else next_state.mean(dim=1)
+                if (torch.sigmoid(self.halting_gate(core_state)) > self.config.thinking_halt_threshold).all():
+                    state = next_state
+                    break
+            if use_contract and cycle >= 1:
+                cur_delta = next_state[:, 0, :] - state[:, 0, :]
+                rel_innov = cur_delta.norm(p=2, dim=-1) / init_scale[:, 0, 0]
+                thresh = getattr(self.config, "deliberation_early_halt_thresh", 0.025)
+                converged = rel_innov < thresh
+                if getattr(self.config, "deliberation_oscillation_halt", True) and not converged.all() and cycle >= 2 and prev_delta is not None:
+                    cos_sim = (cur_delta * prev_delta).sum(dim=-1) / (cur_delta.norm(p=2, dim=-1) * prev_delta.norm(p=2, dim=-1) + 1e-8)
+                    converged = converged | ((rel_innov < 2.5 * thresh) & (cos_sim < -0.3))
+                prev_delta = cur_delta
+                if converged.all():
+                    state = next_state
+                    break
+            elif use_contract and cycle == 0:
+                prev_delta = next_state[:, 0, :] - state[:, 0, :]
+            state = next_state
+
+        plan = self.motor_decoder.init_plan(B, dev, persona_id=persona_id) if self.config.use_plan else None
+        refractory = torch.zeros(B, self.config.vocab_size, device=dev, dtype=state.dtype)
+        prev_thought: Optional[torch.Tensor] = None
+        causal_keys_list: List[torch.Tensor] = []
+        causal_values_list: List[torch.Tensor] = []
+        causal_mask_list: List[torch.Tensor] = []
+        generated_tokens: List[torch.Tensor] = []
+        tied_w = self.sensory_dnn.embedding.weight
+        eff_aff_ans = self.motor_decoder.affine_scale * self.motor_decoder.affine_answer if hasattr(self.motor_decoder, "affine_answer") else self.motor_decoder.affine_scale
+        stop_ids = tuple(int(s) for s in (stop_token_ids if stop_token_ids is not None else (eos_token_id,)) if s is not None)
+        finished = torch.zeros(B, dtype=torch.bool, device=dev)
+
+        for t in range(max(0, L - 1) + max_new_tokens):
+            causal_kv = (torch.cat(causal_keys_list, dim=2), torch.cat(causal_values_list, dim=2)) if causal_keys_list else None
+            causal_kv_mask = torch.cat(causal_mask_list, dim=1) if causal_mask_list else None
+
+            logits, efference, refractory, plan = self.motor_decoder(
+                state=state,
+                sensory_kv=sensory_kv,
+                tied_embedding_weight=tied_w,
+                plan=plan,
+                refractory_trace=refractory,
+                step_idx=t,
+                auditory_feedback=prev_thought if t > 0 else None,
+                repetition_penalty=repetition_penalty,
+                causal_kv=causal_kv,
+                causal_kv_mask=causal_kv_mask,
+                prompt_valid_mask=prompt_valid_mask,
+                affine_scale_override=eff_aff_ans,
+            )
+
+            if t < L - 1:
+                next_tok = prompt_ids[:, t + 1 : t + 2]
+            else:
+                if temperature <= 1e-4:
+                    next_tok = torch.argmax(logits, dim=-1, keepdim=True)
+                else:
+                    scaled = logits / float(temperature)
+                    if top_k > 0:
+                        v, _ = torch.topk(scaled, min(top_k, scaled.size(-1)))
+                        scaled[scaled < v[:, [-1]]] = -float("Inf")
+                    if top_p < 1.0:
+                        sorted_logits, sorted_indices = torch.sort(scaled, descending=True)
+                        cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                        to_remove = cum_probs > top_p
+                        to_remove[:, 1:] = to_remove[:, :-1].clone()
+                        to_remove[:, 0] = False
+                        scaled[to_remove.scatter(1, sorted_indices, to_remove)] = -float("Inf")
+                    next_tok = torch.multinomial(F.softmax(scaled, dim=-1), num_samples=1)
+                generated_tokens.append(next_tok)
+                flat_gen = next_tok.squeeze(-1)
+                for sid in stop_ids:
+                    finished = finished | (flat_gen == sid)
+                if finished.all():
+                    break
+
+            flat_tok = next_tok.squeeze(-1)
+            prev_thought_seq, (tok_k, tok_v) = self.sensory_dnn(flat_tok.unsqueeze(1), pos_offset=t + 1, is_causal=True)
+            prev_thought = prev_thought_seq[:, 0, :]
+            causal_keys_list.append(tok_k)
+            causal_values_list.append(tok_v)
+            causal_mask_list.append(torch.ones((B, 1), dtype=torch.bool, device=dev))
+
+            if getattr(self.config, "use_per_token_efference", False):
+                state = self.volumetric_core.step_efference_fast(state, efference)
+
+        if not generated_tokens:
+            return torch.empty((B, 0), dtype=torch.long, device=dev)
+        return torch.cat(generated_tokens, dim=1)
+
+    @torch.no_grad()
     def draft_speculative_tokens(
         self,
         h_last: torch.Tensor,
@@ -2605,6 +2765,7 @@ class CerebroSpheroidV5(nn.Module):
         audio: Optional[torch.Tensor] = None,
         perceptual_inputs: Optional[torch.Tensor] = None,
         execute_tools: bool = True,
+        raw_prompt: bool = False,
     ) -> Union[str, Dict[str, Any]]:
         """
         Generates text using the 3-tier cognitive output protocol:
@@ -2622,11 +2783,6 @@ class CerebroSpheroidV5(nn.Module):
         )
 
         dev = device if device is not None else next(self.parameters()).device
-        formatted_prompt = format_stimulus_prompt(prompt)
-        raw_ids = encode_no_special(tokenizer, formatted_prompt)
-        input_ids = [t % self.config.vocab_size for t in raw_ids] or [getattr(tokenizer, "bos_token_id", 1) or 1]
-        tok_tensor = torch.tensor([input_ids], dtype=torch.long, device=dev)
-
         bio_ids = get_bio_token_ids(tokenizer)
         raw_eos = getattr(tokenizer, "eos_token_id", 2)
         eos_id = int(raw_eos) if raw_eos is not None else 2
@@ -2640,21 +2796,41 @@ class CerebroSpheroidV5(nn.Module):
 
         stop_ids = tuple(s for s in stop_list if s is not None)
 
-        out_ids = self.generate(
-            tok_tensor,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            thinking_cycles=thinking_cycles,
-            eos_token_id=eos_id,
-            seed_token_id=seed_id,
-            stop_token_ids=stop_ids,
-            images=images,
-            audio=audio,
-            perceptual_inputs=perceptual_inputs,
-        )
+        if raw_prompt and images is None and audio is None and perceptual_inputs is None:
+            raw_ids = tokenizer(prompt, add_special_tokens=True).input_ids
+            input_ids = [t % self.config.vocab_size for t in raw_ids] or [getattr(tokenizer, "bos_token_id", 1) or 1]
+            tok_tensor = torch.tensor([input_ids], dtype=torch.long, device=dev)
+            out_ids = self.generate_causal_prefill(
+                tok_tensor,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                thinking_cycles=thinking_cycles,
+                eos_token_id=eos_id,
+                stop_token_ids=stop_ids,
+            )
+        else:
+            formatted_prompt = format_stimulus_prompt(prompt)
+            raw_ids = encode_no_special(tokenizer, formatted_prompt)
+            input_ids = [t % self.config.vocab_size for t in raw_ids] or [getattr(tokenizer, "bos_token_id", 1) or 1]
+            tok_tensor = torch.tensor([input_ids], dtype=torch.long, device=dev)
+            out_ids = self.generate(
+                tok_tensor,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                thinking_cycles=thinking_cycles,
+                eos_token_id=eos_id,
+                seed_token_id=seed_id,
+                stop_token_ids=stop_ids,
+                images=images,
+                audio=audio,
+                perceptual_inputs=perceptual_inputs,
+            )
         seq = out_ids[0].tolist()
 
         if strict_act:
