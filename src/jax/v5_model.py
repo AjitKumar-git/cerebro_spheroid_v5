@@ -82,6 +82,7 @@ class ModelConfigV5:
     act_end_token_id: Optional[int] = 32
     router_loss_weight: float = 0.0
     energy_reg_weight: float = 0.01
+    use_bidirectional_tracts: bool = False
     use_selective_loss: bool = False
     selective_focal_gamma: float = 0.5
     selective_noise_cap: float = 8.5
@@ -287,9 +288,30 @@ def transform_spectral_core_jax(core: jnp.ndarray, params: dict, config: Any) ->
     return rms_norm(core + beta * reconstructed, norm_w)
 
 
-def generate_small_world_indices(num_shells: int, num_tracts: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Generates deterministic bidirectional small-world axonal shortcut wiring in JAX."""
+def generate_small_world_indices(num_shells: int, num_tracts: int, bidirectional: bool = False) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Generates deterministic small-world axonal shortcut wiring in JAX.
+    
+    bidirectional=False restores the canonical baseline wiring under which
+    v5_small was trained for 245k+ steps.
+    """
     srcs, dsts = [], []
+    if not bidirectional:
+        for i in range(num_tracts):
+            if i % 3 == 0:
+                s = i % max(1, num_shells // 4)
+                d = num_shells - 1 - (i % max(1, num_shells // 4))
+            elif i % 3 == 1:
+                s = (i * 2) % num_shells
+                d = (s + num_shells // 2) % num_shells
+            else:
+                s = (i * 7) % num_shells
+                d = (i * 13) % num_shells
+                if s == d and num_shells > 1:
+                    d = (s + 1) % num_shells
+            srcs.append(s)
+            dsts.append(d)
+        return jnp.array(srcs, dtype=jnp.int32), jnp.array(dsts, dtype=jnp.int32)
+
     deep_span = max(1, num_shells // 4)
     for i in range(num_tracts):
         m = i // 3
@@ -484,7 +506,8 @@ def init_params_v5(key: jax.random.PRNGKey, config: ModelConfigV5) -> Tuple[Dict
         params["core.laminar_in_gate"] = jnp.zeros(K - 1, dtype=jnp.float32)
         params["core.laminar_out_gate"] = jnp.zeros(K - 1, dtype=jnp.float32)
 
-    src_idx, dst_idx = generate_small_world_indices(K, T)
+    use_bi = bool(getattr(config, "use_bidirectional_tracts", False))
+    src_idx, dst_idx = generate_small_world_indices(K, T, bidirectional=use_bi)
     buffers = (src_idx, dst_idx)
     return params, buffers
 
