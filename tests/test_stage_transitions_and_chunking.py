@@ -196,15 +196,60 @@ def test_rectified_streamer_deep_reasoning_transition(monkeypatch):
 
 
 def test_train_v5_auto_reasoning_transition_args():
-    """Verifies that train_v5_tpu_jax exposes auto_reasoning_transition, 15.7B defaults, and conservative Stage 2 LR guards."""
+    """Verifies that train_v5_tpu_jax exposes auto_reasoning_transition, 41.4B defaults, and conservative Stage 2 LR guards."""
     from training.train_v5_tpu_jax import parse_args
 
     args = parse_args([])
     assert args.auto_reasoning_transition is True
-    assert args.reasoning_transition_tokens == 15_700_000_000
+    assert args.reasoning_transition_tokens == 41_400_000_000
     assert args.final_campaign_tokens == 50_000_000_000
     assert args.reasoning_max_lr == 2e-4
     assert args.reasoning_min_lr == 3e-5
+
+
+def test_rectified_streamer_41_4b_phase_schedule(monkeypatch):
+    """Verifies 15.7B (FineWeb) -> 15.7B (FineWeb-Edu) -> 5B (FineWeb-Edu) -> 5B (FineWeb-Edu) = 41.4B."""
+    from src.rectified_streamer import RectifiedContiguousPretrainStreamer
+
+    def _mock_doc_gen():
+        while True:
+            yield "Sample training text for tokenizer coverage. " * 20
+
+    monkeypatch.setattr(RectifiedContiguousPretrainStreamer, "_open_fineweb_stream", lambda self: _mock_doc_gen())
+    monkeypatch.setattr(RectifiedContiguousPretrainStreamer, "_open_edu_stream", lambda self: _mock_doc_gen())
+    monkeypatch.setattr(RectifiedContiguousPretrainStreamer, "_open_code_stream", lambda self: _mock_doc_gen())
+    monkeypatch.setattr(RectifiedContiguousPretrainStreamer, "_open_math_stream", lambda self: _mock_doc_gen())
+    monkeypatch.setattr(RectifiedContiguousPretrainStreamer, "_open_cosmopedia_stream", lambda self: _mock_doc_gen())
+    monkeypatch.setattr(RectifiedContiguousPretrainStreamer, "_open_retrieval_stream", lambda self: _mock_doc_gen())
+
+    tok_box = [0]
+    tok = MockTokenizer()
+    streamer = RectifiedContiguousPretrainStreamer(
+        tokenizer=tok,
+        batch_size=2,
+        block_size=256,
+        stage="pretrain",
+        tokens_getter=lambda: tok_box[0],
+        target_tokens=41_400_000_000,
+    )
+    try:
+        # Phase 0: 0 -> 15.7B (e.g. 9.387B) uses broad_web (FineWeb)
+        tok_box[0] = 9_387_028_736
+        assert streamer._smollm2_shares() == {"broad_web": 0.90, "code": 0.10}
+
+        # Phase 1: 15.7B -> 31.4B uses edu_academic (FineWeb-Edu)
+        tok_box[0] = 15_700_000_000
+        assert streamer._smollm2_shares() == {"edu_academic": 0.75, "code": 0.20, "math": 0.05}
+
+        # Phase 2: 31.4B -> 36.4B (5B) uses edu_academic (FineWeb-Edu)
+        tok_box[0] = 31_400_000_000
+        assert streamer._smollm2_shares() == {"edu_academic": 0.70, "code": 0.20, "math": 0.10}
+
+        # Phase 3: 36.4B -> 41.4B (5B) uses edu_academic (FineWeb-Edu)
+        tok_box[0] = 36_400_000_000
+        assert streamer._smollm2_shares() == {"edu_academic": 0.58, "code": 0.24, "math": 0.14, "cosmopedia": 0.04}
+    finally:
+        streamer.stop()
 
 
 def test_stage2_conservative_lr_schedule():

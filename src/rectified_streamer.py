@@ -385,7 +385,7 @@ class RectifiedContiguousPretrainStreamer:
         progress_getter: Optional[Any] = None,
         total_steps: int = 1_500_000,
         tokens_getter: Optional[Any] = None,
-        target_tokens: int = 15_700_000_000,
+        target_tokens: int = 41_400_000_000,
         min_edu_score: float = 3.0,
         domain_loss_weights: Optional[Dict[str, float]] = None,
         reasoning_weight: float = 1.0,
@@ -448,7 +448,7 @@ class RectifiedContiguousPretrainStreamer:
         progress = 0.0
         if getattr(self, "tokens_getter", None) is not None:
             try:
-                tgt = float(getattr(self, "target_tokens", 15_700_000_000) or 15_700_000_000)
+                tgt = float(getattr(self, "target_tokens", 41_400_000_000) or 41_400_000_000)
                 progress = float(self.tokens_getter()) / tgt
             except Exception:
                 progress = 0.0
@@ -456,7 +456,7 @@ class RectifiedContiguousPretrainStreamer:
             try:
                 val = float(self.progress_getter())
                 if val > 10_000_000:
-                    tgt = float(getattr(self, "target_tokens", 15_700_000_000) or 15_700_000_000)
+                    tgt = float(getattr(self, "target_tokens", 41_400_000_000) or 41_400_000_000)
                     progress = val / tgt
                 else:
                     progress = val / float(self.total_steps)
@@ -464,13 +464,16 @@ class RectifiedContiguousPretrainStreamer:
                 progress = 0.0
         progress = min(1.0, max(0.0, progress))
 
-        if progress < 0.55:
+        # 4-phase pretraining schedule (41.4B total: 15.7B + 15.7B + 5.0B + 5.0B)
+        # Phase 0 (0 - 15.7B): FineWeb + Code
+        # Phase 1+ (15.7B onwards): web content upgrades to FineWeb-Edu (edu_academic)
+        if progress < (15.7 / 41.4):
             return {"broad_web": 0.90, "code": 0.10}
-        if progress < 0.73:
-            return {"broad_web": 0.75, "code": 0.20, "math": 0.05}
-        if progress < 0.91:
-            return {"broad_web": 0.70, "code": 0.20, "math": 0.10}
-        return {"broad_web": 0.58, "code": 0.24, "math": 0.14, "cosmopedia": 0.04}
+        if progress < (31.4 / 41.4):
+            return {"edu_academic": 0.75, "code": 0.20, "math": 0.05}
+        if progress < (36.4 / 41.4):
+            return {"edu_academic": 0.70, "code": 0.20, "math": 0.10}
+        return {"edu_academic": 0.58, "code": 0.24, "math": 0.14, "cosmopedia": 0.04}
 
     def transition_to_deep_reasoning(self, reasoning_shares: Optional[Dict[str, float]] = None) -> None:
         """Transitions streamer from broad web pretraining to high-density mathematical & deductive reasoning."""

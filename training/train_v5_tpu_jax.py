@@ -265,7 +265,7 @@ def parse_args(args_list=None):
     parser.add_argument("--effective-batch-size", "--effective_batch_size", dest="effective_batch_size", type=int, default=256, help="Target global effective batch size (default: 256 for TPU v5e-1, supports 128 / 126; automatically computes grad_accum)")
     parser.add_argument("--target-tokens", "--target_tokens", dest="target_tokens", type=int, default=200_000_000_000, help="Target token ingestion budget for campaign (default: 200,000,000,000 tokens)")
     parser.add_argument("--auto-reasoning-transition", "--auto_reasoning_transition", dest="auto_reasoning_transition", action=argparse.BooleanOptionalAction, default=True, help="Automatically transition from pretraining to deep reasoning curriculum after reaching milestone tokens (default: True)")
-    parser.add_argument("--reasoning-transition-tokens", "--reasoning_transition_tokens", dest="reasoning_transition_tokens", type=int, default=15_700_000_000, help="Cumulative token milestone to trigger automatic transition to deep reasoning (default: 15,700,000,000 tokens)")
+    parser.add_argument("--reasoning-transition-tokens", "--reasoning_transition_tokens", dest="reasoning_transition_tokens", type=int, default=41_400_000_000, help="Cumulative token milestone to trigger automatic transition to deep reasoning (default: 41,400,000,000 tokens)")
     parser.add_argument("--final-campaign-tokens", "--final_campaign_tokens", dest="final_campaign_tokens", type=int, default=50_000_000_000, help="Extended token budget target for deep reasoning campaign (default: 50,000,000,000 tokens)")
     parser.add_argument("--reasoning-max-lr", "--reasoning_max_lr", dest="reasoning_max_lr", type=float, default=2e-4, help="Conservative peak learning rate during Deep Reasoning Stage 2 to prevent forgetting Stage 1 foundations (default: 2e-4)")
     parser.add_argument("--reasoning-min-lr", "--reasoning_min_lr", dest="reasoning_min_lr", type=float, default=3e-5, help="Annealed learning rate floor during Deep Reasoning Stage 2 (default: 3e-5)")
@@ -315,7 +315,7 @@ def build_data_stream(
     step_getter: Optional[Any] = None,
     total_steps: int = 1_500_000,
     tokens_getter: Optional[Any] = None,
-    target_tokens: int = 15_700_000_000,
+    target_tokens: int = 41_400_000_000,
     prefetch: bool = True,
     dataset_config: Optional[str] = None,
     dataset_revision: Optional[str] = None,
@@ -346,19 +346,19 @@ def build_data_stream(
         if is_mid:
             print(f"   • Data Mixture (Static)     : 40% FineWeb-Edu (>=3.5) | 30% FineMath | 15% Cosmopedia v2 | 15% Code [ZERO SFT]")
         else:
-            tgt_tok_val = float(target_tokens or 15_700_000_000)
+            tgt_tok_val = float(target_tokens or 41_400_000_000)
             cur_tok_val = float(tokens_getter()) if tokens_getter is not None else 0.0
             cur_pct = min(100.0, max(0.0, (cur_tok_val / max(1.0, tgt_tok_val)) * 100.0))
-            if cur_pct < 55.0:
-                phase_str = "Phase 0 (0-55% tokens: 90% Web / 10% Code)"
-            elif cur_pct < 73.0:
-                phase_str = "Phase 1 (55-73% tokens: 75% Web / 20% Code / 5% Math)"
-            elif cur_pct < 91.0:
-                phase_str = "Phase 2 (73-91% tokens: 70% Web / 20% Code / 10% Math)"
+            if cur_pct < (15.7 / 41.4 * 100.0):
+                phase_str = "Phase 0 (0-15.7B: 90% FineWeb / 10% Code)"
+            elif cur_pct < (31.4 / 41.4 * 100.0):
+                phase_str = "Phase 1 (15.7B-31.4B: 75% FineWeb-Edu / 20% Code / 5% Math)"
+            elif cur_pct < (36.4 / 41.4 * 100.0):
+                phase_str = "Phase 2 (31.4B-36.4B: 70% FineWeb-Edu / 20% Code / 10% Math)"
             else:
-                phase_str = "Phase 3 (91-100% tokens: 58% Web / 24% Code / 14% Math / 4% Cosmo)"
-            print(f"   • Data Mixture (Token-Based): SmolLM2 4-phase schedule ({tgt_tok_val/1e9:.2f}B token budget)")
-            print(f"     - Phases: 90/10 (0-55%) -> 75/20/5 (55-73%) -> 70/20/10 (73-91%) -> 58/24/14/4 (91-100%)")
+                phase_str = "Phase 3 (36.4B-41.4B: 58% FineWeb-Edu / 24% Code / 14% Math / 4% Cosmo)"
+            print(f"   • Data Mixture (Token-Based): 4-phase schedule ({tgt_tok_val/1e9:.2f}B token budget)")
+            print(f"     - Phases: 90/10 FineWeb (15.7B) -> 75/20/5 Edu (15.7B) -> 70/20/10 Edu (5.0B) -> 58/24/14/4 Edu (5.0B)")
             print(f"     - Active: {phase_str} @ {cur_tok_val/1e9:.3f}B/{tgt_tok_val/1e9:.2f}B tokens ({cur_pct:.1f}%)")
         print(f"   • Input Window (Step-Based) : {total_window} tokens (contiguous unbroken next-token loss)")
         print(f"   • Global Batch              : {batch_size} sequences/step")
@@ -371,7 +371,7 @@ def build_data_stream(
             progress_getter=step_getter,
             total_steps=total_steps,
             tokens_getter=tokens_getter,
-            target_tokens=int(target_tokens or 15_700_000_000),
+            target_tokens=int(target_tokens or 41_400_000_000),
         )
         return streamer, None
 
@@ -806,7 +806,7 @@ def main(args=None):
                 push_remote_token_tracker(
                     model=sync_model_name,
                     cumulative_tokens=0,
-                    target_tokens=getattr(args, "target_tokens", 15_700_000_000),
+                    target_tokens=getattr(args, "target_tokens", 41_400_000_000),
                     tokens_by_dataset={},
                     effective_batch_size=args.effective_batch_size,
                     step=0,
@@ -1533,7 +1533,7 @@ def main(args=None):
         step_getter=lambda: current_step_holder[0],
         total_steps=args.total_steps,
         tokens_getter=lambda: cumulative_tokens_holder[0],
-        target_tokens=int(getattr(args, "target_tokens", 15_700_000_000) or 15_700_000_000),
+        target_tokens=int(getattr(args, "target_tokens", 41_400_000_000) or 41_400_000_000),
         prefetch=not use_multi_tpu_local_sgd,
         dataset_config=args.dataset_config,
         dataset_revision=args.dataset_revision,
@@ -1678,16 +1678,16 @@ def main(args=None):
                     weights_req = dict(local_streamer.shares)
                 else:
                     cur_tok = cumulative_tokens_holder[0] if "cumulative_tokens_holder" in locals() and cumulative_tokens_holder else 0
-                    tgt_tok = float(getattr(args, "target_tokens", 15_700_000_000) or 15_700_000_000)
+                    tgt_tok = float(getattr(args, "target_tokens", 41_400_000_000) or 41_400_000_000)
                     progress = min(1.0, max(0.0, float(cur_tok) / max(1.0, tgt_tok)))
-                    if progress < 0.55:
+                    if progress < (15.7 / 41.4):
                         weights_req = {"broad_web": 0.90, "code": 0.10}
-                    elif progress < 0.73:
-                        weights_req = {"broad_web": 0.75, "code": 0.20, "math": 0.05}
-                    elif progress < 0.91:
-                        weights_req = {"broad_web": 0.70, "code": 0.20, "math": 0.10}
+                    elif progress < (31.4 / 41.4):
+                        weights_req = {"edu_academic": 0.75, "code": 0.20, "math": 0.05}
+                    elif progress < (36.4 / 41.4):
+                        weights_req = {"edu_academic": 0.70, "code": 0.20, "math": 0.10}
                     else:
-                        weights_req = {"broad_web": 0.58, "code": 0.24, "math": 0.14, "cosmopedia": 0.04}
+                        weights_req = {"edu_academic": 0.58, "code": 0.24, "math": 0.14, "cosmopedia": 0.04}
                 pct_str = ", ".join(f"{d} {w*100:.0f}%" for d, w in weights_req.items())
                 desc = f"Pretrain Token-Based Mixture ({pct_str})"
             domains_req = list(weights_req.keys())
@@ -2013,7 +2013,7 @@ def main(args=None):
     in_deep_reasoning_phase = False
     reasoning_transition_step = None
     auto_reasoning_trans = getattr(args, "auto_reasoning_transition", True)
-    reasoning_trans_tokens = getattr(args, "reasoning_transition_tokens", 15_700_000_000)
+    reasoning_trans_tokens = getattr(args, "reasoning_transition_tokens", 41_400_000_000)
     final_campaign_budget = getattr(args, "final_campaign_tokens", 50_000_000_000)
 
     # Recalibrate total_steps schedule on resumption if remote/checkpoint token counter was updated

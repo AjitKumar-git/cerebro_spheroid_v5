@@ -106,7 +106,7 @@ def main():
         force_tune=False,                      # Bypasses micro-benchmarks; adopts verified config
         effective_batch_size=256,              # Effective batch size (gradient accumulation over optimal micro-batch)
         save_interval=100,                     # Back up every 100 steps
-        target_tokens=15_700_000_000,          # 15.70 Billion Tokens target budget
+        target_tokens=41_400_000_000,          # 41.40 Billion Tokens target budget (15.7B + 15.7B + 5.0B + 5.0B)
         dataset_source=os.environ.get("DATASET_SOURCE", "pretrain"),  # Pure Contiguous Pretraining (SmolLM2 4-stage curriculum: 90/10 -> 75/20/5 -> 70/20/10 -> 58/24/14/4)
         elastic_window=False,                  # Pure contiguous 100% loss-bearing sequences (zero prompt masking)
         thinking_cycles=4,                     # Matches v5_compact preset deliberation depth
