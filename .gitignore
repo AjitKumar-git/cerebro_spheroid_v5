@@ -71,4 +71,5 @@ download.txt
 # Rust build artifacts
 target/
 tools/**/target/
+deploy/kaggle/**/dee
 
