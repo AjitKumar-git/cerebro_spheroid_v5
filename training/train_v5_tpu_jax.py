@@ -205,6 +205,7 @@ def parse_args(args_list=None):
     parser.add_argument("--selective_focal_gamma", "--selective-focal-gamma", dest="selective_focal_gamma", type=float, default=0.5, help="Mild focal exponent (1-p)^gamma for downweighting mastered tokens (default: 0.5)")
     parser.add_argument("--selective_noise_cap", "--selective-noise-cap", dest="selective_noise_cap", type=float, default=8.5, help="Per-token CE ceiling above which unlearnable web-noise spikes are attenuated (default: 8.5)")
     parser.add_argument("--z_loss_weight", "--z-loss-weight", dest="z_loss_weight", type=float, default=0.0, help="Logit Z-loss regularizer weight (e.g., 1e-4) to stabilize bf16 logits (default: 0.0)")
+    parser.add_argument("--use_bidirectional_tracts", "--use-bidirectional-tracts", dest="use_bidirectional_tracts", action=argparse.BooleanOptionalAction, default=False, help="Enable bidirectional corticofugal small-world shortcut tracts (for new from-scratch runs; default: False)")
 
     # Target Workload & Cognitive Steering Hyperparameters
     parser.add_argument("--num_mtp_heads", "--num-mtp-heads", dest="num_mtp_heads", type=int, default=1, choices=[1, 2, 3, 4], help="Multi-Token Prediction heads (1: standard single-token emission; 2 or 3: speculative decoding & future-token predictive training)")
@@ -693,6 +694,7 @@ def main(args=None):
     cfg_kwargs["selective_focal_gamma"] = float(getattr(args, "selective_focal_gamma", 0.5))
     cfg_kwargs["selective_noise_cap"] = float(getattr(args, "selective_noise_cap", 8.5))
     cfg_kwargs["z_loss_weight"] = float(getattr(args, "z_loss_weight", 0.0))
+    cfg_kwargs["use_bidirectional_tracts"] = bool(getattr(args, "use_bidirectional_tracts", False))
     config = JAXConfigV5(**cfg_kwargs)
     params, buffers = init_params_v5(jax.random.PRNGKey(42), config)
 
