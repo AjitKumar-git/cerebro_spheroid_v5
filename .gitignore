@@ -68,3 +68,7 @@ metrics/
 backups/
 download.txt
 
+# Rust build artifacts
+target/
+tools/**/target/
+
