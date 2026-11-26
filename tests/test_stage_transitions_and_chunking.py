@@ -237,6 +237,12 @@ def test_rectified_streamer_41_4b_phase_schedule(monkeypatch):
         tok_box[0] = 9_387_028_736
         assert streamer._smollm2_shares() == {"broad_web": 0.90, "code": 0.10}
 
+        # Even if caller passed legacy target_tokens=15.7B, absolute token gates keep 9.45B in Phase 0
+        streamer.target_tokens = 15_700_000_000
+        tok_box[0] = 9_450_236_288
+        assert streamer._smollm2_shares() == {"broad_web": 0.90, "code": 0.10}
+        streamer.target_tokens = 41_400_000_000
+
         # Phase 1: 15.7B -> 31.4B uses edu_academic (FineWeb-Edu)
         tok_box[0] = 15_700_000_000
         assert streamer._smollm2_shares() == {"edu_academic": 0.75, "code": 0.20, "math": 0.05}

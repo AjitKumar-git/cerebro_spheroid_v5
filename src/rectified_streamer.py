@@ -445,28 +445,40 @@ class RectifiedContiguousPretrainStreamer:
                 "code": 0.15,
             }
 
-        progress = 0.0
+        # 4-phase pretraining schedule (41.4B total: 15.7B + 15.7B + 5.0B + 5.0B)
+        # Phase 0 (0 - 15.7B): FineWeb + Code
+        # Phase 1+ (15.7B onwards): web content upgrades to FineWeb-Edu (edu_academic)
+        cur_tokens: Optional[float] = None
         if getattr(self, "tokens_getter", None) is not None:
             try:
-                tgt = float(getattr(self, "target_tokens", 41_400_000_000) or 41_400_000_000)
-                progress = float(self.tokens_getter()) / tgt
+                cur_tokens = max(0.0, float(self.tokens_getter()))
             except Exception:
-                progress = 0.0
+                cur_tokens = 0.0
         elif self.progress_getter is not None:
             try:
                 val = float(self.progress_getter())
                 if val > 10_000_000:
-                    tgt = float(getattr(self, "target_tokens", 41_400_000_000) or 41_400_000_000)
-                    progress = val / tgt
-                else:
-                    progress = val / float(self.total_steps)
+                    cur_tokens = max(0.0, val)
+            except Exception:
+                cur_tokens = 0.0
+
+        if cur_tokens is not None:
+            if cur_tokens < 15_700_000_000:
+                return {"broad_web": 0.90, "code": 0.10}
+            if cur_tokens < 31_400_000_000:
+                return {"edu_academic": 0.75, "code": 0.20, "math": 0.05}
+            if cur_tokens < 36_400_000_000:
+                return {"edu_academic": 0.70, "code": 0.20, "math": 0.10}
+            return {"edu_academic": 0.58, "code": 0.24, "math": 0.14, "cosmopedia": 0.04}
+
+        progress = 0.0
+        if self.progress_getter is not None:
+            try:
+                progress = float(self.progress_getter()) / float(self.total_steps)
             except Exception:
                 progress = 0.0
         progress = min(1.0, max(0.0, progress))
 
-        # 4-phase pretraining schedule (41.4B total: 15.7B + 15.7B + 5.0B + 5.0B)
-        # Phase 0 (0 - 15.7B): FineWeb + Code
-        # Phase 1+ (15.7B onwards): web content upgrades to FineWeb-Edu (edu_academic)
         if progress < (15.7 / 41.4):
             return {"broad_web": 0.90, "code": 0.10}
         if progress < (31.4 / 41.4):

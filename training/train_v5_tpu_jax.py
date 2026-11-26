@@ -349,11 +349,11 @@ def build_data_stream(
             tgt_tok_val = float(target_tokens or 41_400_000_000)
             cur_tok_val = float(tokens_getter()) if tokens_getter is not None else 0.0
             cur_pct = min(100.0, max(0.0, (cur_tok_val / max(1.0, tgt_tok_val)) * 100.0))
-            if cur_pct < (15.7 / 41.4 * 100.0):
+            if cur_tok_val < 15_700_000_000:
                 phase_str = "Phase 0 (0-15.7B: 90% FineWeb / 10% Code)"
-            elif cur_pct < (31.4 / 41.4 * 100.0):
+            elif cur_tok_val < 31_400_000_000:
                 phase_str = "Phase 1 (15.7B-31.4B: 75% FineWeb-Edu / 20% Code / 5% Math)"
-            elif cur_pct < (36.4 / 41.4 * 100.0):
+            elif cur_tok_val < 36_400_000_000:
                 phase_str = "Phase 2 (31.4B-36.4B: 70% FineWeb-Edu / 20% Code / 10% Math)"
             else:
                 phase_str = "Phase 3 (36.4B-41.4B: 58% FineWeb-Edu / 24% Code / 14% Math / 4% Cosmo)"
@@ -1677,14 +1677,12 @@ def main(args=None):
                 if local_streamer is not None and hasattr(local_streamer, "shares") and local_streamer.shares:
                     weights_req = dict(local_streamer.shares)
                 else:
-                    cur_tok = cumulative_tokens_holder[0] if "cumulative_tokens_holder" in locals() and cumulative_tokens_holder else 0
-                    tgt_tok = float(getattr(args, "target_tokens", 41_400_000_000) or 41_400_000_000)
-                    progress = min(1.0, max(0.0, float(cur_tok) / max(1.0, tgt_tok)))
-                    if progress < (15.7 / 41.4):
+                    cur_tok = float(cumulative_tokens_holder[0]) if "cumulative_tokens_holder" in locals() and cumulative_tokens_holder else 0.0
+                    if cur_tok < 15_700_000_000:
                         weights_req = {"broad_web": 0.90, "code": 0.10}
-                    elif progress < (31.4 / 41.4):
+                    elif cur_tok < 31_400_000_000:
                         weights_req = {"edu_academic": 0.75, "code": 0.20, "math": 0.05}
-                    elif progress < (36.4 / 41.4):
+                    elif cur_tok < 36_400_000_000:
                         weights_req = {"edu_academic": 0.70, "code": 0.20, "math": 0.10}
                     else:
                         weights_req = {"edu_academic": 0.58, "code": 0.24, "math": 0.14, "cosmopedia": 0.04}
