@@ -209,9 +209,15 @@ impl ParallelPipeline {
 
         let ext = if is_jsonl { "jsonl" } else { "csv" };
         let write_stage = |stage_name: &str, rows: &[String]| -> Result<(), String> {
+            if rows.is_empty() {
+                return Ok(());
+            }
             let path = output_dir.join(format!("{}.{}", stage_name, ext));
-            let mut f = File::create(&path)
-                .map_err(|e| format!("Failed creating {}: {e}", path.display()))?;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map_err(|e| format!("Failed opening {}: {e}", path.display()))?;
             for row in rows {
                 f.write_all(row.as_bytes()).map_err(|e| format!("Write error: {e}"))?;
                 if !row.ends_with('\n') {
