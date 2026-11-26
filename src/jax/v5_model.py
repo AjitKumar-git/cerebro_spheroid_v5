@@ -1462,7 +1462,7 @@ def training_rollout(
             if deliberation_mode == "predictive_coding":
                 thought_err = jnp.mean((prev_thought.astype(jnp.float32) - lax.stop_gradient(tf_aud.astype(jnp.float32))) ** 2, axis=-1)
                 step_loss = step_loss + (0.1 * thought_err * eff_w * (step_idx > 0).astype(jnp.float32))
-            return (nxt_s, nxt_t, nxt_p, nxt_thought), (step_loss, eff_w)
+            return (nxt_s, nxt_t, nxt_p, nxt_thought), (step_loss, eff_w, ce_c * eff_w)
 
         return (nxt_s, nxt_t, nxt_p, nxt_thought), logits
 
@@ -1756,21 +1756,25 @@ def training_rollout(
             mask_c = (t_c >= 0).astype(jnp.float32)
             eff_w = mask_c * w_c
             loss_c, _ = _compute_token_ce_and_z_loss(ce_c, lse, mask_c, eff_w, config)
-            return jnp.sum(loss_c), jnp.sum(eff_w)
+            return jnp.sum(loss_c), jnp.sum(eff_w), jnp.sum(ce_c * eff_w)
 
         if num_chunks == 1:
-            loss_sum, mask_sum = _ce_loss_chunk(h_scaled, targets_flat, weights_flat)
+            loss_sum, mask_sum, raw_ce_sum = _ce_loss_chunk(h_scaled, targets_flat, weights_flat)
         else:
             ce_fn = lambda _, inp: (None, _ce_loss_chunk(inp[0], inp[1], inp[2]))
             ce_scan = jax.checkpoint(ce_fn) if (use_remat or num_chunks > 2) else ce_fn
             h_chunks = h_scaled.reshape(num_chunks, chunk_tokens, surface_dim)
             t_chunks = targets_flat.reshape(num_chunks, chunk_tokens)
             w_chunks = weights_flat.reshape(num_chunks, chunk_tokens)
-            _, (chunk_losses, chunk_masks) = lax.scan(ce_scan, None, (h_chunks, t_chunks, w_chunks))
+            _, (chunk_losses, chunk_masks, chunk_raw_ces) = lax.scan(ce_scan, None, (h_chunks, t_chunks, w_chunks))
             loss_sum = jnp.sum(chunk_losses)
             mask_sum = jnp.sum(chunk_masks)
+            raw_ce_sum = jnp.sum(chunk_raw_ces)
 
-        base_loss = loss_sum / jnp.maximum(mask_sum, 1.0)
+        mask_denom = jnp.maximum(mask_sum, 1.0)
+        opt_loss = loss_sum / mask_denom
+        raw_ce = raw_ce_sum / mask_denom
+        base_loss = opt_loss + lax.stop_gradient(raw_ce - opt_loss)
         if ponder_cost is not None and getattr(config, "use_adaptive_thinking", False):
             base_loss = base_loss + float(getattr(config, "thinking_cost_weight", 0.01)) * ponder_cost
 
@@ -1830,8 +1834,11 @@ def training_rollout(
     scan_fn = jax.checkpoint(_emit) if use_remat else _emit
 
     if targets is not None:
-        _, (all_loss, all_mask) = lax.scan(scan_fn, (state, init_refractory, init_plan, init_thought), jnp.arange(target_len))
-        base_ce = jnp.sum(all_loss) / jnp.maximum(jnp.sum(all_mask), 1.0)
+        _, (all_loss, all_mask, all_raw_ce) = lax.scan(scan_fn, (state, init_refractory, init_plan, init_thought), jnp.arange(target_len))
+        mask_denom = jnp.maximum(jnp.sum(all_mask), 1.0)
+        opt_ce = jnp.sum(all_loss) / mask_denom
+        raw_ce = jnp.sum(all_raw_ce) / mask_denom
+        base_ce = opt_ce + lax.stop_gradient(raw_ce - opt_ce)
         if ponder_cost is not None and getattr(config, "use_adaptive_thinking", False):
             base_ce = base_ce + float(getattr(config, "thinking_cost_weight", 0.01)) * ponder_cost
         if energy_loss is not None and getattr(config, "use_energy_regularization", False):

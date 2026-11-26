@@ -1513,8 +1513,38 @@ def main(args=None):
         train_step_fn_frozen = train_step_fn
 
     # 9. Multi-Stream Ingestion & Prefetched Data Stream
+    # Restore persistent cumulative token accounting BEFORE initializing data streams & eval splits
+    loaded_ckpt = ckpt if ("ckpt" in locals() and isinstance(ckpt, dict)) else {}
+    if getattr(args, "reset_step_counter", False):
+        cumulative_tokens = 0
+        cumulative_prompt_tokens = 0
+        cumulative_loss_tokens = 0
+        cumulative_padded_tokens = 0
+        initial_lifetime_tokens = int(loaded_ckpt.get("lifetime_tokens", 14_745_600_000))
+    else:
+        cumulative_tokens = int(loaded_ckpt.get("cumulative_tokens", 0))
+        cumulative_prompt_tokens = int(loaded_ckpt.get("cumulative_prompt_tokens", 0))
+        cumulative_loss_tokens = int(loaded_ckpt.get("cumulative_loss_tokens", 0))
+        cumulative_padded_tokens = int(loaded_ckpt.get("cumulative_padded_tokens", 0))
+        initial_lifetime_tokens = int(loaded_ckpt.get("lifetime_tokens", 0))
+
+        # Check website remote token tracker to prevent token regression on worker restart within the same run
+        if args.cloud_sync:
+            try:
+                remote_tracker = fetch_remote_token_tracker(sync_model_name or args.preset, run_id=run_id, url=args.cloud_url, token=args.cloud_token)
+                if remote_tracker and isinstance(remote_tracker, dict):
+                    remote_cum = int(remote_tracker.get("cumulative_tokens", 0))
+                    remote_run = remote_tracker.get("run_id")
+                    if (not remote_run or remote_run == run_id) and remote_cum > cumulative_tokens:
+                        print(f"🌐 [cloud_sync] Restored persistent cumulative tokens from bioflo.in website ({run_id}): {remote_cum:,} tokens")
+                        cumulative_tokens = remote_cum
+            except Exception:
+                pass
+
+    lifetime_tokens = initial_lifetime_tokens + cumulative_tokens
+    resumed_cum_tokens = cumulative_tokens
     current_step_holder = [start_step]
-    cumulative_tokens_holder = [resumed_cum_tokens if "resumed_cum_tokens" in locals() else 0]
+    cumulative_tokens_holder = [cumulative_tokens]
     local_streamer = None
     elastic_batcher = None
     batcher = None
@@ -1789,6 +1819,8 @@ def main(args=None):
             print(f"⚠️ [Smart Mixture Engine] Setup notice: {e_mix}")
             smart_mixture_controller = None
 
+    eval_config = dataclasses.replace(config, use_selective_loss=False, z_loss_weight=0.0) if dataclasses.is_dataclass(config) else config
+
     @jax.jit
     def eval_step_loss(p, q_b, r_b, fb_b=None, enc_alpha: float = 1.0):
         return training_rollout(
@@ -1796,7 +1828,7 @@ def main(args=None):
             prompts=q_b,
             target_len=r_b.shape[1],
             buffers=buffers,
-            config=config,
+            config=eval_config,
             feedback_tokens=fb_b,
             feedback_is_shifted=True,
             pad_id=pad_id,
@@ -1971,38 +2003,6 @@ def main(args=None):
     step_window_count = 0
     ema_loss: Optional[float] = initial_ema_loss
     consistent_target_count = 0
-
-    # Persistent Cumulative Token Accounting
-    loaded_ckpt = ckpt if ("ckpt" in locals() and isinstance(ckpt, dict)) else {}
-    if getattr(args, "reset_step_counter", False):
-        cumulative_tokens = 0
-        cumulative_prompt_tokens = 0
-        cumulative_loss_tokens = 0
-        cumulative_padded_tokens = 0
-        initial_lifetime_tokens = int(loaded_ckpt.get("lifetime_tokens", 14_745_600_000))
-    else:
-        cumulative_tokens = int(loaded_ckpt.get("cumulative_tokens", 0))
-        cumulative_prompt_tokens = int(loaded_ckpt.get("cumulative_prompt_tokens", 0))
-        cumulative_loss_tokens = int(loaded_ckpt.get("cumulative_loss_tokens", 0))
-        cumulative_padded_tokens = int(loaded_ckpt.get("cumulative_padded_tokens", 0))
-        initial_lifetime_tokens = int(loaded_ckpt.get("lifetime_tokens", 0))
-
-        # Check website remote token tracker to prevent token regression on worker restart within the same run
-        if args.cloud_sync:
-            try:
-                remote_tracker = fetch_remote_token_tracker(sync_model_name or args.preset, run_id=run_id, url=args.cloud_url, token=args.cloud_token)
-                if remote_tracker and isinstance(remote_tracker, dict):
-                    remote_cum = int(remote_tracker.get("cumulative_tokens", 0))
-                    remote_run = remote_tracker.get("run_id")
-                    if (not remote_run or remote_run == run_id) and remote_cum > cumulative_tokens:
-                        print(f"🌐 [cloud_sync] Restored persistent cumulative tokens from bioflo.in website ({run_id}): {remote_cum:,} tokens")
-                        cumulative_tokens = remote_cum
-            except Exception:
-                pass
-
-    lifetime_tokens = initial_lifetime_tokens + cumulative_tokens
-    resumed_cum_tokens = cumulative_tokens
-    cumulative_tokens_holder[0] = cumulative_tokens
 
     # Diagnostic Tracking for Optimizer Health & Stability
     cumulative_skips = 0
