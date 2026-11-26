@@ -72,8 +72,10 @@ def has_substantive_code(text: str) -> bool:
 
 def main():
     parser = argparse.ArgumentParser(description="DeepCode Dataset Builder - Code & Logic Curation Engine")
-    parser.add_argument("--dataset", type=str, default="bigcode/the-stack-v2-train-smollm", help="Source Hugging Face code dataset")
+    parser.add_argument("--dataset", type=str, default="bigcode/the-stack-dedup", help="Source Hugging Face code dataset")
     parser.add_argument("--subset", type=str, default="default", help="Dataset subset or language config")
+    parser.add_argument("--languages", type=str, default="python,javascript,typescript,c,cpp,rust,go,java", help="Comma-separated code languages to ingest")
+    parser.add_argument("--data-dir", type=str, default="", help="Optional specific data_dir in dataset")
     parser.add_argument("--split", type=str, default="train", help="Dataset split")
     parser.add_argument("--max-documents", type=int, default=0, help="Maximum documents to ingest (0 = stream until disk threshold or end)")
     parser.add_argument("--chunk-size", type=int, default=5000, help="Chunk size for DEE batch processing")
@@ -142,8 +144,28 @@ def main():
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "datasets", "pyarrow", "pandas", "huggingface_hub"], check=True)
         from datasets import load_dataset
 
-    print(f"Connecting to {args.dataset} ({args.subset}, split={args.split}) in streaming mode...")
-    ds = load_dataset(args.dataset, name=args.subset if args.subset != "default" else None, split=args.split, streaming=True, token=hf_token or None)
+    def stream_code_items():
+        if args.data_dir:
+            print(f"Connecting to {args.dataset} (data_dir={args.data_dir}, split={args.split}) in streaming mode...")
+            ds = load_dataset(args.dataset, data_dir=args.data_dir, split=args.split, streaming=True, token=hf_token or None)
+            for itm in ds:
+                yield itm
+        elif "the-stack" in args.dataset:
+            langs = [l.strip() for l in args.languages.split(",") if l.strip()]
+            for lang in langs:
+                lang_data_dir = f"data/{lang}"
+                print(f"Connecting to {args.dataset} ({lang_data_dir}, split={args.split}) in streaming mode...")
+                try:
+                    ds = load_dataset(args.dataset, data_dir=lang_data_dir, split=args.split, streaming=True, token=hf_token or None)
+                    for itm in ds:
+                        yield itm
+                except Exception as e:
+                    print(f"Warning: Failed streaming language {lang}: {e}")
+        else:
+            print(f"Connecting to {args.dataset} ({args.subset}, split={args.split}) in streaming mode...")
+            ds = load_dataset(args.dataset, name=args.subset if args.subset != "default" else None, split=args.split, streaming=True, token=hf_token or None)
+            for itm in ds:
+                yield itm
 
     import csv
     doc_count = 0
@@ -158,7 +180,7 @@ def main():
     print(f"Beginning DeepCode Ingestion: Target={target_desc}, Chunk Size={args.chunk_size}...")
     start_all = time.time()
 
-    for item in ds:
+    for item in stream_code_items():
         text = item.get("content", "") or item.get("text", "")
         if text and len(text.split()) >= 15 and has_substantive_code(text):
             current_chunk.append((item.get("id", f"code_{doc_count}"), text))

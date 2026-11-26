@@ -1,15 +1,15 @@
 # Agent Work State & Activity Tracker
 
-> **Status**: 🟡 `IN_PROGRESS` | **Last Updated**: `2026-11-26T20:51:49.476261+05:30` | **Session**: `734a32d4-30f9-4fa4-b9c2-5336e0f58c27`
+> **Status**: 🟡 `IN_PROGRESS` | **Last Updated**: `2026-11-26T23:00:28.464356+05:30` | **Session**: `734a32d4-30f9-4fa4-b9c2-5336e0f58c27`
 
 ## Current / Active Objective
-**Goal**: stress test these algorithm on curated dataset with these text to quantify correct, false positive, false negative uncertain etc
+**Goal**: update the scripts to upload the dataset directly to my huggingface
 
 - **Phase**: `executing`
-- **Current Task**: Executed run_command: Check git diff for gitignore and WORK_STATE.md
+- **Current Task**: Executed manage_task: manage_task
 
 ## Summary of Completed Work
-An empirical stress test was constructed and executed across a curated benchmark dataset to evaluate DEE's algorithms.
+All builder scripts (`deepweb_builder.py`, `deepmath_builder.py`, and `deepcode_builder.py`) and their corresponding Kaggle kernels have been updated with direct, real-time Parquet shard uploading to your Hugging Face account (`AjitKumar-Bio`).
 
 ## Modified Files
 - [`AGENTS.md`](AGENTS.md)
@@ -185,20 +185,26 @@ An empirical stress test was constructed and executed across a curated benchmark
 - [`scripts/build_stress_test_benchmark.py`](scripts/build_stress_test_benchmark.py)
 - [`scripts/run_dee_stress_test.py`](scripts/run_dee_stress_test.py)
 - [`../../../../.kaggle/access_token`](../../../../.kaggle/access_token)
+- [`deploy/kaggle/deepweb_builder/deepweb_builder.py`](deploy/kaggle/deepweb_builder/deepweb_builder.py)
+- [`deploy/kaggle/deepweb_builder/deepweb_dataset_builder.ipynb`](deploy/kaggle/deepweb_builder/deepweb_dataset_builder.ipynb)
+- [`deploy/kaggle/kernel/kernel-metadata.json`](deploy/kaggle/kernel/kernel-metadata.json)
+- [`deploy/kaggle/deepmath_builder/deepmath_builder.py`](deploy/kaggle/deepmath_builder/deepmath_builder.py)
+- [`deploy/kaggle/deepmath_builder/kernel-metadata.json`](deploy/kaggle/deepmath_builder/kernel-metadata.json)
+- [`deploy/kaggle/deepcode_builder/deepcode_builder.py`](deploy/kaggle/deepcode_builder/deepcode_builder.py)
 
 ## Recent Actions (Last 10)
 | Time | Tool | Details |
 | :--- | :--- | :--- |
-| `20:51:49` | `run_command` | Check git diff for gitignore and WORK_STATE.md |
-| `20:51:40` | `run_command` | Verify zero README files |
-| `20:51:33` | `run_command` | Check DEE binary file type |
-| `20:51:14` | `run_command` | Check username on new kaggle account |
-| `20:51:04` | `run_command` | Verify new kaggle account authentication |
-| `20:50:55` | `write_file` | write_file |
-| `20:50:47` | `run_command` | Read existing kaggle access_token format |
-| `20:50:38` | `run_command` | Check existing Kaggle kernels |
-| `20:50:26` | `run_command` | Check tracked files in tools/ |
-| `20:50:20` | `run_command` | Check git status after gitignore edit |
+| `23:00:28` | `manage_task` | manage_task |
+| `23:00:27` | `run_command` | Check tests in test_jax_scmer.py |
+| `23:00:26` | `run_command` | Git status and unit test suite |
+| `23:00:12` | `manage_task` | manage_task |
+| `23:00:07` | `manage_task` | manage_task |
+| `22:59:58` | `manage_task` | manage_task |
+| `22:59:53` | `manage_task` | manage_task |
+| `22:59:49` | `manage_task` | manage_task |
+| `22:59:43` | `manage_task` | manage_task |
+| `22:59:38` | `manage_task` | manage_task |
 
 ---
 *This file is automatically maintained by `auto-work-tracker`. Other agents can parse `.agents/work_state.json` or inspect this file directly to resume or review progress.*
