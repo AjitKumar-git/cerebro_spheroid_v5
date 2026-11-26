@@ -773,16 +773,26 @@ class RectifiedContiguousPretrainStreamer:
                             text_chunks = [doc_text[ci : ci + CHUNK_CHAR_SIZE] for ci in range(0, len(doc_text), CHUNK_CHAR_SIZE)]
 
                         truncated_doc = False
-                        for c_text in text_chunks:
-                            if hasattr(self.tokenizer, "encode"):
-                                toks = self.tokenizer.encode(c_text, add_special_tokens=False)
-                                for t in toks:
-                                    if t < 0 or t >= self.vocab_size:
-                                        raise ValueError(
-                                            f"Tokenizer emitted out-of-range token ID {t} for vocab_size={self.vocab_size}."
-                                        )
+                        if hasattr(self.tokenizer, "encode"):
+                            # Use fast Rust batch encoding when multiple chunks exist
+                            if len(text_chunks) > 1 and callable(self.tokenizer):
+                                try:
+                                    encoded_chunks = self.tokenizer(text_chunks, add_special_tokens=False)["input_ids"]
+                                except Exception:
+                                    encoded_chunks = [self.tokenizer.encode(c_text, add_special_tokens=False) for c_text in text_chunks]
                             else:
-                                toks = [ord(c) % self.vocab_size for c in c_text]
+                                encoded_chunks = [self.tokenizer.encode(c_text, add_special_tokens=False) for c_text in text_chunks]
+                        else:
+                            encoded_chunks = [[ord(c) % self.vocab_size for c in c_text] for c_text in text_chunks]
+
+                        for toks in encoded_chunks:
+                            if toks and hasattr(self.tokenizer, "encode"):
+                                min_t, max_t = min(toks), max(toks)
+                                if min_t < 0 or max_t >= self.vocab_size:
+                                    bad_t = min_t if min_t < 0 else max_t
+                                    raise ValueError(
+                                        f"Tokenizer emitted out-of-range token ID {bad_t} for vocab_size={self.vocab_size}."
+                                    )
                             buf.extend(toks)
                             if len(buf) >= cur_block_size * 2:
                                 truncated_doc = True

@@ -103,10 +103,13 @@ from src.cloud_sync import (
     pull_checkpoint,
     push_checkpoint_async,
     push_remote_loss_history,
+    push_remote_loss_history_async,
     push_remote_token_tracker,
+    push_remote_token_tracker_async,
     fetch_remote_token_tracker,
     detect_source_environment,
     wait_for_in_flight_uploads,
+    wait_for_telemetry_uploads,
 )
 from src.corpus import build_tokenizer
 from src.elastic_window import (
@@ -2002,6 +2005,8 @@ def main(args=None):
     step_window_tokens = 0
     step_window_count = 0
     ema_loss: Optional[float] = initial_ema_loss
+    last_synced_loss_val: float = float(initial_ema_loss) if initial_ema_loss is not None else 3.0
+    steps_since_shape_change: int = 0
     consistent_target_count = 0
 
     # Diagnostic Tracking for Optimizer Health & Stability
@@ -2216,6 +2221,7 @@ def main(args=None):
                         elif hasattr(b_target, "batcher") and hasattr(b_target.batcher, "update_buckets"):
                             b_target.batcher.update_buckets(new_buckets, new_total_window=active_window)
                     generate_held_out_split("deep_reasoning" if in_deep_reasoning_phase else "pretrain", active_window)
+                    steps_since_shape_change = 0
 
             # Dynamic Sequence Length Transition Check (if seq_transition_steps > 0)
             if target_seq_len is not None and target_seq_len > initial_seq_len and seq_trans_steps > 0:
@@ -2280,6 +2286,22 @@ def main(args=None):
             is_past_freeze_limit = True
             is_frozen_active = False
             is_anneal = False
+
+            crossed_log_step = (prev_step == start_step) or ((step // max(1, args.log_every)) > (prev_step // max(1, args.log_every)))
+            crossed_eval_step = bool(eval_batches) and ((step // max(1, args.eval_interval)) > (prev_step // max(1, args.eval_interval)))
+            crossed_save_step = ((step // max(1, args.save_interval)) > (prev_step // max(1, args.save_interval))) or (
+                args.cloud_save_hours is not None and (time.time() - last_cloud_save_time) >= (args.cloud_save_hours * 3600.0)
+            )
+            crossed_sync_step = (step % max(1, getattr(args, "cloud_sync_interval", 100)) == 0)
+            crossed_periodic_step = (step // max(1, args.periodic_every)) > (prev_step // max(1, args.periodic_every))
+            need_host_sync = (
+                steps_since_shape_change < 3
+                or crossed_log_step
+                or crossed_eval_step
+                or crossed_save_step
+                or crossed_sync_step
+                or crossed_periodic_step
+            )
 
             step_executed = False
             while not step_executed:
@@ -2354,8 +2376,13 @@ def main(args=None):
                                 target_weights=weights_b,
                             )
                             step_tokens, step_prompt, step_loss, step_pad = _count_real_tokens(prompt_b, target_b)
-                        # Explicitly synchronize device execution inside try block so asynchronous OOMs are caught
-                        loss_val = float(loss)
+                        # Synchronize device execution on initial shape steps (for OOM catching) and log/eval/save steps;
+                        # otherwise allow XLA async dispatch to overlap TPU execution with host batch prep.
+                        if need_host_sync:
+                            loss_val = float(loss)
+                            last_synced_loss_val = loss_val
+                        else:
+                            loss_val = last_synced_loss_val
                         step_executed = True
                 except Exception as e_step:
                     if not is_oom_error(e_step) or (args.batch_size <= 1 and remat_choice):
@@ -2426,24 +2453,32 @@ def main(args=None):
                             scmer_pair_samples=eff_scmer_pairs,
                         ) if param_masks is not None else train_step_fn_anneal
 
-            loss_val = float(loss)
-            if math.isfinite(loss_val):
-                # Smooth 0.96 / 0.04 EMA update to prevent single-batch spikes from oscillating the governor
-                ema_loss = loss_val if ema_loss is None else (0.96 * ema_loss + 0.04 * loss_val)
+            steps_since_shape_change += 1
+            if need_host_sync:
+                loss_val = float(loss)
+                last_synced_loss_val = loss_val
+                if math.isfinite(loss_val):
+                    # Smooth 0.96 / 0.04 EMA update to prevent single-batch spikes from oscillating the governor
+                    ema_loss = loss_val if ema_loss is None else (0.96 * ema_loss + 0.04 * loss_val)
+                else:
+                    print(f"\n⚠️ [Divergence Watchdog] Non-finite loss ({loss_val}) detected at Step {step:,}! Stabilizing optimizer momentum...")
+                    ema_loss = last_eval_loss if math.isfinite(last_eval_loss) else 3.00
+                    cur_lr = cur_lr * 0.75
             else:
-                print(f"\n⚠️ [Divergence Watchdog] Non-finite loss ({loss_val}) detected at Step {step:,}! Stabilizing optimizer momentum...")
-                ema_loss = last_eval_loss if math.isfinite(last_eval_loss) else 3.00
-                cur_lr = cur_lr * 0.75
+                loss_val = last_synced_loss_val
 
-            # Extract optimizer diagnostics (grad norm, clipping, skips, update ratios, multi-TPU drift)
+            # Extract optimizer diagnostics only on host-sync steps in one batched device_get
             cur_diag = None
-            if use_multi_tpu_local_sgd and rep_opt_state is not None:
-                raw_diag = rep_opt_state.get("diag")
-                if raw_diag is not None:
-                    cur_diag = {k: float(jax.device_get(v[0])) for k, v in raw_diag.items()}
-            elif opt_state is not None and isinstance(opt_state, dict) and "diag" in opt_state:
-                raw_diag = opt_state["diag"]
-                cur_diag = {k: float(jax.device_get(v)) for k, v in raw_diag.items()}
+            if need_host_sync:
+                if use_multi_tpu_local_sgd and rep_opt_state is not None:
+                    raw_diag = rep_opt_state.get("diag")
+                    if raw_diag is not None:
+                        host_diag = jax.device_get(raw_diag)
+                        cur_diag = {k: float(v[0]) for k, v in host_diag.items()}
+                elif opt_state is not None and isinstance(opt_state, dict) and "diag" in opt_state:
+                    raw_diag = opt_state["diag"]
+                    host_diag = jax.device_get(raw_diag)
+                    cur_diag = {k: float(v) for k, v in host_diag.items()}
 
             if cur_diag is not None:
                 was_skip = cur_diag.get("was_skipped", 0.0)
@@ -2705,7 +2740,7 @@ def main(args=None):
                                 "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                                 "source": detect_source_environment(),
                             }
-                            push_remote_loss_history(
+                            push_remote_loss_history_async(
                                 model=sync_model_name or args.preset,
                                 records=[champ_rec],
                                 url=args.cloud_url,
@@ -2763,7 +2798,7 @@ def main(args=None):
                             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                             "source": detect_source_environment(),
                         }
-                        push_remote_loss_history(
+                        push_remote_loss_history_async(
                             model=sync_model_name or args.preset,
                             records=[latest_rec],
                             url=args.cloud_url,
@@ -2777,7 +2812,7 @@ def main(args=None):
             if args.cloud_sync and crossed_sync:
                 try:
                     ds_stats = batcher.get_tokens_by_dataset() if hasattr(batcher, "get_tokens_by_dataset") else {}
-                    push_remote_token_tracker(
+                    push_remote_token_tracker_async(
                         model=sync_model_name or args.preset,
                         cumulative_tokens=cumulative_tokens,
                         target_tokens=getattr(args, "target_tokens", 200_000_000_000),
@@ -2859,6 +2894,9 @@ def main(args=None):
         if "ckpt_mgr" in locals() and ckpt_mgr is not None:
             ckpt_mgr.flush(_get_host_params(), buffers, final_fname, meta_dict=final_meta, opt_state=_get_host_opt_state())
             ckpt_mgr.shutdown(wait=True)
+
+        if args.cloud_sync:
+            wait_for_telemetry_uploads(timeout=10.0)
 
         if args.cloud_sync:
             try:

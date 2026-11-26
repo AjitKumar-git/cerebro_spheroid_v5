@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import socket
 import ssl
 import sys
@@ -962,6 +963,61 @@ def push_remote_token_tracker(
             return bool(data.get("success", False))
     except Exception:
         return False
+
+
+_TELEMETRY_QUEUE: queue.Queue = queue.Queue(maxsize=64)
+_TELEMETRY_WORKER_STARTED = False
+_TELEMETRY_LOCK = threading.Lock()
+
+
+def _telemetry_worker_loop() -> None:
+    while True:
+        fn, kwargs = _TELEMETRY_QUEUE.get()
+        try:
+            fn(**kwargs)
+        except Exception:
+            pass
+        finally:
+            _TELEMETRY_QUEUE.task_done()
+
+
+def _enqueue_telemetry(fn, **kwargs) -> None:
+    global _TELEMETRY_WORKER_STARTED
+    with _TELEMETRY_LOCK:
+        if not _TELEMETRY_WORKER_STARTED:
+            t = threading.Thread(target=_telemetry_worker_loop, daemon=True, name="CerebroTelemetrySync")
+            t.start()
+            _TELEMETRY_WORKER_STARTED = True
+    try:
+        _TELEMETRY_QUEUE.put_nowait((fn, kwargs))
+    except queue.Full:
+        # Drop oldest stale telemetry item so training never blocks on slow network
+        try:
+            _TELEMETRY_QUEUE.get_nowait()
+            _TELEMETRY_QUEUE.task_done()
+        except queue.Empty:
+            pass
+        try:
+            _TELEMETRY_QUEUE.put_nowait((fn, kwargs))
+        except queue.Full:
+            pass
+
+
+def push_remote_loss_history_async(**kwargs) -> None:
+    """Non-blocking background enqueue of push_remote_loss_history."""
+    _enqueue_telemetry(push_remote_loss_history, **kwargs)
+
+
+def push_remote_token_tracker_async(**kwargs) -> None:
+    """Non-blocking background enqueue of push_remote_token_tracker."""
+    _enqueue_telemetry(push_remote_token_tracker, **kwargs)
+
+
+def wait_for_telemetry_uploads(timeout: float = 10.0) -> None:
+    """Best-effort wait for queued background telemetry requests to finish on shutdown."""
+    deadline = time.time() + max(0.0, float(timeout))
+    while not _TELEMETRY_QUEUE.empty() and time.time() < deadline:
+        time.sleep(0.05)
 
 
 def fetch_remote_token_tracker(
