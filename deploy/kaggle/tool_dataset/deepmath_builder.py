@@ -3,8 +3,9 @@
 DeepMath Dataset Builder (FineMath & OpenWebMath Ingestion Engine).
 Streams high-density mathematical reasoning corpora (HuggingFaceTB/finemath,
 open-web-math, proof-pile-2), applies the Discrete Evidence Engine (DEE)
-for symbolic mathematical and LaTeX delimiter verification, and exports
-compressed Parquet shards partitioned across SmolLM2 developmental stages.
+for symbolic mathematical and LaTeX delimiter verification, and streams
+compressed Parquet shards DIRECTLY to Hugging Face (AjitKumar-Bio/DeepMath)
+partitioned into the SmolLM2 developmental stages.
 """
 
 import os
@@ -20,17 +21,28 @@ import pandas as pd
 
 def fetch_hf_token_from_website() -> str:
     """Fetches HF authentication token dynamically from centralized website vault."""
+    env_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    if env_token and env_token.strip().startswith("hf_"):
+        return env_token.strip()
+
+    sync_token = os.environ.get("BIOFLO_SYNC_TOKEN") or os.environ.get("CEREBRO_SYNC_TOKEN") or "CerebroSpheroid_Sync_Secure_2026"
     url = "https://bioflo.in/api/cerebro/sync.php?action=get_config&model=v5_small&device=backup_hf_token"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "DeepMath-Dataset-Builder/1.0"})
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {sync_token}",
+                "User-Agent": "DeepMath-Dataset-Builder/1.0"
+            }
+        )
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            token = data.get("token") or data.get("config", {}).get("token") or data.get("value")
-            if token and token.startswith("hf_"):
-                return token.strip()
+            tok = data.get("config", {}).get("dtype", "") or data.get("token") or data.get("value")
+            if tok and tok.strip().startswith("hf_"):
+                return tok.strip()
     except Exception as e:
-        print(f"Warning: Failed fetching token from website endpoint: {e}")
-    return os.environ.get("HF_TOKEN", "")
+        print(f"Warning: Website token fetch error: {e}")
+    return ""
 
 def run_dee_pipeline(dee_bin: Path, input_csv: Path, output_dir: Path) -> dict:
     """Executes multi-threaded DEE pipeline on a chunk CSV."""
@@ -53,7 +65,7 @@ def has_mathematical_content(text: str) -> bool:
     math_indicators = [
         "\\begin", "\\frac", "\\sum", "\\int", "\\partial", "\\sqrt", "\\alpha", "\\beta",
         "\\theta", "\\lambda", "\\infty", "\\times", "\\le", "\\ge", "\\neq", "\\in",
-        "$$", "\\(", "\\[", "定理", "proof", "lemma", "corollary", "equation",
+        "$$", "\\(", "\\[", "theorem", "proof", "lemma", "corollary", "equation",
         "solve for", "derivative", "integral", "matrix", "eigenvalue", "polynomial"
     ]
     text_lower = text.lower()
@@ -62,11 +74,14 @@ def has_mathematical_content(text: str) -> bool:
 def main():
     parser = argparse.ArgumentParser(description="DeepMath Dataset Builder - Mathematical Reasoning Curation")
     parser.add_argument("--dataset", type=str, default="HuggingFaceTB/finemath", help="Source Hugging Face math dataset")
-    parser.add_argument("--subset", type=str, default="finemath-4plus", help="Dataset subset or config name (e.g. finemath-4plus, finemath-3plus)")
+    parser.add_argument("--subset", type=str, default="finemath-4plus", help="Dataset subset or config name")
     parser.add_argument("--split", type=str, default="train", help="Dataset split")
     parser.add_argument("--max-documents", type=int, default=0, help="Maximum documents to ingest (0 = stream until disk threshold or end)")
     parser.add_argument("--chunk-size", type=int, default=5000, help="Chunk size for DEE batch processing")
     parser.add_argument("--output-dir", type=Path, default=Path("/kaggle/working/deepmath" if Path("/kaggle/working").exists() else "deepmath_output"), help="Output directory")
+    parser.add_argument("--hf-repo", type=str, default="", help="Destination Hugging Face repository (e.g. AjitKumar-Bio/DeepMath)")
+    parser.add_argument("--upload-to-hf", action="store_true", default=True, help="Directly upload shards to Hugging Face")
+    parser.add_argument("--delete-uploaded-local", action="store_true", default=True, help="Delete local Parquet after upload to preserve disk space")
     parser.add_argument("--disk-limit-gb", type=float, default=18.5, help="Maximum used disk space in GB before graceful halt")
     parser.add_argument("--min-free-gb", type=float, default=1.5, help="Minimum free disk space in GB before graceful halt")
     parser.add_argument("--dee-binary", type=Path, default=Path("./dee"), help="Path to compiled DEE binary")
@@ -101,17 +116,31 @@ def main():
     os.chmod(dee_bin, 0o755)
     print(f"DEE Mathematical Engine Binary: {dee_bin.resolve()}")
 
-    # 2. Authenticate Hugging Face
+    # 2. Authenticate Hugging Face & Setup Target Repo
     hf_token = fetch_hf_token_from_website()
+    hf_api = None
+    hf_repo_id = args.hf_repo
+
     if hf_token:
         os.environ["HF_TOKEN"] = hf_token
-        print("Authenticated Hugging Face token dynamically from centralized vault.")
+        try:
+            from huggingface_hub import HfApi
+            hf_api = HfApi(token=hf_token)
+            user_info = hf_api.whoami()
+            username = user_info.get("name", "AjitKumar-Bio")
+            if not hf_repo_id:
+                hf_repo_id = f"{username}/DeepMath"
+            hf_api.create_repo(repo_id=hf_repo_id, repo_type="dataset", exist_ok=True, private=False)
+            print(f"Connected to Hugging Face: {username} -> Repo: https://huggingface.co/datasets/{hf_repo_id}")
+        except Exception as e:
+            print(f"Warning: Hugging Face setup issue: {e}")
+            hf_api = None
 
     # 3. Stream from Hugging Face
     try:
         from datasets import load_dataset
     except ImportError:
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "datasets", "pyarrow", "pandas"], check=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "datasets", "pyarrow", "pandas", "huggingface_hub"], check=True)
         from datasets import load_dataset
 
     print(f"Connecting to {args.dataset} ({args.subset}, split={args.split}) in streaming mode...")
@@ -124,6 +153,7 @@ def main():
     
     stage_doc_totals = {k: 0 for k in stage_dirs.keys()}
     total_clean_docs = 0
+    uploaded_shards_count = 0
 
     target_desc = f"{args.max_documents} docs" if args.max_documents > 0 else "Continuous until disk limit"
     print(f"Beginning DeepMath Ingestion: Target={target_desc}, Chunk Size={args.chunk_size}...")
@@ -150,7 +180,7 @@ def main():
                 # Process chunk through multi-threaded DEE with math & formula verification
                 run_dee_pipeline(dee_bin, chunk_csv, chunk_out_dir)
                 
-                # Convert each generated stage CSV to compressed Parquet shard immediately
+                # Convert each stage CSV to compressed Parquet and upload to HF directly
                 for stage_key, sdir in stage_dirs.items():
                     stage_csv = chunk_out_dir / f"{stage_key}.csv"
                     if stage_csv.exists() and stage_csv.stat().st_size > 0:
@@ -161,8 +191,21 @@ def main():
                                 df.to_parquet(parquet_path, compression="snappy", index=False)
                                 stage_doc_totals[stage_key] += len(df)
                                 total_clean_docs += len(df)
+
+                                if args.upload_to_hf and hf_api and hf_repo_id:
+                                    repo_path = f"data/{stage_key}/math_shard_{chunk_index:05d}.parquet"
+                                    hf_api.upload_file(
+                                        path_or_fileobj=str(parquet_path),
+                                        path_in_repo=repo_path,
+                                        repo_id=hf_repo_id,
+                                        repo_type="dataset",
+                                        commit_message=f"Upload {stage_key} math shard {chunk_index:05d} ({len(df)} docs)"
+                                    )
+                                    uploaded_shards_count += 1
+                                    if args.delete_uploaded_local:
+                                        parquet_path.unlink(missing_ok=True)
                         except Exception as e:
-                            print(f"Warning reading {stage_csv.name}: {e}")
+                            print(f"Warning processing {stage_csv.name}: {e}")
 
                 shutil.rmtree(chunk_out_dir, ignore_errors=True)
                 chunk_csv.unlink(missing_ok=True)
@@ -170,7 +213,8 @@ def main():
 
                 total_gb, used_gb, free_gb = get_disk_status_gb(args.output_dir)
                 elapsed = time.time() - start_all
-                print(f"DeepMath Chunk {chunk_index:04d} Done | Math Docs: {doc_count:,d} | Clean Kept: {total_clean_docs:,d} | Speed: {doc_count / max(elapsed, 0.001):.1f} docs/sec | Disk: {used_gb:.2f}GB used, {free_gb:.2f}GB free")
+                upload_status = f" | HF Uploads: {uploaded_shards_count} shards" if hf_api else ""
+                print(f"DeepMath Chunk {chunk_index:04d} Done | Math Docs: {doc_count:,d} | Clean: {total_clean_docs:,d} | Speed: {doc_count / max(elapsed, 0.001):.1f} d/s{upload_status} | Disk: {used_gb:.2f}GB used, {free_gb:.2f}GB free")
 
                 if free_gb <= args.min_free_gb or used_gb >= args.disk_limit_gb:
                     print(f"\n[ALERT] Disk space safety limit reached! (Used: {used_gb:.2f}GB, Free: {free_gb:.2f}GB). Gracefully halting...")
@@ -205,8 +249,21 @@ def main():
                         df.to_parquet(parquet_path, compression="snappy", index=False)
                         stage_doc_totals[stage_key] += len(df)
                         total_clean_docs += len(df)
+
+                        if args.upload_to_hf and hf_api and hf_repo_id:
+                            repo_path = f"data/{stage_key}/math_shard_{chunk_index:05d}.parquet"
+                            hf_api.upload_file(
+                                path_or_fileobj=str(parquet_path),
+                                path_in_repo=repo_path,
+                                repo_id=hf_repo_id,
+                                repo_type="dataset",
+                                commit_message=f"Upload {stage_key} math shard {chunk_index:05d} ({len(df)} docs)"
+                            )
+                            uploaded_shards_count += 1
+                            if args.delete_uploaded_local:
+                                parquet_path.unlink(missing_ok=True)
                 except Exception as e:
-                    print(f"Warning reading {stage_csv.name}: {e}")
+                    print(f"Warning processing {stage_csv.name}: {e}")
 
         shutil.rmtree(chunk_out_dir, ignore_errors=True)
         chunk_csv.unlink(missing_ok=True)
@@ -215,16 +272,13 @@ def main():
 
     total_time = time.time() - start_all
     print("\n" + "=" * 80)
-    print("DEEPMATH DATASET GENERATION COMPLETE")
+    print("DEEPMATH PARQUET DIRECT HUGGING FACE STREAMING COMPLETE")
     print(f"Total Evaluated Math Documents:  {doc_count:,d}")
     print(f"Total Clean Kept:                {total_clean_docs:,d} ({total_clean_docs/max(doc_count,1)*100:.1f}%)")
     print(f"Total Execution Time:            {total_time:.2f} seconds ({doc_count / max(total_time, 0.001):.1f} docs/sec)")
-    print(f"Parquet Output Directory:        {parquet_root.resolve()}")
-    print("\nSmolLM2 Curriculum Math Distribution (Snappy Parquet Shards):")
-    for stage_key, sdir in stage_dirs.items():
-        shards = list(sdir.glob("*.parquet"))
-        total_size_mb = sum(f.stat().st_size for f in shards) / (1024 * 1024)
-        print(f"  - {stage_key:<24}: {len(shards):>4} shards | {stage_doc_totals[stage_key]:>8,d} docs | {total_size_mb:>7.2f} MB")
+    if hf_api and hf_repo_id:
+        print(f"Live Hugging Face Dataset:       https://huggingface.co/datasets/{hf_repo_id}")
+        print(f"Total Uploaded Shards:           {uploaded_shards_count} parquet shards")
     print("=" * 80)
 
 if __name__ == "__main__":

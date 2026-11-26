@@ -2,9 +2,9 @@
 """
 DeepWeb Dataset Builder (FineWeb-Edu Ingestion & Parquet Sharding Engine).
 Streams HuggingFaceFW/fineweb-edu, applies the Discrete Evidence Engine (DEE)
-for epistemic, factual, temporal, and mathematical verification, and exports
-the clean 'DeepWeb' dataset partitioned into SmolLM2 developmental stages
-as compressed Parquet shards with an automatic disk-space guard.
+for epistemic, factual, temporal, and mathematical verification, and streams
+compressed Parquet shards DIRECTLY to Hugging Face (AjitKumar-Bio/DeepWeb)
+partitioned into the SmolLM2 4-stage developmental curriculum.
 """
 
 import os
@@ -20,17 +20,28 @@ import pandas as pd
 
 def fetch_hf_token_from_website() -> str:
     """Fetches HF authentication token dynamically from centralized website vault."""
+    env_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    if env_token and env_token.strip().startswith("hf_"):
+        return env_token.strip()
+
+    sync_token = os.environ.get("BIOFLO_SYNC_TOKEN") or os.environ.get("CEREBRO_SYNC_TOKEN") or "CerebroSpheroid_Sync_Secure_2026"
     url = "https://bioflo.in/api/cerebro/sync.php?action=get_config&model=v5_small&device=backup_hf_token"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "DeepWeb-Dataset-Builder/1.0"})
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {sync_token}",
+                "User-Agent": "DeepWeb-Dataset-Builder/1.0"
+            }
+        )
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            token = data.get("token") or data.get("config", {}).get("token") or data.get("value")
-            if token and token.startswith("hf_"):
-                return token.strip()
+            tok = data.get("config", {}).get("dtype", "") or data.get("token") or data.get("value")
+            if tok and tok.strip().startswith("hf_"):
+                return tok.strip()
     except Exception as e:
-        print(f"Warning: Failed fetching token from website endpoint: {e}")
-    return os.environ.get("HF_TOKEN", "")
+        print(f"Warning: Website token fetch error: {e}")
+    return ""
 
 def run_dee_pipeline(dee_bin: Path, input_csv: Path, output_dir: Path) -> dict:
     """Executes multi-threaded DEE pipeline on a chunk CSV."""
@@ -46,10 +57,7 @@ def run_dee_pipeline(dee_bin: Path, input_csv: Path, output_dir: Path) -> dict:
 def get_disk_status_gb(path: Path) -> tuple[float, float, float]:
     """Returns (total_gb, used_gb, free_gb) for the filesystem holding path."""
     stat = shutil.disk_usage(path)
-    total_gb = stat.total / (1024 ** 3)
-    used_gb = stat.used / (1024 ** 3)
-    free_gb = stat.free / (1024 ** 3)
-    return total_gb, used_gb, free_gb
+    return stat.total / (1024 ** 3), stat.used / (1024 ** 3), stat.free / (1024 ** 3)
 
 def main():
     parser = argparse.ArgumentParser(description="DeepWeb Dataset Builder - FineWeb-Edu Ingestion Engine")
@@ -59,10 +67,11 @@ def main():
     parser.add_argument("--max-documents", type=int, default=0, help="Maximum documents to ingest (0 = stream until disk threshold or end)")
     parser.add_argument("--chunk-size", type=int, default=10000, help="Chunk size for DEE batch processing")
     parser.add_argument("--output-dir", type=Path, default=Path("/kaggle/working/deepweb" if Path("/kaggle/working").exists() else "deepweb_output"), help="Output directory")
+    parser.add_argument("--hf-repo", type=str, default="", help="Destination Hugging Face repository (e.g. AjitKumar-Bio/DeepWeb)")
+    parser.add_argument("--upload-to-hf", action="store_true", default=True, help="Directly upload shards to Hugging Face")
+    parser.add_argument("--delete-uploaded-local", action="store_true", default=True, help="Delete local Parquet after upload to preserve disk space")
     parser.add_argument("--disk-limit-gb", type=float, default=18.5, help="Maximum used disk space in GB before graceful halt")
     parser.add_argument("--min-free-gb", type=float, default=1.5, help="Minimum free disk space in GB before graceful halt")
-    parser.add_argument("--shard-index", type=int, default=0, help="Shard index for parallel multi-kernel execution (0-indexed)")
-    parser.add_argument("--total-shards", type=int, default=1, help="Total number of parallel shards")
     parser.add_argument("--dee-binary", type=Path, default=Path("./dee"), help="Path to compiled DEE binary")
     args = parser.parse_args()
 
@@ -70,7 +79,6 @@ def main():
     temp_dir = args.output_dir / "temp_scratch"
     temp_dir.mkdir(parents=True, exist_ok=True)
     
-    # Target Parquet shard directories for each SmolLM2 curriculum stage
     parquet_root = args.output_dir / "parquet_shards"
     stage_dirs = {
         "stage1_fundamental": parquet_root / "stage1_fundamental",
@@ -84,12 +92,10 @@ def main():
     # 1. Resolve DEE binary
     dee_bin = args.dee_binary
     if not dee_bin.exists():
-        if Path("/kaggle/input/deepweb-builder-tool/dee").exists():
-            dee_bin = Path("/kaggle/input/deepweb-builder-tool/dee")
-        elif Path("./tools/dee/target/release/dee").exists():
-            dee_bin = Path("./tools/dee/target/release/dee")
-        elif Path("/kaggle/working/dee").exists():
-            dee_bin = Path("/kaggle/working/dee")
+        for p in [Path("/kaggle/input/deepweb-builder-tool/dee"), Path("./dee"), Path("./tools/dee/target/release/dee"), Path("/kaggle/working/dee")]:
+            if p.exists():
+                dee_bin = p
+                break
         else:
             print("DEE binary not found. Compiling...")
             subprocess.run(["cargo", "build", "--release", "--manifest-path", "tools/dee/Cargo.toml"], check=True)
@@ -98,20 +104,33 @@ def main():
     os.chmod(dee_bin, 0o755)
     print(f"DEE Engine Binary: {dee_bin.resolve()}")
 
-    # 2. Authenticate Hugging Face
+    # 2. Authenticate Hugging Face & Setup Target Repo
     hf_token = fetch_hf_token_from_website()
+    hf_api = None
+    hf_repo_id = args.hf_repo
+
     if hf_token:
         os.environ["HF_TOKEN"] = hf_token
-        print("Authenticated Hugging Face token dynamically from centralized vault.")
+        try:
+            from huggingface_hub import HfApi
+            hf_api = HfApi(token=hf_token)
+            user_info = hf_api.whoami()
+            username = user_info.get("name", "AjitKumar-Bio")
+            if not hf_repo_id:
+                hf_repo_id = f"{username}/DeepWeb"
+            hf_api.create_repo(repo_id=hf_repo_id, repo_type="dataset", exist_ok=True, private=False)
+            print(f"Connected to Hugging Face: {username} -> Repo: https://huggingface.co/datasets/{hf_repo_id}")
+        except Exception as e:
+            print(f"Warning: Hugging Face setup issue: {e}")
+            hf_api = None
     else:
-        print("Proceeding with public streaming.")
+        print("Proceeding without Hugging Face direct upload.")
 
     # 3. Stream from Hugging Face
     try:
         from datasets import load_dataset
     except ImportError:
-        print("Installing datasets and pyarrow...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "datasets", "pyarrow", "pandas"], check=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "datasets", "pyarrow", "pandas", "huggingface_hub"], check=True)
         from datasets import load_dataset
 
     print(f"Connecting to {args.dataset} ({args.subset}, split={args.split}) in streaming mode...")
@@ -119,24 +138,18 @@ def main():
 
     import csv
     doc_count = 0
-    streamed_doc_count = 0
     chunk_index = 0
     current_chunk = []
     
     stage_doc_totals = {k: 0 for k in stage_dirs.keys()}
     total_clean_docs = 0
+    uploaded_shards_count = 0
 
     target_desc = f"{args.max_documents} docs" if args.max_documents > 0 else "Continuous until disk limit"
-    print(f"Beginning Ingestion: Target={target_desc}, Chunk Size={args.chunk_size}, Shard={args.shard_index+1}/{args.total_shards}...")
+    print(f"Beginning Ingestion: Target={target_desc}, Chunk Size={args.chunk_size}...")
     start_all = time.time()
 
     for item in ds:
-        streamed_doc_count += 1
-        
-        # Apply sharding filter if running in multi-kernel mode
-        if args.total_shards > 1 and ((streamed_doc_count - 1) % args.total_shards != args.shard_index):
-            continue
-
         text = item.get("text", "") or item.get("content", "")
         if text and len(text.split()) >= 15:
             current_chunk.append((item.get("id", f"doc_{doc_count}"), text))
@@ -155,9 +168,9 @@ def main():
                         wtr.writerow([cid, ctext])
 
                 # Process chunk through multi-threaded DEE
-                res = run_dee_pipeline(dee_bin, chunk_csv, chunk_out_dir)
+                run_dee_pipeline(dee_bin, chunk_csv, chunk_out_dir)
                 
-                # Convert each generated stage CSV to compressed Parquet shard immediately
+                # Convert each stage CSV to compressed Parquet and upload to HF directly
                 for stage_key, sdir in stage_dirs.items():
                     stage_csv = chunk_out_dir / f"{stage_key}.csv"
                     if stage_csv.exists() and stage_csv.stat().st_size > 0:
@@ -168,29 +181,41 @@ def main():
                                 df.to_parquet(parquet_path, compression="snappy", index=False)
                                 stage_doc_totals[stage_key] += len(df)
                                 total_clean_docs += len(df)
-                        except Exception as e:
-                            print(f"Warning reading {stage_csv.name}: {e}")
 
-                # Purge raw and intermediate CSVs immediately to preserve disk space
+                                # Direct upload to Hugging Face
+                                if args.upload_to_hf and hf_api and hf_repo_id:
+                                    repo_path = f"data/{stage_key}/shard_{chunk_index:05d}.parquet"
+                                    hf_api.upload_file(
+                                        path_or_fileobj=str(parquet_path),
+                                        path_in_repo=repo_path,
+                                        repo_id=hf_repo_id,
+                                        repo_type="dataset",
+                                        commit_message=f"Upload {stage_key} shard {chunk_index:05d} ({len(df)} docs)"
+                                    )
+                                    uploaded_shards_count += 1
+                                    if args.delete_uploaded_local:
+                                        parquet_path.unlink(missing_ok=True)
+                        except Exception as e:
+                            print(f"Warning processing {stage_csv.name}: {e}")
+
                 shutil.rmtree(chunk_out_dir, ignore_errors=True)
                 chunk_csv.unlink(missing_ok=True)
                 current_chunk.clear()
 
-                # Telemetry & Disk space monitoring
                 total_gb, used_gb, free_gb = get_disk_status_gb(args.output_dir)
                 elapsed = time.time() - start_all
-                print(f"Chunk {chunk_index:04d} Done | Processed: {doc_count:,d} docs | Clean Kept: {total_clean_docs:,d} docs | Speed: {doc_count / max(elapsed, 0.001):.1f} docs/sec | Disk: {used_gb:.2f}GB used, {free_gb:.2f}GB free")
+                upload_status = f" | HF Uploads: {uploaded_shards_count} shards" if hf_api else ""
+                print(f"Chunk {chunk_index:04d} Done | Docs: {doc_count:,d} | Clean: {total_clean_docs:,d} | Speed: {doc_count / max(elapsed, 0.001):.1f} d/s{upload_status} | Disk: {used_gb:.2f}GB used, {free_gb:.2f}GB free")
 
-                # Safety guard check
                 if free_gb <= args.min_free_gb or used_gb >= args.disk_limit_gb:
-                    print(f"\n[ALERT] Disk space safety limit reached! (Used: {used_gb:.2f}GB, Free: {free_gb:.2f}GB). Gracefully halting ingestion...")
+                    print(f"\n[ALERT] Disk space safety limit reached! (Used: {used_gb:.2f}GB, Free: {free_gb:.2f}GB). Gracefully halting...")
                     break
 
         if args.max_documents > 0 and doc_count >= args.max_documents:
             print(f"\nTarget document limit ({args.max_documents:,d}) reached.")
             break
 
-    # Process final trailing chunk if present
+    # Process final trailing chunk
     if current_chunk:
         chunk_index += 1
         chunk_csv = temp_dir / f"raw_chunk_{chunk_index:05d}.csv"
@@ -215,27 +240,36 @@ def main():
                         df.to_parquet(parquet_path, compression="snappy", index=False)
                         stage_doc_totals[stage_key] += len(df)
                         total_clean_docs += len(df)
+
+                        if args.upload_to_hf and hf_api and hf_repo_id:
+                            repo_path = f"data/{stage_key}/shard_{chunk_index:05d}.parquet"
+                            hf_api.upload_file(
+                                path_or_fileobj=str(parquet_path),
+                                path_in_repo=repo_path,
+                                repo_id=hf_repo_id,
+                                repo_type="dataset",
+                                commit_message=f"Upload {stage_key} shard {chunk_index:05d} ({len(df)} docs)"
+                            )
+                            uploaded_shards_count += 1
+                            if args.delete_uploaded_local:
+                                parquet_path.unlink(missing_ok=True)
                 except Exception as e:
-                    print(f"Warning reading {stage_csv.name}: {e}")
+                    print(f"Warning processing {stage_csv.name}: {e}")
 
         shutil.rmtree(chunk_out_dir, ignore_errors=True)
         chunk_csv.unlink(missing_ok=True)
 
-    # Clean temporary scratch directory
     shutil.rmtree(temp_dir, ignore_errors=True)
 
     total_time = time.time() - start_all
     print("\n" + "=" * 80)
-    print("DEEPWEB PARQUET STREAMING INGESTION COMPLETE")
+    print("DEEPWEB PARQUET DIRECT HUGGING FACE STREAMING COMPLETE")
     print(f"Total Ingested Documents:  {doc_count:,d}")
     print(f"Total Clean Kept:          {total_clean_docs:,d} ({total_clean_docs/max(doc_count,1)*100:.1f}%)")
     print(f"Total Execution Time:      {total_time:.2f} seconds ({doc_count / max(total_time, 0.001):.1f} docs/sec)")
-    print(f"Parquet Output Directory:  {parquet_root.resolve()}")
-    print("\nSmolLM2 Curriculum Stage Breakdown (Snappy Parquet Shards):")
-    for stage_key, sdir in stage_dirs.items():
-        shards = list(sdir.glob("*.parquet"))
-        total_size_mb = sum(f.stat().st_size for f in shards) / (1024 * 1024)
-        print(f"  - {stage_key:<24}: {len(shards):>4} shards | {stage_doc_totals[stage_key]:>8,d} docs | {total_size_mb:>7.2f} MB")
+    if hf_api and hf_repo_id:
+        print(f"Live Hugging Face Dataset: https://huggingface.co/datasets/{hf_repo_id}")
+        print(f"Total Uploaded Shards:     {uploaded_shards_count} parquet shards")
     print("=" * 80)
 
 if __name__ == "__main__":
