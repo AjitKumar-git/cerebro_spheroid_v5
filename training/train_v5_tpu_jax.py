@@ -1811,8 +1811,17 @@ def main(args=None):
         if step_idx <= warmup_s:
             return float(peak_lr * (float(step_idx) / max(1.0, float(warmup_s))))
         if args.lr_schedule == "warm_restart":
-            cycle_step = (step_idx - warmup_s) % max(1, args.restart_steps)
+            # Relative to start_step on resumption so fresh cycles always start at peak_lr rather than arbitrary modulo offset
+            ref_step = start_step if start_step > 0 else warmup_s
+            cycle_step = max(0, step_idx - ref_step) % max(1, args.restart_steps)
             ratio = float(cycle_step) / float(args.restart_steps)
+            coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
+            return float(min_lr + (peak_lr - min_lr) * coeff)
+        elif args.lr_schedule == "session":
+            # Session-relative cosine decay across current resumption window
+            elapsed = max(0, step_idx - start_step)
+            session_len = max(1, total_s - start_step)
+            ratio = min(1.0, float(elapsed) / float(session_len))
             coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
             return float(min_lr + (peak_lr - min_lr) * coeff)
         else:  # cosine
