@@ -137,7 +137,7 @@ def main():
         if args.total_shards > 1 and ((streamed_doc_count - 1) % args.total_shards != args.shard_index):
             continue
 
-        text = item.get("text", "")
+        text = item.get("text", "") or item.get("content", "")
         if text and len(text.split()) >= 15:
             current_chunk.append((item.get("id", f"doc_{doc_count}"), text))
             doc_count += 1
