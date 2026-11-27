@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write as IoWrite};
 use std::path::Path;
@@ -28,6 +29,7 @@ pub enum PurgeReason {
     PseudoscienceQuackery,
     GrammarAndSyntacticCollapse,
     RepetitiveBoilerplateOrNavigation,
+    RepetitiveContentOrDegenerativeLoop,
     LogOrCodeDump,
     ContextTooFragmented,
 }
@@ -48,6 +50,7 @@ impl PurgeReason {
             Self::PseudoscienceQuackery => "pseudoscience_quackery",
             Self::GrammarAndSyntacticCollapse => "grammar_syntactic_collapse",
             Self::RepetitiveBoilerplateOrNavigation => "boilerplate_navigation_spam",
+            Self::RepetitiveContentOrDegenerativeLoop => "repetitive_content_or_loop",
             Self::LogOrCodeDump => "log_or_code_dump",
             Self::ContextTooFragmented => "context_too_fragmented",
         }
@@ -194,6 +197,189 @@ const BOILERPLATE_PATTERNS: &[&str] = &[
     "your email address will not be published",
 ];
 
+/// Result of within-document repetition and degenerative loop analysis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepetitionAuditResult {
+    pub is_clean: bool,
+    pub top_2gram_ratio: f64,
+    pub top_3gram_ratio: f64,
+    pub top_4gram_ratio: f64,
+    pub duplicate_line_ratio: f64,
+    pub max_char_run: usize,
+    pub defects: Vec<String>,
+}
+
+/// Gopher / FineWeb within-document repetition auditor.
+/// Detects top n-gram concentration, duplicate lines, repeated sentence loops,
+/// and degenerate character runs to prevent model repetition failure modes.
+pub struct RepetitionAuditor;
+
+impl RepetitionAuditor {
+    pub fn audit_text(text: &str) -> RepetitionAuditResult {
+        let mut defects = Vec::new();
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return RepetitionAuditResult {
+                is_clean: true,
+                top_2gram_ratio: 0.0,
+                top_3gram_ratio: 0.0,
+                top_4gram_ratio: 0.0,
+                duplicate_line_ratio: 0.0,
+                max_char_run: 0,
+                defects,
+            };
+        }
+
+        // Domain-sensitive modality detection:
+        // Code and Math contain legitimate structural repetitions (assignments, equations)
+        let is_code = text.contains("```")
+            || text.starts_with("def ")
+            || text.starts_with("fn ")
+            || text.contains("class ")
+            || text.contains("import ");
+        let is_math = text.contains("$$") || text.contains("\\begin") || text.contains("\\[");
+
+        // 1. Character Run Check (e.g. "aaaaaaa" or "===========")
+        let mut max_char_run = 0usize;
+        let mut current_char_run = 0usize;
+        let mut last_char = None;
+        for c in text.chars() {
+            if !c.is_whitespace() {
+                if Some(c) == last_char {
+                    current_char_run += 1;
+                } else {
+                    last_char = Some(c);
+                    current_char_run = 1;
+                }
+                if current_char_run > max_char_run {
+                    max_char_run = current_char_run;
+                }
+            } else {
+                last_char = None;
+                current_char_run = 0;
+            }
+        }
+
+        let max_allowed_char_run = if is_code { 40 } else { 20 };
+        if max_char_run > max_allowed_char_run {
+            defects.push(format!("Excessive character run (length {max_char_run} > {max_allowed_char_run})"));
+        }
+
+        // 2. Tokenize words (lowercase without punctuation)
+        let words: Vec<String> = trimmed
+            .split_whitespace()
+            .map(|w| w.trim_matches(|c: char| c.is_ascii_punctuation()).to_ascii_lowercase())
+            .filter(|w| !w.is_empty())
+            .collect();
+
+        let mut top_2gram_ratio = 0.0;
+        let mut top_3gram_ratio = 0.0;
+        let mut top_4gram_ratio = 0.0;
+
+        if words.len() >= 12 {
+            // 2-grams
+            let mut gram2_counts: HashMap<(&str, &str), usize> = HashMap::new();
+            for w in words.windows(2) {
+                *gram2_counts.entry((&w[0], &w[1])).or_insert(0) += 1;
+            }
+            let total_2grams = words.len() - 1;
+            let max_2gram = gram2_counts.values().cloned().max().unwrap_or(0);
+            top_2gram_ratio = max_2gram as f64 / total_2grams as f64;
+
+            // 3-grams
+            let mut gram3_counts: HashMap<(&str, &str, &str), usize> = HashMap::new();
+            for w in words.windows(3) {
+                *gram3_counts.entry((&w[0], &w[1], &w[2])).or_insert(0) += 1;
+            }
+            let total_3grams = words.len() - 2;
+            let max_3gram = gram3_counts.values().cloned().max().unwrap_or(0);
+            top_3gram_ratio = max_3gram as f64 / total_3grams as f64;
+
+            // 4-grams
+            let mut gram4_counts: HashMap<(&str, &str, &str, &str), usize> = HashMap::new();
+            for w in words.windows(4) {
+                *gram4_counts.entry((&w[0], &w[1], &w[2], &w[3])).or_insert(0) += 1;
+            }
+            let total_4grams = words.len() - 3;
+            let max_4gram = gram4_counts.values().cloned().max().unwrap_or(0);
+            top_4gram_ratio = max_4gram as f64 / total_4grams as f64;
+
+            let (thresh_2g, thresh_3g, thresh_4g) = if is_code {
+                (0.40, 0.35, 0.30)
+            } else if is_math {
+                (0.35, 0.30, 0.25)
+            } else {
+                (0.20, 0.18, 0.15)
+            };
+
+            if top_2gram_ratio > thresh_2g && max_2gram >= 4 {
+                defects.push(format!("Top 2-gram repetition ratio {:.1}% exceeds maximum {:.1}%", top_2gram_ratio * 100.0, thresh_2g * 100.0));
+            }
+            if top_3gram_ratio > thresh_3g && max_3gram >= 3 {
+                defects.push(format!("Top 3-gram repetition ratio {:.1}% exceeds maximum {:.1}%", top_3gram_ratio * 100.0, thresh_3g * 100.0));
+            }
+            if top_4gram_ratio > thresh_4g && max_4gram >= 3 {
+                defects.push(format!("Top 4-gram repetition ratio {:.1}% exceeds maximum {:.1}%", top_4gram_ratio * 100.0, thresh_4g * 100.0));
+            }
+        }
+
+        // 3. Duplicate Lines Check
+        let lines: Vec<&str> = text
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect();
+
+        let mut duplicate_line_ratio = 0.0;
+        if lines.len() >= 5 {
+            let mut line_counts: HashMap<&str, usize> = HashMap::new();
+            for l in &lines {
+                *line_counts.entry(l).or_insert(0) += 1;
+            }
+            let unique_lines = line_counts.len();
+            let duplicate_lines = lines.len() - unique_lines;
+            duplicate_line_ratio = duplicate_lines as f64 / lines.len() as f64;
+
+            let max_dup_line_ratio = if is_code { 0.45 } else if is_math { 0.35 } else { 0.28 };
+            if duplicate_line_ratio > max_dup_line_ratio {
+                defects.push(format!("Duplicate line ratio {:.1}% exceeds maximum {:.1}%", duplicate_line_ratio * 100.0, max_dup_line_ratio * 100.0));
+            }
+        }
+
+        // 4. Repeated Sentence Loop Check (identical sentences appearing >= 3 times)
+        let sentences: Vec<&str> = trimmed
+            .split(|c| c == '.' || c == '!' || c == '?' || c == '\n')
+            .map(|s| s.trim())
+            .filter(|s| s.split_whitespace().count() >= 3)
+            .collect();
+
+        if sentences.len() >= 4 {
+            let mut sent_counts: HashMap<String, usize> = HashMap::new();
+            for s in &sentences {
+                let norm = s.to_ascii_lowercase();
+                *sent_counts.entry(norm).or_insert(0) += 1;
+            }
+            for (sent, count) in sent_counts {
+                if count >= 3 {
+                    defects.push(format!("Identical sentence repeated {count} times: \"{sent}\""));
+                    break;
+                }
+            }
+        }
+
+        let is_clean = defects.is_empty();
+        RepetitionAuditResult {
+            is_clean,
+            top_2gram_ratio,
+            top_3gram_ratio,
+            top_4gram_ratio,
+            duplicate_line_ratio,
+            max_char_run,
+            defects,
+        }
+    }
+}
+
 pub struct SystematicQualityFilter {
     pub min_words: usize,
     pub max_words: usize,
@@ -332,6 +518,13 @@ impl SystematicQualityFilter {
         if !pseudoscience_eval.is_scientifically_grounded {
             purge_reasons.push(PurgeReason::PseudoscienceAndConservationViolation);
             explanations.push(pseudoscience_eval.explanation);
+        }
+
+        // 3i. Repetition & Degenerative Loop Auditing (FineWeb / Gopher parity)
+        let repetition_eval = RepetitionAuditor::audit_text(text);
+        if !repetition_eval.is_clean {
+            purge_reasons.push(PurgeReason::RepetitiveContentOrDegenerativeLoop);
+            explanations.push(format!("Repetition defects: {}", repetition_eval.defects.join("; ")));
         }
 
         // 4. Repetitive Boilerplate / Scraped Footers
@@ -602,5 +795,35 @@ mod tests {
         let eval = filter.evaluate_document(free_energy_doc);
         assert!(!eval.is_clean);
         assert!(eval.purge_reasons.contains(&PurgeReason::PseudoscienceAndConservationViolation));
+    }
+
+    #[test]
+    fn test_filter_purges_repetitive_sentence_loops() {
+        let filter = SystematicQualityFilter::default();
+        let loop_doc = "The quick brown fox jumps over the dog. The quick brown fox jumps over the dog. The quick brown fox jumps over the dog. The quick brown fox jumps over the dog.";
+        let eval = filter.evaluate_document(loop_doc);
+        assert!(!eval.is_clean);
+        assert!(eval.purge_reasons.contains(&PurgeReason::RepetitiveContentOrDegenerativeLoop));
+    }
+
+    #[test]
+    fn test_filter_purges_excessive_duplicate_lines() {
+        let filter = SystematicQualityFilter::default();
+        let dup_lines_doc = "First line with meaningful text.\nRepeated warning banner alert.\nRepeated warning banner alert.\nRepeated warning banner alert.\nRepeated warning banner alert.\nFinal conclusion here.";
+        let eval = filter.evaluate_document(dup_lines_doc);
+        assert!(!eval.is_clean);
+        assert!(eval.purge_reasons.contains(&PurgeReason::RepetitiveContentOrDegenerativeLoop));
+    }
+
+    #[test]
+    fn test_filter_allows_natural_prose_and_code() {
+        let filter = SystematicQualityFilter::default();
+        let clean_prose = "In molecular biology, ribosomes are macromolecular machines found within all cells that perform biological protein synthesis. They link amino acids together in the order specified by the codons of messenger RNA molecules to create polypeptide chains.";
+        let eval_prose = filter.evaluate_document(clean_prose);
+        assert!(eval_prose.is_clean, "Clean prose must pass: {:?}", eval_prose.purge_reasons);
+
+        let clean_doc_with_code = "Here is a Python function that demonstrates standard algorithmic array manipulation. The code implements a clean linear scan with branching logic to transform items efficiently.\n\n```python\ndef solve_problem(items):\n    \"\"\"Docstring explaining functionality.\"\"\"\n    result = []\n    for item in items:\n        if item > 0:\n            result.append(item * 2)\n    return result\n```\n\nThis implementation maintains optimal time complexity.";
+        let eval_code = filter.evaluate_document(clean_doc_with_code);
+        assert!(eval_code.is_clean, "Clean code block document must pass: {:?}", eval_code.purge_reasons);
     }
 }
