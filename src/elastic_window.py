@@ -654,9 +654,11 @@ def build_online_dataset_iterator(
         math_it: Optional[Iterator[Any]] = None
         cosmo_it: Optional[Iterator[Any]] = None
 
-        # Strict zero-fallback directive: no emergency offline pool mock cycling
+        # Strict zero-fallback directive: prioritized verified pretraining corpora
         def _open_english_web_stream():
             candidates = [
+                ("AjitKumar-Bio/DeepWeb", None),
+                ("HuggingFaceFW/fineweb-edu", "sample-10BT"),
                 ("HuggingFaceFW/fineweb", "sample-10BT"),
                 ("HuggingFaceFW/fineweb", "sample-350BT"),
                 ("HuggingFaceFW/fineweb", "default"),
@@ -666,10 +668,11 @@ def build_online_dataset_iterator(
                     return _open_hf_stream(c_repo, c_cfg, rank=rank, world_size=world_size)
                 except Exception:
                     continue
-            return _open_hf_stream("HuggingFaceFW/fineweb", "sample-10BT", rank=rank, world_size=world_size)
+            return _open_hf_stream("AjitKumar-Bio/DeepWeb", None, rank=rank, world_size=world_size)
 
         def _open_code_stream():
             candidates = [
+                ("AjitKumar-Bio/DeepCode", None),
                 ("bigcode/the-stack-dedup", "data/python"),
                 ("HuggingFaceTB/smollm-corpus", "starcoder"),
                 ("ajibawa-2023/Python-Code-Large", None),
@@ -680,10 +683,11 @@ def build_online_dataset_iterator(
                     return _open_hf_stream(c_repo, c_cfg, rank=rank, world_size=world_size)
                 except Exception:
                     continue
-            return _open_hf_stream("ajibawa-2023/Python-Code-Large", None, rank=rank, world_size=world_size)
+            return _open_hf_stream("AjitKumar-Bio/DeepCode", None, rank=rank, world_size=world_size)
 
         def _open_math_stream():
             candidates = [
+                ("AjitKumar-Bio/DeepMath", None),
                 ("HuggingFaceTB/finemath", "finemath-4plus"),
                 ("HuggingFaceTB/finemath", "finemath-3plus"),
                 ("Infi-MM/InfiMM-WebMath-40B", None),
@@ -694,13 +698,14 @@ def build_online_dataset_iterator(
                     return _open_hf_stream(c_repo, c_cfg, rank=rank, world_size=world_size)
                 except Exception:
                     continue
-            return _open_hf_stream("HuggingFaceTB/finemath", "finemath-4plus", rank=rank, world_size=world_size)
+            return _open_hf_stream("AjitKumar-Bio/DeepMath", None, rank=rank, world_size=world_size)
 
         def _open_cosmo_stream():
             candidates = [
+                ("AjitKumar-Bio/DeepSynth", None),
                 ("AjitKumar-Bio/cosmopedia-v2-digested", None),
-                ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2"),
                 ("HuggingFaceTB/cosmopedia-v2", "cosmopedia-v2"),
+                ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2"),
                 ("AjitKumar-Bio/cerebro-spheroid-v5-digested-pretrain", None),
             ]
             for c_repo, c_cfg in candidates:
@@ -708,7 +713,7 @@ def build_online_dataset_iterator(
                     return _open_hf_stream(c_repo, c_cfg, rank=rank, world_size=world_size)
                 except Exception:
                     continue
-            return _open_hf_stream("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", rank=rank, world_size=world_size)
+            return _open_hf_stream("AjitKumar-Bio/DeepSynth", None, rank=rank, world_size=world_size)
 
         def _get_step_val() -> int:
             val = 0
@@ -2056,34 +2061,44 @@ def build_pretrain_eval_split(
     }
 
     def _open_fineweb_stream():
-        try:
-            return _open_hf_stream("HuggingFaceFW/fineweb", "sample-10BT", max_retries=1)
-        except Exception:
-            return iter([])
+        for r, c in [("AjitKumar-Bio/DeepWeb", None), ("HuggingFaceFW/fineweb-edu", "sample-10BT"), ("HuggingFaceFW/fineweb", "sample-10BT")]:
+            try:
+                return _open_hf_stream(r, c, max_retries=1)
+            except Exception:
+                continue
+        return iter([])
 
     def _open_code_stream():
-        try:
-            return _open_hf_stream("ajibawa-2023/Python-Code-Large", None, max_retries=1)
-        except Exception:
-            return iter([])
+        for r, c in [("AjitKumar-Bio/DeepCode", None), ("bigcode/the-stack-dedup", "data/python"), ("ajibawa-2023/Python-Code-Large", None)]:
+            try:
+                return _open_hf_stream(r, c, max_retries=1)
+            except Exception:
+                continue
+        return iter([])
 
     def _open_math_stream():
-        try:
-            return _open_hf_stream("HuggingFaceTB/finemath", "finemath-4plus", max_retries=1)
-        except Exception:
-            return iter([])
+        for r, c in [("AjitKumar-Bio/DeepMath", None), ("HuggingFaceTB/finemath", "finemath-4plus")]:
+            try:
+                return _open_hf_stream(r, c, max_retries=1)
+            except Exception:
+                continue
+        return iter([])
 
     def _open_cosmopedia_stream():
-        try:
-            return _open_hf_stream("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", max_retries=1)
-        except Exception:
-            return iter([])
+        for r, c in [("AjitKumar-Bio/DeepSynth", None), ("HuggingFaceTB/cosmopedia-v2", "cosmopedia-v2"), ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2")]:
+            try:
+                return _open_hf_stream(r, c, max_retries=1)
+            except Exception:
+                continue
+        return iter([])
 
     def _open_edu_stream():
-        try:
-            return _open_hf_stream("HuggingFaceFW/fineweb-edu", "sample-10BT", max_retries=1)
-        except Exception:
-            return iter([])
+        for r, c in [("AjitKumar-Bio/DeepWeb", None), ("HuggingFaceFW/fineweb-edu", "sample-10BT")]:
+            try:
+                return _open_hf_stream(r, c, max_retries=1)
+            except Exception:
+                continue
+        return iter([])
 
     all_domain_configs = [
         (
