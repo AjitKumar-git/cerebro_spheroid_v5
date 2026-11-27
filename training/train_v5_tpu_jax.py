@@ -127,6 +127,58 @@ from autotune import (
 )
 
 
+def apply_from_scratch_arch_upgrades(cfg_kwargs: Dict[str, Any], args: Any) -> Dict[str, Any]:
+    """Activates V5.1 architectural upgrades (multi-layer sensory, full-mantle readout, bidirectional tracts) ONLY on from-scratch runs."""
+    explicit_layers = getattr(args, "num_sensory_layers", None)
+    if getattr(args, "from_scratch", False):
+        cfg_kwargs["num_sensory_layers"] = int(explicit_layers) if explicit_layers is not None else 4
+        cfg_kwargs["use_centralized_readout"] = False
+        cfg_kwargs["use_shell_tap"] = True
+        cfg_kwargs["use_bidirectional_tracts"] = True
+    else:
+        if explicit_layers is not None:
+            cfg_kwargs["num_sensory_layers"] = int(explicit_layers)
+        cfg_kwargs["use_bidirectional_tracts"] = bool(getattr(args, "use_bidirectional_tracts", False))
+    return cfg_kwargs
+
+
+def resolve_checkpoint_arch_overrides(ckpt: Dict[str, Any], cfg_kwargs: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+    """Preserves V5.1 architecture flags when resuming a checkpoint created from scratch, leaving legacy runs untouched."""
+    updated = dict(cfg_kwargs)
+    changed = False
+    raw_state = ckpt.get("model_state") or ckpt.get("params") or ckpt.get("state_dict") or {}
+    saved_cfg = ckpt.get("config") if isinstance(ckpt.get("config"), dict) else {}
+
+    extra_idx = -1
+    if isinstance(raw_state, dict):
+        for k in raw_state.keys():
+            if k.startswith("sensory_dnn.extra_layers."):
+                try:
+                    idx = int(k.split(".")[2])
+                    if idx > extra_idx:
+                        extra_idx = idx
+                except (IndexError, ValueError):
+                    pass
+    detected_layers = (extra_idx + 2) if extra_idx >= 0 else int(ckpt.get("num_sensory_layers", saved_cfg.get("num_sensory_layers", updated.get("num_sensory_layers", 1))))
+    if detected_layers != updated.get("num_sensory_layers", 1):
+        updated["num_sensory_layers"] = detected_layers
+        changed = True
+
+    for flag in ("use_centralized_readout", "use_shell_tap", "use_bidirectional_tracts"):
+        if flag in ckpt:
+            val = bool(ckpt[flag])
+            if val != updated.get(flag):
+                updated[flag] = val
+                changed = True
+        elif flag in saved_cfg:
+            val = bool(saved_cfg[flag])
+            if val != updated.get(flag):
+                updated[flag] = val
+                changed = True
+
+    return updated, changed
+
+
 def parse_args(args_list=None):
     if args_list is None:
         args_list = sys.argv[1:]
@@ -209,6 +261,7 @@ def parse_args(args_list=None):
     parser.add_argument("--selective_noise_cap", "--selective-noise-cap", dest="selective_noise_cap", type=float, default=8.5, help="Per-token CE ceiling above which unlearnable web-noise spikes are attenuated (default: 8.5)")
     parser.add_argument("--z_loss_weight", "--z-loss-weight", dest="z_loss_weight", type=float, default=0.0, help="Logit Z-loss regularizer weight (e.g., 1e-4) to stabilize bf16 logits (default: 0.0)")
     parser.add_argument("--use_bidirectional_tracts", "--use-bidirectional-tracts", dest="use_bidirectional_tracts", action=argparse.BooleanOptionalAction, default=False, help="Enable bidirectional corticofugal small-world shortcut tracts (for new from-scratch runs; default: False)")
+    parser.add_argument("--num_sensory_layers", "--num-sensory-layers", dest="num_sensory_layers", type=int, default=None, help="Causal sensory self-attention layers before KV projection (default: 4 on --from_scratch, 1 on resume)")
 
     # Target Workload & Cognitive Steering Hyperparameters
     parser.add_argument("--num_mtp_heads", "--num-mtp-heads", dest="num_mtp_heads", type=int, default=1, choices=[1, 2, 3, 4], help="Multi-Token Prediction heads (1: standard single-token emission; 2 or 3: speculative decoding & future-token predictive training)")
@@ -697,7 +750,7 @@ def main(args=None):
     cfg_kwargs["selective_focal_gamma"] = float(getattr(args, "selective_focal_gamma", 0.5))
     cfg_kwargs["selective_noise_cap"] = float(getattr(args, "selective_noise_cap", 8.5))
     cfg_kwargs["z_loss_weight"] = float(getattr(args, "z_loss_weight", 0.0))
-    cfg_kwargs["use_bidirectional_tracts"] = bool(getattr(args, "use_bidirectional_tracts", False))
+    cfg_kwargs = apply_from_scratch_arch_upgrades(cfg_kwargs, args)
     config = JAXConfigV5(**cfg_kwargs)
     params, buffers = init_params_v5(jax.random.PRNGKey(42), config)
 
@@ -1018,6 +1071,11 @@ def main(args=None):
                 if restored_ema is not None and math.isfinite(float(restored_ema)) and float(restored_ema) > 0.0:
                     initial_ema_loss = float(restored_ema)
                 is_resuming_active = (existing_preset_step > 0 or not getattr(args, "from_scratch", False))
+                if not getattr(args, "from_scratch", False):
+                    cfg_kwargs, arch_changed = resolve_checkpoint_arch_overrides(ckpt, cfg_kwargs)
+                    if arch_changed:
+                        config = JAXConfigV5(**cfg_kwargs)
+                        params, buffers = init_params_v5(jax.random.PRNGKey(42), config)
                 adapt_res = adapt_and_load_checkpoint_weights(
                     ckpt, params, target_dtype, config, buffers=buffers,
                     apply_net2net=False
@@ -2729,6 +2787,10 @@ def main(args=None):
                         "preset": args.preset,
                         "use_rope": config.use_rope,
                         "max_phase_steps": config.max_phase_steps,
+                        "num_sensory_layers": config.num_sensory_layers,
+                        "use_centralized_readout": config.use_centralized_readout,
+                        "use_shell_tap": config.use_shell_tap,
+                        "use_bidirectional_tracts": config.use_bidirectional_tracts,
                         "sync_model": sync_model_name,
                         "cumulative_tokens": cumulative_tokens,
                         "cumulative_prompt_tokens": cumulative_prompt_tokens,
@@ -2792,6 +2854,10 @@ def main(args=None):
                     "preset": args.preset,
                     "use_rope": config.use_rope,
                     "max_phase_steps": config.max_phase_steps,
+                    "num_sensory_layers": config.num_sensory_layers,
+                    "use_centralized_readout": config.use_centralized_readout,
+                    "use_shell_tap": config.use_shell_tap,
+                    "use_bidirectional_tracts": config.use_bidirectional_tracts,
                     "sync_model": sync_model_name,
                     "cumulative_tokens": cumulative_tokens,
                     "cumulative_prompt_tokens": cumulative_prompt_tokens,

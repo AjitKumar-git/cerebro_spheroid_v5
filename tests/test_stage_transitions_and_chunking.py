@@ -278,3 +278,48 @@ def test_stage2_conservative_lr_schedule():
     assert cur_lr <= r_peak
     assert cur_lr >= r_min
     assert cur_lr <= 2e-4
+
+
+def test_from_scratch_arch_upgrades_gating():
+    """Verifies V5.1 arch upgrades (4 sensory layers, full-mantle readout, bidirectional tracts) activate ONLY on --from_scratch."""
+    from src.jax.v5_model import PRESETS_V5
+    from training.train_v5_tpu_jax import (
+        apply_from_scratch_arch_upgrades,
+        parse_args,
+        resolve_checkpoint_arch_overrides,
+    )
+
+    # 1. Resume mode (from_scratch=False) preserves legacy v5_small architecture
+    args_resume = parse_args([])
+    args_resume.from_scratch = False
+    cfg_resume = apply_from_scratch_arch_upgrades(PRESETS_V5["v5_small"].copy(), args_resume)
+    assert cfg_resume.get("num_sensory_layers", 1) == 1
+    assert cfg_resume.get("use_centralized_readout", True) is True
+    assert cfg_resume.get("use_bidirectional_tracts", False) is False
+
+    # Legacy checkpoint resume leaves everything unchanged
+    legacy_ckpt = {"model_state": {"sensory.embedding.weight": None}, "step": 266000}
+    resumed_cfg, changed_legacy = resolve_checkpoint_arch_overrides(legacy_ckpt, cfg_resume)
+    assert changed_legacy is False
+    assert resumed_cfg.get("num_sensory_layers", 1) == 1
+
+    # 2. Fresh from_scratch=True activates V5.1 upgrades
+    args_fresh = parse_args(["--from_scratch"])
+    cfg_fresh = apply_from_scratch_arch_upgrades(PRESETS_V5["v5_small"].copy(), args_fresh)
+    assert cfg_fresh["num_sensory_layers"] == 4
+    assert cfg_fresh["use_centralized_readout"] is False
+    assert cfg_fresh["use_shell_tap"] is True
+    assert cfg_fresh["use_bidirectional_tracts"] is True
+
+    # 3. Resuming a V5.1 checkpoint later with from_scratch=False preserves V5.1 flags
+    v51_ckpt = {
+        "model_state": {"sensory_dnn.extra_layers.2.q_proj.weight": None},
+        "use_centralized_readout": False,
+        "use_shell_tap": True,
+        "use_bidirectional_tracts": True,
+    }
+    restored_cfg, changed_v51 = resolve_checkpoint_arch_overrides(v51_ckpt, cfg_resume)
+    assert changed_v51 is True
+    assert restored_cfg["num_sensory_layers"] == 4
+    assert restored_cfg["use_centralized_readout"] is False
+    assert restored_cfg["use_bidirectional_tracts"] is True
