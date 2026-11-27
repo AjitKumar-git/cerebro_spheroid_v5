@@ -1844,7 +1844,15 @@ def main(args=None):
         )
 
     # 10. Learning Rate & Scheduled Sampling Schedules
-    def get_learning_rate(step_idx: int, total_s: int, peak_lr: float, min_lr: float, warmup_s: int) -> float:
+    def get_learning_rate(
+        step_idx: int,
+        total_s: int,
+        peak_lr: float,
+        min_lr: float,
+        warmup_s: int,
+        cur_tokens: Optional[float] = None,
+        target_toks: Optional[float] = None,
+    ) -> float:
         if step_idx <= warmup_s:
             return float(peak_lr * (float(step_idx) / max(1.0, float(warmup_s))))
         if args.lr_schedule == "warm_restart":
@@ -1861,8 +1869,11 @@ def main(args=None):
             ratio = min(1.0, float(elapsed) / float(session_len))
             coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
             return float(min_lr + (peak_lr - min_lr) * coeff)
-        else:  # cosine
-            ratio = min(1.0, float(step_idx - warmup_s) / max(1.0, float(total_s - warmup_s)))
+        else:  # cosine (token-progress when token budget is active, step-progress fallback otherwise)
+            if cur_tokens is not None and target_toks is not None and float(target_toks) > 0.0:
+                ratio = min(1.0, max(0.0, float(cur_tokens) / float(target_toks)))
+            else:
+                ratio = min(1.0, float(step_idx - warmup_s) / max(1.0, float(total_s - warmup_s)))
             coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
             return float(min_lr + (peak_lr - min_lr) * coeff)
 
@@ -2248,13 +2259,20 @@ def main(args=None):
                 # Conservative Stage 2 Learning Rate: guards against catastrophic forgetting of Stage 1
                 r_peak = getattr(args, "reasoning_max_lr", 2e-4)
                 r_min = getattr(args, "reasoning_min_lr", 3e-5)
-                r_total_steps = max(1, args.total_steps - reasoning_transition_step)
-                r_elapsed = max(0, step - reasoning_transition_step)
-                r_ratio = min(1.0, float(r_elapsed) / float(r_total_steps))
+                if budget_active and target_token_budget is not None and target_token_budget > reasoning_trans_tokens:
+                    r_ratio = min(1.0, max(0.0, float(cumulative_tokens - reasoning_trans_tokens) / float(max(1.0, target_token_budget - reasoning_trans_tokens))))
+                else:
+                    r_total_steps = max(1, args.total_steps - reasoning_transition_step)
+                    r_elapsed = max(0, step - reasoning_transition_step)
+                    r_ratio = min(1.0, float(r_elapsed) / float(r_total_steps))
                 r_coeff = 0.5 * (1.0 + math.cos(math.pi * r_ratio))
                 cur_lr = float(r_min + (r_peak - r_min) * r_coeff)
             else:
-                cur_lr = get_learning_rate(step, args.total_steps, args.lr, args.min_lr, args.warmup_steps)
+                cur_lr = get_learning_rate(
+                    step, args.total_steps, args.lr, args.min_lr, args.warmup_steps,
+                    cur_tokens=cumulative_tokens if budget_active else None,
+                    target_toks=target_token_budget if budget_active else None,
+                )
 
             # Smooth resumption warmup: prevents cold-optimizer momentum shock on resume
             resume_warm_steps = int(getattr(args, "resume_warmup_steps", 100))
