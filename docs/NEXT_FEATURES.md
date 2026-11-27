@@ -61,4 +61,21 @@ Planned improvements tracked for future development cycles and scaling phases.
   3. **One-Pass Zero-Backprop Update (`mezo_1pass` / `mezo_central`)**: Reuse the validation baseline loss $L_0$ plus a seeded in-place `torch.no_grad()` SPSA perturbation across **all unlocked concentric shells (`0` to `K-1`)** with zero optimizer momentum buffers (preserving bare `bfloat16` compliance), `_clamp_spectral_norm` ($\rho \le 1.0$), periodic SCMER embedding regularization, and automatic loss-degradation rollback.
   4. **Dataset Feedback Sink (`data/consolidated/07_chat_ingested/`)**: Deduplicate and export validated turns in canonical ChatML / 3-tier SFT schema (`chat_ingested_spheroid.jsonl`, `chat_ingested_sharegpt.jsonl`, and `chat_ingested.parquet`) for downstream SFT/TPU training, wired to opt-in `/ingest` and `/approve` commands in `scripts/chat_cerebro_v5.py` and batch stream ingestion (`scripts/ingest_chats_and_self_train.py`).
 
+---
+
+## 6. External Key-Value Memory Architecture (Edge + Server Split)
+
+- **Current State**:
+  - `v5_small` uses a single shared sensory KV pair (`[B, 8, L, 80]`) in `encode_sensory` (`src/jax/v5_model.py`), costing only **`2,560 bytes/token`** (`~2.5 KB/token`, or **`10.0 MiB` at 4,096 tokens** in `bfloat16`) — 16× smaller than a 16-layer Transformer of equal width.
+  - Working-memory KV is compact and scales easily, while long-term factual breadth is not stored in bloated HBM-resident MoE experts (`use_sparse_mot=False`).
+  - `retrieval_injection` (`src/elastic_window.py`) and `<act>`/`tool_call` routing (`act_token_id=31`, `motor.affine_act`) exist, but no external KV cache or host-RAM hash table is wired yet.
+- **Planned Upgrades (Post-Pretraining / V5.1+)**:
+  1. **Option 1 — Pre-Encoded External KV Bank (Zero-Retraining Inference & Late-SFT)**:
+     - Index document chunks (e.g., 256 tokens = `640 KB` each) using **hybrid BM25 + quantized HNSW vector search** with Reciprocal Rank Fusion (RRF) and two-stage reranking, plus hot-shard `(k_ext, v_ext)` caching in host RAM/NVMe (`10M` tokens ≈ `25 GB`, `0` HBM until retrieved).
+     - Concatenate retrieved `(k_ext, v_ext)` with prompt `(k_prompt, v_prompt)` into `sensory_kv` (updating `valid_buf` in `generate_causal_prefill_jax` so prepended slots are attended). Leave pretraining untouched; enable `retrieval_injection=True` only in late pretraining / SFT.
+  2. **Option 2 — Server-Side $O(1)$ N-Gram Hash / Engram KV Table**:
+     - Store a large `int8`/`bf16` fact table (e.g., 20–100 GB in cheap server host RAM, `0` HBM) with deterministic $O(1)$ bigram/trigram hashing on CPU.
+     - Inject fetched vectors via a **zero-initialized gate (`gate = 0` at init)** to guarantee zero loss shock on existing checkpoints, trained with **gate dropout** so the model remains functional when deployed without the table.
+  3. **Composable Edge + Server Split**:
+     - Edge runs compact `v5_small` locally for private, low-latency reasoning (with optional Option 1 local/remote lookup); Server pairs `v5_small` with Option 2 ($O(1)$ RAM table) + Option 1 (indexed search / `<act>` tool calls).
 
