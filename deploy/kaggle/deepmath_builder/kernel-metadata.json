@@ -1,5 +1,5 @@
 {
-  "id": "ajitkumar010/deepmath-dataset-builder",
+  "id": "ajitsheoran/deepmath-dataset-builder",
   "title": "DeepMath Dataset Builder",
   "code_file": "deepmath_dataset_builder.ipynb",
   "language": "python",
@@ -9,7 +9,7 @@
   "enable_tpu": "false",
   "enable_internet": "true",
   "dataset_sources": [
-    "ajitkumar010/deepweb-builder-tool"
+    "ajitsheoran/deepweb-builder-tool"
   ],
   "competition_sources": [],
   "kernel_sources": [],

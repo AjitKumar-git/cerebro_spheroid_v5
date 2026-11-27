@@ -1,0 +1,17 @@
+{
+  "id": "ajitsheoran/deepweb-dataset-builder-fineweb-edu-ingestion",
+  "title": "DeepWeb Dataset Builder (FineWeb-Edu Ingestion)",
+  "code_file": "deepweb_dataset_builder.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": "true",
+  "enable_gpu": "false",
+  "enable_tpu": "false",
+  "enable_internet": "true",
+  "dataset_sources": [
+    "ajitsheoran/deepweb-builder-tool"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}
