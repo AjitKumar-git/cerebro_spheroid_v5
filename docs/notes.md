@@ -44,3 +44,57 @@ In AI systems, **reasoning** is the process of using available information and l
 - **Definition**: Deals with uncertainty by allowing for degrees of truth rather than binary true/false values. Useful when data is vague or incomplete. ([Reference](https://www.geeksforgeeks.org/artificial-intelligence/fuzzy-logic-introduction/))
 - **Example**: The statement *"It's warm outside"* is vague. Fuzzy reasoning might assign a value like `0.7` to represent how warm it is.
 - **Application**: Used in smart appliances and autonomous systems where decisions must be made under uncertain or imprecise conditions.
+
+---
+
+## Information Extraction from a Single Forward Pass (and Classical TPU vs. Quantum)
+*Added: 2026-11-27*
+
+### 1. Hard Information-Theoretic Ceiling (Target Bits)
+- From ground-truth labels alone, 1 forward pass over $B \cdot T$ tokens supplies at most the conditional entropy of the targets:
+  $$I_{\text{targets}} \approx B \cdot T \cdot \frac{\mathcal{L}_{\text{CE}}}{\ln 2} \text{ bits}$$
+- At $\mathcal{L}_{\text{CE}} \approx 3.0\text{ nats}$ ($\approx 4.33\text{ bits/token}$), a batch of $16,384$ tokens contains only $\sim 71\text{ kbits}$ ($\sim 8.9\text{ KB}$) of irreducible prediction error.
+- Standard Cross-Entropy compresses the entire forward pass down to **1 scalar per token**, discarding rich structural and geometric information already computed in memory.
+
+### 2. Extra Optimization Signal Extractable from 1 Forward Pass (TPU / JAX Native)
+Without adding a second forward pass, the activations ($T \times K \times D$) and logits ($T \times V$) already in memory provide:
+- **Logit Scale & Selective Weighting** *(active in V5)*: `z_loss_weight * lse^2`, `selective_focal_gamma`, and `selective_noise_cap` in `src/jax/v5_model.py` (`_compute_token_ce_and_z_loss`).
+- **Matrix Spectral Preconditioning & Covariance** *(active in V5)*: `power_v` and `scmer_loss` (`neg_cov_loss`) in `src/jax/spheroid_optimizer.py`.
+- **Token Entropy $H(p_t)$ vs. $\text{CE}_t$**: Distinguishes *confidently wrong* tokens (high $\text{CE}_t$, low $H(p_t)$) from *genuinely ambiguous* tokens (high $\text{CE}_t$, high $H(p_t)$) with 0 new parameters (~1–2% FLOPs).
+- **Latent Predictive Coding ($h_t \to h_{t+1}$)**: Supervising $h_t$ against `lax.stop_gradient(h_{t+1})` along the sequence already in memory provides dense $D$-dimensional continuous targets (~1–2% FLOPs).
+- **Per-Shell Deep Supervision**: Distilling inner/motor logits (with `stop_gradient`) into outer shell states `state[:, k, :]` gives outer shells direct gradient signal without altering `use_shell_tap` on the live motor readout (~2–5% FLOPs).
+- **Gauss-Newton / K-FAC Curvature**: Combining forward activation covariance $a_\ell a_\ell^\top$ with backward gradient covariance $g_\ell g_\ell^\top$ yields second-order preconditioning with zero extra forward passes (~3–5% FLOPs).
+
+### 3. Limits of 1 Forward Pass
+- **Multi-step exposure bias / rollout error**: Requires autoregressive rollout or `dual_pass` ($>1$ forward pass).
+- **Exact non-diagonal Hessian directions**: Requires JVP / second-backward passes.
+
+### 4. Quantum Computing vs. Current TPU Architecture
+- **No quantum computer is needed**, and quantum hardware would not help here: all of the signals above are dense classical linear-algebra operations (`bfloat16`/`float32` matmuls and reductions) that TPUs are built for.
+- Loading $16\text{k}$ tokens + $85.4\text{M}$ parameters into quantum states and reading out $85.4\text{M}$ classical gradient updates every step (QRAM/readout bottleneck) would negate any theoretical quantum speedup.
+- Everything above can be emulated directly inside Cerebro Spheroid V5's existing 1 forward + 1 backward pass in JAX on TPU.
+
+---
+
+## Refined GRPO & Multi-Tier Exploration Reward Engine (V5 Small)
+*Added: 2026-11-28*
+
+### 1. Architectural Core
+- **Policy Checkpoint**: Anchored to aligned base checkpoint `checkpoints/tool_aligned/v5_small_tool_aligned_step_500.pt`.
+- **Dataset Integration**: Ingests 8,743 verified agentic records from `data/consolidated/02_agentic_tools/agentic_tools_sensory_grounded.jsonl` covering tool calling, sensory KV needle grounding, grounded answers, and pulsating waiting loops.
+- **Rollout Sampling**: Batched group generation ($G=4$) with temperature sampling ($T=0.85$, $p=0.95$).
+
+### 2. Multi-Tier Reward Model (`CerebroExplorationRewardModel`)
+- **Verifiable Tool Dispatching** (`ToolExecutionEvaluator`): Deterministic execution of parsed tool calls (`calc`, `factual`, `python`) via `UnifiedToolDispatcher`. Awards $+1.0$ for exact ground-truth matches, $+0.4$ for clean execution, and $-0.4$ for unparseable syntax crashes.
+- **Cognitive Boundary Compliance** (`ProtocolAndFormattingEvaluator`): Evaluates balanced 3-tier tags (`<think>`, `<tool_call>`, `<tool_response>`), temporal prefixes ("calling the calculator..."), waiting/pulsating loops ("waiting for tool response..."), and sensory-KV grounded phrasing ("by calling the calculator I got..."). Penalizes legacy/hallucinated tag dialects (`<tool_use>`, `<call:`, `<observation>`).
+- **Process Verification** (`ProcessVerificationEvaluator`): Evaluates hypothesis generation, self-verification, and self-correction.
+- **Curiosity & Manifold Exploration**: Random Network Distillation (RND) novelty with predictor familiarity decay, plus active concentric SVD rank, radial convection velocity, and shell energy entropy.
+- **Trajectory Diversity**: Leave-one-out 3-gram Jaccard distance and representation cosine dispersion.
+
+### 3. Clipped Surrogate & Unbiased KL
+- Unbiased token-level KL divergence against frozen reference model $\pi_{\text{ref}}$:
+  $$\mathbb{D}_{\text{KL}}(\pi_\theta \parallel \pi_{\text{ref}})_{i, t} = \exp(-\Delta_{i, t}) + \Delta_{i, t} - 1 \ge 0$$
+- Clipped surrogate policy loss with group advantage standardization: $A_i = (R_i - \bar{R}) / (\sigma_R + \epsilon)$.
+- Memory-efficient AMP BF16 training on local RTX 3050 (< 1.2 GB VRAM, ~0.5s/step).
+- Bare BF16 serialization purging all optimizer momentum fluff from checkpoints.
+

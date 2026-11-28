@@ -1956,7 +1956,7 @@ def training_rollout(
         raw_ce = raw_ce_sum / mask_denom
         base_loss = opt_loss + lax.stop_gradient(raw_ce - opt_loss)
         if ponder_cost is not None and getattr(config, "use_adaptive_thinking", False):
-            base_loss = base_loss + float(getattr(config, "thinking_cost_weight", 0.01)) * ponder_cost
+            base_loss = base_loss + float(getattr(config, "thinking_cost_weight", 0.001)) * ponder_cost
 
         # Multi-Token Prediction (MTP) auxiliary cross-entropy
         if getattr(config, "num_mtp_heads", 1) > 1:
@@ -2020,7 +2020,7 @@ def training_rollout(
         raw_ce = jnp.sum(all_raw_ce) / mask_denom
         base_ce = opt_ce + lax.stop_gradient(raw_ce - opt_ce)
         if ponder_cost is not None and getattr(config, "use_adaptive_thinking", False):
-            base_ce = base_ce + float(getattr(config, "thinking_cost_weight", 0.01)) * ponder_cost
+            base_ce = base_ce + float(getattr(config, "thinking_cost_weight", 0.001)) * ponder_cost
         if energy_loss is not None and getattr(config, "use_energy_regularization", False):
             base_ce = base_ce + float(getattr(config, "energy_reg_weight", 0.01)) * (energy_loss / max(thinking_cycles, 1))
         router_weight = float(getattr(config, "router_loss_weight", 0.0))

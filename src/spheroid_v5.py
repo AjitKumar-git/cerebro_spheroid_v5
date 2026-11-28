@@ -67,6 +67,7 @@ class ModelConfigV5:
     use_adaptive_thinking: bool = True     # Dynamic halting gate during subconscious deliberation
     max_thinking_cycles: int = 8           # Upper bound for adaptive deliberation
     thinking_halt_threshold: float = 0.75  # Halting confidence threshold
+    thinking_cost_weight: float = 0.001    # Mild ACT ponder regularization (keeps Cycles 2+ competitive with CE)
     num_mtp_heads: int = 1                 # Multi-Token Prediction heads (1 = standard, 2 or 3 = MTP)
     use_sparse_mot: bool = True            # Mixture-of-Tracts sparse axonal routing
     top_k_tracts: int = 24                 # Active shortcut tracts routed per step
