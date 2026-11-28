@@ -2074,6 +2074,12 @@ def main(args=None):
     if use_multi_tpu_local_sgd:
         import queue as _py_queue
         import threading as _py_threading
+        from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+        _pmap_batch_sharding = (
+            NamedSharding(Mesh(np.array(devices), ("_pmap_dev",)), P("_pmap_dev"))
+            if len(devices) == eff_num_devices
+            else None
+        )
         _multi_tpu_queue = _py_queue.Queue(maxsize=3)
         _multi_tpu_stop = _py_threading.Event()
 
@@ -2081,13 +2087,13 @@ def main(args=None):
             while not _multi_tpu_stop.is_set():
                 try:
                     q_a, r_a, fb_a, wt_a = _build_multi_tpu_round()
-                    if len(devices) == eff_num_devices:
-                        q_a = jax.device_put_sharded(list(q_a), devices)
-                        r_a = jax.device_put_sharded(list(r_a), devices)
+                    if _pmap_batch_sharding is not None:
+                        q_a = jax.device_put(q_a, _pmap_batch_sharding)
+                        r_a = jax.device_put(r_a, _pmap_batch_sharding)
                         if fb_a is not None:
-                            fb_a = jax.device_put_sharded(list(fb_a), devices)
+                            fb_a = jax.device_put(fb_a, _pmap_batch_sharding)
                         if wt_a is not None:
-                            wt_a = jax.device_put_sharded(list(wt_a), devices)
+                            wt_a = jax.device_put(wt_a, _pmap_batch_sharding)
                     item = (q_a, r_a, fb_a, wt_a)
                     while not _multi_tpu_stop.is_set():
                         try:

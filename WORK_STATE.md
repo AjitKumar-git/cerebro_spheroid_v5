@@ -1,15 +1,16 @@
 # Agent Work State & Activity Tracker
 
-> **Status**: 🟢 `COMPLETED` | **Last Updated**: `2026-11-28T21:46:58.115336+05:30` | **Session**: `45bf0dba-195f-4a63-aad5-39c69eb0f7b0`
+> **Status**: 🟡 `IN_PROGRESS` | **Last Updated**: `2026-11-29T00:16:13.727308+05:30` | **Session**: `45bf0dba-195f-4a63-aad5-39c69eb0f7b0`
 
 ## Current / Active Objective
-**Goal**: push
+**Goal**: /home/ajit/Documents/Startup/Active_Development/cerebro_spheroid_v5/download.txt check latest log, the kaggle tpu run failed
 
-- **Phase**: `completed`
-- **Current Task**: Idle / Awaiting next request
+- **Phase**: `executing`
+- **Current Task**: Executed run_command: Revert hardware_configs and inspect WORK_STATE.md diff
 
 ## Summary of Completed Work
-All identified audit issues, test failures, critical static-analysis bugs, and security findings have been fixed and verified.
+**Root Cause** (from [download.txt](file:///home/ajit/Documents/Startup/Active_Development/cerebro_spheroid_v5/download.txt#L178-L195)):
+- The Kaggle TPU runtime uses a newer JAX version where `jax.device_put_sharded` has been removed, causing `AttributeError: jax.device_put_sharded is deprecated; use jax.device_put instead` inside `_multi_tpu_prefetch_worker` in [training/train_v5_tpu_jax.py](file:///home/ajit/Documents/Startup/Active_Development/cerebro_spheroid_v5/training/train_v5_tpu_jax.py#L2085-L2090) when resuming Step 279,000 across 8 TPU devices.
 
 ## Modified Files
 - [`AGENTS.md`](AGENTS.md)
@@ -209,16 +210,16 @@ All identified audit issues, test failures, critical static-analysis bugs, and s
 ## Recent Actions (Last 10)
 | Time | Tool | Details |
 | :--- | :--- | :--- |
-| `21:46:56` | `run_command` | Commit modified files and push to origin main |
-| `21:46:41` | `run_command` | Check git status and current branch |
-| `21:43:06` | `update_steps` | update_steps |
-| `21:43:01` | `run_command` | Run AGENTS.md standard verification suite |
-| `21:40:47` | `run_command` | Run audit_remediations and hf_token_resolution tests |
-| `21:40:24` | `manage_task` | manage_task |
-| `21:39:05` | `edit_file` | edit_file |
-| `21:38:56` | `run_command` | Check edu_academic vs broad_web in tests and streamer |
-| `21:38:50` | `run_command` | Run affected test suites to verify fixes |
-| `21:38:42` | `run_command` | Run compileall and ruff critical checks |
+| `00:16:13` | `run_command` | Revert hardware_configs and inspect WORK_STATE.md diff |
+| `00:16:08` | `run_command` | Check diff in hardware_configs.json |
+| `00:16:03` | `run_command` | Check git status |
+| `00:15:59` | `run_command` | Check diff in train_v5_tpu_jax.py and compare with scripts/ |
+| `00:10:48` | `run_command` | Verify 2-device pmap with NamedSharding + jax.device_put |
+| `00:10:31` | `run_command` | Run multi-TPU Local-SGD test |
+| `00:07:42` | `manage_task` | manage_task |
+| `00:06:25` | `edit_file` | edit_file |
+| `00:06:16` | `read_file` | read_file |
+| `00:06:12` | `run_command` | Test NamedSharding + jax.device_put with pmap |
 
 ---
 *This file is automatically maintained by `auto-work-tracker`. Other agents can parse `.agents/work_state.json` or inspect this file directly to resume or review progress.*
