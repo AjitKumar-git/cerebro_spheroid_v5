@@ -949,7 +949,7 @@ class FactualKnowledgeEngine:
     def generate_qa_pairs(
         self,
         num_samples: int = 5000,
-        thinking_levels: List[int] = [0, 1, 3],
+        thinking_levels: Optional[List[int]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Synthesizes structured V5 training pairs from all registered factual tables.
@@ -958,6 +958,8 @@ class FactualKnowledgeEngine:
           - Level 1: Short deductive scratchpad (<think>...</think> answer)
           - Level 3: Agentic SQL tool calls (<think>...</think> <tool_call> sql_query(...) </tool_call> answer)
         """
+        if thinking_levels is None:
+            thinking_levels = [0, 1, 3]
         samples: List[Dict[str, Any]] = []
 
         # Load fresh snapshots from DB
@@ -1296,9 +1298,11 @@ class FactualKnowledgeEngine:
         output_path: str,
         num_samples: int = 5000,
         format_type: str = "auto",
-        thinking_levels: List[int] = [0, 1, 3],
+        thinking_levels: Optional[List[int]] = None,
     ) -> str:
         """Compiles and writes a new custom dataset on command to disk."""
+        if thinking_levels is None:
+            thinking_levels = [0, 1, 3]
         samples = self.generate_qa_pairs(num_samples=num_samples, thinking_levels=thinking_levels)
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 

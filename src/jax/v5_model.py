@@ -14,7 +14,7 @@ Native Cloud TPU & GPU implementation:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import jax
@@ -116,6 +116,7 @@ PRESETS_V5: Dict[str, Dict[str, Any]] = {
         "use_deliberation_probe": False,
         "use_adaptive_thinking": False,
         "use_energy_regularization": False,
+        "use_bidirectional_tracts": True,
     },
     "tpu_v5e_1": {
         "surface_dim": 640,

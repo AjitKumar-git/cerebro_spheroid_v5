@@ -24,6 +24,8 @@ from src.cerebro_reward_model import (
     ConcentricManifoldExplorer,
     TrajectoryDiversityEvaluator,
     ProcessVerificationEvaluator,
+    ToolExecutionEvaluator,
+    ProtocolAndFormattingEvaluator,
     AntiDegenerationGuardrails,
     CerebroExplorationRewardModel,
 )
@@ -332,4 +334,73 @@ def test_grpo_loss_computation_and_policy_gradient():
             assert torch.all(torch.isfinite(p.grad))
             has_grad = True
     assert has_grad
+
+
+def test_tool_execution_evaluator():
+    evaluator = ToolExecutionEvaluator()
+
+    # 1. Matching calculator tool execution
+    cand_match = (
+        "Calling the calculator to compute 17 * 24 + 85...\n"
+        "<tool_call>calc(17 * 24 + 85)</tool_call>\n"
+        "Waiting for tool execution..."
+    )
+    res_match = evaluator.evaluate_tool_execution(cand_match, ground_truth="493")
+    assert res_match["has_tool_call"] is True
+    assert res_match["tool_success"] is True
+    assert res_match["tool_matches_ground_truth"] is True
+    assert res_match["tool_reward"] == 1.0
+
+    # 2. Non-crashing factual tool execution
+    cand_factual = "<tool_call>factual('capital of Germany')</tool_call>"
+    res_factual = evaluator.evaluate_tool_execution(cand_factual, ground_truth="Berlin")
+    assert res_factual["has_tool_call"] is True
+    assert res_factual["tool_success"] is True
+    assert res_factual["tool_matches_ground_truth"] is True
+
+    # 3. Errored / unparseable tool call
+    cand_err = "<tool_call>calc(///invalid syntax///)</tool_call>"
+    res_err = evaluator.evaluate_tool_execution(cand_err, ground_truth="42")
+    assert res_err["has_tool_call"] is True
+    assert res_err["tool_success"] is False
+    assert res_err["tool_reward"] < 0.0
+
+    # 4. No tool call
+    cand_none = "The answer is simply 42 without any external tools."
+    res_none = evaluator.evaluate_tool_execution(cand_none, ground_truth="42")
+    assert res_none["has_tool_call"] is False
+    assert res_none["tool_reward"] == 0.0
+
+
+def test_protocol_and_formatting_evaluator():
+    evaluator = ProtocolAndFormattingEvaluator()
+
+    # 1. Compliant 3-tier formatting with temporal, waiting, and grounded phrasing
+    good_text = (
+        "<think>Let's evaluate the prompt and prepare the tool.</think>\n"
+        "Calling the calculator to compute this. Waiting for tool response...\n"
+        "<tool_call>calc(400 * 0.35)</tool_call>\n"
+        "<tool_response>140</tool_response>\n"
+        "The tool has responded. Calling the calculator yielded 140, so the answer is 140."
+    )
+    res_good = evaluator.evaluate_protocol_and_formatting(good_text)
+    assert res_good["format_reward"] > 0.5
+    assert res_good["balanced_tags"] > 0.0
+    assert res_good["temporal_cues"] > 0.0
+    assert res_good["waiting_cues"] > 0.0
+    assert res_good["grounded_phrasing"] > 0.0
+    assert res_good["unbalanced_penalty"] == 0.0
+    assert res_good["legacy_tag_penalty"] == 0.0
+
+    # 2. Unbalanced / legacy tags
+    bad_text = (
+        "<think>Unclosed thinking block\n"
+        "<tool_use>calc(10 + 5)</tool_use>\n"
+        "<observation>15</observation>"
+    )
+    res_bad = evaluator.evaluate_protocol_and_formatting(bad_text)
+    assert res_bad["unbalanced_penalty"] > 0.0
+    assert res_bad["legacy_tag_penalty"] > 0.0
+    assert res_bad["format_reward"] < 0.0
+
 

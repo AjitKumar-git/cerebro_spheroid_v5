@@ -696,7 +696,7 @@ def main(args=None):
                             )
                             loss_acc = loss_acc + g_loss
                             step_tokens += prompt_b.shape[0] * (prompt_b.shape[1] + target_b.shape[1])
-                        acc_grads = jax.tree_util.tree_map(lambda a: a * inv_accum, acc_grads)
+                        acc_grads = jax.tree_util.tree_map(lambda a, _inv=inv_accum: a * _inv, acc_grads)
                         loss_val = float(loss_acc * inv_accum)
                         params, opt_state = apply_opt_step(params, opt_state, acc_grads, cur_lr)
                     else:

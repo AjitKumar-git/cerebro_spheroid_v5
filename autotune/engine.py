@@ -16,7 +16,7 @@ import sys
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .objectives import TuneObjective
-from .hardware import get_hardware_info, resolve_jax_compute_dtype
+from .hardware import HardwareInfo, get_hardware_info, resolve_jax_compute_dtype
 from .architecture import (
     ArchitectureDetector,
     ArchitectureInfo,
@@ -549,10 +549,6 @@ class AutoTuner:
                 cached_remote = fetch_remote_hardware_config(
                     model=preset, device_signature=cache_sig, url=cloud_url, token=cloud_token
                 )
-                if cached_remote is None and cap_suffix:
-                    cached_remote = fetch_remote_hardware_config(
-                        model=preset, device_signature=f"{sig}{seq_suffix}{dev_suffix}", url=cloud_url, token=cloud_token
-                    )
                 if cached_remote is None and cache_sig != sig and eff_devs == 1:
                     fallback_remote = fetch_remote_hardware_config(
                         model=preset, device_signature=sig, url=cloud_url, token=cloud_token

@@ -110,7 +110,7 @@ FALLBACK_PROMPTS = [
 
 def load_exploration_dataset(
     dataset_path: Optional[str] = None,
-    max_samples: int = 5000,
+    max_samples: int = 10000,
 ) -> List[Dict[str, Any]]:
     """Loads prompt-ground_truth pairs from jsonl or falls back to built-in curriculum."""
     records = []
@@ -125,23 +125,53 @@ def load_exploration_dataset(
                     try:
                         data = json.loads(line)
                         prompt = data.get("prompt", "").strip()
-                        raw_resp = data.get("response", data.get("answer", "")).strip()
-                        if not prompt:
+                        raw_input = data.get("input", "").strip()
+                        raw_output = data.get("output", data.get("response", data.get("answer", ""))).strip()
+                        category = data.get("category", "general")
+
+                        if not prompt and not raw_input:
                             continue
 
                         # Extract ground truth target
-                        gt = ""
-                        # Check for numerical / final answer
-                        m = re.findall(r"(?:answer is|equals|####|result:?)\s*([^\n\.]+)", raw_resp.lower())
-                        if m:
-                            gt = m[-1].strip()
-                        elif raw_resp:
-                            gt = raw_resp.split("\n")[-1].strip()
+                        gt = data.get("ground_truth", "").strip()
+                        if not gt:
+                            # 1. Check for tool_response tag in input (sensory KV grounding)
+                            m_resp = re.findall(r"<tool_response>\s*([^\n<]+)\s*</tool_response>", raw_input)
+                            if m_resp:
+                                gt = m_resp[0].strip()
+
+                        if not gt:
+                            # 2. Check for tool_call in output (for tool_calling records)
+                            m_call = re.findall(r"<tool_call>\s*(calc(?:ulator)?|factual|python)\((.*?)\)\s*</tool_call>", raw_output, re.DOTALL | re.IGNORECASE)
+                            if m_call:
+                                fn, arg = m_call[0]
+                                try:
+                                    from src.tools.unified_tool_dispatcher import UnifiedToolDispatcher
+                                    if "_shared_dispatcher" not in globals():
+                                        globals()["_shared_dispatcher"] = UnifiedToolDispatcher()
+                                    gt = globals()["_shared_dispatcher"].dispatch_call(fn, arg).strip()
+                                except Exception:
+                                    pass
+
+                        if not gt:
+                            # 3. Check for answer patterns in output
+                            m_code = re.findall(
+                                r"(?:code for \S+ is|the answer is|equals|yielded|output|####|result:?)\s*([^\n\.,]+)",
+                                raw_output,
+                                re.IGNORECASE,
+                            )
+                            if m_code:
+                                gt = m_code[-1].strip()
+                            elif raw_output and category != "pulsating_waiting_loop":
+                                lines = [l.strip() for l in raw_output.split("\n") if l.strip()]
+                                if lines:
+                                    gt = lines[-1].strip()
 
                         records.append({
-                            "prompt": prompt,
+                            "prompt": prompt or raw_input,
+                            "formatted_input": raw_input,
                             "ground_truth": gt,
-                            "category": data.get("category", "general"),
+                            "category": category,
                         })
                         if len(records) >= max_samples:
                             break
@@ -185,9 +215,6 @@ def setup_model_and_tokenizer(
 
     # Alignment settings
     cfg.use_sensory_self_attn = True
-    if preset == "v5_small":
-        cfg.use_rope = False
-        cfg.top_k_resonance = 0
 
     policy_model = CerebroSpheroidV5(cfg)
     if state is not None:
@@ -214,6 +241,7 @@ def compute_grpo_loss(
     prompt_ids: torch.Tensor,       # [G, L_p]
     completion_ids: torch.Tensor,   # [G, L_c]
     advantages: torch.Tensor,       # [G]
+    old_log_probs: Optional[torch.Tensor] = None, # [G, L_c]
     clip_ratio: float = 0.20,
     kl_coef: float = 0.04,
     pad_id: int = 0,
@@ -221,25 +249,30 @@ def compute_grpo_loss(
     """
     Computes Group Relative Policy Optimization (GRPO) clipped surrogate loss
     with token-level KL divergence penalty against reference policy.
+    Uses AMP mixed-precision for memory efficiency and numerical stability.
     """
     G, L_c = completion_ids.shape
     dev = prompt_ids.device
     mask = (completion_ids != pad_id).float()  # [G, L_c]
+    amp_dev = "cuda" if dev.type == "cuda" else "cpu"
 
-    # 1. Forward through Reference Model (no grad)
+    # 1. Forward through Reference Model (no grad, AMP)
     with torch.no_grad():
-        _, ref_logits = ref_model(prompts=prompt_ids, targets=completion_ids, use_anchor_loss=False)
-        ref_log_probs = F.log_softmax(ref_logits, dim=-1)
-        ref_tok_lp = torch.gather(ref_log_probs, dim=-1, index=completion_ids.unsqueeze(-1)).squeeze(-1)  # [G, L_c]
+        with torch.amp.autocast(device_type=amp_dev, dtype=torch.bfloat16):
+            _, ref_logits = ref_model(prompts=prompt_ids, targets=completion_ids, use_anchor_loss=False)
+            ref_log_probs = F.log_softmax(ref_logits.float(), dim=-1)
+            ref_tok_lp = torch.gather(ref_log_probs, dim=-1, index=completion_ids.unsqueeze(-1)).squeeze(-1)  # [G, L_c]
 
-    # 2. Forward through Policy Model (with grad)
-    _, policy_logits = policy_model(prompts=prompt_ids, targets=completion_ids, use_anchor_loss=False)
-    policy_log_probs = F.log_softmax(policy_logits, dim=-1)
-    policy_tok_lp = torch.gather(policy_log_probs, dim=-1, index=completion_ids.unsqueeze(-1)).squeeze(-1)  # [G, L_c]
+    # 2. Forward through Policy Model (with grad, AMP)
+    with torch.amp.autocast(device_type=amp_dev, dtype=torch.bfloat16):
+        _, policy_logits = policy_model(prompts=prompt_ids, targets=completion_ids, use_anchor_loss=False)
+        policy_log_probs = F.log_softmax(policy_logits.float(), dim=-1)
+        policy_tok_lp = torch.gather(policy_log_probs, dim=-1, index=completion_ids.unsqueeze(-1)).squeeze(-1)  # [G, L_c]
 
     # 3. Probability Ratio
-    # r_t = exp(log pi_theta - log pi_ref)
-    log_ratio = policy_tok_lp - ref_tok_lp
+    # r_t = exp(log pi_theta - log pi_old)
+    old_lp = old_log_probs if old_log_probs is not None else policy_tok_lp.detach()
+    log_ratio = policy_tok_lp - old_lp
     ratio = torch.exp(torch.clamp(log_ratio, min=-10.0, max=10.0))
 
     # 4. GRPO Clipped Surrogate Objective
@@ -248,9 +281,10 @@ def compute_grpo_loss(
     surr2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * adv
     policy_loss_token = -torch.min(surr1, surr2)  # [G, L_c]
 
-    # 5. Token-level KL Divergence Penalty
+    # 5. Token-level KL Divergence Penalty (against reference policy)
     # D_KL = exp(log pi_ref - log pi_theta) - 1 - (log pi_ref - log pi_theta)
-    kl_div = torch.exp(-log_ratio) - 1.0 + log_ratio  # Non-negative approx
+    log_ref_ratio = policy_tok_lp - ref_tok_lp
+    kl_div = torch.exp(-log_ref_ratio) - 1.0 + log_ref_ratio  # Unbiased non-negative approx
 
     # Weighted sum over completion tokens
     token_denom = mask.sum(dim=-1).clamp(min=1.0)  # [G]
@@ -305,10 +339,12 @@ def train_grpo_exploration(
         rnd_out_dim=256,
         rnd_lr=rnd_lr,
         w_outcome=1.2,
-        w_curiosity=0.40,
-        w_manifold=0.35,
+        w_tool_exec=1.0,
+        w_format=0.50,
+        w_curiosity=0.35,
+        w_manifold=0.30,
         w_diversity=0.30,
-        w_process=0.40,
+        w_process=0.35,
         w_penalty=0.50,
     ).to(dev)
 
@@ -334,7 +370,10 @@ def train_grpo_exploration(
         raw_prompt = sample["prompt"]
         gt_answer = sample.get("ground_truth", "")
 
-        formatted_p = format_stimulus_prompt(raw_prompt)
+        formatted_p = sample.get("formatted_input")
+        if not formatted_p:
+            formatted_p = f"<|im_start|>user\n{raw_prompt}<|im_end|>\n<|im_start|>assistant\n"
+
         p_ids = encode_no_special(tokenizer, formatted_p)
         if len(p_ids) > max_prompt_len:
             p_ids = p_ids[:max_prompt_len]
@@ -342,17 +381,19 @@ def train_grpo_exploration(
         # 2. Batched Parallel Rollout Generation
         # Prompt tensor: [G, L_p]
         p_tensor = torch.tensor([p_ids] * group_size, dtype=torch.long, device=dev)
+        amp_dev = "cuda" if dev.type == "cuda" else "cpu"
 
         policy_model.eval()
         with torch.no_grad():
-            rollout_tokens = policy_model.generate(
-                prompt_ids=p_tensor,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                repetition_penalty=1.15,
-                eos_token_id=eos_id,
-            )
+            with torch.amp.autocast(device_type=amp_dev, dtype=torch.bfloat16):
+                rollout_tokens = policy_model.generate(
+                    prompt_ids=p_tensor,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    repetition_penalty=1.15,
+                    eos_token_id=eos_id,
+                )
 
             # Extract Spheroid concentric state & hidden representation
             # current_spheroid_state: [G, K, D]
@@ -438,6 +479,8 @@ def train_grpo_exploration(
         mean_diversity = float(np.mean([c["diversity_reward"] for c in scored_candidates]))
         mean_manifold = float(np.mean([c["manifold_exploration"] for c in scored_candidates]))
         mean_outcome = float(np.mean([c["outcome_reward"] for c in scored_candidates]))
+        mean_tool = float(np.mean([c.get("tool_reward", 0.0) for c in scored_candidates]))
+        mean_format = float(np.mean([c.get("format_reward", 0.0) for c in scored_candidates]))
 
         running_rewards.append(r_mean)
         running_outcomes.append(mean_outcome)
@@ -450,9 +493,10 @@ def train_grpo_exploration(
             f"Step {step:03d}/{num_steps:03d} [{dt:.2f}s] | "
             f"R_tot: {r_mean:+.3f} | "
             f"Outcome: {mean_outcome:.2f} | "
+            f"Tool: {mean_tool:.2f} | "
+            f"Fmt: {mean_format:.2f} | "
             f"Curiosity: {mean_curiosity:.3f} | "
-            f"Diversity: {mean_diversity:.3f} | "
-            f"Manifold: {mean_manifold:.3f} | "
+            f"Div: {mean_diversity:.3f} | "
             f"Loss: {loss.item():.4f} | "
             f"KL: {metrics['kl_div']:.4f}"
         )
@@ -465,25 +509,32 @@ def train_grpo_exploration(
                 txt_snippet = txt_preview.replace('\n', ' ')[:90]
                 print(
                     f"  Cand {g_idx}: R={sc['total_reward']:+.3f} "
-                    f"[Out:{sc['outcome_reward']:.1f}, Proc:{sc['process_reward']:.2f}, Cur:{sc['curiosity_novelty']:.2f}, Div:{sc['diversity_reward']:.2f}] "
+                    f"[Out:{sc['outcome_reward']:.1f}, Tool:{sc.get('tool_reward', 0.0):.2f}, Fmt:{sc.get('format_reward', 0.0):.2f}, Proc:{sc['process_reward']:.2f}, Cur:{sc['curiosity_novelty']:.2f}] "
                     f"-> \"{txt_snippet}...\""
                 )
             print()
 
-        # Checkpointing
+        # Checkpointing (Strict Bare BF16 without optimizer momentum)
         if step % save_interval == 0 or step == num_steps:
             save_path = os.path.join(output_dir, f"cerebro_grpo_step_{step}.pt")
             reward_save_path = os.path.join(output_dir, f"reward_model_step_{step}.pt")
 
+            bare_state = {
+                k: v.detach().to(torch.bfloat16).cpu()
+                for k, v in policy_model.state_dict().items()
+            }
             torch.save({
                 "step": step,
-                "model_state": policy_model.state_dict(),
+                "model_state": bare_state,
                 "config": cfg,
+                "loss": float(loss.item()),
+                "mean_reward": float(r_mean),
                 "metrics": {
                     "running_rewards": running_rewards,
                     "running_curiosity": running_curiosity,
                     "running_diversity": running_diversity,
                     "running_manifold": running_manifold,
+                    "running_outcomes": running_outcomes,
                 },
             }, save_path)
 
@@ -503,16 +554,16 @@ def train_grpo_exploration(
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train CerebroSpheroid V5 with Exploration-Augmented GRPO")
-    parser.add_argument("--model_path", type=str, default="checkpoints/v5_small_reasoning_sft_p05_best.pt", help="Base model checkpoint")
-    parser.add_argument("--dataset_path", type=str, default="data/gemini_golden_reasoning_sft.jsonl", help="Exploration prompt dataset")
+    parser.add_argument("--model_path", type=str, default="checkpoints/tool_aligned/v5_small_tool_aligned_step_500.pt", help="Base model checkpoint")
+    parser.add_argument("--dataset_path", type=str, default="data/consolidated/02_agentic_tools/agentic_tools_sensory_grounded.jsonl", help="Exploration prompt dataset")
     parser.add_argument("--output_dir", type=str, default="checkpoints/grpo_exploration", help="Checkpoint output directory")
     parser.add_argument("--preset", type=str, default="v5_small", help="Architecture preset")
     parser.add_argument("--device", type=str, default="cuda", help="cuda or cpu")
     parser.add_argument("--num_steps", type=int, default=50, help="Number of GRPO exploration steps")
     parser.add_argument("--group_size", type=int, default=4, help="Candidate rollouts per prompt (G)")
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="Policy learning rate")
-    parser.add_argument("--max_prompt_len", type=int, default=128, help="Max prompt length")
-    parser.add_argument("--max_new_tokens", type=int, default=48, help="Max rollout tokens per candidate")
+    parser.add_argument("--max_prompt_len", type=int, default=256, help="Max prompt length")
+    parser.add_argument("--max_new_tokens", type=int, default=64, help="Max rollout tokens per candidate")
     parser.add_argument("--temperature", type=float, default=0.85, help="Sampling temperature")
     parser.add_argument("--top_p", type=float, default=0.95, help="Nucleus top-p")
     parser.add_argument("--clip_ratio", type=float, default=0.20, help="GRPO / PPO clip ratio")

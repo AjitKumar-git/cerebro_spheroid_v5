@@ -2521,7 +2521,7 @@ def main(args=None):
                                 step_prompt += m_p
                                 step_loss += m_l
                                 step_pad += m_pad
-                            acc_grads = jax.tree_util.tree_map(lambda a: a * inv_accum, acc_grads)
+                            acc_grads = jax.tree_util.tree_map(lambda a, _inv=inv_accum: a * _inv, acc_grads)
                             loss = loss_acc * inv_accum
                             cur_apply_opt = apply_opt_step_anneal if (not is_frozen_active or is_anneal or param_masks is None) else (apply_opt_step_frozen or apply_opt_step_anneal)
                             params, opt_state = cur_apply_opt(params, opt_state, acc_grads, cur_lr)

@@ -93,6 +93,8 @@ class SandboxedToolExecutor:
         "HF_TOKEN",
         "HUGGINGFACE_HUB_TOKEN",
         "HUGGING_FACE_HUB_TOKEN",
+        "BIOFLO_SYNC_TOKEN",
+        "CEREBRO_SYNC_TOKEN",
     )
 
     def __init__(self, workspace_root: Optional[str] = None):
@@ -325,11 +327,7 @@ def execute_agentic_tool(tool_str: str, workspace_root: Optional[str] = None) ->
         code_body = m_py.group(1).strip()
         if (code_body.startswith("'") and code_body.endswith("'")) or (code_body.startswith('"') and code_body.endswith('"')):
             code_body = code_body[1:-1]
-        try:
-            val = eval(code_body, {"__builtins__": {"max": max, "min": min, "abs": abs, "round": round, "sum": sum, "len": len, "list": list, "reversed": reversed, "range": range, "True": True, "False": False, "int": int, "float": float, "str": str}})
-            return str(val)
-        except Exception:
-            return executor.execute_python(code_body)
+        return executor.execute_python(code_body)
 
     # 3. search(query=...) or search(...)
     m_search = re.match(r"^search\((?:query=)?(.*)\)$", raw, re.DOTALL)

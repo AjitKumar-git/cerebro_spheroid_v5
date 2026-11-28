@@ -20,7 +20,7 @@ import queue
 import random
 import threading
 import time
-from typing import Generator, List, Optional, Tuple
+from typing import Any, Generator, List, Optional, Tuple
 
 import numpy as np
 import jax.numpy as jnp

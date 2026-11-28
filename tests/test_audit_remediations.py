@@ -406,13 +406,13 @@ class TestAuditRemediations(unittest.TestCase):
         streamer.progress_getter = lambda: 54
         self.assertEqual(streamer._smollm2_shares(), {"broad_web": 0.90, "code": 0.10})
         streamer.progress_getter = lambda: 60
-        self.assertEqual(streamer._smollm2_shares(), {"broad_web": 0.75, "code": 0.20, "math": 0.05})
+        self.assertEqual(streamer._smollm2_shares(), {"edu_academic": 0.75, "code": 0.20, "math": 0.05})
         streamer.progress_getter = lambda: 80
-        self.assertEqual(streamer._smollm2_shares(), {"broad_web": 0.70, "code": 0.20, "math": 0.10})
+        self.assertEqual(streamer._smollm2_shares(), {"edu_academic": 0.70, "code": 0.20, "math": 0.10})
         streamer.progress_getter = lambda: 95
         self.assertEqual(
             streamer._smollm2_shares(),
-            {"broad_web": 0.58, "code": 0.24, "math": 0.14, "cosmopedia": 0.04},
+            {"edu_academic": 0.58, "code": 0.24, "math": 0.14, "cosmopedia": 0.04},
         )
 
     def test_scmer_public_defaults(self):

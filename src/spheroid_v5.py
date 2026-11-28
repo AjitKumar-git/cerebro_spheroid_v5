@@ -248,8 +248,10 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, offset: in
     return x * c + x_rot * s
 
 
-def create_dct_matrix(dim: int, device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.float32) -> torch.Tensor:
+def create_dct_matrix(dim: int, device: Optional[torch.device] = None, dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """Orthonormal Discrete Cosine Transform (DCT-II) matrix (Parseval energy-conserving)."""
+    if device is None:
+        device = torch.device("cpu")
     n = torch.arange(dim, device=device, dtype=torch.float32)
     k = torch.arange(dim, device=device, dtype=torch.float32).unsqueeze(1)
     M = torch.cos(math.pi / float(dim) * (n + 0.5) * k)

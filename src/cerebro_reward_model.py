@@ -378,6 +378,213 @@ class ProcessVerificationEvaluator:
         }
 
 
+class ToolExecutionEvaluator:
+    """
+    Evaluates tool invocation and verification outcomes for candidate rollouts.
+    Dispatches extracted tool calls (calc, factual, python, etc.) to UnifiedToolDispatcher.
+    Awards rewards for:
+      - Valid, non-crashing tool execution
+      - Execution results matching expected ground truth
+    Penalizes:
+      - Malformed, crashing, or non-parseable tool invocations
+    """
+
+    def __init__(self, dispatcher: Optional[Any] = None):
+        self._dispatcher = dispatcher
+
+    @property
+    def dispatcher(self):
+        if self._dispatcher is None:
+            try:
+                from src.tools.unified_tool_dispatcher import UnifiedToolDispatcher
+                self._dispatcher = UnifiedToolDispatcher()
+            except Exception:
+                self._dispatcher = None
+        return self._dispatcher
+
+    def extract_tool_calls(self, text: str) -> List[str]:
+        """Extracts tool call strings from XML tags, functional calls, or JSON."""
+        calls = []
+        # 1. XML tags: <tool_call>...</tool_call> or <act>...</act>
+        xml_matches = re.findall(r"<(?:tool_call|act)>(.*?)</(?:tool_call|act)>", text, re.DOTALL | re.IGNORECASE)
+        for m in xml_matches:
+            c = m.strip()
+            if c:
+                calls.append(c)
+
+        # 2. Functional calls if not already in XML: calc(...), factual(...), python(...)
+        if not calls:
+            fn_matches = re.findall(r"\b(?:calc(?:ulator)?|factual|python|unit_convert)\s*\([^\)]*\)", text, re.IGNORECASE)
+            for m in fn_matches:
+                c = m.strip()
+                if c:
+                    calls.append(c)
+
+        return calls
+
+    def evaluate_tool_execution(
+        self,
+        text: str,
+        ground_truth: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        calls = self.extract_tool_calls(text)
+        if not calls or self.dispatcher is None:
+            return {
+                "has_tool_call": bool(calls),
+                "tool_calls": calls,
+                "tool_results": [],
+                "tool_success": False,
+                "tool_matches_ground_truth": False,
+                "tool_reward": 0.0,
+            }
+
+        results = []
+        any_success = False
+        matches_gt = False
+
+        for c_str in calls:
+            try:
+                res = self.dispatcher.execute_raw_call_string(c_str)
+                is_err = "[Cannot parse" in res or "Traceback" in res or "Error:" in res
+                results.append(res)
+                if not is_err:
+                    any_success = True
+                    if ground_truth and ground_truth.strip():
+                        gt_clean = ground_truth.strip().lower()
+                        res_clean = res.strip().lower()
+                        if gt_clean == res_clean or gt_clean in res_clean:
+                            matches_gt = True
+                        else:
+                            try:
+                                gt_nums = re.findall(r"-?\d+(?:\.\d+)?", gt_clean)
+                                res_nums = re.findall(r"-?\d+(?:\.\d+)?", res_clean)
+                                if gt_nums and res_nums:
+                                    gt_val = float(gt_nums[0])
+                                    res_val = float(res_nums[0])
+                                    if abs(gt_val - res_val) < 1e-4:
+                                        matches_gt = True
+                            except Exception:
+                                pass
+            except Exception as e:
+                results.append(f"Error: {e}")
+
+        # Compute tool execution reward
+        if matches_gt:
+            tool_reward = 1.0
+        elif any_success:
+            tool_reward = 0.4
+        else:
+            # Attempted tool call but crashed / errored
+            tool_reward = -0.4
+
+        return {
+            "has_tool_call": True,
+            "tool_calls": calls,
+            "tool_results": results,
+            "tool_success": any_success,
+            "tool_matches_ground_truth": matches_gt,
+            "tool_reward": float(tool_reward),
+        }
+
+
+class ProtocolAndFormattingEvaluator:
+    """
+    Evaluates 3-tier cognitive boundary and agentic protocol formatting.
+    Rewards:
+      - Balanced cognitive tags (<think>...</think>, <tool_call>...</tool_call>)
+      - Temporal preparation cues ("calling the calculator to compute...")
+      - Waiting & keep-alive loop syntax ("waiting for tool response...")
+      - Sensory-KV grounded response phrasing ("by calling the calculator I got...")
+    Penalizes:
+      - Unbalanced / dangling opened tags
+      - Legacy or contaminated tag dialects (<tool_use>, <call:, etc.)
+    """
+
+    TEMPORAL_PATTERNS = [
+        r"\bcalling the (?:calculator|tool|database|repl|python)\b",
+        r"\bquerying the (?:knowledge|database|table|knowledgebase)\b",
+        r"\bto compute this\b",
+        r"\bevaluat(?:e|ing) (?:the )?request\b",
+        r"\bexecuting (?:tool|query)\b",
+    ]
+
+    WAITING_PATTERNS = [
+        r"\bwaiting for (?:tool|external|execution|response|database)\b",
+        r"\bhas the tool responded\b",
+        r"\bstill waiting for\b",
+        r"\bwill return observation shortly\b",
+        r"\bbackground process is running\b",
+        r"\bkeep-alive\b",
+    ]
+
+    GROUNDED_ANSWER_PATTERNS = [
+        r"\b(?:by|after) calling the (?:calculator|tool|database)\b",
+        r"\b(?:by|after) querying the (?:knowledge database|table|database)\b",
+        r"\bthe tool has responded\b",
+        r"\bcalling the calculator yielded\b",
+        r"\bafter waiting for the (?:database|tool)\b",
+        r"\bthe answer is\b",
+    ]
+
+    LEGACY_TAG_PATTERNS = [
+        r"</?tool_use>",
+        r"<call:[^>]+>",
+        r"</?observation>",
+    ]
+
+    @classmethod
+    def evaluate_protocol_and_formatting(cls, text: str) -> Dict[str, float]:
+        text_lower = text.lower()
+
+        # 1. Tag balance checks
+        unbalanced_pen = 0.0
+        balanced_bonus = 0.0
+
+        for open_tag, close_tag in [("<think>", "</think>"), ("<tool_call>", "</tool_call>"), ("<tool_response>", "</tool_response>")]:
+            has_open = open_tag in text_lower
+            has_close = close_tag in text_lower
+            if has_open and has_close:
+                balanced_bonus += 0.30
+            elif has_open and not has_close:
+                unbalanced_pen += 0.40
+
+        # 2. Temporal cues
+        temporal_hits = sum(1 for pat in cls.TEMPORAL_PATTERNS if re.search(pat, text_lower))
+        temporal_score = min(1.0, temporal_hits * 0.35)
+
+        # 3. Waiting / pulsating loops
+        waiting_hits = sum(1 for pat in cls.WAITING_PATTERNS if re.search(pat, text_lower))
+        waiting_score = min(1.0, waiting_hits * 0.35)
+
+        # 4. Sensory-KV grounded response phrasing
+        grounded_hits = sum(1 for pat in cls.GROUNDED_ANSWER_PATTERNS if re.search(pat, text_lower))
+        grounded_score = min(1.0, grounded_hits * 0.35)
+
+        # 5. Legacy / contaminated tag penalties
+        legacy_hits = sum(1 for pat in cls.LEGACY_TAG_PATTERNS if re.search(pat, text_lower))
+        legacy_penalty = min(1.0, legacy_hits * 0.50)
+
+        # Composite format reward in [-1.0, 1.0]
+        format_reward = (
+            0.30 * min(1.0, balanced_bonus)
+            + 0.25 * temporal_score
+            + 0.25 * waiting_score
+            + 0.20 * grounded_score
+            - unbalanced_pen
+            - legacy_penalty
+        )
+
+        return {
+            "format_reward": float(np.clip(format_reward, -1.0, 1.0)),
+            "balanced_tags": float(min(1.0, balanced_bonus)),
+            "temporal_cues": float(temporal_score),
+            "waiting_cues": float(waiting_score),
+            "grounded_phrasing": float(grounded_score),
+            "unbalanced_penalty": float(unbalanced_pen),
+            "legacy_tag_penalty": float(legacy_penalty),
+        }
+
+
 class AntiDegenerationGuardrails:
     """Detects and penalizes repetitive loops, runaway verbosity, and character gibberish."""
 
@@ -413,6 +620,8 @@ class CerebroExplorationRewardModel(nn.Module):
       - RND Intrinsic Curiosity (Representation Novelty)
       - Concentric Manifold Volumetric Exploration (Multi-shell active rank & radial flow)
       - Group Trajectory Diversity (GRPO Leave-One-Out Dispersion)
+      - Verifiable Tool Execution & Grounding (Deterministic execution of extracted tool calls)
+      - Protocol & Formatting Boundary Compliance (3-tier tags, temporal, waiting, sensory-KV grounding)
       - Process & Self-Verification (Hypothesis Testing & Verification)
       - Ground Truth Outcome Verifier
       - Anti-Degeneration Guardrails
@@ -423,12 +632,15 @@ class CerebroExplorationRewardModel(nn.Module):
         surface_dim: int = 768,
         rnd_out_dim: int = 256,
         rnd_lr: float = 1e-4,
-        w_outcome: float = 1.0,
-        w_curiosity: float = 0.40,
-        w_manifold: float = 0.35,
+        w_outcome: float = 1.2,
+        w_tool_exec: float = 1.0,
+        w_format: float = 0.5,
+        w_curiosity: float = 0.35,
+        w_manifold: float = 0.30,
         w_diversity: float = 0.30,
         w_process: float = 0.35,
         w_penalty: float = 0.50,
+        dispatcher: Optional[Any] = None,
     ):
         super().__init__()
         self.surface_dim = surface_dim
@@ -436,10 +648,14 @@ class CerebroExplorationRewardModel(nn.Module):
         self.manifold_evaluator = ConcentricManifoldExplorer()
         self.diversity_evaluator = TrajectoryDiversityEvaluator()
         self.process_evaluator = ProcessVerificationEvaluator()
+        self.tool_evaluator = ToolExecutionEvaluator(dispatcher=dispatcher)
+        self.format_evaluator = ProtocolAndFormattingEvaluator()
         self.guardrails = AntiDegenerationGuardrails()
 
         # Weighting factors
         self.w_outcome = w_outcome
+        self.w_tool_exec = w_tool_exec
+        self.w_format = w_format
         self.w_curiosity = w_curiosity
         self.w_manifold = w_manifold
         self.w_diversity = w_diversity
@@ -458,32 +674,49 @@ class CerebroExplorationRewardModel(nn.Module):
         """
         Computes the exploration-augmented reward for a single rollout.
         """
-        # 1. RND Curiosity Novelty Bonus
-        curiosity_score = 0.0
-        if hidden_representation is not None:
-            if hidden_representation.ndim == 1:
-                hidden_representation = hidden_representation.unsqueeze(0)
-            curiosity_score = float(self.curiosity_rnd.compute_novelty(hidden_representation)[0].item())
+        # 1. Tool execution evaluation & verification
+        tool_metrics = self.tool_evaluator.evaluate_tool_execution(
+            text=response_text, ground_truth=ground_truth
+        )
 
-        # 2. Concentric Manifold Exploration Bonus
-        manifold_metrics = {"manifold_reward": 0.0, "effective_rank": 1.0, "radial_flow": 0.0, "shell_entropy": 0.0}
-        if concentric_state is not None:
-            manifold_metrics = self.manifold_evaluator.evaluate_manifold_exploration(concentric_state)
+        # 2. Protocol and formatting evaluation
+        format_metrics = self.format_evaluator.evaluate_protocol_and_formatting(
+            text=response_text
+        )
 
         # 3. Process & Verification Reward
         proc_metrics = self.process_evaluator.evaluate_process_and_verification(
             text=response_text, ground_truth=ground_truth
         )
 
-        # 4. Anti-Degeneration Guardrail Penalties
+        # Outcome score: verified either via text ground truth match or tool execution match
+        verified_outcome = max(
+            proc_metrics["outcome_reward"],
+            1.0 if tool_metrics["tool_matches_ground_truth"] else 0.0
+        )
+
+        # 4. RND Curiosity Novelty Bonus
+        curiosity_score = 0.0
+        if hidden_representation is not None:
+            if hidden_representation.ndim == 1:
+                hidden_representation = hidden_representation.unsqueeze(0)
+            curiosity_score = float(self.curiosity_rnd.compute_novelty(hidden_representation)[0].item())
+
+        # 5. Concentric Manifold Exploration Bonus
+        manifold_metrics = {"manifold_reward": 0.0, "effective_rank": 1.0, "radial_flow": 0.0, "shell_entropy": 0.0}
+        if concentric_state is not None:
+            manifold_metrics = self.manifold_evaluator.evaluate_manifold_exploration(concentric_state)
+
+        # 6. Anti-Degeneration Guardrail Penalties
         rep_pen = self.guardrails.check_repetition_penalty(token_ids)
         len_pen = self.guardrails.check_length_penalty(len(token_ids))
         total_penalty = rep_pen + len_pen
 
-        # 5. Composite Reward Formulation
-        # R_total = w_out * outcome + w_proc * process + w_cur * curiosity + w_man * manifold - w_pen * penalty
+        # 7. Composite Reward Formulation
         total_reward = (
-            self.w_outcome * proc_metrics["outcome_reward"]
+            self.w_outcome * verified_outcome
+            + self.w_tool_exec * tool_metrics["tool_reward"]
+            + self.w_format * format_metrics["format_reward"]
             + self.w_process * proc_metrics["process_reward"]
             + self.w_curiosity * curiosity_score
             + self.w_manifold * manifold_metrics["manifold_reward"]
@@ -492,7 +725,9 @@ class CerebroExplorationRewardModel(nn.Module):
 
         return {
             "total_reward": float(total_reward),
-            "outcome_reward": proc_metrics["outcome_reward"],
+            "outcome_reward": float(verified_outcome),
+            "tool_reward": float(tool_metrics["tool_reward"]),
+            "format_reward": float(format_metrics["format_reward"]),
             "process_reward": proc_metrics["process_reward"],
             "curiosity_novelty": curiosity_score,
             "manifold_exploration": manifold_metrics["manifold_reward"],
@@ -501,9 +736,15 @@ class CerebroExplorationRewardModel(nn.Module):
             "penalty": float(total_penalty),
             "repetition_penalty": float(rep_pen),
             "length_penalty": float(len_pen),
+            "tool_success": tool_metrics["tool_success"],
+            "tool_matches_ground_truth": tool_metrics["tool_matches_ground_truth"],
+            "tool_calls": tool_metrics.get("tool_calls", []),
+            "tool_results": tool_metrics.get("tool_results", []),
             "details": {
                 **proc_metrics,
                 **manifold_metrics,
+                **tool_metrics,
+                **format_metrics,
             },
         }
 
@@ -566,6 +807,8 @@ class CerebroExplorationRewardModel(nn.Module):
             "config": {
                 "surface_dim": self.surface_dim,
                 "w_outcome": self.w_outcome,
+                "w_tool_exec": self.w_tool_exec,
+                "w_format": self.w_format,
                 "w_curiosity": self.w_curiosity,
                 "w_manifold": self.w_manifold,
                 "w_diversity": self.w_diversity,
@@ -576,10 +819,20 @@ class CerebroExplorationRewardModel(nn.Module):
 
     def load_checkpoint(self, path: str) -> None:
         """Restores exploration components."""
-        data = torch.load(path, map_location="cpu")
+        data = torch.load(path, map_location="cpu", weights_only=True)
         self.curiosity_rnd.predictor.load_state_dict(data["predictor_state"])
         if "target_state" in data:
             self.curiosity_rnd.target.load_state_dict(data["target_state"])
         self.curiosity_rnd.running_stats.mean = data["running_mean"]
         self.curiosity_rnd.running_stats.var = data["running_var"]
         self.curiosity_rnd.running_stats.count = data["running_count"]
+        if "config" in data:
+            cfg = data["config"]
+            self.w_outcome = cfg.get("w_outcome", self.w_outcome)
+            self.w_tool_exec = cfg.get("w_tool_exec", self.w_tool_exec)
+            self.w_format = cfg.get("w_format", self.w_format)
+            self.w_curiosity = cfg.get("w_curiosity", self.w_curiosity)
+            self.w_manifold = cfg.get("w_manifold", self.w_manifold)
+            self.w_diversity = cfg.get("w_diversity", self.w_diversity)
+            self.w_process = cfg.get("w_process", self.w_process)
+            self.w_penalty = cfg.get("w_penalty", self.w_penalty)

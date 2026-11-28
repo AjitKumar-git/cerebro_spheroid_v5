@@ -91,6 +91,15 @@ def get_hf_token(explicit_token: Optional[str] = None) -> Optional[str]:
     if web_tok:
         return web_tok
 
+    # 3b. Google Colab Secrets
+    try:
+        from google.colab import userdata
+        colab_tok = _clean_token(userdata.get("HF_TOKEN"))
+        if colab_tok:
+            return colab_tok
+    except Exception:
+        pass
+
     # 4. Kaggle Secrets
     try:
         from kaggle_secrets import UserSecretsClient

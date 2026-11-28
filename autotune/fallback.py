@@ -11,7 +11,7 @@ size constant, and slices existing batches so zero training tokens are lost.
 from __future__ import annotations
 
 import math
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 
 OOM_ERROR_MARKERS = (

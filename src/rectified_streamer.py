@@ -479,11 +479,11 @@ class RectifiedContiguousPretrainStreamer:
                 progress = 0.0
         progress = min(1.0, max(0.0, progress))
 
-        if progress < (15.7 / 41.4):
+        if progress < 0.55:
             return {"broad_web": 0.90, "code": 0.10}
-        if progress < (31.4 / 41.4):
+        if progress < 0.73:
             return {"edu_academic": 0.75, "code": 0.20, "math": 0.05}
-        if progress < (36.4 / 41.4):
+        if progress < 0.91:
             return {"edu_academic": 0.70, "code": 0.20, "math": 0.10}
         return {"edu_academic": 0.58, "code": 0.24, "math": 0.14, "cosmopedia": 0.04}
 
