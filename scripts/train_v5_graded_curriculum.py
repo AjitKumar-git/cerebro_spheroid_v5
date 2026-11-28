@@ -188,9 +188,10 @@ def parse_args(args_list: Optional[Sequence[str]] = None):
     parser.add_argument("--max-lr", type=float, default=5e-4, help="Peak learning rate (default: 5e-4 matching TPU)")
     parser.add_argument("--warmup-steps", type=int, default=500, help="Linear warmup steps (default: 500 matching TPU)")
     parser.add_argument("--resume-warmup-steps", "--resume_warmup_steps", dest="resume_warmup_steps", type=int, default=100, help="Smooth warmup steps upon checkpoint resumption (default: 100)")
-    parser.add_argument("--log-interval", type=int, default=10, help="Steps between log lines")
-    parser.add_argument("--eval-interval", type=int, default=250, help="Steps between fixed held-out validation passes (default: 250)")
+    parser.add_argument("--log-interval", type=int, default=50, help="Steps between log lines (default: 50)")
+    parser.add_argument("--eval-interval", type=int, default=1000, help="Steps between fixed held-out validation passes (default: 1000)")
     parser.add_argument("--save-interval", type=int, default=1000, help="Steps between checkpoints")
+    parser.add_argument("--max-thinking-cycles", "--max_thinking_cycles", dest="max_thinking_cycles", type=int, default=4, help="Maximum thinking cycles when adaptive thinking is active (default: 4)")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints/graded_curriculum", help="Checkpoint directory")
     parser.add_argument("--cloud-sync", action="store_true", help="Enable bi-directional checkpoint sync with bioflo.in")
     parser.add_argument("--cloud-sync-interval", type=int, default=100, help="Steps between background cloud sync uploads")
@@ -503,6 +504,14 @@ def _run_training(
         preset_kwargs["max_seq_len"] = max_seq_budget
         preset_kwargs["use_sparse_mot"] = True
         preset_kwargs["use_energy_regularization"] = True
+        if getattr(args, "from_scratch", False):
+            preset_kwargs["num_sensory_layers"] = 4
+            preset_kwargs["use_centralized_readout"] = False
+            preset_kwargs["use_shell_tap"] = True
+            preset_kwargs["use_sequential_cascade"] = True
+            preset_kwargs["use_sensory_core_coupling"] = False
+            preset_kwargs["use_parallel_plan_scan"] = False
+            preset_kwargs["preserve_shell_norm_clamp"] = True
         if hasattr(tokenizer, "vocab_size") and tokenizer.vocab_size:
             preset_kwargs["vocab_size"] = tokenizer.vocab_size
         config = ModelConfigV5(**preset_kwargs)
@@ -513,6 +522,8 @@ def _run_training(
         config.use_adaptive_thinking = args.use_adaptive_thinking
     if getattr(args, "thinking_cycles", None) is not None:
         config.thinking_cycles = args.thinking_cycles
+    if getattr(args, "max_thinking_cycles", None) is not None:
+        config.max_thinking_cycles = args.max_thinking_cycles
     if getattr(args, "max_thinking_cycles", None) is not None:
         config.max_thinking_cycles = args.max_thinking_cycles
 

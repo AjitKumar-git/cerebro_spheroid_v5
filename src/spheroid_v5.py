@@ -586,6 +586,7 @@ class VolumetricSpheroidCoreV5(nn.Module):
         use_sparse_mot: bool = True,
         top_k_tracts: int = 24,
         use_laminar_transport: bool = True,
+        use_sequential_cascade: bool = False,
         use_bidirectional_tracts: bool = False,
     ):
         super().__init__()
@@ -596,6 +597,7 @@ class VolumetricSpheroidCoreV5(nn.Module):
         self.use_sparse_mot = use_sparse_mot
         self.top_k_tracts = min(top_k_tracts, num_shortcut_tracts)
         self.use_laminar_transport = use_laminar_transport
+        self.use_sequential_cascade = use_sequential_cascade
 
         # Mixture-of-Axonal-Tracts (MoT) dynamic routing gate
         if use_sparse_mot:
@@ -720,39 +722,67 @@ class VolumetricSpheroidCoreV5(nn.Module):
 
     def _deliberate_step_impl(self, state: torch.Tensor) -> torch.Tensor:
         B, K, D = state.shape
+        rad_scale = torch.clamp(self.radial_mix_scale, 0.01, 1.0).to(state.dtype)
+        use_laminar = getattr(self, "use_laminar_transport", True) and hasattr(self, "laminar_in_gate") and self.laminar_in_gate is not None
+        if use_laminar:
+            tau_in = 2.0 * torch.sigmoid(self.laminar_in_gate).view(1, K - 1, 1).to(state.dtype) * rad_scale
+            tau_out = 2.0 * torch.sigmoid(self.laminar_out_gate).view(1, K - 1, 1).to(state.dtype) * rad_scale
 
-        # 1. Intra-shell SwiGLU update
-        intra_updates = []
-        for k in range(K):
-            s_k = state[:, k, :]
-            h_k = self.intra_norms[k](s_k)
-            u_k = self.intra_shell_swiglu[k](h_k) * self.shell_gains[k]
-            intra_updates.append(s_k + self.dropout(u_k))
-        state_intra = torch.stack(intra_updates, dim=1)  # [B, K, D]
+        if getattr(self, "use_sequential_cascade", False):
+            # Sequential K-1 -> 0 Transformer-like shell cascade with identity residual highway
+            shells_out: List[Optional[torch.Tensor]] = [None] * K
+            for k in range(K - 1, -1, -1):
+                s_k = state[:, k, :]
+                if k < K - 1:
+                    prev_k1 = shells_out[k + 1]
+                    assert prev_k1 is not None
+                    h_prev = self.radial_norm(prev_k1)
+                    rad_in = self.radial_in_proj(h_prev)
+                    in_flux = torch.bmm(rad_in.unsqueeze(1), self.w_radial_in[k].unsqueeze(0).expand(B, -1, -1)).squeeze(1)
+                    in_up = self.radial_up(in_flux)
+                    t_in = tau_in[:, k, :] if use_laminar else rad_scale
+                    s_k = s_k + (0.7071 * prev_k1) + (t_in * in_up)
+                h_k = self.intra_norms[k](s_k)
+                u_k = self.intra_shell_swiglu[k](h_k) * self.shell_gains[k]
+                shells_out[k] = s_k + self.dropout(u_k)
 
-        # 2. Inter-shell radial wave propagation (Pre-Norm preserves inter-shell magnitude hierarchy)
-        h_comm = self.radial_norm(state_intra)
-        # Inward wave: Shell k+1 -> Shell k
-        rad_in = self.radial_in_proj(h_comm[:, 1:, :])   # [B, K-1, Dr]
-        in_flux = torch.einsum("bkd,kde->bke", rad_in, self.w_radial_in)  # [B, K-1, Dr]
-        in_up = self.radial_up(in_flux)  # [B, K-1, D]
-
-        # Outward wave: Shell k -> Shell k+1 (decoupled radial_up_out projection)
-        rad_out = self.radial_out_proj(h_comm[:, :-1, :])  # [B, K-1, Dr]
-        out_flux = torch.einsum("bkd,kde->bke", rad_out, self.w_radial_out)  # [B, K-1, Dr]
-        out_up = self.radial_up_out(out_flux)  # [B, K-1, D]
-
-        # Assemble radial deltas out-of-place (zero in-place modifications)
-        rad_scale = torch.clamp(self.radial_mix_scale, 0.01, 1.0).to(state_intra.dtype)
-        if getattr(self, "use_laminar_transport", True) and hasattr(self, "laminar_in_gate") and self.laminar_in_gate is not None:
-            tau_in = 2.0 * torch.sigmoid(self.laminar_in_gate).view(1, K - 1, 1).to(state_intra.dtype) * rad_scale
-            tau_out = 2.0 * torch.sigmoid(self.laminar_out_gate).view(1, K - 1, 1).to(state_intra.dtype) * rad_scale
-            delta_in = F.pad(tau_in * in_up, (0, 0, 0, 1))
-            delta_out = F.pad(tau_out * out_up, (0, 0, 1, 0))
+            work = torch.stack([s for s in shells_out if s is not None], dim=1)  # [B, K, D]
+            h_comm = self.radial_norm(work)
+            rad_out = self.radial_out_proj(h_comm[:, :-1, :])
+            out_flux = torch.einsum("bkd,kde->bke", rad_out, self.w_radial_out)
+            out_up = self.radial_up_out(out_flux)
+            delta_out = F.pad((tau_out if use_laminar else rad_scale) * out_up, (0, 0, 1, 0))
+            state_radial = work + delta_out
         else:
-            delta_in = F.pad(rad_scale * in_up, (0, 0, 0, 1))    # [B, K, D], zero padded on Shell K-1
-            delta_out = F.pad(rad_scale * out_up, (0, 0, 1, 0))  # [B, K, D], zero padded on Shell 0
-        state_radial = state_intra + delta_in + delta_out
+            # 1. Intra-shell SwiGLU update
+            intra_updates = []
+            for k in range(K):
+                s_k = state[:, k, :]
+                h_k = self.intra_norms[k](s_k)
+                u_k = self.intra_shell_swiglu[k](h_k) * self.shell_gains[k]
+                intra_updates.append(s_k + self.dropout(u_k))
+            state_intra = torch.stack(intra_updates, dim=1)  # [B, K, D]
+
+            # 2. Inter-shell radial wave propagation (Pre-Norm preserves inter-shell magnitude hierarchy)
+            h_comm = self.radial_norm(state_intra)
+            # Inward wave: Shell k+1 -> Shell k
+            rad_in = self.radial_in_proj(h_comm[:, 1:, :])   # [B, K-1, Dr]
+            in_flux = torch.einsum("bkd,kde->bke", rad_in, self.w_radial_in)  # [B, K-1, Dr]
+            in_up = self.radial_up(in_flux)  # [B, K-1, D]
+
+            # Outward wave: Shell k -> Shell k+1 (decoupled radial_up_out projection)
+            rad_out = self.radial_out_proj(h_comm[:, :-1, :])  # [B, K-1, Dr]
+            out_flux = torch.einsum("bkd,kde->bke", rad_out, self.w_radial_out)  # [B, K-1, Dr]
+            out_up = self.radial_up_out(out_flux)  # [B, K-1, D]
+
+            # Assemble radial deltas out-of-place (zero in-place modifications)
+            if use_laminar:
+                delta_in = F.pad(tau_in * in_up, (0, 0, 0, 1))
+                delta_out = F.pad(tau_out * out_up, (0, 0, 1, 0))
+            else:
+                delta_in = F.pad(rad_scale * in_up, (0, 0, 0, 1))    # [B, K, D], zero padded on Shell K-1
+                delta_out = F.pad(rad_scale * out_up, (0, 0, 1, 0))  # [B, K, D], zero padded on Shell 0
+            state_radial = state_intra + delta_in + delta_out
 
         # 3. Mixture-of-Axonal-Tracts (MoT Sparse Small-World Routing)
         conductances = torch.sigmoid(self.shortcut_gate)  # [T]
@@ -1677,6 +1707,7 @@ class CerebroSpheroidV5(nn.Module):
             use_sparse_mot=self.config.use_sparse_mot,
             top_k_tracts=self.config.top_k_tracts,
             use_laminar_transport=getattr(self.config, "use_laminar_transport", True),
+            use_sequential_cascade=getattr(self.config, "use_sequential_cascade", False),
             use_bidirectional_tracts=getattr(self.config, "use_bidirectional_tracts", False),
         )
 
