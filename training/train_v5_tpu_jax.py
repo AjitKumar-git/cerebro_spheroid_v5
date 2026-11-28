@@ -1169,8 +1169,6 @@ def main(args=None):
     remat_choice = True if args.remat.lower() == "true" else False
     max_bs = getattr(args, "max_batch_size", None)
     worst_case_seq = max(args.seq_len, args.total_window, getattr(args, "target_seq_len", 0) or 0)
-    if getattr(args, "context_curriculum", False) and "context_stages" in locals():
-        worst_case_seq = max(worst_case_seq, max(context_stages))
     require_tuned_remat = (
         args.seq_len >= 1024
         or args.total_window >= 1024
@@ -2336,6 +2334,28 @@ def main(args=None):
                         f"\n🔄 [Window Expansion Transition (Step-Based)] Step {step:,}: Advancing to Window Stage {active_stage_idx} ({active_window} tokens)!\n"
                         f"   Active Buckets: {new_buckets}\n"
                     )
+                    if args.batch_size * active_window > 65536:
+                        new_bs = max(1, 65536 // active_window)
+                        if new_bs >= 16:
+                            new_bs = (new_bs // 16) * 16
+                        elif new_bs >= 8:
+                            new_bs = (new_bs // 8) * 8
+                        if new_bs < args.batch_size:
+                            print(f"🛡️ [Phase HBM Guard] Scaling micro batch_size {args.batch_size} -> {new_bs} for {active_window}-token phase.")
+                            args.batch_size = new_bs
+                            if local_streamer is not None and hasattr(local_streamer, "batch_size"):
+                                local_streamer.batch_size = new_bs
+                            if elastic_batcher is not None:
+                                if hasattr(elastic_batcher, "batch_size"):
+                                    elastic_batcher.batch_size = new_bs
+                                if hasattr(elastic_batcher, "batcher") and hasattr(elastic_batcher.batcher, "batch_size"):
+                                    elastic_batcher.batcher.batch_size = new_bs
+                    if "_multi_tpu_queue" in locals() and _multi_tpu_queue is not None:
+                        while not _multi_tpu_queue.empty():
+                            try:
+                                _multi_tpu_queue.get_nowait()
+                            except Exception:
+                                break
                     if local_streamer is not None and hasattr(local_streamer, "update_block_size"):
                         local_streamer.update_block_size(active_window)
                     b_target = elastic_batcher
