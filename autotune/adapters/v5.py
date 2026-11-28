@@ -29,6 +29,146 @@ def clear_v5_adapter_cache() -> None:
     _V5_TRAIN_STEP_CACHE.clear()
 
 
+def benchmark_v5_pytorch_model(
+    preset: str = "v5_small",
+    batch_size: int = 32,
+    remat: bool = True,
+    seq_len: int = 512,
+    num_steps: int = 2,
+    dtype: str = "auto",
+    prompt_len: int = 256,
+    model_config: Optional[Any] = None,
+    config_overrides: Optional[Dict[str, Any]] = None,
+    worst_case_seq_len: Optional[int] = None,
+    num_devices: int = 1,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """Benchmarks PyTorch CerebroSpheroidV5 on CUDA/CPU and returns AutoTuner metrics."""
+    import torch
+    from src.spheroid_v5 import CerebroSpheroidV5, ModelConfigV5, PRESETS_V5
+
+    hw = get_hardware_info()
+    is_gpu = hw["is_gpu"]
+    total_mem_bytes = hw["total_memory_bytes"]
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    use_cuda = device.type == "cuda"
+    pref = (dtype or "auto").lower()
+    if pref in ("bf16", "bfloat16"):
+        amp_dtype = torch.bfloat16
+    elif pref in ("fp16", "float16", "half"):
+        amp_dtype = torch.float16
+    elif pref in ("fp32", "float32"):
+        amp_dtype = torch.float32
+    else:
+        amp_dtype = torch.bfloat16 if (use_cuda and torch.cuda.get_device_capability(0)[0] >= 8) else (torch.float16 if use_cuda else torch.float32)
+
+    if model_config is not None:
+        config = model_config
+    else:
+        cfg_dict = dict(PRESETS_V5.get(preset, PRESETS_V5.get("v5_small", {})))
+        if config_overrides:
+            cfg_dict.update(config_overrides)
+        config = ModelConfigV5(**cfg_dict)
+
+    model = optimizer = prompts = targets = None
+    try:
+        if use_cuda:
+            torch.cuda.set_device(0)
+            torch.cuda.reset_peak_memory_stats(0)
+        model = CerebroSpheroidV5(config).to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        eff_seq = max(seq_len, worst_case_seq_len or 0)
+        prompts = torch.randint(1, min(1000, config.vocab_size), (batch_size, prompt_len), device=device)
+        targets = torch.randint(1, min(1000, config.vocab_size), (batch_size, eff_seq), device=device)
+
+        t0 = time.perf_counter()
+        init_loss = final_loss = None
+        for s_idx in range(max(1, num_steps)):
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast(device.type, enabled=use_cuda and amp_dtype != torch.float32, dtype=amp_dtype):
+                loss, _ = model(prompts, targets=targets, sampling_p=1.0, deliberation_mode="teacher_forcing")
+            loss.backward()
+            optimizer.step()
+            if use_cuda:
+                torch.cuda.synchronize(0)
+            lv = float(loss.detach().item())
+            if s_idx == 0:
+                init_loss = lv
+            final_loss = lv
+            if s_idx == 0:
+                t_warmup = time.perf_counter()
+
+        compile_t = (t_warmup - t0) if num_steps > 1 else 0.0
+        elapsed = max(1e-6, (time.perf_counter() - (t_warmup if num_steps > 1 else t0)))
+        timed_steps = max(1, num_steps - 1) if num_steps > 1 else 1
+        steps_per_sec = timed_steps / elapsed
+        tok_per_step = batch_size * (prompt_len + eff_seq) * max(1, num_devices)
+        tok_per_sec = steps_per_sec * tok_per_step
+        peak_bytes = float(torch.cuda.max_memory_allocated(device)) if use_cuda else 0.0
+        mem_gb = peak_bytes / (1024.0 ** 3)
+        mem_pct = (peak_bytes / max(1.0, float(total_mem_bytes))) * 100.0 if total_mem_bytes else 0.0
+        vel = calculate_loss_reduction_velocity(
+            initial_loss=init_loss,
+            final_loss=final_loss,
+            num_steps=timed_steps,
+            steps_per_sec=steps_per_sec,
+            batch_size=batch_size,
+            tok_per_sec=tok_per_sec,
+        )
+        return {
+            "preset": preset,
+            "batch_size": batch_size,
+            "remat": remat,
+            "seq_len": seq_len,
+            "prompt_len": prompt_len,
+            "dtype": str(amp_dtype).replace("torch.", ""),
+            "compile_time": compile_t,
+            "step_ms": (elapsed / timed_steps) * 1000.0,
+            "steps_per_sec": steps_per_sec,
+            "tok_per_sec": tok_per_sec,
+            "memory_gb": mem_gb,
+            "memory_utilization_pct": mem_pct,
+            "memory_type": "VRAM" if is_gpu else "RAM",
+            "vram_gb": mem_gb,
+            "vram_utilization_pct": mem_pct,
+            "initial_loss": init_loss,
+            "final_loss": final_loss,
+            "delta_loss": (init_loss - final_loss) if (init_loss is not None and final_loss is not None) else 0.0,
+            "loss_reduction_per_sec": vel,
+            "status": "OK",
+        }
+    except Exception as e:
+        err_msg = str(e)
+        status_desc = "OOM (Memory Exceeded)" if "out of memory" in err_msg.lower() else f"FAIL ({type(e).__name__}: {err_msg[:40]})"
+        return {
+            "preset": preset,
+            "batch_size": batch_size,
+            "remat": remat,
+            "seq_len": seq_len,
+            "prompt_len": prompt_len,
+            "dtype": str(dtype),
+            "compile_time": None,
+            "step_ms": None,
+            "steps_per_sec": 0.0,
+            "tok_per_sec": 0.0,
+            "memory_gb": 0.0,
+            "memory_utilization_pct": 0.0,
+            "memory_type": "VRAM" if is_gpu else "RAM",
+            "vram_gb": 0.0,
+            "vram_utilization_pct": 0.0,
+            "initial_loss": None,
+            "final_loss": None,
+            "delta_loss": 0.0,
+            "loss_reduction_per_sec": 0.0,
+            "status": status_desc,
+        }
+    finally:
+        del model, optimizer, prompts, targets
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+
 def benchmark_v5_model(
     preset: str = "v5_small",
     batch_size: int = 32,
@@ -48,6 +188,21 @@ def benchmark_v5_model(
     token throughput, loss reduction velocity, and memory metrics. Gracefully catches OOM.
     Enforces the worst-case envelope across distributed devices and elastic bucket sizes.
     """
+    if str(kwargs.get("framework", "jax")).lower() in ("pytorch", "torch"):
+        return benchmark_v5_pytorch_model(
+            preset=preset,
+            batch_size=batch_size,
+            remat=remat,
+            seq_len=seq_len,
+            num_steps=num_steps,
+            dtype=dtype,
+            prompt_len=prompt_len,
+            model_config=model_config,
+            config_overrides=config_overrides,
+            worst_case_seq_len=worst_case_seq_len,
+            num_devices=num_devices,
+            **kwargs,
+        )
     import jax
     import jax.numpy as jnp
 

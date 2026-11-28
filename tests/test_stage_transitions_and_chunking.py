@@ -395,6 +395,38 @@ def test_chunked_mha_exact_parity():
     assert jnp.allclose(out_full, out_chunk16, atol=1e-5)
 
 
+def test_gpu_tpu_1to1_parity():
+    """Verifies PyTorch GPU model, AutoTuner framework='pytorch', and GPU trainer CLI match TPU V5.1 flags."""
+    from autotune.adapters.v5 import benchmark_v5_model
+    from scripts.train_v5_graded_curriculum import parse_args as parse_gpu_args
+    from src.spheroid_v5 import ModelConfigV5 as TorchCfg
+
+    t_cfg = TorchCfg(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32)
+    assert t_cfg.use_sensory_core_coupling is False
+    assert t_cfg.use_parallel_plan_scan is False
+    assert t_cfg.preserve_shell_norm_clamp is True
+
+    res = benchmark_v5_model(
+        preset="v5_small",
+        batch_size=2,
+        seq_len=8,
+        prompt_len=4,
+        num_steps=2,
+        dtype="float32",
+        model_config=t_cfg,
+        framework="pytorch",
+    )
+    assert res["status"] == "OK"
+    assert res["tok_per_sec"] > 0.0
+
+    gpu_args = parse_gpu_args(["--dataset_source", "pretrain", "--auto_tune", "--selective_loss", "--z_loss_weight", "1e-4"])
+    assert gpu_args.dataset_source == "pretrain"
+    assert gpu_args.auto_tune is True
+    assert gpu_args.selective_loss is True
+    assert gpu_args.z_loss_weight == 1e-4
+    assert gpu_args.target_tokens == 41_400_000_000
+
+
 def test_from_scratch_coupled_core_and_parallel_plan_forward_grad():
     """Verifies use_sensory_core_coupling + use_parallel_plan_scan run forward & grad cleanly without touching defaults."""
     import jax

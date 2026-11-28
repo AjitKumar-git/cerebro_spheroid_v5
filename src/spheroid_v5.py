@@ -85,6 +85,9 @@ class ModelConfigV5:
     z_loss_weight: float = 0.0             # Logit Z-loss regularizer (z_loss_weight * logsumexp^2)
     use_bidirectional_tracts: bool = False # Canonical Option A wiring (False) vs bidirectional Option B (True)
     use_sequential_cascade: bool = False # Sequential K-1 -> 0 Transformer-like shell cascade (from-scratch only)
+    use_sensory_core_coupling: bool = False # Per-token sensory-core coupling without recurrent h_t drift
+    use_parallel_plan_scan: bool = False    # Parallel associative scan for plan recurrence
+    preserve_shell_norm_clamp: bool = True  # Preserve per-shell L2 clamp on legacy checkpoints
 
 
 PRESETS_V5: Dict[str, Dict[str, Any]] = {
@@ -555,6 +558,7 @@ class SensoryInputDNNV5(nn.Module):
                         rope_cos=self.rope_cos,
                         rope_sin=self.rope_sin,
                     )
+                flux = self.norm_out(flux)
 
         # Multi-Head KV projections: [B, L, D] -> [B, H, L, head_dim]
         k = self.k_proj(flux).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
@@ -2035,6 +2039,7 @@ class CerebroSpheroidV5(nn.Module):
         use_contract = getattr(self.config, "use_contractive_deliberation", True)
         delib_decay = getattr(self.config, "contractive_delib_decay", 0.75)
         init_scale = state.norm(p=2, dim=-1, keepdim=True) + 1e-8
+        target_scale = init_scale if getattr(self.config, "preserve_shell_norm_clamp", True) else init_scale.mean(dim=1, keepdim=True)
 
         if use_adapt:
             accum_state = torch.zeros_like(state)
@@ -2050,7 +2055,7 @@ class CerebroSpheroidV5(nn.Module):
                 alpha = float(delib_decay ** cycle)
                 updated = state + alpha * (raw_next - state)
                 norm_up = updated.norm(p=2, dim=-1, keepdim=True) + 1e-8
-                next_state = (updated / norm_up) * init_scale
+                next_state = (updated / norm_up) * target_scale
             else:
                 next_state = raw_next
 
@@ -2100,7 +2105,7 @@ class CerebroSpheroidV5(nn.Module):
             state = (accum_state / norm_factor.to(accum_state.dtype)).to(state.dtype)
             if use_contract:
                 norm_final = state.norm(p=2, dim=-1, keepdim=True) + 1e-8
-                state = (state / norm_final) * init_scale
+                state = (state / norm_final) * target_scale
 
         # Pre-embed aligned previous-token feedback (prev_tokens[:, t] feeds step t predicting targets[:, t])
         prev_tokens = None
@@ -2453,6 +2458,7 @@ class CerebroSpheroidV5(nn.Module):
         use_contract = getattr(self.config, "use_contractive_deliberation", True)
         delib_decay = getattr(self.config, "contractive_delib_decay", 0.75)
         init_scale = state.norm(p=2, dim=-1, keepdim=True) + 1e-8
+        target_scale = init_scale if getattr(self.config, "preserve_shell_norm_clamp", True) else init_scale.mean(dim=1, keepdim=True)
 
         prev_delta = None
         for cycle in range(cycles):
@@ -2463,7 +2469,7 @@ class CerebroSpheroidV5(nn.Module):
                 alpha = float(delib_decay ** cycle)
                 updated = state + alpha * (raw_next - state)
                 norm_up = updated.norm(p=2, dim=-1, keepdim=True) + 1e-8
-                next_state = (updated / norm_up) * init_scale
+                next_state = (updated / norm_up) * target_scale
             else:
                 next_state = raw_next
 
@@ -2636,6 +2642,7 @@ class CerebroSpheroidV5(nn.Module):
         use_contract = getattr(self.config, "use_contractive_deliberation", True)
         delib_decay = getattr(self.config, "contractive_delib_decay", 0.75)
         init_scale = state.norm(p=2, dim=-1, keepdim=True) + 1e-8
+        target_scale = init_scale if getattr(self.config, "preserve_shell_norm_clamp", True) else init_scale.mean(dim=1, keepdim=True)
         prev_delta = None
         for cycle in range(cycles):
             state = self._apply_deliberation_probe(state, sensory_kv, cycle)
@@ -2644,7 +2651,7 @@ class CerebroSpheroidV5(nn.Module):
                 alpha = float(delib_decay ** cycle)
                 updated = state + alpha * (raw_next - state)
                 norm_up = updated.norm(p=2, dim=-1, keepdim=True) + 1e-8
-                next_state = (updated / norm_up) * init_scale
+                next_state = (updated / norm_up) * target_scale
             else:
                 next_state = raw_next
             if use_adapt:
@@ -3031,13 +3038,14 @@ class CerebroSpheroidV5(nn.Module):
         use_contract = getattr(self.config, "use_contractive_deliberation", True)
         delib_decay = getattr(self.config, "contractive_delib_decay", 0.75)
         init_scale = state.norm(p=2, dim=-1, keepdim=True) + 1e-8
+        target_scale = init_scale if getattr(self.config, "preserve_shell_norm_clamp", True) else init_scale.mean(dim=1, keepdim=True)
         for cycle in range(cycles):
             raw_next = self.volumetric_core.deliberate_step(state)
             if use_contract:
                 alpha = float(delib_decay ** cycle)
                 updated = state + alpha * (raw_next - state)
                 norm_up = updated.norm(p=2, dim=-1, keepdim=True) + 1e-8
-                state = (updated / norm_up) * init_scale
+                state = (updated / norm_up) * target_scale
             else:
                 state = raw_next
 
