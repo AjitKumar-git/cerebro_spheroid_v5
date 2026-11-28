@@ -590,15 +590,28 @@ class AutoTuner:
             print(f"Tune Objective     : {obj_enum.label}")
             print("-" * 80)
 
-        # Smart candidate ladder generation: on >=16GB accelerators, start at 32 or 64
+        target_ladder_seq = worst_case_seq_len if (worst_case_seq_len and worst_case_seq_len > seq_len) else seq_len
+
+        # Smart candidate ladder generation: on >=16GB accelerators, start at 32 or 64 for short seqs,
+        # but allow smaller micro-batches on 16GB-24GB (e.g. TPU v5e-1) for long contexts (>=1024) to avoid OOM.
         min_batch = None
-        if total_gb >= 16.0 and max_batch_size is None:
-            min_batch = 32 if total_gb < 64.0 else 64
+        if total_gb >= 64.0 and max_batch_size is None:
+            min_batch = 64
+        elif total_gb >= 28.0 and max_batch_size is None:
+            min_batch = 32
+        elif total_gb >= 16.0 and max_batch_size is None:
+            if target_ladder_seq >= 4096:
+                min_batch = 4
+            elif target_ladder_seq >= 2048:
+                min_batch = 8
+            elif target_ladder_seq >= 1024:
+                min_batch = 16
+            else:
+                min_batch = 32
         elif total_gb >= 12.0 and max_batch_size is None:
-            min_batch = 16
+            min_batch = 4 if target_ladder_seq >= 2048 else (8 if target_ladder_seq >= 1024 else 16)
 
         if candidates is None:
-            target_ladder_seq = worst_case_seq_len if (worst_case_seq_len and worst_case_seq_len > seq_len) else seq_len
             candidates = generate_vram_maximizing_candidates(
                 preset=preset,
                 total_gb=total_gb,

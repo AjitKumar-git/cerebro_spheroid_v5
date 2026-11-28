@@ -302,13 +302,13 @@ def parse_args(args_list=None):
     # Checkpoint & Cloud Sync
     parser.add_argument("--checkpoint-dir", "--ckpt-dir", dest="checkpoint_dir", type=str, default="/content/checkpoints" if os.path.exists("/content") else "checkpoints/tpu_jax", help="Checkpoint directory")
     parser.add_argument("--scratch_dir", type=str, default="/tmp/cerebro_v5_ckpts", help="Fast local disk for staging")
-    parser.add_argument("--save-interval", "--save-every", dest="save_interval", type=int, default=100, help="Steps between local checkpoint saves (default: 100)")
-    parser.add_argument("--periodic_every", type=int, default=1000, help="Steps between milestone archive saves (default: 1000)")
-    parser.add_argument("--log-every", "--log_every", dest="log_every", type=int, default=10, help="Steps between console progress lines (default: 10)")
-    parser.add_argument("--eval_interval", type=int, default=100, help="Steps between held-out validation evaluations (default: 100)")
+    parser.add_argument("--save-interval", "--save-every", dest="save_interval", type=int, default=1000, help="Steps between local checkpoint saves (default: 1000)")
+    parser.add_argument("--periodic_every", type=int, default=5000, help="Steps between milestone archive saves (default: 5000)")
+    parser.add_argument("--log-every", "--log_every", dest="log_every", type=int, default=50, help="Steps between console progress lines (default: 50)")
+    parser.add_argument("--eval_interval", type=int, default=1000, help="Steps between held-out validation evaluations (default: 1000)")
     parser.add_argument("--cloud-sync", "--cloud_sync", dest="cloud_sync", action="store_true", default=True, help="Enable live sync with bioflo.in")
     parser.add_argument("--no-cloud-sync", "--no_cloud_sync", dest="cloud_sync", action="store_false", help="Disable live sync with bioflo.in")
-    parser.add_argument("--cloud_sync_interval", "--cloud-sync-interval", dest="cloud_sync_interval", type=int, default=100, help="Steps between cloud sync uploads")
+    parser.add_argument("--cloud_sync_interval", "--cloud-sync-interval", dest="cloud_sync_interval", type=int, default=1000, help="Steps between cloud sync uploads (default: 1000)")
     parser.add_argument(
         "--cloud_weights_only",
         "--cloud-weights-only",
@@ -2014,7 +2014,7 @@ def main(args=None):
 
     _round_bucket_idx = 0
 
-    def _next_multi_tpu_round():
+    def _build_multi_tpu_round():
         nonlocal _round_bucket_idx
         total_shards = eff_num_devices * eff_local_steps
         bucket_batcher = elastic_batcher
@@ -2058,6 +2058,43 @@ def main(args=None):
         else:
             wt_arr = None
         return q_arr, r_arr, fb_arr, wt_arr
+
+    _multi_tpu_queue = None
+    _multi_tpu_stop = None
+    _multi_tpu_thread = None
+    if use_multi_tpu_local_sgd:
+        import queue as _py_queue
+        import threading as _py_threading
+        _multi_tpu_queue = _py_queue.Queue(maxsize=3)
+        _multi_tpu_stop = _py_threading.Event()
+
+        def _multi_tpu_prefetch_worker():
+            while not _multi_tpu_stop.is_set():
+                try:
+                    item = _build_multi_tpu_round()
+                    while not _multi_tpu_stop.is_set():
+                        try:
+                            _multi_tpu_queue.put(item, timeout=0.2)
+                            break
+                        except _py_queue.Full:
+                            continue
+                except Exception as exc:
+                    if not _multi_tpu_stop.is_set():
+                        _multi_tpu_queue.put(exc)
+                    break
+
+        _multi_tpu_thread = _py_threading.Thread(
+            target=_multi_tpu_prefetch_worker, name="MultiTpuRoundPrefetcher", daemon=True
+        )
+        _multi_tpu_thread.start()
+
+    def _next_multi_tpu_round():
+        if _multi_tpu_queue is not None:
+            item = _multi_tpu_queue.get()
+            if isinstance(item, Exception):
+                raise item
+            return item
+        return _build_multi_tpu_round()
 
     def _get_host_params():
         if use_multi_tpu_local_sgd:
@@ -2413,7 +2450,7 @@ def main(args=None):
                             sampling_p=cur_sampling_p,
                             target_weights_micro=wt_shard,
                         )
-                        loss = float(loss_rep[0])
+                        loss = loss_rep[0]
                         step_tokens, step_prompt, step_loss, step_pad = _count_real_tokens(q_shard, r_shard)
                         step_executed = True
                     else:
@@ -3025,6 +3062,10 @@ def main(args=None):
                 )
             except Exception:
                 pass
+        if "_multi_tpu_stop" in locals() and _multi_tpu_stop is not None:
+            _multi_tpu_stop.set()
+            if "_multi_tpu_thread" in locals() and _multi_tpu_thread is not None:
+                _multi_tpu_thread.join(timeout=2.0)
         if "local_streamer" in locals() and local_streamer is not None:
             local_streamer.stop()
         if b_ref is not None:

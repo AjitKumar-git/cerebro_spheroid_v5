@@ -93,9 +93,9 @@ def generate_vram_maximizing_candidates(
     elif total_gb >= 28.0:
         tier_common = {32, 64, 128, 256, 512, 1024}
     elif total_gb >= 16.0:
-        tier_common = {32, 48, 64, 128, 192, 256}
+        tier_common = set() if seq_len >= 1024 else {32, 48, 64, 128, 192, 256}
     elif total_gb >= 12.0:
-        tier_common = {16, 32, 48, 64, 128, 256}
+        tier_common = set() if seq_len >= 1024 else {16, 32, 48, 64, 128, 256}
     elif total_gb >= 6.0:
         tier_common = {8, 16, 32, 48, 64, 128}
     else:
@@ -103,8 +103,9 @@ def generate_vram_maximizing_candidates(
 
     base_ladder = sorted(set(base_ladder).union(tier_common))
 
-    # For accelerators >= 16 GB, explicitly filter out 1, 2, 4, 8 unless constrained by max_batch_size
-    if total_gb >= 16.0:
+    # For accelerators >= 16 GB, explicitly filter out 1, 2, 4, 8 for short seq_len (<1024)
+    # unless constrained by max_batch_size; keep small batches when seq_len >= 1024 on <28GB (e.g. TPU v5e-1).
+    if total_gb >= 16.0 and (total_gb >= 28.0 or seq_len < 1024):
         if max_batch_size is not None and max_batch_size < 32:
             pass  # Keep constrained sizes if user requested low cap
         else:
