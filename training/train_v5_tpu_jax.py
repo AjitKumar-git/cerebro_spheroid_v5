@@ -137,12 +137,15 @@ def apply_from_scratch_arch_upgrades(cfg_kwargs: Dict[str, Any], args: Any) -> D
         cfg_kwargs["use_bidirectional_tracts"] = True
         cfg_kwargs["use_sensory_core_coupling"] = True
         cfg_kwargs["use_parallel_plan_scan"] = True
+        cfg_kwargs["top_k_resonance"] = 0
+        cfg_kwargs["preserve_shell_norm_clamp"] = False
     else:
         if explicit_layers is not None:
             cfg_kwargs["num_sensory_layers"] = int(explicit_layers)
         cfg_kwargs["use_bidirectional_tracts"] = bool(getattr(args, "use_bidirectional_tracts", False))
         cfg_kwargs.setdefault("use_sensory_core_coupling", False)
         cfg_kwargs.setdefault("use_parallel_plan_scan", False)
+        cfg_kwargs.setdefault("preserve_shell_norm_clamp", True)
     return cfg_kwargs
 
 
@@ -168,7 +171,7 @@ def resolve_checkpoint_arch_overrides(ckpt: Dict[str, Any], cfg_kwargs: Dict[str
         updated["num_sensory_layers"] = detected_layers
         changed = True
 
-    for flag in ("use_centralized_readout", "use_shell_tap", "use_bidirectional_tracts", "use_sensory_core_coupling", "use_parallel_plan_scan"):
+    for flag in ("use_centralized_readout", "use_shell_tap", "use_bidirectional_tracts", "use_sensory_core_coupling", "use_parallel_plan_scan", "preserve_shell_norm_clamp"):
         if flag in ckpt:
             val = bool(ckpt[flag])
             if val != updated.get(flag):
@@ -179,6 +182,17 @@ def resolve_checkpoint_arch_overrides(ckpt: Dict[str, Any], cfg_kwargs: Dict[str
             if val != updated.get(flag):
                 updated[flag] = val
                 changed = True
+
+    if "top_k_resonance" in ckpt:
+        tk_val = int(ckpt["top_k_resonance"])
+        if tk_val != updated.get("top_k_resonance"):
+            updated["top_k_resonance"] = tk_val
+            changed = True
+    elif "top_k_resonance" in saved_cfg:
+        tk_val = int(saved_cfg["top_k_resonance"])
+        if tk_val != updated.get("top_k_resonance"):
+            updated["top_k_resonance"] = tk_val
+            changed = True
 
     return updated, changed
 
@@ -2797,6 +2811,8 @@ def main(args=None):
                         "use_bidirectional_tracts": config.use_bidirectional_tracts,
                         "use_sensory_core_coupling": config.use_sensory_core_coupling,
                         "use_parallel_plan_scan": config.use_parallel_plan_scan,
+                        "preserve_shell_norm_clamp": config.preserve_shell_norm_clamp,
+                        "top_k_resonance": config.top_k_resonance,
                         "sync_model": sync_model_name,
                         "cumulative_tokens": cumulative_tokens,
                         "cumulative_prompt_tokens": cumulative_prompt_tokens,
@@ -2866,6 +2882,8 @@ def main(args=None):
                     "use_bidirectional_tracts": config.use_bidirectional_tracts,
                     "use_sensory_core_coupling": config.use_sensory_core_coupling,
                     "use_parallel_plan_scan": config.use_parallel_plan_scan,
+                    "preserve_shell_norm_clamp": config.preserve_shell_norm_clamp,
+                    "top_k_resonance": config.top_k_resonance,
                     "sync_model": sync_model_name,
                     "cumulative_tokens": cumulative_tokens,
                     "cumulative_prompt_tokens": cumulative_prompt_tokens,

@@ -325,8 +325,54 @@ def test_from_scratch_arch_upgrades_gating():
     assert restored_cfg["use_bidirectional_tracts"] is True
     assert cfg_fresh["use_sensory_core_coupling"] is True
     assert cfg_fresh["use_parallel_plan_scan"] is True
+    assert cfg_fresh["top_k_resonance"] == 0
+    assert cfg_fresh["preserve_shell_norm_clamp"] is False
     assert cfg_resume["use_sensory_core_coupling"] is False
     assert cfg_resume["use_parallel_plan_scan"] is False
+    assert cfg_resume["preserve_shell_norm_clamp"] is True
+
+
+def test_cached_sensory_step_matches_causal_encode():
+    """Verifies _encode_sensory_cached_step matches full-sequence encode_sensory(..., is_causal=True) step-by-step."""
+    import jax
+    import jax.numpy as jnp
+    from src.jax.v5_model import (
+        ModelConfigV5,
+        _encode_sensory_cached_step,
+        encode_sensory,
+        generate_causal_prefill_jax,
+        init_params_v5,
+    )
+
+    cfg = ModelConfigV5(
+        vocab_size=64,
+        num_shells=4,
+        surface_dim=32,
+        radial_dim=16,
+        num_heads=4,
+        max_phase_steps=32,
+        num_sensory_layers=2,
+        top_k_resonance=0,
+        preserve_shell_norm_clamp=False,
+    )
+    params, buffers = init_params_v5(jax.random.PRNGKey(3), cfg)
+    toks = jnp.array([[1, 7, 12, 19]], dtype=jnp.int32)
+    full_flux, (full_k, full_v) = encode_sensory(params, toks, config=cfg, pos_offset=0, is_causal=True)
+
+    L = toks.shape[1]
+    skb = jnp.zeros((2, 1, 4, L, 8), dtype=jnp.float32)
+    svb = jnp.zeros((2, 1, 4, L, 8), dtype=jnp.float32)
+    for t in range(L):
+        mask = (jnp.arange(L) <= t)[None, None, None, :]
+        step_flux, (sk, sv), skb, svb = _encode_sensory_cached_step(
+            params, toks[:, t:t + 1], jnp.array(t, dtype=jnp.int32), skb, svb, mask, config=cfg
+        )
+        assert jnp.allclose(step_flux[:, 0, :], full_flux[:, t, :], atol=5e-3)
+        assert jnp.allclose(sk[:, :, 0, :], full_k[:, :, t, :], atol=5e-3)
+        assert jnp.allclose(sv[:, :, 0, :], full_v[:, :, t, :], atol=5e-3)
+
+    out_ids = generate_causal_prefill_jax(params, toks, max_new_tokens=3, buffers=buffers, config=cfg, temperature=0.0)
+    assert len(out_ids) == 3
 
 
 def test_from_scratch_coupled_core_and_parallel_plan_forward_grad():

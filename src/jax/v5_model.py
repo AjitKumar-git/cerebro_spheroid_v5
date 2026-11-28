@@ -85,6 +85,7 @@ class ModelConfigV5:
     use_bidirectional_tracts: bool = False
     use_sensory_core_coupling: bool = False
     use_parallel_plan_scan: bool = False
+    preserve_shell_norm_clamp: bool = True
     use_selective_loss: bool = False
     selective_focal_gamma: float = 0.5
     selective_noise_cap: float = 8.5
@@ -691,6 +692,7 @@ def encode_sensory(
                     params[f"{pfx}swiglu.fc_down.weight"],
                 )
                 flux = flux + h2_swiglu
+        flux = rms_norm(flux, params["sensory.norm_out.weight"])
 
     k = jnp.matmul(flux, params["sensory.k_proj.weight"].T).reshape(B, L, num_heads, head_dim)
     k = jnp.swapaxes(k, 1, 2)  # [B, H, L, head_dim]
@@ -788,6 +790,8 @@ def deliberate_cycles_jax(
     """
     B, K, D = state.shape
     init_scale = jnp.sqrt(jnp.sum(jnp.square(state.astype(jnp.float32)), axis=-1, keepdims=True) + 1e-8).astype(state.dtype)
+    preserve_shell_clamp = bool(getattr(config, "preserve_shell_norm_clamp", True)) if config is not None else True
+    target_scale = init_scale if preserve_shell_clamp else jnp.mean(init_scale, axis=1, keepdims=True)
     use_contract = bool(getattr(config, "use_contractive_deliberation", True)) if config is not None else False
     delib_decay = float(getattr(config, "contractive_delib_decay", 0.75)) if config is not None else 0.75
     if config is None:
@@ -847,7 +851,7 @@ def deliberate_cycles_jax(
                 alpha = (delib_decay ** step_idx).astype(curr_state.dtype)
                 updated = probed_state + alpha * (raw_next - probed_state)
                 norm_up = jnp.sqrt(jnp.sum(jnp.square(updated.astype(jnp.float32)), axis=-1, keepdims=True) + 1e-8).astype(curr_state.dtype)
-                next_state = (updated / norm_up) * init_scale
+                next_state = (updated / norm_up) * target_scale
             else:
                 next_state = raw_next
             return (next_state, cum_energy + step_energy), None
@@ -876,7 +880,7 @@ def deliberate_cycles_jax(
             alpha = (delib_decay ** step_idx).astype(curr_state.dtype)
             updated = probed_state + alpha * (raw_next - probed_state)
             norm_up = jnp.sqrt(jnp.sum(jnp.square(updated.astype(jnp.float32)), axis=-1, keepdims=True) + 1e-8).astype(curr_state.dtype)
-            next_state = (updated / norm_up) * init_scale
+            next_state = (updated / norm_up) * target_scale
         else:
             next_state = raw_next
 
@@ -910,7 +914,7 @@ def deliberate_cycles_jax(
     final_state = (final_accum / norm_factor).astype(state.dtype)
     if use_contract:
         norm_final = jnp.sqrt(jnp.sum(jnp.square(final_state.astype(jnp.float32)), axis=-1, keepdims=True) + 1e-8).astype(state.dtype)
-        final_state = (final_state / norm_final) * init_scale
+        final_state = (final_state / norm_final) * target_scale
     ponder_cost = jnp.mean(cum_ponder)
 
     if return_energy:
@@ -2024,6 +2028,95 @@ def compute_manifold_diagnostics_jax(state: jnp.ndarray) -> Dict[str, Any]:
     }
 
 
+def _encode_sensory_cached_step(
+    params: Dict[str, jnp.ndarray],
+    tok_ids: jnp.ndarray,
+    pos_offset: Union[int, jnp.ndarray],
+    sens_k_buf: jnp.ndarray,
+    sens_v_buf: jnp.ndarray,
+    valid_mask: jnp.ndarray,
+    config: Optional[ModelConfigV5] = None,
+) -> Tuple[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray, jnp.ndarray]:
+    """Single-token sensory forward pass with causal KV cache over prior sensory tokens."""
+    w_emb = params["sensory.embedding.weight"]
+    x = w_emb[tok_ids]  # [B, 1, D]
+    B, _, D = x.shape
+    num_heads = config.num_heads if config is not None else 8
+    head_dim = D // num_heads
+
+    if "sensory.pos_embed.weight" in params:
+        pos_tbl = params["sensory.pos_embed.weight"]
+        max_p = pos_tbl.shape[0]
+        pos_id = jnp.clip(pos_offset, 0, max_p - 1)
+        in_table = (pos_offset < max_p).astype(pos_tbl.dtype)
+        x = x + (pos_tbl[pos_id] * in_table)[None, None, :].astype(x.dtype)
+
+    h = rms_norm(x, params["sensory.norm_in.weight"])
+    h_swiglu = swiglu(
+        h,
+        params["sensory.swiglu.fc_gate.weight"],
+        params["sensory.swiglu.fc_val.weight"],
+        params["sensory.swiglu.fc_down.weight"],
+        use_swiglu=getattr(config, "use_swiglu", True),
+    )
+    flux = rms_norm(x + h_swiglu, params["sensory.norm_out.weight"])
+    use_rope_cfg = bool(config is not None and getattr(config, "use_rope", True))
+    rope_theta = config.rope_theta if config is not None else 500000.0
+    slot = jnp.clip(pos_offset, 0, sens_k_buf.shape[3] - 1)
+
+    if "sensory.out_self.weight" in params and getattr(config, "use_sensory_self_attn", True):
+        h_ctx = rms_norm(flux, params["sensory.ctx_norm.weight"])
+        q_s = jnp.swapaxes(jnp.matmul(h_ctx, params["sensory.q_self.weight"].T).reshape(B, 1, num_heads, head_dim), 1, 2)
+        k_s = jnp.swapaxes(jnp.matmul(h_ctx, params["sensory.k_self.weight"].T).reshape(B, 1, num_heads, head_dim), 1, 2)
+        v_s = jnp.swapaxes(jnp.matmul(h_ctx, params["sensory.v_self.weight"].T).reshape(B, 1, num_heads, head_dim), 1, 2)
+        if use_rope_cfg:
+            q_s = apply_rope(q_s, pos_offset, theta=rope_theta)
+            k_s = apply_rope(k_s, pos_offset, theta=rope_theta)
+        kb0 = lax.dynamic_update_slice(sens_k_buf[0], k_s.astype(sens_k_buf.dtype), (0, 0, slot, 0))
+        vb0 = lax.dynamic_update_slice(sens_v_buf[0], v_s.astype(sens_v_buf.dtype), (0, 0, slot, 0))
+        sens_k_buf = sens_k_buf.at[0].set(kb0)
+        sens_v_buf = sens_v_buf.at[0].set(vb0)
+        scores = jnp.matmul(q_s, jnp.swapaxes(kb0, -1, -2)) / math.sqrt(head_dim)
+        scores = jnp.where(valid_mask, scores, -1e4)
+        attn_w = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(flux.dtype)
+        ctx = jnp.swapaxes(jnp.matmul(attn_w, vb0), 1, 2).reshape(B, 1, D)
+        flux = flux + jnp.matmul(ctx, params["sensory.out_self.weight"].T)
+
+    num_sens_layers = getattr(config, "num_sensory_layers", 1) if config is not None else 1
+    if num_sens_layers > 1:
+        for idx in range(num_sens_layers - 1):
+            pfx = f"sensory_dnn.extra_layers.{idx}."
+            if f"{pfx}norm1.weight" in params:
+                h_l = rms_norm(flux, params[f"{pfx}norm1.weight"])
+                q_l = jnp.swapaxes(jnp.matmul(h_l, params[f"{pfx}q_proj.weight"].T).reshape(B, 1, num_heads, head_dim), 1, 2)
+                k_l = jnp.swapaxes(jnp.matmul(h_l, params[f"{pfx}k_proj.weight"].T).reshape(B, 1, num_heads, head_dim), 1, 2)
+                v_l = jnp.swapaxes(jnp.matmul(h_l, params[f"{pfx}v_proj.weight"].T).reshape(B, 1, num_heads, head_dim), 1, 2)
+                if use_rope_cfg:
+                    q_l = apply_rope(q_l, pos_offset, theta=rope_theta)
+                    k_l = apply_rope(k_l, pos_offset, theta=rope_theta)
+                kbi = lax.dynamic_update_slice(sens_k_buf[idx + 1], k_l.astype(sens_k_buf.dtype), (0, 0, slot, 0))
+                vbi = lax.dynamic_update_slice(sens_v_buf[idx + 1], v_l.astype(sens_v_buf.dtype), (0, 0, slot, 0))
+                sens_k_buf = sens_k_buf.at[idx + 1].set(kbi)
+                sens_v_buf = sens_v_buf.at[idx + 1].set(vbi)
+                scores_l = jnp.matmul(q_l, jnp.swapaxes(kbi, -1, -2)) / math.sqrt(head_dim)
+                scores_l = jnp.where(valid_mask, scores_l, -1e4)
+                attn_w_l = jax.nn.softmax(scores_l.astype(jnp.float32), axis=-1).astype(flux.dtype)
+                ctx_l = jnp.swapaxes(jnp.matmul(attn_w_l, vbi), 1, 2).reshape(B, 1, D)
+                flux = flux + jnp.matmul(ctx_l, params[f"{pfx}out_proj.weight"].T)
+                h2 = rms_norm(flux, params[f"{pfx}norm2.weight"])
+                flux = flux + swiglu(
+                    h2,
+                    params[f"{pfx}swiglu.fc_gate.weight"],
+                    params[f"{pfx}swiglu.fc_val.weight"],
+                    params[f"{pfx}swiglu.fc_down.weight"],
+                )
+        flux = rms_norm(flux, params["sensory.norm_out.weight"])
+
+    k = jnp.swapaxes(jnp.matmul(flux, params["sensory.k_proj.weight"].T).reshape(B, 1, num_heads, head_dim), 1, 2)
+    v = jnp.swapaxes(jnp.matmul(flux, params["sensory.v_proj.weight"].T).reshape(B, 1, num_heads, head_dim), 1, 2)
+    return flux, (k, v), sens_k_buf, sens_v_buf
+
+
 def generate_causal_prefill_jax(
     params: Dict[str, jnp.ndarray],
     prompt_ids: jnp.ndarray,
@@ -2038,17 +2131,25 @@ def generate_causal_prefill_jax(
     B, L = prompt_ids.shape
     total_len = L + max_new_tokens
     dtype = params["sensory.embedding.weight"].dtype
+    num_heads = config.num_heads if config is not None else 8
+    head_dim = config.surface_dim // num_heads
+    num_sens_layers = max(1, int(getattr(config, "num_sensory_layers", 1)))
+    sens_k_buf = jnp.zeros((num_sens_layers, B, num_heads, total_len, head_dim), dtype=dtype)
+    sens_v_buf = jnp.zeros((num_sens_layers, B, num_heads, total_len, head_dim), dtype=dtype)
+    init_sens_mask = jnp.zeros((B, 1, 1, total_len), dtype=bool).at[:, :, :, 0].set(True)
+
     bos = prompt_ids[:, :1]
-    s_flux, (pk, pv) = encode_sensory(params, bos, config=config, pos_offset=0)
+    s_flux, (pk, pv), sens_k_buf, sens_v_buf = _encode_sensory_cached_step(
+        params, bos, jnp.array(0, dtype=jnp.int32), sens_k_buf, sens_v_buf, init_sens_mask, config=config
+    )
     radial_profile = (jnp.arange(1, config.num_shells + 1, dtype=jnp.float32) / float(config.num_shells))[None, :, None]
     state = (jnp.broadcast_to(s_flux[:, 0:1, :], (B, config.num_shells, config.surface_dim)).astype(jnp.float32) * radial_profile).astype(dtype)
     state, _, _ = deliberate_cycles_jax(
         params, state, buffers, config=config, is_training=False, sensory_kv=(pk, pv), return_energy=True
     )
 
-    H, Dh = pk.shape[1], pk.shape[3]
-    k_buf = jnp.zeros((B, H, total_len, Dh), dtype=dtype).at[:, :, :1, :].set(pk.astype(dtype))
-    v_buf = jnp.zeros((B, H, total_len, Dh), dtype=dtype).at[:, :, :1, :].set(pv.astype(dtype))
+    k_buf = jnp.zeros((B, num_heads, total_len, head_dim), dtype=dtype).at[:, :, :1, :].set(pk.astype(dtype))
+    v_buf = jnp.zeros((B, num_heads, total_len, head_dim), dtype=dtype).at[:, :, :1, :].set(pv.astype(dtype))
     valid_buf = jnp.zeros((B, 1, 1, total_len), dtype=bool).at[:, :, :, 0].set(True)
 
     plan = jnp.zeros((B, config.surface_dim), dtype=dtype)
@@ -2061,7 +2162,7 @@ def generate_causal_prefill_jax(
     gen_key = key if key is not None else jax.random.PRNGKey(42)
 
     def _step(carry, t):
-        st, tr, pl, th, kb, vb, valb = carry
+        st, tr, pl, th, kb, vb, valb, skb, svb = carry
         feed = jnp.where(t == 0, jnp.zeros_like(th), th)
         mask = valb & (jnp.arange(total_len)[None, None, None, :] <= t)
         logits, n_st, n_tr, n_pl = emit_step(
@@ -2075,16 +2176,19 @@ def generate_causal_prefill_jax(
         else:
             pred = lax.stop_gradient(jnp.argmax(logits, axis=-1))
         next_tok = jnp.where(t < L - 1, p_flat[jnp.minimum(t + 1, L - 1)][None], pred)
-        t_flux, (tk, tv) = encode_sensory(params, next_tok[:, None], config=config, pos_offset=t + 1)
         slot = jnp.minimum(t + 1, total_len - 1)
+        n_valb = valb.at[:, :, :, slot].set(True)
+        sens_mask = n_valb & (jnp.arange(total_len)[None, None, None, :] <= (t + 1))
+        t_flux, (tk, tv), n_skb, n_svb = _encode_sensory_cached_step(
+            params, next_tok[:, None], t + 1, skb, svb, sens_mask, config=config
+        )
         n_kb = lax.dynamic_update_slice(kb, tk.astype(dtype), (0, 0, slot, 0))
         n_vb = lax.dynamic_update_slice(vb, tv.astype(dtype), (0, 0, slot, 0))
-        n_valb = valb.at[:, :, :, slot].set(True)
-        return (n_st.astype(dtype), n_tr, n_pl.astype(dtype), t_flux[:, 0, :].astype(dtype), n_kb, n_vb, n_valb), pred
+        return (n_st.astype(dtype), n_tr, n_pl.astype(dtype), t_flux[:, 0, :].astype(dtype), n_kb, n_vb, n_valb, n_skb, n_svb), pred
 
     _, preds = jax.lax.scan(
         _step,
-        (state, trace, plan, jnp.zeros((B, config.surface_dim), dtype=dtype), k_buf, v_buf, valid_buf),
+        (state, trace, plan, jnp.zeros((B, config.surface_dim), dtype=dtype), k_buf, v_buf, valid_buf, sens_k_buf, sens_v_buf),
         jnp.arange(L - 1 + max_new_tokens, dtype=jnp.int32),
     )
     return [int(preds[i, 0]) for i in range(L - 1, L - 1 + max_new_tokens)]
