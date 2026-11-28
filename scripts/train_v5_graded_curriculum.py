@@ -47,7 +47,6 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-from transformers.optimization import Adafactor
 from transformers import AutoTokenizer
 
 from src.spheroid_v5 import (
@@ -607,6 +606,7 @@ def _run_training(
         if is_main:
             print(f"[Optimizer] Configured SpheroidOptimizer (Polar Newton-Schulz NS-5 + Persistent Spectral Clamp)")
     elif args.optimizer == "adafactor":
+        from transformers.optimization import Adafactor
         optimizer = Adafactor(
             all_params,
             lr=schedule_config.max_lr,
