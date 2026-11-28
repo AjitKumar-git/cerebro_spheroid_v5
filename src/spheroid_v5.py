@@ -84,6 +84,7 @@ class ModelConfigV5:
     selective_noise_cap: float = 8.5       # Soft CE cap attenuating unlearnable web-noise spikes
     z_loss_weight: float = 0.0             # Logit Z-loss regularizer (z_loss_weight * logsumexp^2)
     use_bidirectional_tracts: bool = False # Canonical Option A wiring (False) vs bidirectional Option B (True)
+    use_sequential_cascade: bool = False # Sequential K-1 -> 0 Transformer-like shell cascade (from-scratch only)
 
 
 PRESETS_V5: Dict[str, Dict[str, Any]] = {

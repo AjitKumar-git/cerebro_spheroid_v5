@@ -143,6 +143,7 @@ def apply_from_scratch_arch_upgrades(cfg_kwargs: Dict[str, Any], args: Any) -> D
         if explicit_layers is not None:
             cfg_kwargs["num_sensory_layers"] = int(explicit_layers)
         cfg_kwargs["use_bidirectional_tracts"] = bool(getattr(args, "use_bidirectional_tracts", False))
+        cfg_kwargs["use_sequential_cascade"] = True
         cfg_kwargs.setdefault("use_sensory_core_coupling", False)
         cfg_kwargs.setdefault("use_parallel_plan_scan", False)
         cfg_kwargs.setdefault("preserve_shell_norm_clamp", True)
@@ -171,7 +172,7 @@ def resolve_checkpoint_arch_overrides(ckpt: Dict[str, Any], cfg_kwargs: Dict[str
         updated["num_sensory_layers"] = detected_layers
         changed = True
 
-    for flag in ("use_centralized_readout", "use_shell_tap", "use_bidirectional_tracts", "use_sensory_core_coupling", "use_parallel_plan_scan", "preserve_shell_norm_clamp"):
+    for flag in ("use_centralized_readout", "use_shell_tap", "use_bidirectional_tracts", "use_sensory_core_coupling", "use_parallel_plan_scan", "preserve_shell_norm_clamp", "use_sequential_cascade"):
         if flag in ckpt:
             val = bool(ckpt[flag])
             if val != updated.get(flag):
@@ -240,7 +241,7 @@ def parse_args(args_list=None):
     parser.add_argument("--scmer-margin", "--scmer_margin", dest="scmer_margin", type=float, default=0.12, help="Cosine margin threshold m above which positive similarity is penalized (default: 0.12)")
     parser.add_argument("--scmer-subsample", "--scmer_subsample", dest="scmer_subsample", type=int, default=512, help="Number of token embedding rows sampled per regularizer event")
     parser.add_argument("--scmer-pair-samples", "--scmer_pair_samples", dest="scmer_pair_samples", type=int, default=8192, help="Number of unique unordered token pairs sampled without replacement")
-    parser.add_argument("--scmer-interval", "--scmer_interval", dest="scmer_interval", type=int, default=8, help="Apply SCMER regularization every N optimizer updates")
+    parser.add_argument("--scmer-interval", "--scmer_interval", dest="scmer_interval", type=int, default=16, help="Apply SCMER regularization every N optimizer updates (default: 16)")
 
     # Backward compatibility aliases for SCMER
     parser.add_argument("--neg-cov-lambda", "--neg_cov_lambda", dest="neg_cov_lambda", type=float, default=None, help="Alias for --scmer-lambda")
@@ -287,7 +288,7 @@ def parse_args(args_list=None):
     parser.add_argument("--use_adaptive_thinking", "--use-adaptive-thinking", dest="use_adaptive_thinking", action=argparse.BooleanOptionalAction, default=True, help="Toggle dynamic subconscious deliberation halting gate (True: adaptive thinking up to max cycles; False: fast fixed cycles)")
     parser.add_argument("--no_adaptive_thinking", "--no-adaptive-thinking", dest="use_adaptive_thinking", action="store_false", help="Disable adaptive thinking (use fast fixed cycles)")
     parser.add_argument("--thinking_cycles", "--thinking-cycles", dest="thinking_cycles", type=int, default=4, help="Subconscious deliberation iterations per token (default: 4)")
-    parser.add_argument("--max_thinking_cycles", "--max-thinking-cycles", dest="max_thinking_cycles", type=int, default=16, help="Maximum thinking cycles when adaptive thinking is active (default: 16)")
+    parser.add_argument("--max_thinking_cycles", "--max-thinking-cycles", dest="max_thinking_cycles", type=int, default=4, help="Maximum thinking cycles when adaptive thinking is active (default: 4 for fast pretraining; raise to 8-16 for Stage 2 reasoning)")
 
     # Data Source & Tokenizer
     parser.add_argument("--hf-token", "--hf_token", dest="hf_token", type=str, default=None, help="Hugging Face API token for authenticated dataset streaming")
@@ -359,6 +360,14 @@ def parse_args(args_list=None):
 
     parsed = parser.parse_args(args_list)
     raw_args = args_list if args_list is not None else sys.argv[1:]
+    parsed.local_steps_explicit = any(
+        arg == "--local-steps" or arg == "--local_steps" or arg.startswith("--local-steps=") or arg.startswith("--local_steps=")
+        for arg in args_list
+    )
+    parsed.remat_explicit = any(
+        arg == "--remat" or arg.startswith("--remat=")
+        for arg in args_list
+    )
     parsed.batch_size_explicit = any(
         arg == "--batch-size" or arg == "--batch_size" or arg.startswith("--batch-size=") or arg.startswith("--batch_size=")
         for arg in raw_args
@@ -1211,8 +1220,8 @@ def main(args=None):
     elif max_bs is not None:
         args.batch_size = min(int(args.batch_size), int(max_bs))
 
-    # Strict HBM Safety Enforcement for Long-Context Horizons
-    if require_tuned_remat and not remat_choice:
+    # Strict HBM Safety Enforcement for Long-Context Horizons (respects explicit --remat=false)
+    if require_tuned_remat and not remat_choice and not getattr(args, "remat_explicit", False):
         print(f"🛡️ [HBM Safety Guard] Sequence window {max(args.seq_len, args.total_window)} >= 1024 requires activation rematerialization. Enabling remat=True.")
         remat_choice = True
 
@@ -1314,6 +1323,8 @@ def main(args=None):
         print(f"ℹ️ [Multi-Device Dispatch] Multi-device pmap Local-SGD is specialized for the SCMER / Spheroid optimizer (polar NS-5 + spectral clamp). Running {args.optimizer.upper()} in standard single-accelerator JIT mode.")
     eff_num_devices = num_devices if use_multi_tpu_local_sgd else 1
     base_local_steps = max(1, int(getattr(args, "local_steps", 4)))
+    if use_multi_tpu_local_sgd and num_devices >= 8 and not getattr(args, "local_steps_explicit", False):
+        base_local_steps = max(base_local_steps, 8)
     eff_local_steps = max(1, base_local_steps * grad_accum) if use_multi_tpu_local_sgd else 1
     step_stride = eff_num_devices * eff_local_steps
 
@@ -2069,7 +2080,15 @@ def main(args=None):
         def _multi_tpu_prefetch_worker():
             while not _multi_tpu_stop.is_set():
                 try:
-                    item = _build_multi_tpu_round()
+                    q_a, r_a, fb_a, wt_a = _build_multi_tpu_round()
+                    if len(devices) == eff_num_devices:
+                        q_a = jax.device_put_sharded(list(q_a), devices)
+                        r_a = jax.device_put_sharded(list(r_a), devices)
+                        if fb_a is not None:
+                            fb_a = jax.device_put_sharded(list(fb_a), devices)
+                        if wt_a is not None:
+                            wt_a = jax.device_put_sharded(list(wt_a), devices)
+                    item = (q_a, r_a, fb_a, wt_a)
                     while not _multi_tpu_stop.is_set():
                         try:
                             _multi_tpu_queue.put(item, timeout=0.2)

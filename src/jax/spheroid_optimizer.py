@@ -67,7 +67,7 @@ def is_manifold_operator(k: str, p: jnp.ndarray) -> bool:
     return p.ndim >= 2
 
 
-def zeropower_via_newtonschulz5_jax(G: jnp.ndarray, steps: int = 3, eps: float = 1e-7) -> jnp.ndarray:
+def zeropower_via_newtonschulz5_jax(G: jnp.ndarray, steps: int = 2, eps: float = 1e-7) -> jnp.ndarray:
     """Vectorized Quintic Newton-Schulz iteration mapping update matrices to the orthogonal manifold.
     Runs strictly in float32 to prevent half-precision exponent overflow.
     For batched 3D tensors (e.g. concentric shell stacks), applies slice-relative trust scaling
@@ -387,7 +387,7 @@ def _apply_spheroid_grads(
                 # Recurrent manifold weights are bounded by contractive spectral clamp; exempt from weight decay
                 decay_factor = 0.0 if k in RECURRENT_KEYS else weight_decay
                 p_decayed = p_f32 * (1.0 - base_lr * decay_factor)
-                O = zeropower_via_newtonschulz5_jax(m_new, steps=3).astype(jnp.float32)
+                O = zeropower_via_newtonschulz5_jax(m_new, steps=2).astype(jnp.float32)
 
                 rows = param.shape[-2]
                 cols = param.shape[-1]

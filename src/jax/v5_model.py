@@ -83,6 +83,7 @@ class ModelConfigV5:
     router_loss_weight: float = 0.0
     energy_reg_weight: float = 0.01
     use_bidirectional_tracts: bool = False
+    use_sequential_cascade: bool = False
     use_sensory_core_coupling: bool = False
     use_parallel_plan_scan: bool = False
     preserve_shell_norm_clamp: bool = True
@@ -595,6 +596,17 @@ def _chunked_mha_jax(
     """Memory-bounded multi-head attention via query-axis chunking (8x lower HBM at 4K ctx)."""
     B, H, Q_len, Dh = q.shape
     K_len = k.shape[2]
+    if (
+        top_k_res == 0
+        and attn_mask is None
+        and hasattr(jax.nn, "dot_product_attention")
+        and ((not is_causal) or (isinstance(query_pos_offset, int) and query_pos_offset == 0 and Q_len == K_len))
+    ):
+        q_bthd = jnp.swapaxes(q, 1, 2)
+        k_bthd = jnp.swapaxes(k, 1, 2)
+        v_bthd = jnp.swapaxes(v, 1, 2)
+        out_bthd = jax.nn.dot_product_attention(q_bthd, k_bthd, v_bthd, is_causal=is_causal)
+        return out_bthd.reshape(B, Q_len, H * Dh)
     k_t = jnp.swapaxes(k, -1, -2)
     scale = 1.0 / math.sqrt(Dh)
 
@@ -761,6 +773,60 @@ def deliberate_step(
     B, K, D = state.shape
     src_idx, dst_idx = buffers
     st_dtype = state.dtype
+
+    if getattr(config, "use_sequential_cascade", False):
+        # Sequential K-1 -> 0 Transformer-like shell cascade: each shell feeds directly into the next inward shell
+        # in the same pass so all K shells receive direct O(1) gradient, followed by vectorized outward/shortcut flux.
+        K = state.shape[1]
+        r_mix = jnp.clip(params.get("core.radial_mix_scale", jnp.array(0.1, dtype=jnp.float32)), 0.01, 1.0).astype(st_dtype)
+        s_mix = jnp.clip(params.get("core.shortcut_mix_scale", jnp.array(0.05, dtype=jnp.float32)), 0.005, 1.0).astype(st_dtype)
+        w_up_out = params.get("core.radial_up_out.weight", params["core.radial_up.weight"])
+        use_laminar = getattr(config, "use_laminar_transport", True) and ("core.laminar_in_gate" in params)
+        if use_laminar:
+            tau_in_all = 2.0 * jax.nn.sigmoid(params["core.laminar_in_gate"]).astype(st_dtype) * r_mix
+            tau_out_all = 2.0 * jax.nn.sigmoid(params["core.laminar_out_gate"]).astype(st_dtype) * r_mix
+
+        work = state
+        for k in range(K - 1, -1, -1):
+            s_k = work[:, k, :]
+            if k < K - 1:
+                h_prev = rms_norm(work[:, k + 1, :], params["core.radial_norm.weight"])
+                rad_in = jnp.matmul(h_prev, params["core.radial_in_proj.weight"].T)
+                in_flux = jnp.matmul(rad_in, params["core.w_radial_in"][k])
+                in_up = jnp.matmul(in_flux, params["core.radial_up.weight"].T)
+                t_in = tau_in_all[k] if use_laminar else r_mix
+                s_k = s_k + (0.7071 * work[:, k + 1, :]) + (t_in * in_up)
+
+            s_f32 = s_k.astype(jnp.float32)
+            v_k = jnp.mean(jnp.square(s_f32), axis=-1, keepdims=True)
+            h_k = (s_f32 * jax.lax.rsqrt(v_k + 1e-6) * params["core.intra_norms.weight"][k][None, :].astype(jnp.float32)).astype(st_dtype)
+            g_k = jax.nn.silu(jnp.matmul(h_k, params["core.intra_swiglu.w_gate"][k]))
+            if getattr(config, "use_swiglu", True):
+                val_k = jnp.matmul(h_k, params["core.intra_swiglu.w_val"][k])
+                down_k = jnp.matmul(g_k * val_k, params["core.intra_swiglu.w_down"][k])
+            else:
+                down_k = jnp.matmul(g_k, params["core.intra_swiglu.w_down"][k])
+            s_k_out = s_k + down_k * params["core.shell_gains"][k].astype(st_dtype)
+            work = work.at[:, k, :].set(s_k_out)
+
+        h_rad = rms_norm(work, params["core.radial_norm.weight"])
+        rad_out = jnp.matmul(h_rad[:, :-1, :], params["core.radial_out_proj.weight"].T)
+        out_flux = jnp.einsum("bkd,kde->bke", rad_out, params["core.w_radial_out"])
+        out_up = jnp.matmul(out_flux, w_up_out.T)
+        if use_laminar:
+            state_radial = work.at[:, 1:, :].add(tau_out_all[None, :, None] * out_up)
+        else:
+            state_radial = work.at[:, 1:, :].add(r_mix * out_up)
+
+        conductances = jax.nn.sigmoid(params["core.shortcut_gate"]).astype(st_dtype)
+        if config is not None and getattr(config, "use_sparse_mot", False):
+            k_val = min(int(getattr(config, "top_k_tracts", 8)), conductances.shape[0])
+            _, top_idx = lax.top_k(conductances, k_val)
+            sparse_mask = jnp.zeros_like(conductances).at[top_idx].set(1.0)
+            conductances = conductances * sparse_mask
+        src_acts = h_rad[:, src_idx, :]
+        shortcut_flux = jnp.einsum("btd,tde->bte", src_acts, params["core.shortcut_weight"]) * conductances[None, :, None]
+        return state_radial.at[:, dst_idx, :].add(s_mix * shortcut_flux).astype(st_dtype)
 
     # 1. Batched Intra-shell Pre-Norm across all K shells simultaneously (float32 accumulation)
     state_f32 = state.astype(jnp.float32)

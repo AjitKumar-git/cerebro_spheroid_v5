@@ -213,6 +213,7 @@ def parse_args(args_list: Optional[Sequence[str]] = None):
     parser.add_argument("--from-scratch", "--from_scratch", dest="from_scratch", action="store_true", default=False, help="Start clean from Step 0 without restoring local/cloud checkpoints")
     parser.add_argument("--max-hours", type=float, default=None, help="Wall-clock budget in hours for clean checkpoint save before timeout")
     parser.add_argument("--seed", type=int, default=42, help="Base PRNG seed (offset per DDP rank for data streaming)")
+    parser.add_argument("--compile", action="store_true", default=False, help="Enable torch.compile on combined model for faster GPU throughput")
     parser.add_argument("--local-rank", "--local_rank", dest="local_rank", type=int, default=0, help="Local device rank when launched via distributed runner")
     return parser.parse_args(args_list)
 
@@ -558,6 +559,12 @@ def _run_training(
     elif args.from_scratch and is_main:
         print("🌱 [--from-scratch] Starting clean training from Step 0.")
 
+    if use_cuda:
+        torch.set_float32_matmul_precision("high")
+    if getattr(args, "compile", False) and hasattr(torch, "compile"):
+        if is_main:
+            print("⚡ [torch.compile] Compiling combined model graph...")
+        raw_combined = torch.compile(raw_combined)
     if is_distributed:
         ddp_kwargs = {"find_unused_parameters": True}
         if use_cuda:
@@ -630,6 +637,8 @@ def _run_training(
         print("\n--- Starting Graded Pre-Training Pipeline ---")
     start_time = time.time()
     max_seconds = (args.max_hours * 3600.0) if (args.max_hours is not None and args.max_hours > 0) else None
+    accum_loss_t = torch.zeros((), device=device, dtype=torch.float32)
+    accum_act_loss_t = torch.zeros((), device=device, dtype=torch.float32)
     accum_loss = 0.0
     accum_act_loss = 0.0
     steps_since_log = 0
@@ -828,8 +837,8 @@ def _run_training(
                         total_batch_loss = (ce_loss + 0.1 * act_loss) / args.grad_accum
                     scaler.scale(total_batch_loss).backward()
 
-                    accum_loss += ce_loss.item() / args.grad_accum
-                    accum_act_loss += act_loss.item() / args.grad_accum
+                    accum_loss_t.add_(ce_loss.detach().float() / args.grad_accum)
+                    accum_act_loss_t.add_(act_loss.detach().float() / args.grad_accum)
                     tokens_processed += micro_tokens
 
             # Clip gradients & optimizer step
@@ -868,8 +877,8 @@ def _run_training(
             # Periodic Logging
             if step % args.log_interval == 0:
                 elapsed = time.time() - start_time
-                avg_loss_local = accum_loss / max(1, steps_since_log)
-                avg_act_local = accum_act_loss / max(1, steps_since_log)
+                avg_loss_local = float(accum_loss_t.item()) / max(1, steps_since_log)
+                avg_act_local = float(accum_act_loss_t.item()) / max(1, steps_since_log)
                 global_tok = float(tokens_processed)
                 if is_distributed:
                     stats = torch.tensor([avg_loss_local, avg_act_local, global_tok], dtype=torch.float64, device=device)
@@ -899,6 +908,8 @@ def _run_training(
                         f"Loss: {avg_loss:.4f} (EMA: {ema_loss:.4f}){eval_str}{samp_str}{act_str} | LR: {lr:.2e} | "
                         f"Tok/s: {tok_per_sec:6.1f} | VRAM: {vram_mb:5.0f}MB"
                     )
+                accum_loss_t.zero_()
+                accum_act_loss_t.zero_()
                 accum_loss = 0.0
                 accum_act_loss = 0.0
                 steps_since_log = 0
@@ -907,7 +918,7 @@ def _run_training(
             need_local_save = (step % args.save_interval == 0 and step > start_step)
             need_cloud_sync = (args.cloud_sync and step > start_step and (step % args.cloud_sync_interval == 0))
             if (need_local_save or need_cloud_sync) and is_main:
-                cur_loss = (accum_loss / steps_since_log) if steps_since_log > 0 else (ema_loss or last_avg_loss)
+                cur_loss = (float(accum_loss_t.item()) / steps_since_log) if steps_since_log > 0 else (ema_loss or last_avg_loss)
                 best_loss = _save_and_push_checkpoints(
                     checkpoint_dir=args.checkpoint_dir,
                     model_preset=args.model_preset,
@@ -925,7 +936,7 @@ def _run_training(
                 )
 
         # Final Checkpoint
-        final_loss_local = (accum_loss / steps_since_log) if steps_since_log > 0 else (ema_loss or last_avg_loss)
+        final_loss_local = (float(accum_loss_t.item()) / steps_since_log) if steps_since_log > 0 else (ema_loss or last_avg_loss)
         if is_distributed:
             loss_t = torch.tensor([final_loss_local], dtype=torch.float64, device=device)
             dist.all_reduce(loss_t, op=dist.ReduceOp.SUM)
