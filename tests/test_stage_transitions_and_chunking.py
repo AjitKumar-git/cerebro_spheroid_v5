@@ -323,3 +323,46 @@ def test_from_scratch_arch_upgrades_gating():
     assert restored_cfg["num_sensory_layers"] == 4
     assert restored_cfg["use_centralized_readout"] is False
     assert restored_cfg["use_bidirectional_tracts"] is True
+    assert cfg_fresh["use_sensory_core_coupling"] is True
+    assert cfg_fresh["use_parallel_plan_scan"] is True
+    assert cfg_resume["use_sensory_core_coupling"] is False
+    assert cfg_resume["use_parallel_plan_scan"] is False
+
+
+def test_from_scratch_coupled_core_and_parallel_plan_forward_grad():
+    """Verifies use_sensory_core_coupling + use_parallel_plan_scan run forward & grad cleanly without touching defaults."""
+    import jax
+    import jax.numpy as jnp
+    from src.jax.v5_model import ModelConfigV5, init_params_v5, training_rollout
+
+    cfg_default = ModelConfigV5(vocab_size=64, num_shells=4, surface_dim=32, radial_dim=16, num_heads=4, max_phase_steps=32)
+    assert cfg_default.use_sensory_core_coupling is False
+    assert cfg_default.use_parallel_plan_scan is False
+
+    cfg_new = ModelConfigV5(
+        vocab_size=64,
+        num_shells=4,
+        surface_dim=32,
+        radial_dim=16,
+        num_heads=4,
+        max_phase_steps=32,
+        num_sensory_layers=2,
+        use_centralized_readout=False,
+        use_shell_tap=True,
+        use_bidirectional_tracts=True,
+        use_sensory_core_coupling=True,
+        use_parallel_plan_scan=True,
+    )
+    params, buffers = init_params_v5(jax.random.PRNGKey(0), cfg_new)
+    prompts = jnp.array([[1], [1]], dtype=jnp.int32)
+    targets = jnp.array([[5, 6, 7, 8, 9, 10], [11, 12, 13, 14, 15, 16]], dtype=jnp.int32)
+
+    def _loss(p):
+        return training_rollout(
+            p, prompts, 6, buffers, config=cfg_new, targets=targets, pure_teacher_forcing=True, deliberation_mode="teacher_forcing"
+        )
+
+    loss_val, grads = jax.value_and_grad(_loss)(params)
+    assert jnp.isfinite(loss_val)
+    assert float(jnp.linalg.norm(grads["core.intra_swiglu.w_gate"])) > 0.0
+    assert float(jnp.linalg.norm(grads["motor.plan_update.weight"])) > 0.0

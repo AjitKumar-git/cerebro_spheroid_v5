@@ -83,6 +83,8 @@ class ModelConfigV5:
     router_loss_weight: float = 0.0
     energy_reg_weight: float = 0.01
     use_bidirectional_tracts: bool = False
+    use_sensory_core_coupling: bool = False
+    use_parallel_plan_scan: bool = False
     use_selective_loss: bool = False
     selective_focal_gamma: float = 0.5
     selective_noise_cap: float = 8.5
@@ -939,6 +941,10 @@ def emit_step(
     """Single motor emission step with affine-tied dictionary projection and progressive encephalization."""
     B, K, D = state.shape
     st_dtype = state.dtype
+    if getattr(config, "use_sensory_core_coupling", False) and auditory_feedback is not None:
+        rad_prof = (jnp.arange(1, K + 1, dtype=jnp.float32) / float(K))[None, :, None].astype(st_dtype)
+        coupled_s = state + (0.1 * auditory_feedback[:, None, :].astype(st_dtype) * rad_prof)
+        state = deliberate_step(params, coupled_s, buffers, config=config)
     core = state[:, 0, :]
     if K > 16:
         surface = (1.0 - encephalization_alpha) * state[:, 15, :] + encephalization_alpha * state[:, -1, :]
@@ -1579,11 +1585,9 @@ def training_rollout(
 
     if is_pure_tf:
         T = int(target_len)
-        if num_shells > 16:
-            surface = (1.0 - encephalization_alpha) * state[:, 15, :] + encephalization_alpha * state[:, -1, :]
-        else:
-            surface = state[:, -1, :]
-        init_core = state[:, 0, :]
+        use_cent_readout = use_cent_readout_cfg
+        use_core_coupling = bool(getattr(config, "use_sensory_core_coupling", False))
+        use_par_plan = bool(getattr(config, "use_parallel_plan_scan", False)) and (not getattr(config, "use_per_token_efference", False))
 
         # 1. Precompute all T normalized phase clocks and motor surface vectors outside scan
         max_phase = params["motor.phase_embed.weight"].shape[0]
@@ -1594,15 +1598,81 @@ def training_rollout(
             params.get("motor.phase_scale", jnp.array(2.0, dtype=jnp.float32)), 0.05, 5.0
         ).astype(jnp.float32)
         p_scaled_all = (phases * (p_scale_val / p_norms)).astype(target_dtype)  # [T, D]
-        use_cent_readout = use_cent_readout_cfg
-        eff_core = transform_spectral_core_jax(init_core, params, config) if use_cent_readout else init_core
-        if use_cent_readout:
-            core_t = eff_core[:, None, :] + p_scaled_all[None, :, :]
-            query_surface_all = core_t + tf_flux.astype(target_dtype)
-            motor_surface_all = jnp.zeros_like(query_surface_all)
+
+        use_shell_tap = getattr(config, "use_shell_tap", True) and (not use_cent_readout)
+        w_shell_t = params["motor.shell_proj.weight"].T
+        if use_shell_tap:
+            shell_weights = jax.nn.softmax(params["motor.shell_score"].astype(jnp.float32), axis=0).astype(target_dtype)
+            norm_factor = math.sqrt(float(num_shells))
+            shell_scale = (params["motor.shell_scale"].astype(target_dtype) * norm_factor).astype(target_dtype)
+            w_shell_scaled = (w_shell_t * shell_scale).astype(target_dtype)
         else:
-            motor_surface_all = surface[:, None, :] + p_scaled_all[None, :, :]
-            query_surface_all = motor_surface_all + tf_flux.astype(target_dtype)
+            shell_weights = jnp.zeros(num_shells, dtype=target_dtype)
+            w_shell_scaled = jnp.zeros_like(w_shell_t)
+
+        if use_core_coupling:
+            # Chunked parallel per-token concentric core coupling from teacher-forced tf_flux (zero recurrent h_t drift)
+            rad_prof = (jnp.arange(1, num_shells + 1, dtype=jnp.float32) / float(num_shells))[None, :, None].astype(target_dtype)
+            tf_flat = tf_flux.astype(target_dtype).reshape(B * T, surface_dim)
+            base_s_flat = jnp.broadcast_to(state[:, None, :, :], (B, T, num_shells, surface_dim)).reshape(B * T, num_shells, surface_dim)
+            tot_bt = B * T
+            c_chunk = tot_bt if tot_bt <= 256 else next(
+                (c for c in (256, 128, 64, 32, 16, 8, 4, 2, 1) if tot_bt % c == 0),
+                tot_bt,
+            )
+
+            def _couple_step(bs_c, tf_c):
+                coupled = bs_c + (0.1 * tf_c[:, None, :] * rad_prof)
+                st_out = deliberate_step(params, coupled, buffers, config=config)
+                c0 = transform_spectral_core_jax(st_out[:, 0, :], params, config) if use_cent_readout else st_out[:, 0, :]
+                sf = ((1.0 - encephalization_alpha) * st_out[:, 15, :] + encephalization_alpha * st_out[:, -1, :]) if num_shells > 16 else st_out[:, -1, :]
+                if use_shell_tap:
+                    sp = jnp.sum(shell_weights[None, :, None] * jnp.matmul(st_out, w_shell_scaled), axis=1)
+                else:
+                    sp = jnp.zeros((st_out.shape[0], surface_dim), dtype=target_dtype)
+                return c0, sf, sp
+
+            couple_fn = jax.checkpoint(_couple_step) if use_remat else _couple_step
+            if c_chunk == tot_bt:
+                eff_core_flat, surface_flat, shell_pool_flat = couple_fn(base_s_flat, tf_flat)
+            else:
+                n_c = tot_bt // c_chunk
+                _, (eff_core_flat, surface_flat, shell_pool_flat) = lax.scan(
+                    lambda _, inp: (None, couple_fn(inp[0], inp[1])),
+                    None,
+                    (base_s_flat.reshape(n_c, c_chunk, num_shells, surface_dim), tf_flat.reshape(n_c, c_chunk, surface_dim)),
+                )
+                eff_core_flat = eff_core_flat.reshape(tot_bt, surface_dim)
+                surface_flat = surface_flat.reshape(tot_bt, surface_dim)
+                shell_pool_flat = shell_pool_flat.reshape(tot_bt, surface_dim)
+
+            eff_core_all = eff_core_flat.reshape(B, T, surface_dim)
+            surface_all = surface_flat.reshape(B, T, surface_dim)
+            shell_pool_all = shell_pool_flat.reshape(B, T, surface_dim)
+            init_core = eff_core_all[:, 0, :]
+            eff_core = init_core
+            if use_cent_readout:
+                query_surface_all = eff_core_all + p_scaled_all[None, :, :] + tf_flux.astype(target_dtype)
+                motor_surface_all = jnp.zeros_like(query_surface_all)
+            else:
+                motor_surface_all = surface_all + p_scaled_all[None, :, :]
+                query_surface_all = motor_surface_all + tf_flux.astype(target_dtype)
+        else:
+            if num_shells > 16:
+                surface = (1.0 - encephalization_alpha) * state[:, 15, :] + encephalization_alpha * state[:, -1, :]
+            else:
+                surface = state[:, -1, :]
+            init_core = state[:, 0, :]
+            eff_core = transform_spectral_core_jax(init_core, params, config) if use_cent_readout else init_core
+            eff_core_all = jnp.broadcast_to(eff_core[:, None, :], (B, T, surface_dim))
+            shell_pool_all = None
+            if use_cent_readout:
+                core_t = eff_core[:, None, :] + p_scaled_all[None, :, :]
+                query_surface_all = core_t + tf_flux.astype(target_dtype)
+                motor_surface_all = jnp.zeros_like(query_surface_all)
+            else:
+                motor_surface_all = surface[:, None, :] + p_scaled_all[None, :, :]
+                query_surface_all = motor_surface_all + tf_flux.astype(target_dtype)
 
         # 2. Vectorized Multi-Head Arcuate Cross-Resonance across all T tokens in one systolic block
         total_len = causal_keys.shape[2]
@@ -1639,17 +1709,6 @@ def training_rollout(
         resonance_all = res_fn(query_surface_all)  # [B, T, D]
 
         # 3. Dynamic concentric shell pooling & vectorized depth-decayed efference recurrence setup
-        w_shell_t = params["motor.shell_proj.weight"].T
-        use_shell_tap = getattr(config, "use_shell_tap", True) and (not use_cent_readout)
-        if use_shell_tap:
-            shell_weights = jax.nn.softmax(params["motor.shell_score"].astype(jnp.float32), axis=0).astype(target_dtype)
-            norm_factor = math.sqrt(float(num_shells))
-            shell_scale = (params["motor.shell_scale"].astype(target_dtype) * norm_factor).astype(target_dtype)
-            w_shell_scaled = (w_shell_t * shell_scale).astype(target_dtype)
-        else:
-            shell_weights = jnp.zeros(num_shells, dtype=target_dtype)
-            w_shell_scaled = jnp.zeros_like(w_shell_t)
-
         if num_shells > 1:
             gamma_0 = 0.15
             gamma_end = 0.02
@@ -1727,9 +1786,81 @@ def training_rollout(
 
             return (nxt_state, nxt_plan), h
 
-        motor_scan_fn = jax.checkpoint(_tf_motor_step) if use_remat else _tf_motor_step
-        motor_init_state = state.at[:, 0, :].set(eff_core) if use_cent_readout else state
-        _, h_seq = lax.scan(motor_scan_fn, (motor_init_state, init_plan), (gated_ms_seq, gated_res_seq, p_scaled_all))
+        if use_par_plan:
+            # Parallel associative scan over T tokens (log2(T) depth instead of T-step sequential scan)
+            if shell_pool_all is None:
+                if use_shell_tap:
+                    sp_static = jnp.sum(shell_weights[None, :, None] * jnp.matmul(state, w_shell_scaled), axis=1)
+                    sp_all = jnp.broadcast_to(sp_static[:, None, :], (B, T, surface_dim))
+                else:
+                    sp_all = jnp.zeros((B, T, surface_dim), dtype=target_dtype)
+            else:
+                sp_all = shell_pool_all
+
+            fused_par = jnp.concatenate([
+                ig[0] * motor_surface_all,
+                ig[1] * eff_core_all,
+                ig[2] * resonance_all,
+                ig[3] * sp_all,
+                jnp.zeros((B, T, surface_dim), dtype=target_dtype),
+            ], axis=-1)
+            h_pre = rms_norm(
+                swiglu(rms_norm(fused_par, fused_norm_w), fc_gate_w, fc_val_w, fc_down_w, use_swiglu=use_swiglu_motor),
+                norm_mid_w,
+            )
+            if use_plan:
+                phase_bt = jnp.broadcast_to(p_scaled_all[None, :, :], (B, T, surface_dim))
+                plan_in = jnp.concatenate([h_pre, phase_bt], axis=-1)
+                p_gate = jax.nn.sigmoid(jnp.matmul(plan_in, plan_gate_w_t) + plan_gate_b)
+                p_upd = jnp.matmul(plan_in, plan_update_w_t)
+                b_seq = (plan_write * p_gate * p_upd).astype(jnp.float32)
+                a_seq = jnp.broadcast_to(plan_decay.astype(jnp.float32), b_seq.shape)
+
+                def _assoc_op(left, right):
+                    a1, b1 = left
+                    a2, b2 = right
+                    return a2 * a1, a2 * b1 + b2
+
+                _, plan_out = lax.associative_scan(_assoc_op, (a_seq, b_seq), axis=1)
+                plan_prev = jnp.concatenate([init_plan[:, None, :].astype(jnp.float32), plan_out[:, :-1, :]], axis=1)
+                plan_prev = jnp.clip(plan_prev, -50.0, 50.0).astype(target_dtype)
+                h_seq = jnp.swapaxes(rms_norm(h_pre + ig[4] * plan_prev, norm_mid_w), 0, 1)
+            else:
+                h_seq = jnp.swapaxes(h_pre, 0, 1)
+        elif use_core_coupling and (not getattr(config, "use_per_token_efference", False)):
+            gated_core_seq = jnp.swapaxes(ig[1] * eff_core_all, 0, 1)
+            gated_sp_seq = jnp.swapaxes(
+                ig[3] * (shell_pool_all if shell_pool_all is not None else jnp.zeros((B, T, surface_dim), dtype=target_dtype)),
+                0, 1,
+            )
+
+            def _tf_coupled_step(cur_plan, xs):
+                ms_t, core_t, res_t, sp_t, p_scaled_t = xs
+                fused_in = jnp.concatenate([
+                    ms_t,
+                    core_t,
+                    res_t,
+                    sp_t,
+                    ig[4] * (cur_plan if use_plan else jnp.zeros_like(cur_plan)),
+                ], axis=-1)
+                fused = rms_norm(fused_in, fused_norm_w)
+                h = rms_norm(swiglu(fused, fc_gate_w, fc_val_w, fc_down_w, use_swiglu=use_swiglu_motor), norm_mid_w)
+                if use_plan:
+                    phase_batch = jnp.broadcast_to(p_scaled_t[None, :], (B, surface_dim))
+                    plan_input = jnp.concatenate([h, phase_batch], axis=-1)
+                    p_gate = jax.nn.sigmoid(jnp.matmul(plan_input, plan_gate_w_t) + plan_gate_b)
+                    plan_update = jnp.matmul(plan_input, plan_update_w_t)
+                    nxt_plan = jnp.clip(plan_decay * cur_plan + plan_write * p_gate * plan_update, -50.0, 50.0).astype(target_dtype)
+                else:
+                    nxt_plan = cur_plan
+                return nxt_plan, h
+
+            c_scan_fn = jax.checkpoint(_tf_coupled_step) if use_remat else _tf_coupled_step
+            _, h_seq = lax.scan(c_scan_fn, init_plan, (gated_ms_seq, gated_core_seq, gated_res_seq, gated_sp_seq, p_scaled_all))
+        else:
+            motor_scan_fn = jax.checkpoint(_tf_motor_step) if use_remat else _tf_motor_step
+            motor_init_state = state.at[:, 0, :].set(eff_core) if use_cent_readout else state
+            _, h_seq = lax.scan(motor_scan_fn, (motor_init_state, init_plan), (gated_ms_seq, gated_res_seq, p_scaled_all))
 
         # 4. Chunked Systolic Vocabulary Projection & Cross-Entropy Outside Sequential Scan
         temp = jnp.clip(params["motor.temperature_scale"].astype(jnp.float32), 0.1, 5.0).astype(target_dtype)

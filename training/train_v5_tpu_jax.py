@@ -128,17 +128,21 @@ from autotune import (
 
 
 def apply_from_scratch_arch_upgrades(cfg_kwargs: Dict[str, Any], args: Any) -> Dict[str, Any]:
-    """Activates V5.1 architectural upgrades (multi-layer sensory, full-mantle readout, bidirectional tracts) ONLY on from-scratch runs."""
+    """Activates V5.1 architectural upgrades (multi-layer sensory, full-mantle readout, bidirectional tracts, sensory-core coupling, parallel plan scan) ONLY on from-scratch runs."""
     explicit_layers = getattr(args, "num_sensory_layers", None)
     if getattr(args, "from_scratch", False):
         cfg_kwargs["num_sensory_layers"] = int(explicit_layers) if explicit_layers is not None else 4
         cfg_kwargs["use_centralized_readout"] = False
         cfg_kwargs["use_shell_tap"] = True
         cfg_kwargs["use_bidirectional_tracts"] = True
+        cfg_kwargs["use_sensory_core_coupling"] = True
+        cfg_kwargs["use_parallel_plan_scan"] = True
     else:
         if explicit_layers is not None:
             cfg_kwargs["num_sensory_layers"] = int(explicit_layers)
         cfg_kwargs["use_bidirectional_tracts"] = bool(getattr(args, "use_bidirectional_tracts", False))
+        cfg_kwargs.setdefault("use_sensory_core_coupling", False)
+        cfg_kwargs.setdefault("use_parallel_plan_scan", False)
     return cfg_kwargs
 
 
@@ -164,7 +168,7 @@ def resolve_checkpoint_arch_overrides(ckpt: Dict[str, Any], cfg_kwargs: Dict[str
         updated["num_sensory_layers"] = detected_layers
         changed = True
 
-    for flag in ("use_centralized_readout", "use_shell_tap", "use_bidirectional_tracts"):
+    for flag in ("use_centralized_readout", "use_shell_tap", "use_bidirectional_tracts", "use_sensory_core_coupling", "use_parallel_plan_scan"):
         if flag in ckpt:
             val = bool(ckpt[flag])
             if val != updated.get(flag):
@@ -2791,6 +2795,8 @@ def main(args=None):
                         "use_centralized_readout": config.use_centralized_readout,
                         "use_shell_tap": config.use_shell_tap,
                         "use_bidirectional_tracts": config.use_bidirectional_tracts,
+                        "use_sensory_core_coupling": config.use_sensory_core_coupling,
+                        "use_parallel_plan_scan": config.use_parallel_plan_scan,
                         "sync_model": sync_model_name,
                         "cumulative_tokens": cumulative_tokens,
                         "cumulative_prompt_tokens": cumulative_prompt_tokens,
@@ -2858,6 +2864,8 @@ def main(args=None):
                     "use_centralized_readout": config.use_centralized_readout,
                     "use_shell_tap": config.use_shell_tap,
                     "use_bidirectional_tracts": config.use_bidirectional_tracts,
+                    "use_sensory_core_coupling": config.use_sensory_core_coupling,
+                    "use_parallel_plan_scan": config.use_parallel_plan_scan,
                     "sync_model": sync_model_name,
                     "cumulative_tokens": cumulative_tokens,
                     "cumulative_prompt_tokens": cumulative_prompt_tokens,
