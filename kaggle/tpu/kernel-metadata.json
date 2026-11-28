@@ -1,9 +1,9 @@
 {
-  "id": "ajitsheoran/cerebrospheroid-v5-tpu-v5e-8-training",
-  "title": "CerebroSpheroid V5 TPU v5e-8 Training",
-  "code_file": "cerebro_spheroid_v5_kaggle_tpu.py",
+  "id": "ajitsheoran/cerebrospheroid-v5-colab-tpu-jax",
+  "title": "CerebroSpheroid_V5_Colab_TPU_JAX",
+  "code_file": "CerebroSpheroid_V5_Kaggle_TPU_small.ipynb",
   "language": "python",
-  "kernel_type": "script",
+  "kernel_type": "notebook",
   "is_private": true,
   "enable_gpu": false,
   "enable_tpu": true,

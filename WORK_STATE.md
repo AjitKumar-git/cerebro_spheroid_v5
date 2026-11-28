@@ -1,16 +1,15 @@
 # Agent Work State & Activity Tracker
 
-> **Status**: 🟡 `IN_PROGRESS` | **Last Updated**: `2026-11-29T00:16:13.727308+05:30` | **Session**: `45bf0dba-195f-4a63-aad5-39c69eb0f7b0`
+> **Status**: 🟡 `IN_PROGRESS` | **Last Updated**: `2026-11-29T00:20:18.041358+05:30` | **Session**: `45bf0dba-195f-4a63-aad5-39c69eb0f7b0`
 
 ## Current / Active Objective
-**Goal**: /home/ajit/Documents/Startup/Active_Development/cerebro_spheroid_v5/download.txt check latest log, the kaggle tpu run failed
+**Goal**: push
 
 - **Phase**: `executing`
-- **Current Task**: Executed run_command: Revert hardware_configs and inspect WORK_STATE.md diff
+- **Current Task**: Executed run_command: Check git status
 
 ## Summary of Completed Work
-**Root Cause** (from [download.txt](file:///home/ajit/Documents/Startup/Active_Development/cerebro_spheroid_v5/download.txt#L178-L195)):
-- The Kaggle TPU runtime uses a newer JAX version where `jax.device_put_sharded` has been removed, causing `AttributeError: jax.device_put_sharded is deprecated; use jax.device_put instead` inside `_multi_tpu_prefetch_worker` in [training/train_v5_tpu_jax.py](file:///home/ajit/Documents/Startup/Active_Development/cerebro_spheroid_v5/training/train_v5_tpu_jax.py#L2085-L2090) when resuming Step 279,000 across 8 TPU devices.
+Pushed commit [`3153724`](https://github.com/AjitKumar-git/cerebro_spheroid_v5/commit/3153724) to `origin main`:
 
 ## Modified Files
 - [`AGENTS.md`](AGENTS.md)
@@ -206,20 +205,22 @@
 - [`src/jax/data_streamer.py`](src/jax/data_streamer.py)
 - [`training/train_v5_sft.py`](training/train_v5_sft.py)
 - [`tests/test_audit_remediations.py`](tests/test_audit_remediations.py)
+- [`kaggle/tpu/kernel-metadata.json`](kaggle/tpu/kernel-metadata.json)
+- [`scripts/launch_kaggle_tpu.py`](scripts/launch_kaggle_tpu.py)
 
 ## Recent Actions (Last 10)
 | Time | Tool | Details |
 | :--- | :--- | :--- |
-| `00:16:13` | `run_command` | Revert hardware_configs and inspect WORK_STATE.md diff |
-| `00:16:08` | `run_command` | Check diff in hardware_configs.json |
-| `00:16:03` | `run_command` | Check git status |
-| `00:15:59` | `run_command` | Check diff in train_v5_tpu_jax.py and compare with scripts/ |
-| `00:10:48` | `run_command` | Verify 2-device pmap with NamedSharding + jax.device_put |
-| `00:10:31` | `run_command` | Run multi-TPU Local-SGD test |
-| `00:07:42` | `manage_task` | manage_task |
-| `00:06:25` | `edit_file` | edit_file |
-| `00:06:16` | `read_file` | read_file |
-| `00:06:12` | `run_command` | Test NamedSharding + jax.device_put with pmap |
+| `00:20:18` | `run_command` | Check git status |
+| `00:20:12` | `run_command` | Check TPU kernel status on Kaggle |
+| `00:20:05` | `run_command` | Push Kaggle TPU kernel to Kaggle |
+| `00:19:57` | `edit_file` | edit_file |
+| `00:19:57` | `edit_file` | edit_file |
+| `00:19:45` | `read_file` | read_file |
+| `00:19:34` | `run_command` | Check status of 2xT4 GPU kernel |
+| `00:19:22` | `run_command` | Compare TPU notebook in kaggle/ vs kaggle/tpu/ |
+| `00:19:15` | `run_command` | Compare Cell 8 of pulled vs local notebook |
+| `00:19:00` | `run_command` | Diff pulled notebook against colab TPU JAX notebook |
 
 ---
 *This file is automatically maintained by `auto-work-tracker`. Other agents can parse `.agents/work_state.json` or inspect this file directly to resume or review progress.*

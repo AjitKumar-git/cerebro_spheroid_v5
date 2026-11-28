@@ -26,7 +26,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
 TPU_DIR = REPO_ROOT / "kaggle" / "tpu"
-KERNEL_SLUG = "ajitsheoran/cerebrospheroid-v5-tpu-v5e-8-training"
+KERNEL_SLUG = "ajitsheoran/cerebrospheroid-v5-colab-tpu-jax"
 DEFAULT_TOPIC = "cs5-tpu-ajitsheoran"
 
 
