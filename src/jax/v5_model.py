@@ -581,6 +581,58 @@ def project_perceptual(
     return rms_norm(h_swiglu, params["perceptual.norm_out.weight"])
 
 
+def _chunked_mha_jax(
+    q: jnp.ndarray,
+    k: jnp.ndarray,
+    v: jnp.ndarray,
+    attn_mask: Optional[jnp.ndarray] = None,
+    is_causal: bool = False,
+    query_pos_offset: Union[int, jnp.ndarray] = 0,
+    top_k_res: int = 0,
+    chunk_size: int = 512,
+    use_remat: bool = False,
+) -> jnp.ndarray:
+    """Memory-bounded multi-head attention via query-axis chunking (8x lower HBM at 4K ctx)."""
+    B, H, Q_len, Dh = q.shape
+    K_len = k.shape[2]
+    k_t = jnp.swapaxes(k, -1, -2)
+    scale = 1.0 / math.sqrt(Dh)
+
+    def _attend_block(q_blk, q_pos_blk):
+        scores = jnp.matmul(q_blk, k_t) * scale
+        if attn_mask is not None:
+            scores = jnp.where(attn_mask, scores, -1e4)
+        if is_causal:
+            k_pos = jnp.arange(K_len, dtype=jnp.int32)[None, :]
+            c_mask = (k_pos <= q_pos_blk[:, None])[None, None, :, :]
+            scores = jnp.where(c_mask, scores, -1e4)
+        if top_k_res > 0 and K_len > top_k_res:
+            top_vals, _ = lax.top_k(scores, top_k_res)
+            scores = jnp.where(scores >= top_vals[..., -1:], scores, -1e4)
+        attn_w = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(q.dtype)
+        return jnp.matmul(attn_w, v)
+
+    c_sz = chunk_size if (Q_len > chunk_size and Q_len % chunk_size == 0) else next(
+        (c for c in (chunk_size, 384, 256, 192, 128) if Q_len > c and Q_len % c == 0),
+        Q_len,
+    )
+    if c_sz >= Q_len:
+        q_pos = query_pos_offset + jnp.arange(Q_len, dtype=jnp.int32)
+        out = _attend_block(q, q_pos)
+        return jnp.swapaxes(out, 1, 2).reshape(B, Q_len, H * Dh)
+
+    n_chunks = Q_len // c_sz
+    q_chunks = jnp.swapaxes(q.reshape(B, H, n_chunks, c_sz, Dh), 0, 2)  # [n_chunks, H, B, c_sz, Dh]
+    q_chunks = jnp.swapaxes(q_chunks, 1, 2)  # [n_chunks, B, H, c_sz, Dh]
+    q_pos_all = (query_pos_offset + jnp.arange(Q_len, dtype=jnp.int32)).reshape(n_chunks, c_sz)
+
+    blk_fn = jax.checkpoint(_attend_block) if use_remat else _attend_block
+    _, out_chunks = lax.scan(lambda _, inp: (None, blk_fn(inp[0], inp[1])), None, (q_chunks, q_pos_all))
+    # out_chunks: [n_chunks, B, H, c_sz, Dh] -> [B, H, Q_len, Dh]
+    out = jnp.swapaxes(jnp.swapaxes(out_chunks, 0, 1), 1, 2).reshape(B, H, Q_len, Dh)
+    return jnp.swapaxes(out, 1, 2).reshape(B, Q_len, H * Dh)
+
+
 def encode_sensory(
     params: Dict[str, jnp.ndarray],
     input_tokens_or_emb: jnp.ndarray,
@@ -641,15 +693,12 @@ def encode_sensory(
             q_s = apply_rope(q_s, sens_pos, theta=config.rope_theta)
             k_s = apply_rope(k_s, sens_pos, theta=config.rope_theta)
 
-        scores = jnp.matmul(q_s, jnp.swapaxes(k_s, -1, -2)) / math.sqrt(head_dim)
-        if attn_mask is not None:
-            scores = jnp.where(attn_mask, scores, -1e4)
-        elif is_causal:
-            causal_mask = jnp.tril(jnp.ones((L, L), dtype=bool))[None, None, :, :]
-            scores = jnp.where(causal_mask, scores, -1e4)
-        attn_w = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(flux.dtype)
-        ctx = jnp.matmul(attn_w, v_s)  # [B, H, L, head_dim]
-        ctx = jnp.swapaxes(ctx, 1, 2).reshape(B, L, D)  # [B, L, D]
+        ctx = _chunked_mha_jax(
+            q_s, k_s, v_s,
+            attn_mask=attn_mask,
+            is_causal=(is_causal and attn_mask is None),
+            query_pos_offset=0,
+        )
         flux = flux + jnp.matmul(ctx, params["sensory.out_self.weight"].T)
 
     # Stacked extra sensory layers (if num_sensory_layers > 1)
@@ -673,15 +722,12 @@ def encode_sensory(
                     q_l = apply_rope(q_l, sens_pos, theta=config.rope_theta)
                     k_l = apply_rope(k_l, sens_pos, theta=config.rope_theta)
 
-                scores_l = jnp.matmul(q_l, jnp.swapaxes(k_l, -1, -2)) / math.sqrt(head_dim)
-                if attn_mask is not None:
-                    scores_l = jnp.where(attn_mask, scores_l, -1e4)
-                elif is_causal:
-                    causal_mask = jnp.tril(jnp.ones((L, L), dtype=bool))[None, None, :, :]
-                    scores_l = jnp.where(causal_mask, scores_l, -1e4)
-                attn_w_l = jax.nn.softmax(scores_l.astype(jnp.float32), axis=-1).astype(flux.dtype)
-                ctx_l = jnp.matmul(attn_w_l, v_l)
-                ctx_l = jnp.swapaxes(ctx_l, 1, 2).reshape(B, L, D)
+                ctx_l = _chunked_mha_jax(
+                    q_l, k_l, v_l,
+                    attn_mask=attn_mask,
+                    is_causal=(is_causal and attn_mask is None),
+                    query_pos_offset=0,
+                )
                 flux = flux + jnp.matmul(ctx_l, params[f"{pfx}out_proj.weight"].T)
 
                 h2 = rms_norm(flux, params[f"{pfx}norm2.weight"])
@@ -1678,32 +1724,31 @@ def training_rollout(
                 motor_surface_all = surface[:, None, :] + p_scaled_all[None, :, :]
                 query_surface_all = motor_surface_all + tf_flux.astype(target_dtype)
 
-        # 2. Vectorized Multi-Head Arcuate Cross-Resonance across all T tokens in one systolic block
+        # 2. Query-Chunked Multi-Head Arcuate Cross-Resonance (hoist RoPE keys outside remat boundary)
         total_len = causal_keys.shape[2]
-        keys_t = jnp.swapaxes(causal_keys, -1, -2)
+        keys_att = (
+            apply_rope(causal_keys, jnp.arange(total_len, dtype=jnp.int32), theta=config.rope_theta)
+            if (config is not None and config.use_rope)
+            else causal_keys
+        )
+        top_k_res = getattr(config, "top_k_resonance", 0) if config is not None else 0
 
         def _parallel_cross_resonance(ms_all):
             q_all = jnp.matmul(ms_all, params["motor.q_proj.weight"].T).reshape(B, T, num_heads, head_dim)
             q_all = jnp.swapaxes(q_all, 1, 2)  # [B, H, T, head_dim]
             if config is not None and config.use_rope:
                 q_all = apply_rope(q_all, total_prompt_L + jnp.arange(T, dtype=jnp.int32), theta=config.rope_theta)
-                keys_att = apply_rope(causal_keys, jnp.arange(total_len, dtype=jnp.int32), theta=config.rope_theta)
-                keys_att_t = jnp.swapaxes(keys_att, -1, -2)
-            else:
-                keys_att_t = keys_t
-            scores_all = jnp.matmul(q_all, keys_att_t) / math.sqrt(head_dim)
-            pos = jnp.arange(total_len, dtype=jnp.int32)[None, :]
-            step_pos = (total_prompt_L + jnp.arange(T, dtype=jnp.int32))[:, None]
-            step_mask_all = all_valid & ((pos <= step_pos)[None, None, :, :])
-            scores_all = jnp.where(step_mask_all, scores_all, -1e4)
-            top_k_res = getattr(config, "top_k_resonance", 0) if config is not None else 0
-            if top_k_res > 0 and scores_all.shape[-1] > top_k_res:
-                top_vals, _ = lax.top_k(scores_all, top_k_res)
-                min_top = top_vals[..., -1:]
-                scores_all = jnp.where(scores_all >= min_top, scores_all, -1e4)
-            attn_w = jax.nn.softmax(scores_all.astype(jnp.float32), axis=-1).astype(target_dtype)
-            res_heads = jnp.matmul(attn_w, causal_values)
-            res_heads = jnp.swapaxes(res_heads, 1, 2).reshape(B, T, surface_dim)
+            res_heads = _chunked_mha_jax(
+                q_all,
+                keys_att,
+                causal_values,
+                attn_mask=all_valid,
+                is_causal=True,
+                query_pos_offset=total_prompt_L,
+                top_k_res=top_k_res,
+                chunk_size=512,
+                use_remat=use_remat,
+            )
             return rms_norm(
                 jnp.matmul(res_heads, params["motor.out_proj.weight"].T),
                 params["motor.resonance_norm.weight"],

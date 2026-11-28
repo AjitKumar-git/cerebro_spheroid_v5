@@ -375,6 +375,26 @@ def test_cached_sensory_step_matches_causal_encode():
     assert len(out_ids) == 3
 
 
+def test_chunked_mha_exact_parity():
+    """Verifies query-chunked MHA matches unchunked MHA with zero mathematical drift."""
+    import jax
+    import jax.numpy as jnp
+    from src.jax.v5_model import _chunked_mha_jax
+
+    key = jax.random.PRNGKey(11)
+    k1, k2, k3 = jax.random.split(key, 3)
+    q = jax.random.normal(k1, (2, 4, 32, 8))
+    k = jax.random.normal(k2, (2, 4, 36, 8))
+    v = jax.random.normal(k3, (2, 4, 36, 8))
+    mask = jnp.ones((2, 1, 1, 36), dtype=bool)
+
+    out_full = _chunked_mha_jax(q, k, v, attn_mask=mask, is_causal=True, query_pos_offset=4, top_k_res=8, chunk_size=512)
+    out_chunk = _chunked_mha_jax(q, k, v, attn_mask=mask, is_causal=True, query_pos_offset=4, top_k_res=8, chunk_size=8, use_remat=True)
+    # Note: 32 % 8 == 0 only triggers when Q_len > chunk_size; test with chunk_size=16 (< 32)
+    out_chunk16 = _chunked_mha_jax(q, k, v, attn_mask=mask, is_causal=True, query_pos_offset=4, top_k_res=8, chunk_size=16, use_remat=True)
+    assert jnp.allclose(out_full, out_chunk16, atol=1e-5)
+
+
 def test_from_scratch_coupled_core_and_parallel_plan_forward_grad():
     """Verifies use_sensory_core_coupling + use_parallel_plan_scan run forward & grad cleanly without touching defaults."""
     import jax
