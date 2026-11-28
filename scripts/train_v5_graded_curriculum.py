@@ -211,6 +211,18 @@ def parse_args(args_list: Optional[Sequence[str]] = None):
     parser.add_argument("--enable-aalw", action=argparse.BooleanOptionalAction, default=True, help="Enable Answer-Anchor Loss Weighting (3.5x penalty on final answer/reasoning tokens)")
     parser.add_argument("--anchor-weight", type=float, default=3.5, help="Loss multiplier for anchor and target completion tokens (default: 3.5)")
     parser.add_argument("--from-scratch", "--from_scratch", dest="from_scratch", action="store_true", default=False, help="Start clean from Step 0 without restoring local/cloud checkpoints")
+    parser.add_argument("--dataset-source", "--dataset_source", dest="dataset_source", type=str, default="graded", help="Dataset stream: 'pretrain' (41.4B 4-phase FineWeb/FineWeb-Edu/Code/Math) or 'graded' (legacy GradedCurriculumStreamer)")
+    parser.add_argument("--target-tokens", "--target_tokens", dest="target_tokens", type=int, default=41_400_000_000, help="Target loss-bearing token budget (default: 41.4B)")
+    parser.add_argument("--auto-tune", "--auto_tune", dest="auto_tune", action=argparse.BooleanOptionalAction, default=False, help="Auto-tune micro-batch size on active CUDA GPU before training")
+    parser.add_argument("--force-tune", "--force_tune", dest="force_tune", action="store_true", default=False, help="Force re-running GPU AutoTuner benchmarks")
+    parser.add_argument("--max-batch-size", "--max_batch_size", dest="max_batch_size", type=int, default=None, help="Optional cap on auto-tuned GPU micro-batch size")
+    parser.add_argument("--effective-batch-size", "--effective_batch_size", dest="effective_batch_size", type=int, default=None, help="Target effective batch size (auto-computes grad_accum)")
+    parser.add_argument("--selective-loss", "--selective_loss", dest="selective_loss", action=argparse.BooleanOptionalAction, default=False, help="Enable noise-capped selective token loss weighting")
+    parser.add_argument("--selective-focal-gamma", "--selective_focal_gamma", dest="selective_focal_gamma", type=float, default=0.5, help="Selective focal exponent (default: 0.5)")
+    parser.add_argument("--selective-noise-cap", "--selective_noise_cap", dest="selective_noise_cap", type=float, default=8.5, help="Selective noise cap (default: 8.5)")
+    parser.add_argument("--z-loss-weight", "--z_loss_weight", dest="z_loss_weight", type=float, default=0.0, help="Logit Z-loss weight (default: 0.0)")
+    parser.add_argument("--use-bidirectional-tracts", "--use_bidirectional_tracts", dest="use_bidirectional_tracts", action=argparse.BooleanOptionalAction, default=False, help="Enable bidirectional corticofugal shortcut tracts")
+    parser.add_argument("--num-sensory-layers", "--num_sensory_layers", dest="num_sensory_layers", type=int, default=None, help="Causal sensory layers (4 on --from_scratch, 1 on resume)")
     parser.add_argument("--max-hours", type=float, default=None, help="Wall-clock budget in hours for clean checkpoint save before timeout")
     parser.add_argument("--seed", type=int, default=42, help="Base PRNG seed (offset per DDP rank for data streaming)")
     parser.add_argument("--compile", action="store_true", default=False, help="Enable torch.compile on combined model for faster GPU throughput")
@@ -503,14 +515,24 @@ def _run_training(
         preset_kwargs["max_seq_len"] = max_seq_budget
         preset_kwargs["use_sparse_mot"] = True
         preset_kwargs["use_energy_regularization"] = True
+        preset_kwargs["use_selective_loss"] = bool(getattr(args, "selective_loss", False))
+        preset_kwargs["selective_focal_gamma"] = float(getattr(args, "selective_focal_gamma", 0.5))
+        preset_kwargs["selective_noise_cap"] = float(getattr(args, "selective_noise_cap", 8.5))
+        preset_kwargs["z_loss_weight"] = float(getattr(args, "z_loss_weight", 0.0))
         if getattr(args, "from_scratch", False):
-            preset_kwargs["num_sensory_layers"] = 4
+            preset_kwargs["num_sensory_layers"] = int(getattr(args, "num_sensory_layers", None) or 4)
             preset_kwargs["use_centralized_readout"] = False
             preset_kwargs["use_shell_tap"] = True
+            preset_kwargs["use_bidirectional_tracts"] = True
             preset_kwargs["use_sequential_cascade"] = True
-            preset_kwargs["use_sensory_core_coupling"] = False
-            preset_kwargs["use_parallel_plan_scan"] = False
-            preset_kwargs["preserve_shell_norm_clamp"] = True
+            preset_kwargs["use_sensory_core_coupling"] = True
+            preset_kwargs["use_parallel_plan_scan"] = True
+            preset_kwargs["top_k_resonance"] = 0
+            preset_kwargs["preserve_shell_norm_clamp"] = False
+        else:
+            if getattr(args, "num_sensory_layers", None) is not None:
+                preset_kwargs["num_sensory_layers"] = int(args.num_sensory_layers)
+            preset_kwargs["use_bidirectional_tracts"] = bool(getattr(args, "use_bidirectional_tracts", False))
         if hasattr(tokenizer, "vocab_size") and tokenizer.vocab_size:
             preset_kwargs["vocab_size"] = tokenizer.vocab_size
         config = ModelConfigV5(**preset_kwargs)
@@ -584,7 +606,35 @@ def _run_training(
     else:
         train_module = raw_combined
 
-    # 2. Setup Memory-Saving Curriculum Streamer (distinct seed & HF shard per DDP rank)
+    # Optional PyTorch GPU Auto-Tuning (1:1 with TPU JAX AutoTuner)
+    if getattr(args, "auto_tune", False) and use_cuda:
+        try:
+            from autotune import run_auto_tuner
+            tuned_cfg = run_auto_tuner(
+                preset=args.model_preset,
+                seq_len=args.seq_len,
+                dtype=args.amp_dtype,
+                use_cached_config=not getattr(args, "force_tune", False),
+                force_tune=getattr(args, "force_tune", False),
+                upload_winner=bool(args.cloud_sync),
+                cloud_token=None,
+                verbose=is_main,
+                prompt_len=args.prompt_len,
+                max_batch_size=getattr(args, "max_batch_size", None),
+                model_config=config,
+                framework="pytorch",
+            )
+            if tuned_cfg and int(tuned_cfg.get("batch_size", 0)) > 0:
+                args.batch_size = int(tuned_cfg["batch_size"])
+                eff_tgt = getattr(args, "effective_batch_size", None) or args.target_batch_size
+                args.grad_accum = max(1, int(eff_tgt) // max(1, args.batch_size * world_size))
+                if is_main:
+                    print(f"⚡ [GPU AutoTuner] Adopted batch_size={args.batch_size}, grad_accum={args.grad_accum} (effective={args.batch_size * args.grad_accum * world_size})")
+        except Exception as e_tune:
+            if is_main:
+                print(f"⚠️ [GPU AutoTuner] Notice: {e_tune}. Keeping batch_size={args.batch_size}.")
+
+    # 2. Setup Memory-Saving Curriculum Streamer (Rectified 41.4B Pretrain or Graded Curriculum)
     schedule_config = CurriculumScheduleConfig(
         total_steps=args.total_steps,
         phase_1_end=50_000,
@@ -598,16 +648,40 @@ def _run_training(
         multimodal_sample_ratio=0.0,
     )
 
-    streamer = GradedCurriculumStreamer(
-        tokenizer=tokenizer,
-        config=schedule_config,
-        seed=args.seed + rank * 10007,
-        mix=args.mix,
-        search_dirs=["data"],
-        offline=args.offline,
-        rank=rank,
-        world_size=world_size,
-    )
+    cumulative_tokens_holder = [0]
+    if args.cloud_sync:
+        try:
+            from src.cloud_sync import fetch_remote_token_tracker
+            rt = fetch_remote_token_tracker(args.model_preset)
+            if isinstance(rt, dict) and int(rt.get("cumulative_tokens", 0)) > 0:
+                cumulative_tokens_holder[0] = int(rt["cumulative_tokens"])
+        except Exception:
+            pass
+
+    ds_source = getattr(args, "dataset_source", "graded").lower()
+    is_rectified_pretrain = ds_source in ("pretrain", "rectified", "rectified_pretrain", "clean_pretrain", "midtrain", "midtraining", "deep_reasoning")
+    if is_rectified_pretrain:
+        from src.rectified_streamer import RectifiedContiguousPretrainStreamer
+        rect_stage = "midtrain" if ds_source in ("midtrain", "midtraining", "deep_reasoning") else "pretrain"
+        streamer = RectifiedContiguousPretrainStreamer(
+            tokenizer=tokenizer,
+            batch_size=args.batch_size,
+            block_size=args.seq_len,
+            stage=rect_stage,
+            tokens_getter=lambda: cumulative_tokens_holder[0],
+            target_tokens=int(getattr(args, "target_tokens", 41_400_000_000)),
+        )
+    else:
+        streamer = GradedCurriculumStreamer(
+            tokenizer=tokenizer,
+            config=schedule_config,
+            seed=args.seed + rank * 10007,
+            mix=args.mix,
+            search_dirs=["data"],
+            offline=args.offline,
+            rank=rank,
+            world_size=world_size,
+        )
 
     # 3. Setup Optimizer (Default: Custom SpheroidOptimizer with Polar Newton-Schulz)
     all_params = list(raw_model.parameters()) + list(raw_action_head.parameters())
@@ -811,19 +885,29 @@ def _run_training(
                     else contextlib.nullcontext()
                 )
                 with sync_ctx:
-                    prompts, targets, feedback, action_labels, perceptual_inputs, batch_phase, _ = streamer.get_elastic_batch(
-                        step=step,
-                        device=device,
-                        batch_size=args.batch_size,
-                        total_window=window_budget,
-                        tail_probability=args.tail_prob,
-                        buckets=static_buckets,
-                    )
+                    if is_rectified_pretrain:
+                        np_p, np_t = streamer.get_batch()
+                        prompts = torch.from_numpy(np_p).to(device=device, dtype=torch.long)
+                        targets = torch.from_numpy(np_t).to(device=device, dtype=torch.long)
+                        feedback = None
+                        action_labels = None
+                        perceptual_inputs = None
+                        compute_action = False
+                    else:
+                        prompts, targets, feedback, action_labels, perceptual_inputs, batch_phase, _ = streamer.get_elastic_batch(
+                            step=step,
+                            device=device,
+                            batch_size=args.batch_size,
+                            total_window=window_budget,
+                            tail_probability=args.tail_prob,
+                            buckets=static_buckets,
+                        )
+                        compute_action = batch_phase in (
+                            CurriculumPhase.PHASE_3_WORKFLOWS,
+                            CurriculumPhase.PHASE_4_CONSOLIDATION,
+                        )
                     micro_tokens = prompts.numel() + targets.numel()
-                    compute_action = batch_phase in (
-                        CurriculumPhase.PHASE_3_WORKFLOWS,
-                        CurriculumPhase.PHASE_4_CONSOLIDATION,
-                    )
+                    cumulative_tokens_holder[0] += micro_tokens * world_size
                     with torch.amp.autocast("cuda", enabled=use_cuda, dtype=amp_dtype):
                         ce_loss, logits, action_logits = train_module(
                             prompts,
@@ -925,8 +1009,8 @@ def _run_training(
                 steps_since_log = 0
 
             # Periodic Checkpointing & Cloud Sync (rank 0 only)
-            need_local_save = (step % args.save_interval == 0 and step > start_step)
-            need_cloud_sync = (args.cloud_sync and step > start_step and (step % args.cloud_sync_interval == 0))
+            need_local_save = (bool(args.save_interval) and args.save_interval > 0 and step % args.save_interval == 0 and step > start_step)
+            need_cloud_sync = (args.cloud_sync and bool(args.cloud_sync_interval) and args.cloud_sync_interval > 0 and step > start_step and (step % args.cloud_sync_interval == 0))
             if (need_local_save or need_cloud_sync) and is_main:
                 cur_loss = (float(accum_loss_t.item()) / steps_since_log) if steps_since_log > 0 else (ema_loss or last_avg_loss)
                 best_loss = _save_and_push_checkpoints(
@@ -980,7 +1064,10 @@ def _run_training(
         if is_distributed:
             dist.barrier()
     finally:
-        streamer.close()
+        if hasattr(streamer, "stop"):
+            streamer.stop()
+        elif hasattr(streamer, "close"):
+            streamer.close()
 
 
 if __name__ == "__main__":
